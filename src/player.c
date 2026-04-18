@@ -1,5 +1,6 @@
 #include "player.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 int player_open(player_t *p, const char *url) {
@@ -62,6 +63,124 @@ void player_close(player_t *p) {
     memset(p, 0, sizeof(*p));
 }
 
-/* player_start / player_stop are stubs in this task; next task fills them. */
-int  player_start(player_t *p) { (void)p; return 0; }
-void player_stop(player_t *p)  { (void)p; }
+static void alloc_frame_copy_yuv(const AVFrame *in, video_frame_t *out) {
+    out->width  = in->width;
+    out->height = in->height;
+    out->stride_y = in->width;
+    out->stride_u = in->width / 2;
+    out->stride_v = in->width / 2;
+    out->y = malloc((size_t)out->stride_y * in->height);
+    out->u = malloc((size_t)out->stride_u * in->height / 2);
+    out->v = malloc((size_t)out->stride_v * in->height / 2);
+    for (int r = 0; r < in->height; ++r)
+        memcpy(out->y + r * out->stride_y, in->data[0] + r * in->linesize[0], out->stride_y);
+    for (int r = 0; r < in->height / 2; ++r)
+        memcpy(out->u + r * out->stride_u, in->data[1] + r * in->linesize[1], out->stride_u);
+    for (int r = 0; r < in->height / 2; ++r)
+        memcpy(out->v + r * out->stride_v, in->data[2] + r * in->linesize[2], out->stride_v);
+}
+
+static double ts_to_seconds(int64_t pts, AVRational tb) {
+    if (pts == AV_NOPTS_VALUE) return 0.0;
+    return (double)pts * tb.num / tb.den;
+}
+
+static void push_video_frame(player_t *p, AVFrame *frame) {
+    if (frame->format != AV_PIX_FMT_YUV420P) {
+        if (!p->sws) {
+            p->sws = sws_getContext(frame->width, frame->height, frame->format,
+                                    frame->width, frame->height, AV_PIX_FMT_YUV420P,
+                                    SWS_BILINEAR, NULL, NULL, NULL);
+        }
+        AVFrame *conv = av_frame_alloc();
+        conv->format = AV_PIX_FMT_YUV420P;
+        conv->width  = frame->width;
+        conv->height = frame->height;
+        av_frame_get_buffer(conv, 32);
+        sws_scale(p->sws, (const uint8_t *const *)frame->data, frame->linesize,
+                  0, frame->height, conv->data, conv->linesize);
+        conv->pts = frame->pts;
+        video_frame_t *vf = calloc(1, sizeof(*vf));
+        alloc_frame_copy_yuv(conv, vf);
+        vf->pts = ts_to_seconds(conv->pts, p->fmt->streams[p->video_idx]->time_base);
+        av_frame_free(&conv);
+        queue_push(&p->video_q, vf);
+        return;
+    }
+    video_frame_t *vf = calloc(1, sizeof(*vf));
+    alloc_frame_copy_yuv(frame, vf);
+    vf->pts = ts_to_seconds(frame->pts, p->fmt->streams[p->video_idx]->time_base);
+    queue_push(&p->video_q, vf);
+}
+
+static void push_audio_frame(player_t *p, AVFrame *frame) {
+    if (!p->swr) {
+        AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
+        swr_alloc_set_opts2(&p->swr,
+            &out_layout, AV_SAMPLE_FMT_S16, p->audio_sample_rate_out,
+            &p->actx->ch_layout, p->actx->sample_fmt, p->actx->sample_rate,
+            0, NULL);
+        swr_init(p->swr);
+    }
+    int max_out_samples = (int)av_rescale_rnd(
+        swr_get_delay(p->swr, p->actx->sample_rate) + frame->nb_samples,
+        p->audio_sample_rate_out, p->actx->sample_rate, AV_ROUND_UP);
+    int16_t *out_buf = malloc((size_t)max_out_samples * 2 * sizeof(int16_t));
+    uint8_t *out_ptrs[1] = { (uint8_t *)out_buf };
+    int written = swr_convert(p->swr, out_ptrs, max_out_samples,
+                              (const uint8_t **)frame->extended_data, frame->nb_samples);
+    if (written <= 0) { free(out_buf); return; }
+    audio_chunk_t *ac = calloc(1, sizeof(*ac));
+    ac->samples     = out_buf;
+    ac->n_samples   = written;
+    ac->sample_rate = p->audio_sample_rate_out;
+    ac->pts         = ts_to_seconds(frame->pts, p->fmt->streams[p->audio_idx]->time_base);
+    queue_push(&p->audio_q, ac);
+}
+
+static void *decoder_loop(void *ud) {
+    player_t *p = ud;
+    AVPacket *pkt = av_packet_alloc();
+    AVFrame  *fr  = av_frame_alloc();
+
+    while (!p->stop) {
+        int rc = av_read_frame(p->fmt, pkt);
+        if (rc < 0) {
+            if (rc == AVERROR_EOF) break;
+            fprintf(stderr, "av_read_frame: %d\n", rc);
+            break;
+        }
+        AVCodecContext *ctx = NULL;
+        int is_video = 0;
+        if (pkt->stream_index == p->video_idx) { ctx = p->vctx; is_video = 1; }
+        else if (pkt->stream_index == p->audio_idx) { ctx = p->actx; }
+        if (!ctx) { av_packet_unref(pkt); continue; }
+
+        if (avcodec_send_packet(ctx, pkt) == 0) {
+            while (avcodec_receive_frame(ctx, fr) == 0) {
+                if (is_video) push_video_frame(p, fr);
+                else          push_audio_frame(p, fr);
+                av_frame_unref(fr);
+            }
+        }
+        av_packet_unref(pkt);
+    }
+
+    queue_close(&p->video_q);
+    queue_close(&p->audio_q);
+    av_frame_free(&fr);
+    av_packet_free(&pkt);
+    return NULL;
+}
+
+int player_start(player_t *p) {
+    p->stop = 0;
+    return pthread_create(&p->thread, NULL, decoder_loop, p);
+}
+
+void player_stop(player_t *p) {
+    p->stop = 1;
+    queue_close(&p->video_q);
+    queue_close(&p->audio_q);
+    pthread_join(p->thread, NULL);
+}

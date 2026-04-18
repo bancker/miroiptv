@@ -28,3 +28,28 @@ void render_toggle_fullscreen(render_t *r) {
     SDL_SetWindowFullscreen(r->window,
         r->fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
 }
+
+void video_tex_init(video_tex_t *t) {
+    t->texture = NULL; t->width = t->height = 0;
+}
+
+static int ensure_texture(video_tex_t *t, SDL_Renderer *r, int w, int h) {
+    if (t->texture && t->width == w && t->height == h) return 0;
+    if (t->texture) SDL_DestroyTexture(t->texture);
+    t->texture = SDL_CreateTexture(r, SDL_PIXELFORMAT_IYUV,
+                                   SDL_TEXTUREACCESS_STREAMING, w, h);
+    if (!t->texture) { fprintf(stderr, "SDL_CreateTexture: %s\n", SDL_GetError()); return -1; }
+    t->width = w; t->height = h;
+    return 0;
+}
+
+int video_tex_upload(video_tex_t *t, SDL_Renderer *r, const video_frame_t *f) {
+    if (ensure_texture(t, r, f->width, f->height) != 0) return -1;
+    return SDL_UpdateYUVTexture(t->texture, NULL,
+        f->y, f->stride_y, f->u, f->stride_u, f->v, f->stride_v);
+}
+
+void video_tex_destroy(video_tex_t *t) {
+    if (t->texture) SDL_DestroyTexture(t->texture);
+    t->texture = NULL;
+}

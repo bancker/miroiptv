@@ -1,34 +1,64 @@
+#include "render.h"
 #include "player.h"
 #include "npo.h"
+#include <SDL2/SDL.h>
 #include <curl/curl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 int main(int argc, char **argv) {
-    const char *url = (argc > 1) ? argv[1] : NULL;
-    char *resolved = NULL;
-
     curl_global_init(CURL_GLOBAL_DEFAULT);
-    if (!url) {
-        if (npo_resolve_stream(&NPO_CHANNELS[0], &resolved) != 0) {
-            fputs("usage: ./tv.exe <hls-url>   (resolver broken, see R1)\n", stderr);
+
+    char *url = NULL;
+    if (argc > 1) {
+        url = strdup(argv[1]);
+        printf("stream (override): %s\n", url);
+    } else {
+        if (npo_resolve_stream(&NPO_CHANNELS[0], &url) != 0) {
+            fputs("usage: ./tv.exe <hls-url>  (NPO resolver broken, see R1)\n", stderr);
             return 2;
         }
-        url = resolved;
+        printf("stream: %s\n", url);
     }
-    printf("url: %s\n", url);
 
-    player_t p;
-    if (player_open(&p, url) != 0) { free(resolved); return 3; }
+    player_t pl;
+    if (player_open(&pl, url) != 0) { free(url); return 3; }
+    if (player_start(&pl) != 0)     { free(url); player_close(&pl); return 3; }
 
-    printf("video: %dx%d, codec=%s\n", p.vctx->width, p.vctx->height,
-           avcodec_get_name(p.vctx->codec_id));
-    printf("audio: %d Hz, %d ch, codec=%s\n", p.actx->sample_rate,
-           p.actx->ch_layout.nb_channels,
-           avcodec_get_name(p.actx->codec_id));
+    render_t r;
+    if (render_init(&r, pl.vctx->width, pl.vctx->height, "tv - NPO") != 0) return 4;
+    video_tex_t tex; video_tex_init(&tex);
 
-    player_close(&p);
-    free(resolved);
+    bool running = true;
+    while (running) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) running = false;
+            else if (ev.type == SDL_KEYDOWN) {
+                if (ev.key.keysym.sym == SDLK_q || ev.key.keysym.sym == SDLK_ESCAPE) running = false;
+                else if (ev.key.keysym.sym == SDLK_f) render_toggle_fullscreen(&r);
+            }
+        }
+
+        video_frame_t *vf = queue_pop(&pl.video_q);
+        if (!vf) { running = false; break; }
+
+        video_tex_upload(&tex, r.renderer, vf);
+        SDL_RenderClear(r.renderer);
+        SDL_RenderCopy(r.renderer, tex.texture, NULL, NULL);
+        SDL_RenderPresent(r.renderer);
+        video_frame_free(vf);
+
+        /* naive pacing (no sync yet): 40ms/frame; audio clock replaces this in task 11 */
+        SDL_Delay(40);
+    }
+
+    player_stop(&pl);
+    video_tex_destroy(&tex);
+    render_shutdown(&r);
+    player_close(&pl);
+    free(url);
     curl_global_cleanup();
     return 0;
 }
