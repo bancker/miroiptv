@@ -70,7 +70,13 @@ static void audio_callback(void *ud, uint8_t *stream, int len) {
              * On miss, fill the remaining frame with silence and return. */
             audio_chunk_t *c = queue_try_pop(ao->q);
             if (!c) {
+                /* No audio data. Write silence AND advance samples_played so
+                 * the av_clock keeps moving — otherwise a decoder hiccup
+                 * freezes the clock, main holds the pending video frame
+                 * forever, the video queue fills to cap, the decoder blocks
+                 * on queue_push, and everything deadlocks. */
                 memset(out, 0, (size_t)need_samples * 2 * sizeof(int16_t));
+                ao->samples_played += need_samples;
                 return;
             }
             /* Seed the A/V clock baseline from the FIRST audio pts we play,

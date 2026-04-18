@@ -387,7 +387,19 @@ int main(int argc, char **argv) {
     int paused         = 0;
     int have_texture   = 0;
     video_frame_t *pending_vf = NULL;  /* held across iterations when not yet due */
-    Uint32 last_frame_ts = SDL_GetTicks();
+    /* Audio-callback liveness tracking. samples_played advances as long as
+     * SDL's audio callback is being called — it's incremented even when the
+     * callback writes silence (no chunks). So if it stops advancing, the
+     * callback has stopped being called, which is the Windows/SDL audio
+     * subsystem glitch we want to recover from. */
+    int64_t prev_samples_played      = 0;
+    Uint32  last_audio_progress_ts   = SDL_GetTicks();
+
+    /* Heartbeat: log state every HEARTBEAT_MS so we can see in the log
+     * exactly when main stops making progress. If the heartbeat pauses,
+     * main thread is blocked somewhere. */
+    Uint32 last_heartbeat = SDL_GetTicks();
+    const Uint32 HEARTBEAT_MS = 15000;
 
     /* Right-click drag state — since the window is borderless there's no title
      * bar to grab, so we implement window-move by: on right-button-down we
@@ -803,9 +815,32 @@ int main(int argc, char **argv) {
             free(zap_prep); zap_prep = NULL;
         }
 
+        /* Audio liveness tick. */
+        Uint32 tnow_ms = SDL_GetTicks();
+        int64_t cur_samples = pb->audio.samples_played;
+        if (cur_samples != prev_samples_played) {
+            prev_samples_played    = cur_samples;
+            last_audio_progress_ts = tnow_ms;
+        }
+
+        /* Heartbeat — liveness ping. */
+        if (tnow_ms - last_heartbeat >= HEARTBEAT_MS) {
+            fprintf(stderr, "[heartbeat] vq=%zu aq=%zu samples=%lld clk=%.1f vframes=%lld aframes=%lld\n",
+                    pb->player.video_q.count, pb->player.audio_q.count,
+                    (long long)pb->audio.samples_played,
+                    av_clock_ready(&pb->clk) ? av_clock_now(&pb->clk) : 0.0,
+                    pb->player.video_frames_pushed, pb->player.audio_frames_pushed);
+            last_heartbeat = tnow_ms;
+        }
+
         /* 2) Try to grab a new frame if we don't have one pending. */
         if (!pending_vf) pending_vf = queue_try_pop(&pb->player.video_q);
-        if (pending_vf) last_frame_ts = SDL_GetTicks();
+        /* NB: last_frame_ts is NOT updated here anymore. It used to update
+         * whenever we held a frame, which meant a stuck clock (audio callback
+         * dead -> clock frozen -> frame held forever) kept the stall detector
+         * from ever firing. Now we only update it on successful PRESENT, so
+         * a genuine presentation freeze triggers the stall-restart after
+         * STALL_MS. */
 
         /* 3) If we have a pending frame, decide what to do with it.
          * Skip the decide-when block until audio has actually started
@@ -829,12 +864,18 @@ int main(int argc, char **argv) {
             /* else: hold for next iteration — its time hasn't come yet. */
         }
 
-        /* 3b) Stall detection + auto-restart. Only kicks in after we've seen
-         * at least one frame (have_texture) so the initial connect phase
-         * doesn't trigger it. Branches on pb->stream_id: if >0 we were zapped
-         * to a portal channel and must reopen THAT stream, not fall back to
-         * an NPO URL derived from the (stale) pb->channel pointer. */
-        if (have_texture && SDL_GetTicks() - last_frame_ts > STALL_MS) {
+        /* 3b) Stall detection + auto-restart. We only trigger restart when
+         * AUDIO has stopped progressing — measured via samples_played not
+         * advancing — because that indicates SDL's audio callback has died
+         * (a known Windows glitch that also freezes our clock, which freezes
+         * video as a side effect). Brief video-only hiccups during HLS
+         * segment boundaries don't fire the restart: as long as audio keeps
+         * playing, the user keeps hearing the stream and video will catch up.
+         *
+         * Gates: must be unpaused, must have presented at least one frame
+         * already, and audio must have previously progressed (has_first_pts). */
+        if (have_texture && !paused && pb->audio.has_first_pts &&
+            SDL_GetTicks() - last_audio_progress_ts > STALL_MS) {
             char *restart_url;
             int   restart_epg_id;
             if (pb->timeshift_start != 0 && portal.host) {
@@ -878,7 +919,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[stall] restart failed - will retry in %ums\n", STALL_MS);
             }
             free(restart_url);
-            last_frame_ts = SDL_GetTicks();  /* reset either way */
+            /* Reset the audio-progress tracker so we don't fire again 3s later. */
+            last_audio_progress_ts = SDL_GetTicks();
+            prev_samples_played    = 0;
         }
 
         /* 4) Always render. VSYNC in SDL_RenderPresent paces the loop to ~60Hz,
