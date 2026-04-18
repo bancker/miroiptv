@@ -26,6 +26,17 @@ char *xtream_stream_url(const xtream_t *x, int stream_id);
  * for sensible-quality default. Index matches NPO_CHANNELS[] in npo.h. */
 extern const int XTREAM_NPO_STREAM_IDS[3];
 
+/* Catch-up ("TERUGKIJKEN") stream IDs — these have tv_archive=1 and support
+ * the /timeshift/... URL pattern. Separate from live IDs because the portal
+ * provisions catch-up on a distinct channel number. 2-day window. */
+extern const int XTREAM_NPO_ARCHIVE_STREAM_IDS[3];
+
+/* Builds an Xtream Codes timeshift URL for a past event:
+ *   http://HOST:PORT/timeshift/USER/PASS/DURATION_MIN/YYYY-MM-DD:HH-MM/ID.ts
+ * start_time is a unix timestamp; the URL uses UTC wall-clock format. */
+char *xtream_timeshift_url(const xtream_t *x, int archive_stream_id,
+                           time_t start_time, int duration_min);
+
 /* Fetches the short EPG (upcoming programs) for a given stream id via the
  * portal's player_api.php?action=get_short_epg endpoint. Titles arrive
  * base64-encoded; we decode them and flag NOS Journaal entries the same way

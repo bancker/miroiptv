@@ -17,6 +17,11 @@
  * If the portal's stream IDs change, update this table. */
 const int XTREAM_NPO_STREAM_IDS[3] = { 755880, 755881, 755882 };
 
+/* Catch-up streams from category "NL | TERUGKIJKEN" (category_id 1550),
+ * with tv_archive=1, tv_archive_duration=2 (days). These are the live-NPO
+ * streams mirrored with timeshift support. */
+const int XTREAM_NPO_ARCHIVE_STREAM_IDS[3] = { 1124362, 1124363, 1124364 };
+
 int xtream_parse(const char *spec, xtream_t *out) {
     memset(out, 0, sizeof(*out));
     if (!spec || !*spec) return -1;
@@ -208,6 +213,32 @@ void xtream_live_list_free(xtream_live_list_t *list) {
     for (size_t i = 0; i < list->count; ++i) free(list->entries[i].name);
     free(list->entries);
     memset(list, 0, sizeof(*list));
+}
+
+char *xtream_timeshift_url(const xtream_t *x, int archive_stream_id,
+                           time_t start_time, int duration_min) {
+    if (duration_min <= 0) duration_min = 30;  /* sensible default */
+    struct tm gmt_tm;
+#ifdef _WIN32
+    if (gmtime_s(&gmt_tm, &start_time) != 0) return NULL;
+#else
+    if (!gmtime_r(&start_time, &gmt_tm)) return NULL;
+#endif
+    /* "YYYY-MM-DD:HH-MM" = 16 chars + NUL. Bumped to 40 so gcc stops worrying
+     * about worst-case tm_year formatting (%04d can produce 5+ chars for
+     * years > 9999 — irrelevant for us but the static analyzer can't tell). */
+    char when[40];
+    snprintf(when, sizeof(when), "%04d-%02d-%02d:%02d-%02d",
+             gmt_tm.tm_year + 1900, gmt_tm.tm_mon + 1, gmt_tm.tm_mday,
+             gmt_tm.tm_hour, gmt_tm.tm_min);
+
+    size_t cap = strlen(x->host) + strlen(x->user) + strlen(x->pass) + 128;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    snprintf(out, cap, "http://%s:%d/timeshift/%s/%s/%d/%s/%d.ts",
+             x->host, x->port, x->user, x->pass,
+             duration_min, when, archive_stream_id);
+    return out;
 }
 
 char *xtream_stream_url(const xtream_t *x, int stream_id) {

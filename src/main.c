@@ -151,27 +151,39 @@ static journaal_hit_t find_latest_journaal(const xtream_t *portal) {
     int    best_past_ch   = -1; time_t best_past_start   = 0; time_t best_past_end   = 0;
     int    best_next_ch   = -1; time_t best_next_start   = 0; time_t best_next_end   = 0;
 
+    /* Scan BOTH live NPO EPGs (for airing-now precision) and TERUGKIJKEN
+     * catch-up EPGs (which reach further into the past AND future). The
+     * get_short_epg endpoint on the live channel IDs often drops entries
+     * older than a few hours, so without the archive sweep 'past' wins
+     * would rarely trigger. */
+    const int scan_ids[3][2] = {
+        { XTREAM_NPO_STREAM_IDS[0], XTREAM_NPO_ARCHIVE_STREAM_IDS[0] },
+        { XTREAM_NPO_STREAM_IDS[1], XTREAM_NPO_ARCHIVE_STREAM_IDS[1] },
+        { XTREAM_NPO_STREAM_IDS[2], XTREAM_NPO_ARCHIVE_STREAM_IDS[2] },
+    };
     for (int i = 0; i < 3; ++i) {
-        epg_t e = {0};
-        if (xtream_fetch_epg(portal, XTREAM_NPO_STREAM_IDS[i], &e) != 0) continue;
-        for (size_t j = 0; j < e.count; ++j) {
-            if (!e.entries[j].is_news) continue;
-            time_t s = e.entries[j].start, en = e.entries[j].end;
-            if (s <= now && now < en) {
-                if (s > best_airing_start) {
-                    best_airing_ch = i; best_airing_start = s; best_airing_end = en;
-                }
-            } else if (en <= now) {
-                if (s > best_past_start) {
-                    best_past_ch = i; best_past_start = s; best_past_end = en;
-                }
-            } else { /* s > now */
-                if (best_next_ch < 0 || s < best_next_start) {
-                    best_next_ch = i; best_next_start = s; best_next_end = en;
+        for (int src = 0; src < 2; ++src) {
+            epg_t e = {0};
+            if (xtream_fetch_epg(portal, scan_ids[i][src], &e) != 0) continue;
+            for (size_t j = 0; j < e.count; ++j) {
+                if (!e.entries[j].is_news) continue;
+                time_t s = e.entries[j].start, en = e.entries[j].end;
+                if (s <= now && now < en) {
+                    if (s > best_airing_start) {
+                        best_airing_ch = i; best_airing_start = s; best_airing_end = en;
+                    }
+                } else if (en <= now) {
+                    if (s > best_past_start) {
+                        best_past_ch = i; best_past_start = s; best_past_end = en;
+                    }
+                } else { /* s > now */
+                    if (best_next_ch < 0 || s < best_next_start) {
+                        best_next_ch = i; best_next_start = s; best_next_end = en;
+                    }
                 }
             }
+            npo_epg_free(&e);
         }
-        npo_epg_free(&e);
     }
 
     if (best_airing_ch >= 0) {
@@ -382,33 +394,50 @@ int main(int argc, char **argv) {
                              "NOS Journaal not found in EPG");
                     fprintf(stderr, "[journaal] no NOS Journaal in NPO 1/2/3 EPG\n");
                 } else {
-                    /* Format the start time in local time for the toast. */
                     struct tm lt = *localtime(&hit.start);
                     const char *chname = NPO_CHANNELS[hit.channel_idx].display;
+
+                    /* Decide URL + whether we'll need to open a different playback:
+                     *   - airing now  -> live NPO stream (we see the in-progress live feed)
+                     *   - past        -> timeshift URL on TERUGKIJKEN stream (replay from start)
+                     *   - future      -> switch to live NPO (user sees upcoming start) */
+                    char *target_url = NULL;
+                    int   target_stream_id = 0;  /* for stall-restart tracking */
+
                     if (hit.is_airing) {
                         long long mins_in = hit.seconds_ago / 60;
                         snprintf(toast_text, sizeof(toast_text),
                                  "NOS Journaal airing on %s (started %02d:%02d, %lld min ago)",
                                  chname, lt.tm_hour, lt.tm_min, mins_in);
+                        target_url = build_channel_url(hit.channel_idx, &portal, direct_url);
+                        target_stream_id = 0;  /* treat as standard live NPO channel */
                     } else if (hit.is_past) {
                         long long ago_m = hit.seconds_ago / 60;
+                        int dur_min = (int)((hit.end - hit.start) / 60);
                         snprintf(toast_text, sizeof(toast_text),
-                                 "Last NOS Journaal on %s ended %lld min ago - can't replay, live only",
-                                 chname, ago_m);
+                                 "Replaying NOS Journaal from %02d:%02d on %s (ended %lld min ago)",
+                                 lt.tm_hour, lt.tm_min, chname, ago_m);
+                        target_stream_id = XTREAM_NPO_ARCHIVE_STREAM_IDS[hit.channel_idx];
+                        target_url = xtream_timeshift_url(&portal, target_stream_id,
+                                                          hit.start, dur_min);
                     } else {
                         long long til_m = hit.seconds_til / 60;
                         snprintf(toast_text, sizeof(toast_text),
                                  "Next NOS Journaal on %s at %02d:%02d (in %lld min)",
                                  chname, lt.tm_hour, lt.tm_min, til_m);
+                        target_url = build_channel_url(hit.channel_idx, &portal, direct_url);
+                        target_stream_id = 0;
                     }
                     fprintf(stderr, "[journaal] %s\n", toast_text);
 
-                    /* Switch channels if the winner isn't what we're watching. */
-                    const npo_channel_t *target = &NPO_CHANNELS[hit.channel_idx];
-                    if (target != pb->channel || pb->stream_id != 0) {
-                        char *u = build_channel_url(hit.channel_idx, &portal, direct_url);
+                    if (target_url) {
+                        const npo_channel_t *target = &NPO_CHANNELS[hit.channel_idx];
                         playback_t *new_pb = calloc(1, sizeof(*new_pb));
-                        if (new_pb && playback_open(new_pb, &r, target, u, &portal, 0) == 0) {
+                        /* For timeshift we use epg_stream_id=target_stream_id so the
+                         * archive EPG loads; for live, 0 keeps NPO-mode defaults. */
+                        int epg_id = hit.is_past ? target_stream_id : 0;
+                        if (new_pb && playback_open(new_pb, &r, target, target_url,
+                                                    &portal, epg_id) == 0) {
                             playback_close(pb); free(pb); pb = new_pb;
                             paused = 0; have_texture = 0;
                             if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
@@ -416,9 +445,10 @@ int main(int argc, char **argv) {
                         } else {
                             free(new_pb);
                             snprintf(toast_text, sizeof(toast_text),
-                                     "Journaal switch to %s failed", target->display);
+                                     "Journaal %s to %s failed",
+                                     hit.is_past ? "replay" : "switch", target->display);
                         }
-                        free(u);
+                        free(target_url);
                     }
                 }
                 toast_until_ms = SDL_GetTicks() + 6000;  /* 6 sec visible */
