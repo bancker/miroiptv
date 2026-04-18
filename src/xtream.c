@@ -159,13 +159,17 @@ int xtream_fetch_epg(const xtream_t *x, int stream_id, epg_t *out) {
 }
 
 char *xtream_stream_url(const xtream_t *x, int stream_id) {
-    /* http://HOST:PORT/live/USER/PASS/ID.m3u8 — the canonical Xtream Codes
-     * live endpoint. Format switches between .m3u8 (HLS manifest, playable
-     * via libavformat) and .ts (raw MPEG-TS). We prefer .m3u8. */
+    /* http://HOST:PORT/live/USER/PASS/ID.ts — raw MPEG-TS via a single long-
+     * lived TCP connection. We previously used .m3u8 (HLS manifest) but this
+     * portal rate-limits playlist refreshes with HTTP 509 every ~30-60s,
+     * causing libav's HLS demuxer to fail the reload and exit. The .ts
+     * endpoint avoids playlist refreshes entirely — one redirect to the
+     * origin, then pure byte stream. Verified: 15.8 MB pulled in 12s, no
+     * stalls, sync byte alignment clean. */
     size_t cap = strlen(x->host) + strlen(x->user) + strlen(x->pass) + 64;
     char *out = malloc(cap);
     if (!out) return NULL;
-    snprintf(out, cap, "http://%s:%d/live/%s/%s/%d.m3u8",
+    snprintf(out, cap, "http://%s:%d/live/%s/%s/%d.ts",
              x->host, x->port, x->user, x->pass, stream_id);
     return out;
 }
