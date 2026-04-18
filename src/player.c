@@ -39,8 +39,10 @@ int player_open(player_t *p, const char *url) {
     av_dict_set(&opts, "reconnect_on_network_error", "1", 0);
     av_dict_set(&opts, "reconnect_on_http_error",    "404,403,5xx", 0);
     av_dict_set(&opts, "reconnect_delay_max",        "5", 0);  /* seconds */
-    /* HLS-specific: keep the HTTP connection alive across segment fetches
-     * (saves the portal's max_connections:1 slot) and start near live edge. */
+    av_dict_set(&opts, "reconnect_at_eof",           "1", 0);  /* retry when server sends EOF mid-stream */
+    av_dict_set(&opts, "reconnect_max_retries",      "10", 0);
+    /* HLS-specific (harmless for raw .ts): keep HTTP connection alive across
+     * segment fetches, start near live edge. */
     av_dict_set(&opts, "http_persistent",            "1", 0);
     av_dict_set(&opts, "live_start_index",           "-1", 0);
 
