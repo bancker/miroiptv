@@ -522,6 +522,13 @@ int main(int argc, char **argv) {
                          "Always on top: %s", always_on_top ? "ON" : "OFF");
                 toast_until_ms = SDL_GetTicks() + 2500;
             }
+            else if ((k == SDLK_UP || k == SDLK_DOWN) && current_live_idx >= 0) {
+                /* Same pipeline as mouse wheel: accumulate into pending_wheel_delta
+                 * and let the WHEEL_DEBOUNCE_MS commit it through the async zap
+                 * worker. Up arrow = previous channel (lower index), down = next. */
+                pending_wheel_delta += (k == SDLK_UP) ? -1 : +1;
+                last_wheel_ts = SDL_GetTicks();
+            }
             else if ((k == SDLK_LEFT || k == SDLK_RIGHT) && pb->timeshift_start != 0) {
                 int delta = (k == SDLK_RIGHT) ? +30 : -30;
                 time_t new_start = pb->timeshift_start + delta;
