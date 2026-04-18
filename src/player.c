@@ -41,6 +41,10 @@ int player_open(player_t *p, const char *url) {
     av_dict_set(&opts, "reconnect_delay_max",        "5", 0);  /* seconds */
     av_dict_set(&opts, "reconnect_at_eof",           "1", 0);  /* retry when server sends EOF mid-stream */
     av_dict_set(&opts, "reconnect_max_retries",      "10", 0);
+    /* 2 MiB TCP recv buffer gives libav headroom to absorb bursty CDN
+     * delivery without blocking the write side, reducing the chance the
+     * server closes the connection for slow reads. */
+    av_dict_set(&opts, "buffer_size",                "2097152", 0);
     /* HLS-specific (harmless for raw .ts): keep HTTP connection alive across
      * segment fetches, start near live edge. */
     av_dict_set(&opts, "http_persistent",            "1", 0);
