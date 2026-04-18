@@ -3,11 +3,27 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Callback that libav polls during blocking I/O (open, read). Returning non-zero
+ * aborts the current operation. We return p->stop so that setting p->stop=1
+ * from another thread can break av_read_frame out of a network read. */
+static int io_interrupt_cb(void *opaque) {
+    player_t *p = opaque;
+    return p->stop;
+}
+
 int player_open(player_t *p, const char *url) {
     memset(p, 0, sizeof(*p));
     p->video_idx = -1;
     p->audio_idx = -1;
     p->audio_sample_rate_out = 48000;
+
+    /* Pre-allocate the AVFormatContext so we can set the interrupt callback
+     * BEFORE avformat_open_input makes its first network call (otherwise a
+     * hostile/slow URL could wedge this function indefinitely). */
+    p->fmt = avformat_alloc_context();
+    if (!p->fmt) { fprintf(stderr, "avformat_alloc_context failed\n"); return -1; }
+    p->fmt->interrupt_callback.callback = io_interrupt_cb;
+    p->fmt->interrupt_callback.opaque   = p;
 
     if (avformat_open_input(&p->fmt, url, NULL, NULL) != 0) {
         fprintf(stderr, "avformat_open_input failed for %s\n", url);

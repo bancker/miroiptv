@@ -92,6 +92,11 @@ static const npo_channel_t *key_to_channel(SDL_Keycode k) {
 }
 
 int main(int argc, char **argv) {
+    /* Line-buffer stdout so diagnostic prints appear in real time even when
+     * redirected to a file (default fully-buffered would only flush at exit,
+     * hiding what happened right before a crash). */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
     /* Parse CLI: supports `--xtream user:pass@host[:port]` OR a bare URL as argv[1]. */
@@ -116,13 +121,17 @@ int main(int argc, char **argv) {
     render_t r;
     if (render_init(&r, 960, 540, "tv - booting") != 0) return 1;
 
-    /* Initial channel = NPO 1 (index 0). */
+    /* IMPORTANT: playback_t is HEAP-allocated, not stack. The audio callback
+     * userdata and av_clock point INTO this struct (at &pb->audio, etc.); if
+     * we ever assign `pb = new_pb` by value, those pointers would dangle to
+     * a scope-local new_pb. Heap + pointer-swap avoids the UAF. */
     char *initial_url = build_channel_url(0, &portal, direct_url);
-    playback_t pb;
-    if (playback_open(&pb, &r, &NPO_CHANNELS[0], initial_url) != 0) {
+    playback_t *pb = calloc(1, sizeof(*pb));
+    if (!pb || playback_open(pb, &r, &NPO_CHANNELS[0], initial_url) != 0) {
         fputs("initial playback_open failed\n"
               "  try: ./tv.exe --xtream user:pass@host:port\n"
               "  or:  ./tv.exe https://some/stream.m3u8\n", stderr);
+        free(pb);
         free(initial_url);
         xtream_free(&portal);
         render_shutdown(&r);
@@ -132,7 +141,8 @@ int main(int argc, char **argv) {
 
     overlay_t ov;
     if (overlay_init(&ov, "assets/DejaVuSans.ttf") != 0) {
-        playback_close(&pb);
+        playback_close(pb);
+        free(pb);
         render_shutdown(&r);
         return 5;
     }
@@ -159,25 +169,34 @@ int main(int argc, char **argv) {
             else if (k == SDLK_f) render_toggle_fullscreen(&r);
             else if (k == SDLK_SPACE) {
                 paused = !paused;
-                SDL_PauseAudioDevice(pb.audio.device, paused);
+                SDL_PauseAudioDevice(pb->audio.device, paused);
             }
             else if (k == SDLK_e) show_overlay = !show_overlay;
             else {
                 const npo_channel_t *nch = key_to_channel(k);
-                if (nch && nch != pb.channel) {
+                if (nch && nch != pb->channel) {
                     int ch_idx = (int)(nch - &NPO_CHANNELS[0]);
+                    fprintf(stderr, "[switch] %s -> %s (idx=%d)\n",
+                            pb->channel->display, nch->display, ch_idx);
                     char *switch_url = build_channel_url(ch_idx, &portal, direct_url);
-                    playback_t new_pb;
-                    if (playback_open(&new_pb, &r, nch, switch_url) == 0) {
-                        playback_close(&pb);
+                    /* Heap-allocate new_pb so its address is stable beyond this scope;
+                     * pointer swap avoids the dangling-pointer bug that bit us on the
+                     * first channel switch. */
+                    playback_t *new_pb = calloc(1, sizeof(*new_pb));
+                    if (new_pb && playback_open(new_pb, &r, nch, switch_url) == 0) {
+                        fprintf(stderr, "[switch] new playback opened, tearing down old\n");
+                        playback_close(pb);
+                        free(pb);
                         pb = new_pb;
                         paused       = 0;
                         have_texture = 0;
                         if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                         overlay_mark_dirty(&ov);
+                        fprintf(stderr, "[switch] swap complete, now on %s\n", pb->channel->display);
                     } else {
+                        free(new_pb);
                         fprintf(stderr, "channel switch to %s failed - staying on %s\n",
-                                nch->display, pb.channel->display);
+                                nch->display, pb->channel->display);
                     }
                     free(switch_url);
                 }
@@ -185,12 +204,12 @@ int main(int argc, char **argv) {
         }
 
         /* 2) Try to grab a new frame if we don't have one pending. */
-        if (!pending_vf) pending_vf = queue_try_pop(&pb.player.video_q);
+        if (!pending_vf) pending_vf = queue_try_pop(&pb->player.video_q);
 
         /* 3) If we have a pending frame, decide what to do with it. */
         if (pending_vf) {
-            if (!pb.clk.have_first) av_clock_mark_first_pts(&pb.clk, pending_vf->pts);
-            double now  = av_clock_now(&pb.clk);
+            if (!pb->clk.have_first) av_clock_mark_first_pts(&pb->clk, pending_vf->pts);
+            double now  = av_clock_now(&pb->clk);
             double diff = pending_vf->pts - now;
 
             if (diff < DUE_WINDOW) {
@@ -198,7 +217,7 @@ int main(int argc, char **argv) {
                 if (-diff > DROP_LATE) {
                     video_frame_free(pending_vf);
                 } else {
-                    video_tex_upload(&pb.tex, r.renderer, pending_vf);
+                    video_tex_upload(&pb->tex, r.renderer, pending_vf);
                     video_frame_free(pending_vf);
                     have_texture = 1;
                 }
@@ -212,18 +231,19 @@ int main(int argc, char **argv) {
          *    even when new frames haven't arrived. */
         SDL_RenderClear(r.renderer);
         if (have_texture) {
-            SDL_RenderCopy(r.renderer, pb.tex.texture, NULL, NULL);
+            SDL_RenderCopy(r.renderer, pb->tex.texture, NULL, NULL);
             if (show_overlay) {
                 int ww, wh;
                 SDL_GetRendererOutputSize(r.renderer, &ww, &wh);
-                overlay_render(&ov, r.renderer, &pb.epg, ww, wh);
+                overlay_render(&ov, r.renderer, &pb->epg, ww, wh);
             }
         }
         SDL_RenderPresent(r.renderer);  /* blocks ~16ms @ 60Hz with VSYNC */
     }
 
     if (pending_vf) video_frame_free(pending_vf);
-    playback_close(&pb);
+    playback_close(pb);
+    free(pb);
     overlay_shutdown(&ov);
     render_shutdown(&r);
     xtream_free(&portal);

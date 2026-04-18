@@ -64,7 +64,11 @@ static void audio_callback(void *ud, uint8_t *stream, int len) {
     while (need_samples > 0) {
         if (ao->cur_remaining == 0) {
             if (ao->cur) { audio_chunk_free(ao->cur); ao->cur = NULL; }
-            audio_chunk_t *c = queue_pop(ao->q);
+            /* try_pop, NOT pop — audio callback runs on SDL's thread and must
+             * return quickly. Blocking on an empty queue (decoder briefly
+             * stalled between HLS segments) would freeze SDL audio entirely.
+             * On miss, fill the remaining frame with silence and return. */
+            audio_chunk_t *c = queue_try_pop(ao->q);
             if (!c) {
                 memset(out, 0, (size_t)need_samples * 2 * sizeof(int16_t));
                 return;
