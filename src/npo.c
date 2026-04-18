@@ -208,3 +208,136 @@ void npo_epg_free(epg_t *e) {
     free(e->entries);
     memset(e, 0, sizeof(*e));
 }
+
+const npo_channel_t NPO_CHANNELS[] = {
+    { "NPO 1", "NED1", "LI_NL1_4188102" },
+    { "NPO 2", "NED2", "LI_NL1_4188103" },
+    { "NPO 3", "NED3", "LI_NL1_4188105" },
+};
+const size_t NPO_CHANNELS_COUNT = sizeof(NPO_CHANNELS) / sizeof(NPO_CHANNELS[0]);
+
+/* --- stream URL resolver ---
+ * NPO's public player flow (two steps):
+ *   1. GET  https://npo.nl/start/api/domain/player-token?productId=<PID>
+ *      Response JSON contains { "jwt": "...", ... } or { "token": "...", ... }.
+ *   2. POST https://prod.npoplayer.nl/stream-link
+ *      Header: Authorization: Bearer <jwt>
+ *      Response: JSON with an HLS URL somewhere (may be nested).
+ *
+ * Because this API is undocumented and changes, we:
+ *   - scan the token response for any string value under any of several likely keys.
+ *   - scan the stream-link response for any string value ending in ".m3u8".
+ * If either step fails, we return -1 and the caller falls back to --stream-url.
+ * Logging is per-step so R1 failures are easy to diagnose.
+ */
+
+static char *find_json_string(const cJSON *node, const char *const *keys) {
+    if (!node || !cJSON_IsObject(node)) return NULL;
+    for (size_t i = 0; keys[i]; ++i) {
+        cJSON *v = cJSON_GetObjectItemCaseSensitive(node, keys[i]);
+        if (cJSON_IsString(v) && v->valuestring) return strdup(v->valuestring);
+    }
+    cJSON *child = node->child;
+    while (child) {
+        char *r = find_json_string(child, keys);
+        if (r) return r;
+        child = child->next;
+    }
+    return NULL;
+}
+
+static char *find_hls_url(const cJSON *node) {
+    if (!node) return NULL;
+    if (cJSON_IsString(node) && node->valuestring) {
+        if (strstr(node->valuestring, ".m3u8")) return strdup(node->valuestring);
+    }
+    cJSON *child = node ? node->child : NULL;
+    while (child) {
+        char *r = find_hls_url(child);
+        if (r) return r;
+        child = child->next;
+    }
+    return NULL;
+}
+
+int npo_resolve_stream(const npo_channel_t *ch, char **out_url) {
+    *out_url = NULL;
+
+    /* Step 1: player-token */
+    char token_url[512];
+    snprintf(token_url, sizeof(token_url),
+        "https://npo.nl/start/api/domain/player-token?productId=%s",
+        ch->product_id);
+
+    fprintf(stderr, "resolve: step 1/2 GET %s\n", token_url);
+
+    char *token_body = NULL; size_t token_len = 0;
+    if (npo_http_get(token_url, NULL, &token_body, &token_len) != 0) {
+        fprintf(stderr, "resolve: step 1 failed (player-token fetch) for %s\n", ch->display);
+        return -1;
+    }
+
+    cJSON *root = cJSON_Parse(token_body);
+    if (!root) {
+        fprintf(stderr, "resolve: step 1 JSON parse failed\n");
+        free(token_body);
+        return -1;
+    }
+    const char *jwt_keys[] = { "jwt", "token", "playerToken", NULL };
+    char *jwt = find_json_string(root, jwt_keys);
+    cJSON_Delete(root);
+    free(token_body);
+    if (!jwt) {
+        fprintf(stderr, "resolve: step 1 — no JWT/token key in player-token response\n");
+        return -1;
+    }
+
+    /* Step 2: stream-link */
+    char auth[1024];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", jwt);
+    const char *headers[] = {
+        auth,
+        "Content-Type: application/json",
+        NULL
+    };
+
+    const char *stream_url_endpoint = "https://prod.npoplayer.nl/stream-link";
+    fprintf(stderr, "resolve: step 2/2 GET %s\n", stream_url_endpoint);
+
+    char *body = NULL; size_t blen = 0;
+    int rc = npo_http_get(stream_url_endpoint, headers, &body, &blen);
+    if (rc != 0) {
+        fprintf(stderr, "resolve: step 2 failed (stream-link fetch)\n");
+        free(jwt);
+        return -1;
+    }
+
+    cJSON *sroot = cJSON_Parse(body);
+    if (!sroot) {
+        fprintf(stderr, "resolve: step 2 JSON parse failed\n");
+        free(body); free(jwt);
+        return -1;
+    }
+    char *hls = find_hls_url(sroot);
+    cJSON_Delete(sroot);
+    free(body);
+    free(jwt);
+
+    if (!hls) {
+        fprintf(stderr, "resolve: step 2 — no HLS URL (.m3u8) found in stream-link response\n");
+        return -1;
+    }
+    *out_url = hls;
+    return 0;
+}
+
+int npo_fetch_epg(const npo_channel_t *ch, epg_t *out) {
+    char url[256];
+    snprintf(url, sizeof(url),
+             "https://start-api.npo.nl/v2/schedule/channel/%s", ch->code);
+    char *body = NULL; size_t len = 0;
+    if (npo_http_get(url, NULL, &body, &len) != 0) return -1;
+    int rc = npo_parse_epg(body, len, out);
+    free(body);
+    return rc;
+}

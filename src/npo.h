@@ -40,4 +40,20 @@ typedef struct {
 int  npo_parse_epg(const char *json, size_t json_len, epg_t *out);
 void npo_epg_free(epg_t *e);
 
+typedef struct {
+    const char *display;    /* "NPO 1" */
+    const char *code;       /* "NED1" — used for EPG */
+    const char *product_id; /* "LI_NL1_4188102" — used for stream-URL resolve */
+} npo_channel_t;
+
+extern const npo_channel_t NPO_CHANNELS[];
+extern const size_t        NPO_CHANNELS_COUNT;
+
+/* Resolves channel to an HLS manifest URL. On success returns 0 and *out_url
+ * points to a malloc'd URL (caller frees). On failure returns -1 with logging. */
+int npo_resolve_stream(const npo_channel_t *ch, char **out_url);
+
+/* Fetches EPG for channel. 0 on success, -1 on failure. */
+int npo_fetch_epg(const npo_channel_t *ch, epg_t *out);
+
 #endif
