@@ -29,6 +29,14 @@ typedef struct {
     epg_t        epg;
     char        *url;
     const npo_channel_t *channel;
+    /* stream_id: operational identity of the currently playing stream.
+     *   0  = NPO mode. Restart URL derived from pb->channel via XTREAM_NPO_STREAM_IDS.
+     *   >0 = Xtream portal mode (NPO or zap). Restart uses this id directly;
+     *        switch comparisons distinguish this playback from pb->channel alone.
+     * Without this field, pb->channel stays "sticky" after a wheel-zap so
+     * 1/2/3, 'n', and stall-restart all treated the prior NPO channel as the
+     * "current" one even while the user was watching TROS Radar. */
+    int          stream_id;
 } playback_t;
 
 /* epg_stream_id:
@@ -39,7 +47,10 @@ static int playback_open(playback_t *pb, render_t *r, const npo_channel_t *ch,
                          const char *override_url, const xtream_t *portal,
                          int epg_stream_id) {
     memset(pb, 0, sizeof(*pb));
-    pb->channel = ch;
+    pb->channel   = ch;
+    /* Persist the stream identity (used later by stall-restart and the
+     * switch comparisons). 0 means "NPO mode, derive from ch". */
+    pb->stream_id = epg_stream_id > 0 ? epg_stream_id : 0;
 
     if (override_url) {
         pb->url = strdup(override_url);
@@ -318,7 +329,10 @@ int main(int argc, char **argv) {
                                            dt < 3600 ? "<1h"   : "1h+"),
                             idx + 1);
                     const npo_channel_t *target = &NPO_CHANNELS[idx];
-                    if (target != pb->channel) {
+                    /* Force the switch if we're currently zapped (stream_id set)
+                     * even when target matches pb->channel — because pb->channel
+                     * is the last NPO stamp, not the channel actually on screen. */
+                    if (target != pb->channel || pb->stream_id != 0) {
                         char *u = build_channel_url(idx, &portal, direct_url);
                         playback_t *new_pb = calloc(1, sizeof(*new_pb));
                         if (new_pb && playback_open(new_pb, &r, target, u, &portal, 0) == 0) {
@@ -336,7 +350,10 @@ int main(int argc, char **argv) {
             }
             else {
                 const npo_channel_t *nch = key_to_channel(k);
-                if (nch && nch != pb->channel) {
+                /* Same "force-on-zap" rule as the 'n' handler: if the user
+                 * pressed 1/2/3 while zapped, pb->channel is a stale NPO stamp;
+                 * use stream_id to detect that we're actually elsewhere. */
+                if (nch && (nch != pb->channel || pb->stream_id != 0)) {
                     int ch_idx = (int)(nch - &NPO_CHANNELS[0]);
                     fprintf(stderr, "[switch] %s -> %s (idx=%d)\n",
                             pb->channel->display, nch->display, ch_idx);
@@ -365,8 +382,10 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* 1b) Apply window drag if right-button is held. */
-        if (drag_active) {
+        /* 1b) Apply window drag if right-button is held. Skip when fullscreen —
+         * moving a fullscreen window is meaningless and SDL_SetWindowPosition
+         * on a fullscreen surface is undefined on some platforms. */
+        if (drag_active && !r.fullscreen) {
             int mx, my;
             SDL_GetGlobalMouseState(&mx, &my);
             SDL_SetWindowPosition(r.window,
@@ -436,14 +455,26 @@ int main(int argc, char **argv) {
 
         /* 3b) Stall detection + auto-restart. Only kicks in after we've seen
          * at least one frame (have_texture) so the initial connect phase
-         * doesn't trigger it. */
+         * doesn't trigger it. Branches on pb->stream_id: if >0 we were zapped
+         * to a portal channel and must reopen THAT stream, not fall back to
+         * an NPO URL derived from the (stale) pb->channel pointer. */
         if (have_texture && SDL_GetTicks() - last_frame_ts > STALL_MS) {
-            fprintf(stderr, "[stall] no frames for %ums on %s - restarting\n",
-                    STALL_MS, pb->channel->display);
-            int ch_idx = (int)(pb->channel - &NPO_CHANNELS[0]);
-            char *restart_url = build_channel_url(ch_idx, &portal, direct_url);
+            char *restart_url;
+            int   restart_epg_id;
+            if (pb->stream_id != 0 && portal.host) {
+                restart_url    = xtream_stream_url(&portal, pb->stream_id);
+                restart_epg_id = pb->stream_id;
+                fprintf(stderr, "[stall] no frames for %ums on portal stream_id=%d - restarting\n",
+                        STALL_MS, pb->stream_id);
+            } else {
+                int ch_idx = (int)(pb->channel - &NPO_CHANNELS[0]);
+                restart_url    = build_channel_url(ch_idx, &portal, direct_url);
+                restart_epg_id = 0;
+                fprintf(stderr, "[stall] no frames for %ums on %s - restarting\n",
+                        STALL_MS, pb->channel->display);
+            }
             playback_t *new_pb = calloc(1, sizeof(*new_pb));
-            if (new_pb && playback_open(new_pb, &r, pb->channel, restart_url, &portal, 0) == 0) {
+            if (new_pb && playback_open(new_pb, &r, pb->channel, restart_url, &portal, restart_epg_id) == 0) {
                 playback_close(pb);
                 free(pb);
                 pb = new_pb;
