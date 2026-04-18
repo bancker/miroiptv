@@ -7,12 +7,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct {
     player_t     player;
     audio_out_t  audio;
     video_tex_t  tex;
     av_clock_t   clk;
+    epg_t        epg;
     char        *url;
     const npo_channel_t *channel;
 } playback_t;
@@ -31,9 +33,16 @@ static int playback_open(playback_t *pb, render_t *r, const npo_channel_t *ch,
     }
 
     if (player_open(&pb->player, pb->url) != 0) { free(pb->url); pb->url = NULL; return -1; }
-    if (player_start(&pb->player) != 0)         { player_close(&pb->player); free(pb->url); pb->url = NULL; return -1; }
+
+    if (npo_fetch_epg(ch, &pb->epg) != 0) {
+        fprintf(stderr, "warn: EPG fetch failed for %s (expected if start-api.npo.nl broken)\n",
+                ch->display);
+        memset(&pb->epg, 0, sizeof(pb->epg));
+    }
+
+    if (player_start(&pb->player) != 0)         { npo_epg_free(&pb->epg); player_close(&pb->player); free(pb->url); pb->url = NULL; return -1; }
     if (audio_open(&pb->audio, &pb->player.audio_q, pb->player.audio_sample_rate_out) != 0) {
-        player_stop(&pb->player); player_close(&pb->player); free(pb->url); pb->url = NULL; return -1;
+        npo_epg_free(&pb->epg); player_stop(&pb->player); player_close(&pb->player); free(pb->url); pb->url = NULL; return -1;
     }
 
     av_clock_init(&pb->clk, &pb->audio.samples_played, pb->audio.sample_rate);
@@ -53,6 +62,7 @@ static void playback_close(playback_t *pb) {
         player_close(&pb->player);
         free(pb->url);
     }
+    npo_epg_free(&pb->epg);
     memset(pb, 0, sizeof(*pb));
 }
 
@@ -81,6 +91,14 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    overlay_t ov;
+    if (overlay_init(&ov, "assets/DejaVuSans.ttf") != 0) {
+        playback_close(&pb);
+        render_shutdown(&r);
+        return 5;
+    }
+    int show_overlay = 1;
+
     int running = 1;
     int paused  = 0;
 
@@ -96,6 +114,7 @@ int main(int argc, char **argv) {
                     paused = !paused;
                     SDL_PauseAudioDevice(pb.audio.device, paused);
                 }
+                else if (k == SDLK_e) show_overlay = !show_overlay;
                 else {
                     const npo_channel_t *nch = key_to_channel(k);
                     if (nch && nch != pb.channel) {
@@ -106,6 +125,7 @@ int main(int argc, char **argv) {
                             playback_close(&pb);
                             pb = new_pb;
                             paused = 0;
+                            overlay_mark_dirty(&ov);
                         } else {
                             fprintf(stderr, "channel switch to %s failed - staying on %s\n",
                                     nch->display, pb.channel->display);
@@ -134,11 +154,17 @@ int main(int argc, char **argv) {
         video_tex_upload(&pb.tex, r.renderer, vf);
         SDL_RenderClear(r.renderer);
         SDL_RenderCopy(r.renderer, pb.tex.texture, NULL, NULL);
+        if (show_overlay) {
+            int ww, wh;
+            SDL_GetRendererOutputSize(r.renderer, &ww, &wh);
+            overlay_render(&ov, r.renderer, &pb.epg, ww, wh);
+        }
         SDL_RenderPresent(r.renderer);
         video_frame_free(vf);
     }
 
     playback_close(&pb);
+    overlay_shutdown(&ov);
     render_shutdown(&r);
     curl_global_cleanup();
     return 0;

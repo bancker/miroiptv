@@ -1,6 +1,7 @@
 #include "render.h"
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 int render_init(render_t *r, int w, int h, const char *title) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS) != 0) {
@@ -107,4 +108,117 @@ void audio_close(audio_out_t *ao) {
     if (ao->device) SDL_CloseAudioDevice(ao->device);
     if (ao->cur)    audio_chunk_free(ao->cur);
     memset(ao, 0, sizeof(*ao));
+}
+
+int overlay_init(overlay_t *o, const char *font_path) {
+    memset(o, 0, sizeof(*o));
+    if (TTF_Init() != 0) { fprintf(stderr, "TTF_Init: %s\n", TTF_GetError()); return -1; }
+    o->font_regular = TTF_OpenFont(font_path, 18);
+    o->font_bold    = TTF_OpenFont(font_path, 20);
+    if (!o->font_regular || !o->font_bold) {
+        fprintf(stderr, "TTF_OpenFont(%s): %s\n", font_path, TTF_GetError());
+        return -1;
+    }
+    TTF_SetFontStyle(o->font_bold, TTF_STYLE_BOLD);
+    o->dirty = 1;
+    return 0;
+}
+
+void overlay_shutdown(overlay_t *o) {
+    if (o->cached) SDL_DestroyTexture(o->cached);
+    if (o->font_regular) TTF_CloseFont(o->font_regular);
+    if (o->font_bold)    TTF_CloseFont(o->font_bold);
+    TTF_Quit();
+    memset(o, 0, sizeof(*o));
+}
+
+void overlay_mark_dirty(overlay_t *o) { o->dirty = 1; }
+
+static SDL_Surface *render_line(TTF_Font *font, const char *text, SDL_Color col) {
+    return TTF_RenderUTF8_Blended(font, text, col);
+}
+
+static const epg_entry_t *find_current(const epg_t *epg, time_t now) {
+    for (size_t i = 0; i < epg->count; ++i)
+        if (epg->entries[i].start <= now && now < epg->entries[i].end)
+            return &epg->entries[i];
+    return NULL;
+}
+
+int overlay_render(overlay_t *o, SDL_Renderer *r, const epg_t *epg, int ww, int wh) {
+    const int pad = 12, line_h = 26, max_lines = 4, overlay_h = pad * 2 + line_h * max_lines;
+    const int overlay_w = ww;
+
+    if (o->dirty || !o->cached || o->cached_w != overlay_w || o->cached_h != overlay_h) {
+        if (o->cached) SDL_DestroyTexture(o->cached);
+        o->cached = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA8888,
+                                      SDL_TEXTUREACCESS_TARGET, overlay_w, overlay_h);
+        if (!o->cached) return -1;
+        SDL_SetTextureBlendMode(o->cached, SDL_BLENDMODE_BLEND);
+
+        SDL_SetRenderTarget(r, o->cached);
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(r, 0, 0, 0, 180);
+        SDL_RenderClear(r);
+
+        time_t now = time(NULL);
+        const epg_entry_t *cur = find_current(epg, now);
+
+        SDL_Color white = { 235, 235, 235, 255 };
+        SDL_Color red   = { 255,  90,  90, 255 };
+
+        int y = pad;
+        char buf[256];
+        if (cur) {
+            struct tm lt_s = *localtime(&cur->start);
+            struct tm lt_e = *localtime(&cur->end);
+            snprintf(buf, sizeof(buf), "Nu: %s  (%02d:%02d - %02d:%02d)",
+                     cur->title, lt_s.tm_hour, lt_s.tm_min, lt_e.tm_hour, lt_e.tm_min);
+        } else {
+            snprintf(buf, sizeof(buf), "Nu: (geen programma gevonden in EPG)");
+        }
+        SDL_Surface *surf = render_line(o->font_bold, buf,
+                                        (cur && cur->is_news) ? red : white);
+        if (surf) {
+            SDL_Texture *tx = SDL_CreateTextureFromSurface(r, surf);
+            SDL_Rect dst = { pad, y, surf->w, surf->h };
+            SDL_RenderCopy(r, tx, NULL, &dst);
+            SDL_DestroyTexture(tx);
+            SDL_FreeSurface(surf);
+        }
+
+        int shown = 0;
+        size_t start_idx = 0;
+        int found_future = 0;
+        for (size_t i = 0; i < epg->count; ++i) {
+            if (epg->entries[i].start > now) { start_idx = i; found_future = 1; break; }
+        }
+        if (found_future) {
+            for (size_t i = start_idx; i < epg->count && shown < max_lines - 1; ++i) {
+                y += line_h;
+                const epg_entry_t *e = &epg->entries[i];
+                struct tm lt_s = *localtime(&e->start);
+                snprintf(buf, sizeof(buf), "   %02d:%02d  %s",
+                         lt_s.tm_hour, lt_s.tm_min, e->title);
+                SDL_Surface *s2 = render_line(o->font_regular, buf, e->is_news ? red : white);
+                if (s2) {
+                    SDL_Texture *tx2 = SDL_CreateTextureFromSurface(r, s2);
+                    SDL_Rect dst = { pad, y, s2->w, s2->h };
+                    SDL_RenderCopy(r, tx2, NULL, &dst);
+                    SDL_DestroyTexture(tx2);
+                    SDL_FreeSurface(s2);
+                }
+                shown++;
+            }
+        }
+
+        SDL_SetRenderTarget(r, NULL);
+        o->cached_w = overlay_w;
+        o->cached_h = overlay_h;
+        o->dirty = 0;
+    }
+
+    SDL_Rect dst = { 0, wh - o->cached_h, o->cached_w, o->cached_h };
+    SDL_RenderCopy(r, o->cached, NULL, &dst);
+    return 0;
 }

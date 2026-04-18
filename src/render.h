@@ -43,4 +43,22 @@ typedef struct {
 int  audio_open(audio_out_t *ao, queue_t *q, int sample_rate);
 void audio_close(audio_out_t *ao);
 
+#include <SDL2/SDL_ttf.h>
+#include "npo.h"
+
+typedef struct {
+    TTF_Font    *font_regular;
+    TTF_Font    *font_bold;
+    SDL_Texture *cached;     /* last-rendered overlay texture */
+    int          cached_w;
+    int          cached_h;
+    int          dirty;
+} overlay_t;
+
+int  overlay_init(overlay_t *o, const char *font_path);
+void overlay_shutdown(overlay_t *o);
+void overlay_mark_dirty(overlay_t *o);
+int  overlay_render(overlay_t *o, SDL_Renderer *r,
+                    const epg_t *epg, int window_w, int window_h);
+
 #endif
