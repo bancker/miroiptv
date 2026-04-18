@@ -220,6 +220,63 @@ static journaal_hit_t find_latest_journaal(const xtream_t *portal) {
     return hit;
 }
 
+/* --- Background zap preparation ---
+ *
+ * Problem we're solving: playback_open does HTTP (EPG fetch + portal redirect)
+ * + libav stream probe + codec open + audio device open + decoder thread spawn.
+ * That can take 1-2 seconds. Running it on the main thread froze the UI on
+ * every wheel zap — no vsync, no keyboard, no mouse drag, no toast update.
+ *
+ * Design: zap_prep_t is the handoff between main and a short-lived worker.
+ *   state: 0 idle, 1 running, 2 ready (pb is a freshly opened playback_t),
+ *          3 failed, 4 cancelled (main abandoned this prep before completion).
+ * The worker allocates pb, calls playback_open, and either hands pb to main
+ * (state=2) or frees it (state=3 fail, or state=4 saw a cancel after open).
+ *
+ * Race discipline: state transitions are atomic word writes; volatile
+ * guarantees visibility on x86-64. url is malloc'd by main and ownership
+ * transfers to the worker — the worker frees it after use. render / portal
+ * pointers outlive both threads (they're main-stack lifetimes). */
+typedef struct {
+    pthread_t             thread;
+    volatile int          state;          /* 0=idle 1=running 2=ready 3=failed 4=cancelled */
+    xtream_t             *portal;
+    render_t             *render;
+    char                 *url;            /* worker frees on exit */
+    int                   epg_stream_id;
+    const npo_channel_t  *channel;
+    char                  label[192];     /* human-readable channel name for toasts */
+    int                   list_idx;       /* target index in the live_list */
+    playback_t           *pb;             /* output: valid iff state == 2 */
+} zap_prep_t;
+
+static void *zap_prep_worker(void *arg) {
+    zap_prep_t *zp = arg;
+    playback_t *pb = calloc(1, sizeof(*pb));
+    if (!pb) {
+        free(zp->url); zp->url = NULL;
+        zp->state = 3;
+        return NULL;
+    }
+    int rc = playback_open(pb, zp->render, zp->channel, zp->url, zp->portal, zp->epg_stream_id);
+    free(zp->url); zp->url = NULL;
+    if (rc != 0) {
+        free(pb);
+        zp->state = 3;
+        return NULL;
+    }
+    /* If main flipped state to 4 while we were inside playback_open, the prep
+     * has been abandoned; destroy our result and silently exit. */
+    if (zp->state == 4) {
+        playback_close(pb);
+        free(pb);
+        return NULL;
+    }
+    zp->pb = pb;
+    zp->state = 2;
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     /* Line-buffer stdout so diagnostic prints appear in real time even when
      * redirected to a file (default fully-buffered would only flush at exit,
@@ -315,7 +372,7 @@ int main(int argc, char **argv) {
     /* Toast state — short message shown in the bottom-right corner for a few
      * seconds. Written by actions like 'n' (Journaal search) so the user gets
      * visible feedback regardless of stderr visibility. */
-    char    toast_text[192] = {0};
+    char    toast_text[512] = {0};  /* room for channel + " | " + programme title */
     Uint32  toast_until_ms  = 0;
 
     /* Mouse-wheel zapping through ALL portal live channels. We fetch the full
@@ -328,6 +385,9 @@ int main(int argc, char **argv) {
     int    pending_wheel_delta = 0;
     Uint32 last_wheel_ts = 0;
     const Uint32 WHEEL_DEBOUNCE_MS = 350;
+
+    /* Background zap prep: see zap_prep_t docs above. */
+    zap_prep_t zap_prep = {0};
 
     /* Diagnostic: if TV_TEST_JOURNAAL env var is set, call the Journaal
      * search once at startup and log the result. Lets automated smoke
@@ -561,8 +621,9 @@ int main(int argc, char **argv) {
                 drag_anchor_wy + (my - drag_anchor_my));
         }
 
-        /* 1c) Debounced wheel-zap: commit the accumulated delta after the wheel
-         * has been idle for WHEEL_DEBOUNCE_MS, opening the target channel. */
+        /* 1c) Debounced wheel-zap: dispatch a background playback_open and
+         * show the channel info toast IMMEDIATELY. Main stays responsive while
+         * the worker does HTTP + libav probe + codec/audio open. */
         if (pending_wheel_delta != 0 && current_live_idx >= 0 &&
             SDL_GetTicks() - last_wheel_ts > WHEEL_DEBOUNCE_MS) {
             int new_idx = current_live_idx + pending_wheel_delta;
@@ -572,45 +633,83 @@ int main(int argc, char **argv) {
 
             if (new_idx != current_live_idx) {
                 xtream_live_entry_t *e = &live_list.entries[new_idx];
-                fprintf(stderr, "[zap] [%d/%zu] %s (id=%d)\n",
+                fprintf(stderr, "[zap] [%d/%zu] %s (id=%d) [async]\n",
                         new_idx + 1, live_list.count, e->name, e->stream_id);
-                char *zap_url = xtream_stream_url(&portal, e->stream_id);
-                playback_t *new_pb = calloc(1, sizeof(*new_pb));
-                /* Use the current pb->channel as a stand-in (pb->channel must be
-                 * non-NULL in main loop); we pass epg_stream_id=e->stream_id so
-                 * the EPG actually matches the zapped channel. */
-                if (new_pb && zap_url && playback_open(new_pb, &r, pb->channel,
-                        zap_url, &portal, e->stream_id) == 0) {
-                    char title[192];
-                    snprintf(title, sizeof(title), "tv - %s", e->name);
-                    SDL_SetWindowTitle(r.window, title);
-                    playback_close(pb); free(pb); pb = new_pb;
-                    current_live_idx = new_idx;
-                    paused = 0; have_texture = 0;
-                    if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
 
-                    /* Show a 5-second toast with channel name + currently
-                     * airing programme title (from the fresh EPG pb holds). */
-                    time_t tnow = time(NULL);
-                    const char *now_title = NULL;
-                    for (size_t i = 0; i < pb->epg.count; ++i) {
-                        if (pb->epg.entries[i].start <= tnow && tnow < pb->epg.entries[i].end) {
-                            now_title = pb->epg.entries[i].title;
-                            break;
-                        }
-                    }
-                    if (now_title && *now_title)
-                        snprintf(toast_text, sizeof(toast_text), "%s  |  %s", e->name, now_title);
-                    else
-                        snprintf(toast_text, sizeof(toast_text), "%s", e->name);
-                    toast_until_ms = SDL_GetTicks() + 5000;
-                    overlay_mark_dirty(&ov);
-                } else {
-                    free(new_pb);
-                    fprintf(stderr, "[zap] failed to open %s\n", e->name);
+                /* If a prep is already in flight, mark it cancelled. Any ready
+                 * result that trickled in gets cleaned up here too. */
+                if (zap_prep.state == 1) {
+                    zap_prep.state = 4;
+                    pthread_detach(zap_prep.thread);
+                } else if (zap_prep.state == 2) {
+                    playback_close(zap_prep.pb); free(zap_prep.pb); zap_prep.pb = NULL;
+                    pthread_join(zap_prep.thread, NULL);
+                    zap_prep.state = 0;
+                } else if (zap_prep.state == 3) {
+                    pthread_join(zap_prep.thread, NULL);
+                    zap_prep.state = 0;
                 }
-                free(zap_url);
+
+                /* Fill the prep struct and spawn. */
+                zap_prep.portal        = &portal;
+                zap_prep.render        = &r;
+                zap_prep.url           = xtream_stream_url(&portal, e->stream_id);
+                zap_prep.epg_stream_id = e->stream_id;
+                zap_prep.channel       = pb->channel;
+                zap_prep.list_idx      = new_idx;
+                zap_prep.pb            = NULL;
+                snprintf(zap_prep.label, sizeof(zap_prep.label), "%s", e->name);
+
+                if (zap_prep.url && pthread_create(&zap_prep.thread, NULL,
+                                                   zap_prep_worker, &zap_prep) == 0) {
+                    zap_prep.state = 1;
+                    /* Instant toast — user feedback that the zap was registered. */
+                    snprintf(toast_text, sizeof(toast_text), "Tuning: %s ...", e->name);
+                    toast_until_ms = SDL_GetTicks() + 8000;
+                } else {
+                    free(zap_prep.url); zap_prep.url = NULL;
+                    snprintf(toast_text, sizeof(toast_text), "Zap dispatch to %s failed", e->name);
+                    toast_until_ms = SDL_GetTicks() + 3000;
+                }
             }
+        }
+
+        /* 1d) Collect a finished zap-prep, if any. */
+        if (zap_prep.state == 2) {
+            playback_t *new_pb = zap_prep.pb;
+            pthread_join(zap_prep.thread, NULL);
+            playback_close(pb); free(pb); pb = new_pb;
+            current_live_idx = zap_prep.list_idx;
+            paused = 0; have_texture = 0;
+            if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
+            overlay_mark_dirty(&ov);
+
+            /* Rich toast: channel + now-playing. */
+            char title[256];
+            snprintf(title, sizeof(title), "tv - %s", zap_prep.label);
+            SDL_SetWindowTitle(r.window, title);
+
+            time_t tnow = time(NULL);
+            const char *now_title = NULL;
+            for (size_t i = 0; i < pb->epg.count; ++i) {
+                if (pb->epg.entries[i].start <= tnow && tnow < pb->epg.entries[i].end) {
+                    now_title = pb->epg.entries[i].title;
+                    break;
+                }
+            }
+            if (now_title && *now_title)
+                snprintf(toast_text, sizeof(toast_text), "%s  |  %s", zap_prep.label, now_title);
+            else
+                snprintf(toast_text, sizeof(toast_text), "%s", zap_prep.label);
+            toast_until_ms = SDL_GetTicks() + 5000;
+
+            zap_prep.pb    = NULL;
+            zap_prep.state = 0;
+        } else if (zap_prep.state == 3) {
+            pthread_join(zap_prep.thread, NULL);
+            snprintf(toast_text, sizeof(toast_text), "Tuning to %s failed", zap_prep.label);
+            toast_until_ms = SDL_GetTicks() + 3000;
+            zap_prep.state = 0;
         }
 
         /* 2) Try to grab a new frame if we don't have one pending. */
@@ -698,6 +797,19 @@ int main(int argc, char **argv) {
             overlay_render_hint(&ov, r.renderer, "Press ? for help", ww, wh);
         }
         SDL_RenderPresent(r.renderer);  /* blocks ~16ms @ 60Hz with VSYNC */
+    }
+
+    /* On quit, abandon any in-flight zap prep. Detach rather than join —
+     * the worker could be mid-network and joining would stall the exit by
+     * up to ~10s. It'll finish, free its own state, and vanish. */
+    if (zap_prep.state == 1) {
+        zap_prep.state = 4;
+        pthread_detach(zap_prep.thread);
+    } else if (zap_prep.state == 2) {
+        playback_close(zap_prep.pb); free(zap_prep.pb);
+        pthread_join(zap_prep.thread, NULL);
+    } else if (zap_prep.state == 3) {
+        pthread_join(zap_prep.thread, NULL);
     }
 
     if (pending_vf) video_frame_free(pending_vf);
