@@ -50,6 +50,7 @@ void  queue_destroy(queue_t *q);                     /* frees remaining items wi
 void  queue_destroy_with(queue_t *q, void (*free_fn)(void *));
 int   queue_push(queue_t *q, void *item);            /* blocks when full; returns -1 if closed */
 void *queue_pop(queue_t *q);                         /* blocks when empty; returns NULL when closed & empty */
+void *queue_try_pop(queue_t *q);                     /* non-blocking; returns NULL when empty (regardless of closed) */
 void  queue_close(queue_t *q);                       /* wakes everyone */
 void  queue_drain(queue_t *q, void (*free_fn)(void *));
 

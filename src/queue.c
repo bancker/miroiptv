@@ -64,6 +64,17 @@ void *queue_pop(queue_t *q) {
     return item;
 }
 
+void *queue_try_pop(queue_t *q) {
+    pthread_mutex_lock(&q->mu);
+    if (q->count == 0) { pthread_mutex_unlock(&q->mu); return NULL; }
+    void *item = q->slots[q->head];
+    q->head = (q->head + 1) % q->capacity;
+    q->count--;
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->mu);
+    return item;
+}
+
 void queue_close(queue_t *q) {
     pthread_mutex_lock(&q->mu);
     q->closed = 1;

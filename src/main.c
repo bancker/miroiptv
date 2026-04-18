@@ -40,9 +40,13 @@ static int playback_open(playback_t *pb, render_t *r, const npo_channel_t *ch,
         memset(&pb->epg, 0, sizeof(pb->epg));
     }
 
-    if (player_start(&pb->player) != 0)         { npo_epg_free(&pb->epg); player_close(&pb->player); free(pb->url); pb->url = NULL; return -1; }
+    if (player_start(&pb->player) != 0) {
+        npo_epg_free(&pb->epg); player_close(&pb->player);
+        free(pb->url); pb->url = NULL; return -1;
+    }
     if (audio_open(&pb->audio, &pb->player.audio_q, pb->player.audio_sample_rate_out) != 0) {
-        npo_epg_free(&pb->epg); player_stop(&pb->player); player_close(&pb->player); free(pb->url); pb->url = NULL; return -1;
+        npo_epg_free(&pb->epg); player_stop(&pb->player); player_close(&pb->player);
+        free(pb->url); pb->url = NULL; return -1;
     }
 
     av_clock_init(&pb->clk, &pb->audio.samples_played, pb->audio.sample_rate);
@@ -55,7 +59,7 @@ static int playback_open(playback_t *pb, render_t *r, const npo_channel_t *ch,
 }
 
 static void playback_close(playback_t *pb) {
-    if (pb->url) {  /* only tear down if we successfully opened */
+    if (pb->url) {
         player_stop(&pb->player);
         audio_close(&pb->audio);
         video_tex_destroy(&pb->tex);
@@ -97,72 +101,90 @@ int main(int argc, char **argv) {
         render_shutdown(&r);
         return 5;
     }
-    int show_overlay = 1;
+    int show_overlay   = 1;
+    int running        = 1;
+    int paused         = 0;
+    int have_texture   = 0;
+    video_frame_t *pending_vf = NULL;  /* held across iterations when not yet due */
 
-    int running = 1;
-    int paused  = 0;
+    /* Sync tolerances (seconds):
+     *  DUE_WINDOW  — how "early" a frame can be to count as due-now (one vsync @ 60Hz ≈ 16ms)
+     *  DROP_LATE   — how late a frame can be before we drop it (80ms ≈ 2 frames at 25fps) */
+    const double DUE_WINDOW = 0.010;
+    const double DROP_LATE  = 0.080;
 
     while (running) {
+        /* 1) Events first, every iteration — keeps UI responsive regardless of decode state. */
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT) running = 0;
-            else if (ev.type == SDL_KEYDOWN) {
-                SDL_Keycode k = ev.key.keysym.sym;
-                if (k == SDLK_q || k == SDLK_ESCAPE) running = 0;
-                else if (k == SDLK_f) render_toggle_fullscreen(&r);
-                else if (k == SDLK_SPACE) {
-                    paused = !paused;
-                    SDL_PauseAudioDevice(pb.audio.device, paused);
-                }
-                else if (k == SDLK_e) show_overlay = !show_overlay;
-                else {
-                    const npo_channel_t *nch = key_to_channel(k);
-                    if (nch && nch != pb.channel) {
-                        playback_t new_pb;
-                        /* Try to open the new channel WITHOUT tearing down current.
-                         * If it fails (R1 resolver broken), keep current playback alive. */
-                        if (playback_open(&new_pb, &r, nch, NULL) == 0) {
-                            playback_close(&pb);
-                            pb = new_pb;
-                            paused = 0;
-                            overlay_mark_dirty(&ov);
-                        } else {
-                            fprintf(stderr, "channel switch to %s failed - staying on %s\n",
-                                    nch->display, pb.channel->display);
-                            /* restore title (playback_open may have changed it briefly - nope,
-                             * it only sets title on success, so this is a no-op) */
-                        }
+            if (ev.type == SDL_QUIT) { running = 0; break; }
+            if (ev.type != SDL_KEYDOWN) continue;
+            SDL_Keycode k = ev.key.keysym.sym;
+            if (k == SDLK_q || k == SDLK_ESCAPE) { running = 0; break; }
+            else if (k == SDLK_f) render_toggle_fullscreen(&r);
+            else if (k == SDLK_SPACE) {
+                paused = !paused;
+                SDL_PauseAudioDevice(pb.audio.device, paused);
+            }
+            else if (k == SDLK_e) show_overlay = !show_overlay;
+            else {
+                const npo_channel_t *nch = key_to_channel(k);
+                if (nch && nch != pb.channel) {
+                    playback_t new_pb;
+                    if (playback_open(&new_pb, &r, nch, override_url) == 0) {
+                        playback_close(&pb);
+                        pb = new_pb;
+                        paused       = 0;
+                        have_texture = 0;
+                        if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
+                        overlay_mark_dirty(&ov);
+                    } else {
+                        fprintf(stderr, "channel switch to %s failed - staying on %s\n",
+                                nch->display, pb.channel->display);
                     }
                 }
             }
         }
 
-        video_frame_t *vf = queue_pop(&pb.player.video_q);
-        if (!vf) {
-            SDL_Delay(100);
-            continue;
-        }
-        if (!pb.clk.have_first) av_clock_mark_first_pts(&pb.clk, vf->pts);
+        /* 2) Try to grab a new frame if we don't have one pending. */
+        if (!pending_vf) pending_vf = queue_try_pop(&pb.player.video_q);
 
-        double diff = vf->pts - av_clock_now(&pb.clk);
-        if (diff > 0) SDL_Delay((Uint32)((diff > 0.1 ? 0.1 : diff) * 1000));
-        if (av_clock_now(&pb.clk) - vf->pts > 0.040) {
-            video_frame_free(vf);
-            continue;
+        /* 3) If we have a pending frame, decide what to do with it. */
+        if (pending_vf) {
+            if (!pb.clk.have_first) av_clock_mark_first_pts(&pb.clk, pending_vf->pts);
+            double now  = av_clock_now(&pb.clk);
+            double diff = pending_vf->pts - now;
+
+            if (diff < DUE_WINDOW) {
+                /* Due now (or past due). Either upload-for-display, or drop if way late. */
+                if (-diff > DROP_LATE) {
+                    video_frame_free(pending_vf);
+                } else {
+                    video_tex_upload(&pb.tex, r.renderer, pending_vf);
+                    video_frame_free(pending_vf);
+                    have_texture = 1;
+                }
+                pending_vf = NULL;
+            }
+            /* else: hold for next iteration — its time hasn't come yet. */
         }
 
-        video_tex_upload(&pb.tex, r.renderer, vf);
+        /* 4) Always render. VSYNC in SDL_RenderPresent paces the loop to ~60Hz,
+         *    so holding the last frame costs nothing and keeps the window alive
+         *    even when new frames haven't arrived. */
         SDL_RenderClear(r.renderer);
-        SDL_RenderCopy(r.renderer, pb.tex.texture, NULL, NULL);
-        if (show_overlay) {
-            int ww, wh;
-            SDL_GetRendererOutputSize(r.renderer, &ww, &wh);
-            overlay_render(&ov, r.renderer, &pb.epg, ww, wh);
+        if (have_texture) {
+            SDL_RenderCopy(r.renderer, pb.tex.texture, NULL, NULL);
+            if (show_overlay) {
+                int ww, wh;
+                SDL_GetRendererOutputSize(r.renderer, &ww, &wh);
+                overlay_render(&ov, r.renderer, &pb.epg, ww, wh);
+            }
         }
-        SDL_RenderPresent(r.renderer);
-        video_frame_free(vf);
+        SDL_RenderPresent(r.renderer);  /* blocks ~16ms @ 60Hz with VSYNC */
     }
 
+    if (pending_vf) video_frame_free(pending_vf);
     playback_close(&pb);
     overlay_shutdown(&ov);
     render_shutdown(&r);
