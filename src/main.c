@@ -248,6 +248,21 @@ int main(int argc, char **argv) {
     int drag_anchor_mx = 0, drag_anchor_my = 0;
     int drag_anchor_wx = 0, drag_anchor_wy = 0;
 
+    /* Left double-click cycles the window through a set of zoom factors.
+     * Base size is the window's initial dimensions (960x540). */
+    static const float SIZE_FACTORS[] = { 1.0f, 1.5f, 2.0f, 3.0f, 4.0f };
+    const int  SIZE_COUNT = (int)(sizeof(SIZE_FACTORS) / sizeof(SIZE_FACTORS[0]));
+    int        size_idx   = 0;
+    const int  base_w     = 960;
+    const int  base_h     = 540;
+
+    /* Help overlay state.
+     *  help_visible   — toggled by '?' key
+     *  hint_until_ms  — while SDL_GetTicks() < this, show a transient hint
+     *                   at bottom-right suggesting "Press ? for help" */
+    int    help_visible  = 0;
+    Uint32 hint_until_ms = SDL_GetTicks() + 8000;  /* 8 seconds after start */
+
     /* Mouse-wheel zapping through ALL portal live channels. We fetch the full
      * catalog once, find our current stream_id in it, and the wheel moves the
      * index ±1 per notch. Actual switch is debounced — rapid scrolling only
@@ -295,6 +310,16 @@ int main(int argc, char **argv) {
                 SDL_CaptureMouse(SDL_TRUE);
                 continue;
             }
+            if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT &&
+                ev.button.clicks == 2 && !r.fullscreen) {
+                size_idx = (size_idx + 1) % SIZE_COUNT;
+                int new_w = (int)(base_w * SIZE_FACTORS[size_idx]);
+                int new_h = (int)(base_h * SIZE_FACTORS[size_idx]);
+                SDL_SetWindowSize(r.window, new_w, new_h);
+                SDL_SetWindowPosition(r.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                fprintf(stderr, "[size] %.1fx (%dx%d)\n", SIZE_FACTORS[size_idx], new_w, new_h);
+                continue;
+            }
             if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_RIGHT) {
                 drag_active = 0;
                 SDL_CaptureMouse(SDL_FALSE);
@@ -315,6 +340,11 @@ int main(int argc, char **argv) {
                 SDL_PauseAudioDevice(pb->audio.device, paused);
             }
             else if (k == SDLK_e) show_overlay = !show_overlay;
+            else if (k == SDLK_QUESTION ||
+                     (k == SDLK_SLASH && (ev.key.keysym.mod & KMOD_SHIFT))) {
+                help_visible = !help_visible;
+                hint_until_ms = 0;  /* startup hint has served its purpose */
+            }
             else if (k == SDLK_n) {
                 int airing = 0;
                 long long dt = 0;
@@ -495,14 +525,18 @@ int main(int argc, char **argv) {
          *    so holding the last frame costs nothing and keeps the window alive
          *    even when new frames haven't arrived. */
         SDL_RenderClear(r.renderer);
+        int ww = 0, wh = 0;
+        SDL_GetRendererOutputSize(r.renderer, &ww, &wh);
         if (have_texture) {
             SDL_RenderCopy(r.renderer, pb->tex.texture, NULL, NULL);
-            if (show_overlay) {
-                int ww, wh;
-                SDL_GetRendererOutputSize(r.renderer, &ww, &wh);
+            if (show_overlay)
                 overlay_render(&ov, r.renderer, &pb->epg, ww, wh);
-            }
         }
+        /* Help + startup hint on top of everything so they stay legible. */
+        if (help_visible)
+            overlay_render_help(&ov, r.renderer, ww, wh);
+        else if (SDL_GetTicks() < hint_until_ms)
+            overlay_render_hint(&ov, r.renderer, "Press ? for help", ww, wh);
         SDL_RenderPresent(r.renderer);  /* blocks ~16ms @ 60Hz with VSYNC */
     }
 

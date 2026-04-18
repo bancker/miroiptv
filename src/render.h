@@ -61,4 +61,11 @@ void overlay_mark_dirty(overlay_t *o);
 int  overlay_render(overlay_t *o, SDL_Renderer *r,
                     const epg_t *epg, int window_w, int window_h);
 
+/* Full keybinding cheat sheet, centered on screen with a translucent box. */
+int  overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh);
+/* One-line transient hint ("Press ? for help"), bottom-right. Used at
+ * startup only, disappears after N seconds. */
+int  overlay_render_hint(overlay_t *o, SDL_Renderer *r, const char *text,
+                         int ww, int wh);
+
 #endif

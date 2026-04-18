@@ -226,3 +226,70 @@ int overlay_render(overlay_t *o, SDL_Renderer *r, const epg_t *epg, int ww, int 
     SDL_RenderCopy(r, o->cached, NULL, &dst);
     return 0;
 }
+
+int overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh) {
+    /* Help sheet lines. Keep in sync with the actual bindings in main.c. */
+    static const char *lines[] = {
+        "Keyboard",
+        "",
+        "  1 / 2 / 3     Switch NPO 1 / 2 / 3",
+        "  n             Next NOS Journaal (finds which NPO channel)",
+        "  e             Toggle EPG overlay (bottom strip)",
+        "  f             Toggle fullscreen",
+        "  space         Pause / resume audio",
+        "  ?             Toggle this help",
+        "  q / Esc       Quit",
+        "",
+        "Mouse",
+        "",
+        "  Wheel         Zap through all portal channels",
+        "  Right-drag    Move the window",
+        "  Double-click  Cycle window size (1x -> 4x -> back)",
+    };
+    const int N = (int)(sizeof(lines) / sizeof(lines[0]));
+    const int line_h = 24;
+    const int pad_x  = 28;
+    const int pad_y  = 20;
+    const int box_w  = 580;
+    const int box_h  = N * line_h + pad_y * 2;
+    SDL_Rect box = { (ww - box_w) / 2, (wh - box_h) / 2, box_w, box_h };
+
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 220);
+    SDL_RenderFillRect(r, &box);
+
+    const SDL_Color white = { 240, 240, 240, 255 };
+    int y = box.y + pad_y;
+    for (int i = 0; i < N; ++i) {
+        if (!*lines[i]) { y += line_h; continue; }
+        TTF_Font *font = (i == 0 || strcmp(lines[i], "Mouse") == 0) ? o->font_bold : o->font_regular;
+        SDL_Surface *s = TTF_RenderUTF8_Blended(font, lines[i], white);
+        if (s) {
+            SDL_Texture *t = SDL_CreateTextureFromSurface(r, s);
+            SDL_Rect dst = { box.x + pad_x, y, s->w, s->h };
+            SDL_RenderCopy(r, t, NULL, &dst);
+            SDL_DestroyTexture(t);
+            SDL_FreeSurface(s);
+        }
+        y += line_h;
+    }
+    return 0;
+}
+
+int overlay_render_hint(overlay_t *o, SDL_Renderer *r, const char *text, int ww, int wh) {
+    if (!text || !*text) return 0;
+    const SDL_Color white = { 255, 255, 255, 230 };
+    SDL_Surface *s = TTF_RenderUTF8_Blended(o->font_regular, text, white);
+    if (!s) return -1;
+    const int pad = 8;
+    SDL_Rect box = { ww - s->w - pad * 3, wh - s->h - pad * 3, s->w + pad * 2, s->h + pad * 2 };
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 180);
+    SDL_RenderFillRect(r, &box);
+    SDL_Texture *t = SDL_CreateTextureFromSurface(r, s);
+    SDL_Rect dst = { box.x + pad, box.y + pad, s->w, s->h };
+    SDL_RenderCopy(r, t, NULL, &dst);
+    SDL_DestroyTexture(t);
+    SDL_FreeSurface(s);
+    return 0;
+}
