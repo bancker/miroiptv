@@ -32,7 +32,7 @@ typedef struct {
 } playback_t;
 
 static int playback_open(playback_t *pb, render_t *r, const npo_channel_t *ch,
-                         const char *override_url) {
+                         const char *override_url, const xtream_t *portal) {
     memset(pb, 0, sizeof(*pb));
     pb->channel = ch;
 
@@ -46,9 +46,22 @@ static int playback_open(playback_t *pb, render_t *r, const npo_channel_t *ch,
 
     if (player_open(&pb->player, pb->url) != 0) { free(pb->url); pb->url = NULL; return -1; }
 
-    if (npo_fetch_epg(ch, &pb->epg) != 0) {
-        fprintf(stderr, "warn: EPG fetch failed for %s (expected if start-api.npo.nl broken)\n",
-                ch->display);
+    /* EPG: prefer portal's get_short_epg when running in xtream mode (it works
+     * today); fall back to NPO's start-api when no portal (currently broken,
+     * R1). Either failure is non-fatal — overlay shows "(geen programma)". */
+    int epg_rc = -1;
+    if (portal && portal->host) {
+        int ch_idx = (int)(ch - &NPO_CHANNELS[0]);
+        epg_rc = xtream_fetch_epg(portal, XTREAM_NPO_STREAM_IDS[ch_idx], &pb->epg);
+        if (epg_rc == 0) {
+            fprintf(stderr, "EPG: loaded %zu entries from portal for %s\n",
+                    pb->epg.count, ch->display);
+        }
+    } else {
+        epg_rc = npo_fetch_epg(ch, &pb->epg);
+    }
+    if (epg_rc != 0) {
+        fprintf(stderr, "warn: EPG fetch failed for %s\n", ch->display);
         memset(&pb->epg, 0, sizeof(pb->epg));
     }
 
@@ -127,7 +140,7 @@ int main(int argc, char **argv) {
      * a scope-local new_pb. Heap + pointer-swap avoids the UAF. */
     char *initial_url = build_channel_url(0, &portal, direct_url);
     playback_t *pb = calloc(1, sizeof(*pb));
-    if (!pb || playback_open(pb, &r, &NPO_CHANNELS[0], initial_url) != 0) {
+    if (!pb || playback_open(pb, &r, &NPO_CHANNELS[0], initial_url, &portal) != 0) {
         fputs("initial playback_open failed\n"
               "  try: ./tv.exe --xtream user:pass@host:port\n"
               "  or:  ./tv.exe https://some/stream.m3u8\n", stderr);
@@ -188,7 +201,7 @@ int main(int argc, char **argv) {
                      * pointer swap avoids the dangling-pointer bug that bit us on the
                      * first channel switch. */
                     playback_t *new_pb = calloc(1, sizeof(*new_pb));
-                    if (new_pb && playback_open(new_pb, &r, nch, switch_url) == 0) {
+                    if (new_pb && playback_open(new_pb, &r, nch, switch_url, &portal) == 0) {
                         fprintf(stderr, "[switch] new playback opened, tearing down old\n");
                         playback_close(pb);
                         free(pb);
@@ -241,7 +254,7 @@ int main(int argc, char **argv) {
             int ch_idx = (int)(pb->channel - &NPO_CHANNELS[0]);
             char *restart_url = build_channel_url(ch_idx, &portal, direct_url);
             playback_t *new_pb = calloc(1, sizeof(*new_pb));
-            if (new_pb && playback_open(new_pb, &r, pb->channel, restart_url) == 0) {
+            if (new_pb && playback_open(new_pb, &r, pb->channel, restart_url, &portal) == 0) {
                 playback_close(pb);
                 free(pb);
                 pb = new_pb;
