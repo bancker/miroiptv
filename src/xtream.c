@@ -158,6 +158,58 @@ int xtream_fetch_epg(const xtream_t *x, int stream_id, epg_t *out) {
     return 0;
 }
 
+int xtream_fetch_live_list(const xtream_t *x, const char *category_id,
+                           xtream_live_list_t *out) {
+    memset(out, 0, sizeof(*out));
+    char url[512];
+    if (category_id) {
+        snprintf(url, sizeof(url),
+            "http://%s:%d/player_api.php?username=%s&password=%s&action=get_live_streams&category_id=%s",
+            x->host, x->port, x->user, x->pass, category_id);
+    } else {
+        snprintf(url, sizeof(url),
+            "http://%s:%d/player_api.php?username=%s&password=%s&action=get_live_streams",
+            x->host, x->port, x->user, x->pass);
+    }
+
+    char *body = NULL; size_t len = 0;
+    if (npo_http_get(url, NULL, &body, &len) != 0) return -1;
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!cJSON_IsArray(root)) { if (root) cJSON_Delete(root); return -1; }
+
+    size_t n = cJSON_GetArraySize(root);
+    out->entries = calloc(n, sizeof(xtream_live_entry_t));
+    if (!out->entries) { cJSON_Delete(root); return -1; }
+
+    size_t w = 0;
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, root) {
+        cJSON *id_j   = cJSON_GetObjectItemCaseSensitive(item, "stream_id");
+        cJSON *name_j = cJSON_GetObjectItemCaseSensitive(item, "name");
+        cJSON *num_j  = cJSON_GetObjectItemCaseSensitive(item, "num");
+        if (!cJSON_IsNumber(id_j)) continue;
+        if (!cJSON_IsString(name_j) || !name_j->valuestring) continue;
+
+        out->entries[w].stream_id = id_j->valueint;
+        out->entries[w].num       = cJSON_IsNumber(num_j) ? num_j->valueint : (int)(w + 1);
+        out->entries[w].name      = strdup(name_j->valuestring);
+        if (!out->entries[w].name) continue;
+        w++;
+    }
+    out->count = w;
+    cJSON_Delete(root);
+    return 0;
+}
+
+void xtream_live_list_free(xtream_live_list_t *list) {
+    if (!list) return;
+    for (size_t i = 0; i < list->count; ++i) free(list->entries[i].name);
+    free(list->entries);
+    memset(list, 0, sizeof(*list));
+}
+
 char *xtream_stream_url(const xtream_t *x, int stream_id) {
     /* http://HOST:PORT/live/USER/PASS/ID.ts — raw MPEG-TS via a single long-
      * lived TCP connection. We previously used .m3u8 (HLS manifest) but this

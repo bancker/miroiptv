@@ -31,8 +31,13 @@ typedef struct {
     const npo_channel_t *channel;
 } playback_t;
 
+/* epg_stream_id:
+ *   0  -> derive from ch (existing NPO 1/2/3 behavior via XTREAM_NPO_STREAM_IDS)
+ *   -1 -> skip EPG fetch (used when zapping to a non-NPO portal channel)
+ *   >0 -> use this exact stream_id for the portal's get_short_epg call. */
 static int playback_open(playback_t *pb, render_t *r, const npo_channel_t *ch,
-                         const char *override_url, const xtream_t *portal) {
+                         const char *override_url, const xtream_t *portal,
+                         int epg_stream_id) {
     memset(pb, 0, sizeof(*pb));
     pb->channel = ch;
 
@@ -50,9 +55,13 @@ static int playback_open(playback_t *pb, render_t *r, const npo_channel_t *ch,
      * today); fall back to NPO's start-api when no portal (currently broken,
      * R1). Either failure is non-fatal — overlay shows "(geen programma)". */
     int epg_rc = -1;
-    if (portal && portal->host) {
-        int ch_idx = (int)(ch - &NPO_CHANNELS[0]);
-        epg_rc = xtream_fetch_epg(portal, XTREAM_NPO_STREAM_IDS[ch_idx], &pb->epg);
+    if (epg_stream_id == -1) {
+        /* caller said: skip EPG entirely. */
+    } else if (portal && portal->host) {
+        int use_id = epg_stream_id > 0
+                   ? epg_stream_id
+                   : XTREAM_NPO_STREAM_IDS[(int)(ch - &NPO_CHANNELS[0])];
+        epg_rc = xtream_fetch_epg(portal, use_id, &pb->epg);
         if (epg_rc == 0) {
             fprintf(stderr, "EPG: loaded %zu entries from portal for %s\n",
                     pb->epg.count, ch->display);
@@ -60,7 +69,7 @@ static int playback_open(playback_t *pb, render_t *r, const npo_channel_t *ch,
     } else {
         epg_rc = npo_fetch_epg(ch, &pb->epg);
     }
-    if (epg_rc != 0) {
+    if (epg_rc != 0 && epg_stream_id != -1) {
         fprintf(stderr, "warn: EPG fetch failed for %s\n", ch->display);
         memset(&pb->epg, 0, sizeof(pb->epg));
     }
@@ -104,6 +113,53 @@ static const npo_channel_t *key_to_channel(SDL_Keycode k) {
     }
 }
 
+/* Find the NPO channel whose EPG has a NOS Journaal airing right now, or
+ * whose next Journaal is soonest. Returns 0-2 on success, -1 if no Journaal
+ * was found in any channel's EPG. *out_is_airing is set to 1 if the chosen
+ * channel's Journaal is on air right now, 0 if it's in the future.
+ * *out_seconds_until is the seconds until start (0 if airing).
+ *
+ * Fetches EPG for each NPO channel via the Xtream portal — ~3 HTTP calls,
+ * completes in under a second typically. */
+static int find_next_journaal_channel(const xtream_t *portal,
+                                      int *out_is_airing,
+                                      long long *out_seconds_until) {
+    if (!portal || !portal->host) return -1;
+    time_t now = time(NULL);
+    int    best_ch = -1;
+    int    best_airing = 0;
+    long long best_dt = (long long)1 << 62;  /* effectively +inf */
+
+    for (int i = 0; i < 3; ++i) {
+        epg_t e = {0};
+        if (xtream_fetch_epg(portal, XTREAM_NPO_STREAM_IDS[i], &e) != 0) continue;
+        for (size_t j = 0; j < e.count; ++j) {
+            if (!e.entries[j].is_news) continue;
+            time_t s = e.entries[j].start;
+            time_t en = e.entries[j].end;
+            if (now >= s && now < en) {
+                /* On air right now — always prefer this. */
+                best_ch = i;
+                best_airing = 1;
+                best_dt = 0;
+                break;
+            } else if (s > now) {
+                long long dt = (long long)(s - now);
+                if (!best_airing && dt < best_dt) {
+                    best_dt = dt;
+                    best_ch = i;
+                }
+            }
+        }
+        npo_epg_free(&e);
+        if (best_airing) break;
+    }
+
+    if (out_is_airing)     *out_is_airing     = best_airing;
+    if (out_seconds_until) *out_seconds_until = best_ch >= 0 ? best_dt : -1;
+    return best_ch;
+}
+
 int main(int argc, char **argv) {
     /* Line-buffer stdout so diagnostic prints appear in real time even when
      * redirected to a file (default fully-buffered would only flush at exit,
@@ -145,7 +201,7 @@ int main(int argc, char **argv) {
      * a scope-local new_pb. Heap + pointer-swap avoids the UAF. */
     char *initial_url = build_channel_url(0, &portal, direct_url);
     playback_t *pb = calloc(1, sizeof(*pb));
-    if (!pb || playback_open(pb, &r, &NPO_CHANNELS[0], initial_url, &portal) != 0) {
+    if (!pb || playback_open(pb, &r, &NPO_CHANNELS[0], initial_url, &portal, 0) != 0) {
         fputs("initial playback_open failed\n"
               "  try: ./tv.exe --xtream user:pass@host:port\n"
               "  or:  ./tv.exe https://some/stream.m3u8\n", stderr);
@@ -181,6 +237,31 @@ int main(int argc, char **argv) {
     int drag_anchor_mx = 0, drag_anchor_my = 0;
     int drag_anchor_wx = 0, drag_anchor_wy = 0;
 
+    /* Mouse-wheel zapping through ALL portal live channels. We fetch the full
+     * catalog once, find our current stream_id in it, and the wheel moves the
+     * index ±1 per notch. Actual switch is debounced — rapid scrolling only
+     * triggers one playback_open after the wheel stops for WHEEL_DEBOUNCE_MS,
+     * which matters because the portal caps concurrent connections at 1. */
+    xtream_live_list_t live_list = {0};
+    int    current_live_idx = -1;
+    int    pending_wheel_delta = 0;
+    Uint32 last_wheel_ts = 0;
+    const Uint32 WHEEL_DEBOUNCE_MS = 350;
+
+    if (portal.host) {
+        if (xtream_fetch_live_list(&portal, NULL, &live_list) == 0) {
+            fprintf(stderr, "[zap] loaded %zu channels from portal\n", live_list.count);
+            for (size_t i = 0; i < live_list.count; ++i) {
+                if (live_list.entries[i].stream_id == XTREAM_NPO_STREAM_IDS[0]) {
+                    current_live_idx = (int)i;
+                    break;
+                }
+            }
+        } else {
+            fprintf(stderr, "[zap] failed to fetch live channel list — wheel disabled\n");
+        }
+    }
+
     /* Sync tolerances (seconds):
      *  DUE_WINDOW  — how "early" a frame can be to count as due-now (one vsync @ 60Hz ≈ 16ms)
      *  DROP_LATE   — how late a frame can be before we drop it (80ms ≈ 2 frames at 25fps) */
@@ -208,6 +289,12 @@ int main(int argc, char **argv) {
                 SDL_CaptureMouse(SDL_FALSE);
                 continue;
             }
+            if (ev.type == SDL_MOUSEWHEEL && current_live_idx >= 0) {
+                /* wheel up (positive y) = previous channel; down = next channel */
+                pending_wheel_delta -= ev.wheel.y;
+                last_wheel_ts = SDL_GetTicks();
+                continue;
+            }
             if (ev.type != SDL_KEYDOWN) continue;
             SDL_Keycode k = ev.key.keysym.sym;
             if (k == SDLK_q || k == SDLK_ESCAPE) { running = 0; break; }
@@ -217,6 +304,36 @@ int main(int argc, char **argv) {
                 SDL_PauseAudioDevice(pb->audio.device, paused);
             }
             else if (k == SDLK_e) show_overlay = !show_overlay;
+            else if (k == SDLK_n) {
+                int airing = 0;
+                long long dt = 0;
+                int idx = find_next_journaal_channel(&portal, &airing, &dt);
+                if (idx < 0) {
+                    fprintf(stderr, "[journaal] no NOS Journaal in NPO 1/2/3 EPG\n");
+                } else {
+                    fprintf(stderr, "[journaal] %s: %s%s (NPO %d)\n",
+                            airing ? "airing NOW" : "next",
+                            airing ? "" : "in ",
+                            airing ? "" : (dt < 60   ? "<1min" :
+                                           dt < 3600 ? "<1h"   : "1h+"),
+                            idx + 1);
+                    const npo_channel_t *target = &NPO_CHANNELS[idx];
+                    if (target != pb->channel) {
+                        char *u = build_channel_url(idx, &portal, direct_url);
+                        playback_t *new_pb = calloc(1, sizeof(*new_pb));
+                        if (new_pb && playback_open(new_pb, &r, target, u, &portal, 0) == 0) {
+                            playback_close(pb); free(pb); pb = new_pb;
+                            paused = 0; have_texture = 0;
+                            if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
+                            overlay_mark_dirty(&ov);
+                        } else {
+                            free(new_pb);
+                            fprintf(stderr, "[journaal] failed to open %s\n", target->display);
+                        }
+                        free(u);
+                    }
+                }
+            }
             else {
                 const npo_channel_t *nch = key_to_channel(k);
                 if (nch && nch != pb->channel) {
@@ -228,7 +345,7 @@ int main(int argc, char **argv) {
                      * pointer swap avoids the dangling-pointer bug that bit us on the
                      * first channel switch. */
                     playback_t *new_pb = calloc(1, sizeof(*new_pb));
-                    if (new_pb && playback_open(new_pb, &r, nch, switch_url, &portal) == 0) {
+                    if (new_pb && playback_open(new_pb, &r, nch, switch_url, &portal, 0) == 0) {
                         fprintf(stderr, "[switch] new playback opened, tearing down old\n");
                         playback_close(pb);
                         free(pb);
@@ -255,6 +372,42 @@ int main(int argc, char **argv) {
             SDL_SetWindowPosition(r.window,
                 drag_anchor_wx + (mx - drag_anchor_mx),
                 drag_anchor_wy + (my - drag_anchor_my));
+        }
+
+        /* 1c) Debounced wheel-zap: commit the accumulated delta after the wheel
+         * has been idle for WHEEL_DEBOUNCE_MS, opening the target channel. */
+        if (pending_wheel_delta != 0 && current_live_idx >= 0 &&
+            SDL_GetTicks() - last_wheel_ts > WHEEL_DEBOUNCE_MS) {
+            int new_idx = current_live_idx + pending_wheel_delta;
+            if (new_idx < 0) new_idx = 0;
+            if (new_idx >= (int)live_list.count) new_idx = (int)live_list.count - 1;
+            pending_wheel_delta = 0;
+
+            if (new_idx != current_live_idx) {
+                xtream_live_entry_t *e = &live_list.entries[new_idx];
+                fprintf(stderr, "[zap] [%d/%zu] %s (id=%d)\n",
+                        new_idx + 1, live_list.count, e->name, e->stream_id);
+                char *zap_url = xtream_stream_url(&portal, e->stream_id);
+                playback_t *new_pb = calloc(1, sizeof(*new_pb));
+                /* Use the current pb->channel as a stand-in (pb->channel must be
+                 * non-NULL in main loop); we pass epg_stream_id=e->stream_id so
+                 * the EPG actually matches the zapped channel. */
+                if (new_pb && zap_url && playback_open(new_pb, &r, pb->channel,
+                        zap_url, &portal, e->stream_id) == 0) {
+                    char title[192];
+                    snprintf(title, sizeof(title), "tv - %s", e->name);
+                    SDL_SetWindowTitle(r.window, title);
+                    playback_close(pb); free(pb); pb = new_pb;
+                    current_live_idx = new_idx;
+                    paused = 0; have_texture = 0;
+                    if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
+                    overlay_mark_dirty(&ov);
+                } else {
+                    free(new_pb);
+                    fprintf(stderr, "[zap] failed to open %s\n", e->name);
+                }
+                free(zap_url);
+            }
         }
 
         /* 2) Try to grab a new frame if we don't have one pending. */
@@ -290,7 +443,7 @@ int main(int argc, char **argv) {
             int ch_idx = (int)(pb->channel - &NPO_CHANNELS[0]);
             char *restart_url = build_channel_url(ch_idx, &portal, direct_url);
             playback_t *new_pb = calloc(1, sizeof(*new_pb));
-            if (new_pb && playback_open(new_pb, &r, pb->channel, restart_url, &portal) == 0) {
+            if (new_pb && playback_open(new_pb, &r, pb->channel, restart_url, &portal, 0) == 0) {
                 playback_close(pb);
                 free(pb);
                 pb = new_pb;
@@ -327,6 +480,7 @@ int main(int argc, char **argv) {
     free(pb);
     overlay_shutdown(&ov);
     render_shutdown(&r);
+    xtream_live_list_free(&live_list);
     xtream_free(&portal);
     curl_global_cleanup();
     return 0;

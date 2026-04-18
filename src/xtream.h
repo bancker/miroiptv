@@ -33,4 +33,23 @@ extern const int XTREAM_NPO_STREAM_IDS[3];
  * with npo_epg_free (same struct). */
 int xtream_fetch_epg(const xtream_t *x, int stream_id, epg_t *out);
 
+/* One entry in the portal's live-stream catalog. */
+typedef struct {
+    int   stream_id;
+    int   num;         /* portal's display order */
+    char *name;        /* malloc'd, free via xtream_live_list_free */
+} xtream_live_entry_t;
+
+typedef struct {
+    xtream_live_entry_t *entries;
+    size_t               count;
+} xtream_live_list_t;
+
+/* Fetches the full live-stream catalog (all channels the account has access
+ * to). Typically ~15000 entries. category_id == NULL means "all categories".
+ * Returns 0 on success. */
+int  xtream_fetch_live_list(const xtream_t *x, const char *category_id,
+                            xtream_live_list_t *out);
+void xtream_live_list_free(xtream_live_list_t *list);
+
 #endif
