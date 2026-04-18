@@ -248,10 +248,16 @@ char *xtream_timeshift_url(const xtream_t *x, int archive_stream_id,
              local_tm.tm_year + 1900, local_tm.tm_mon + 1, local_tm.tm_mday,
              local_tm.tm_hour, local_tm.tm_min);
 
+    /* Use .m3u8, not .ts. The .ts variant is served as one long finite HTTP
+     * response that the portal drops mid-transfer every 30-60 s, forcing libav
+     * to reconnect from byte 0 (the server doesn't honour Range). The .m3u8
+     * variant serves the same content as ~30 short segments so each TCP
+     * connection only lives for one 60 s segment; libav's HLS demuxer handles
+     * the stitching seamlessly. */
     size_t cap = strlen(x->host) + strlen(x->user) + strlen(x->pass) + 128;
     char *out = malloc(cap);
     if (!out) return NULL;
-    snprintf(out, cap, "http://%s:%d/timeshift/%s/%s/%d/%s/%d.ts",
+    snprintf(out, cap, "http://%s:%d/timeshift/%s/%s/%d/%s/%d.m3u8",
              x->host, x->port, x->user, x->pass,
              duration_min, when, archive_stream_id);
     return out;
