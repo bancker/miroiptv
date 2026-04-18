@@ -49,6 +49,16 @@ int player_open(player_t *p, const char *url) {
      * segment fetches, start near live edge. */
     av_dict_set(&opts, "http_persistent",            "1", 0);
     av_dict_set(&opts, "live_start_index",           "-1", 0);
+    /* Probe / analyze generously so mid-stream opens (timeshift, catch-up
+     * replay) find the H.264 SPS/PPS before we call avformat_find_stream_info
+     * done. Defaults (5 MB / 5 s) often miss the first keyframe when opened
+     * at an arbitrary wall-clock offset, producing audio-only playback with
+     * "non-existing PPS 0 referenced" warnings forever. */
+    av_dict_set(&opts, "probesize",                  "32000000", 0);   /* 32 MB */
+    av_dict_set(&opts, "analyzeduration",            "15000000", 0);   /* 15 sec in us */
+    /* Tolerate bitstream hiccups around the mid-stream entry point rather
+     * than hard-failing the decode context. */
+    av_dict_set(&opts, "fflags",                     "+discardcorrupt+genpts", 0);
 
     int rc_open = avformat_open_input(&p->fmt, url, NULL, &opts);
     av_dict_free(&opts);
@@ -211,10 +221,27 @@ static void *decoder_loop(void *ud) {
         else if (pkt->stream_index == p->audio_idx) { ctx = p->actx; }
         if (!ctx) { av_packet_unref(pkt); continue; }
 
+        /* Don't skip packets here — the MPEG-TS demuxer interleaves SPS/PPS
+         * NAL units with the slice NALs they describe, and skipping any
+         * packet can strand the decoder without parameter sets. Let the
+         * H.264 decoder emit "non-existing PPS" warnings until it picks up
+         * in-band headers; that's normal for mid-stream opens. */
         if (avcodec_send_packet(ctx, pkt) == 0) {
             while (avcodec_receive_frame(ctx, fr) == 0) {
-                if (is_video) push_video_frame(p, fr);
-                else          push_audio_frame(p, fr);
+                if (is_video) {
+                    push_video_frame(p, fr);
+                    p->video_frames_pushed++;
+                    if (p->video_frames_pushed == 1)
+                        fprintf(stderr, "[decoder] first video frame decoded (%dx%d, pts=%.2fs)\n",
+                                fr->width, fr->height,
+                                (double)fr->pts * p->fmt->streams[p->video_idx]->time_base.num
+                                / p->fmt->streams[p->video_idx]->time_base.den);
+                } else {
+                    push_audio_frame(p, fr);
+                    p->audio_frames_pushed++;
+                    if (p->audio_frames_pushed == 1)
+                        fprintf(stderr, "[decoder] first audio frame decoded\n");
+                }
                 av_frame_unref(fr);
             }
         }

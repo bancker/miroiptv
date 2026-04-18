@@ -23,6 +23,8 @@ typedef struct {
     pthread_t         thread;
     volatile int      stop;
     int               audio_sample_rate_out;
+    long long         video_frames_pushed;
+    long long         audio_frames_pushed;
 } player_t;
 
 int  player_open(player_t *p, const char *url);

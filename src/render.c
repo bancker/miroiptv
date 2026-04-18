@@ -73,6 +73,14 @@ static void audio_callback(void *ud, uint8_t *stream, int len) {
                 memset(out, 0, (size_t)need_samples * 2 * sizeof(int16_t));
                 return;
             }
+            /* Seed the A/V clock baseline from the FIRST audio pts we play,
+             * not the first video frame's pts — in mid-stream opens audio
+             * starts well before the first IDR and using video's pts made
+             * the clock race ahead, dropping every subsequent video frame. */
+            if (!ao->has_first_pts) {
+                ao->first_pts     = c->pts;
+                ao->has_first_pts = 1;
+            }
             ao->cur = c;
             ao->cur_samples   = c->samples;
             ao->cur_remaining = c->n_samples;

@@ -94,7 +94,11 @@ static int playback_open(playback_t *pb, render_t *r, const npo_channel_t *ch,
         free(pb->url); pb->url = NULL; return -1;
     }
 
-    av_clock_init(&pb->clk, &pb->audio.samples_played, pb->audio.sample_rate);
+    av_clock_init_from_audio(&pb->clk,
+                             &pb->audio.samples_played,
+                             &pb->audio.first_pts,
+                             &pb->audio.has_first_pts,
+                             pb->audio.sample_rate);
     video_tex_init(&pb->tex);
 
     char title[128];
@@ -550,9 +554,11 @@ int main(int argc, char **argv) {
         if (!pending_vf) pending_vf = queue_try_pop(&pb->player.video_q);
         if (pending_vf) last_frame_ts = SDL_GetTicks();
 
-        /* 3) If we have a pending frame, decide what to do with it. */
-        if (pending_vf) {
-            if (!pb->clk.have_first) av_clock_mark_first_pts(&pb->clk, pending_vf->pts);
+        /* 3) If we have a pending frame, decide what to do with it.
+         * Skip the decide-when block until audio has actually started
+         * (first chunk consumed by SDL) — without that baseline av_clock
+         * returns 0 and every frame with a real pts looks "late". */
+        if (pending_vf && av_clock_ready(&pb->clk)) {
             double now  = av_clock_now(&pb->clk);
             double diff = pending_vf->pts - now;
 

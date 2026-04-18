@@ -38,6 +38,14 @@ typedef struct {
     size_t            cur_remaining;  /* per channel */
     audio_chunk_t    *cur;            /* currently consumed chunk */
     volatile int64_t  samples_played; /* monotonically increasing, guarded by device lock */
+
+    /* PTS of the first audio chunk ever popped. Written once in the audio
+     * callback, then read by the main thread via av_clock. Using the first
+     * AUDIO pts (instead of first VIDEO pts) as the clock baseline matters
+     * for mid-stream opens like timeshift, where audio starts seconds
+     * before the first IDR video frame. */
+    volatile double   first_pts;
+    volatile int      has_first_pts;
 } audio_out_t;
 
 int  audio_open(audio_out_t *ao, queue_t *q, int sample_rate);
