@@ -245,6 +245,7 @@ int overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh) {
         "  left / right  Skip -30s / +30s (during timeshift replay only)",
         "  e             Toggle EPG overlay (bottom strip)",
         "  f             Toggle fullscreen",
+        "  t             Toggle always-on-top",
         "  space         Pause / resume audio",
         "  ?             Toggle this help",
         "  q / Esc       Quit",

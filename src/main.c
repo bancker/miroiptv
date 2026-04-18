@@ -405,6 +405,14 @@ int main(int argc, char **argv) {
                 SDL_PauseAudioDevice(pb->audio.device, paused);
             }
             else if (k == SDLK_e) show_overlay = !show_overlay;
+            else if (k == SDLK_t) {
+                static int always_on_top = 0;
+                always_on_top = !always_on_top;
+                SDL_SetWindowAlwaysOnTop(r.window, always_on_top ? SDL_TRUE : SDL_FALSE);
+                snprintf(toast_text, sizeof(toast_text),
+                         "Always on top: %s", always_on_top ? "ON" : "OFF");
+                toast_until_ms = SDL_GetTicks() + 2500;
+            }
             else if ((k == SDLK_LEFT || k == SDLK_RIGHT) && pb->timeshift_start != 0) {
                 int delta = (k == SDLK_RIGHT) ? +30 : -30;
                 time_t new_start = pb->timeshift_start + delta;
