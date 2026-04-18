@@ -580,6 +580,22 @@ int main(int argc, char **argv) {
                     current_live_idx = new_idx;
                     paused = 0; have_texture = 0;
                     if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
+
+                    /* Show a 5-second toast with channel name + currently
+                     * airing programme title (from the fresh EPG pb holds). */
+                    time_t tnow = time(NULL);
+                    const char *now_title = NULL;
+                    for (size_t i = 0; i < pb->epg.count; ++i) {
+                        if (pb->epg.entries[i].start <= tnow && tnow < pb->epg.entries[i].end) {
+                            now_title = pb->epg.entries[i].title;
+                            break;
+                        }
+                    }
+                    if (now_title && *now_title)
+                        snprintf(toast_text, sizeof(toast_text), "%s  |  %s", e->name, now_title);
+                    else
+                        snprintf(toast_text, sizeof(toast_text), "%s", e->name);
+                    toast_until_ms = SDL_GetTicks() + 5000;
                     overlay_mark_dirty(&ov);
                 } else {
                     free(new_pb);
