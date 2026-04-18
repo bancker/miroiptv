@@ -110,6 +110,11 @@ int main(int argc, char **argv) {
      * hiding what happened right before a crash). */
     setvbuf(stdout, NULL, _IOLBF, 0);
 
+    /* Silence libav's info-level chatter ("Opening '...ts'" on every segment).
+     * We keep warnings/errors, which is where real diagnostics live. Our own
+     * [decoder]/[stall] fprintf(stderr, ...) lines are untouched. */
+    av_log_set_level(AV_LOG_WARNING);
+
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
     /* Parse CLI: supports `--xtream user:pass@host[:port]` OR a bare URL as argv[1]. */
