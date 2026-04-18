@@ -99,13 +99,16 @@ static int b64_decode_inplace(char *s) {
     return (int)(out - s);
 }
 
-int xtream_fetch_epg(const xtream_t *x, int stream_id, epg_t *out) {
+/* Shared parsing logic. `action` is either "get_short_epg" (fast, 4 upcoming)
+ * or "get_simple_data_table" (slower, entire 2-day window including past). */
+static int xtream_fetch_epg_internal(const xtream_t *x, int stream_id,
+                                     const char *action, epg_t *out) {
     memset(out, 0, sizeof(*out));
 
     char url[512];
     snprintf(url, sizeof(url),
-        "http://%s:%d/player_api.php?username=%s&password=%s&action=get_short_epg&stream_id=%d",
-        x->host, x->port, x->user, x->pass, stream_id);
+        "http://%s:%d/player_api.php?username=%s&password=%s&action=%s&stream_id=%d",
+        x->host, x->port, x->user, x->pass, action, stream_id);
 
     char *body = NULL;
     size_t len = 0;
@@ -161,6 +164,14 @@ int xtream_fetch_epg(const xtream_t *x, int stream_id, epg_t *out) {
     out->count = written;
     cJSON_Delete(root);
     return 0;
+}
+
+int xtream_fetch_epg(const xtream_t *x, int stream_id, epg_t *out) {
+    return xtream_fetch_epg_internal(x, stream_id, "get_short_epg", out);
+}
+
+int xtream_fetch_epg_full(const xtream_t *x, int stream_id, epg_t *out) {
+    return xtream_fetch_epg_internal(x, stream_id, "get_simple_data_table", out);
 }
 
 int xtream_fetch_live_list(const xtream_t *x, const char *category_id,

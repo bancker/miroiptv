@@ -41,8 +41,17 @@ char *xtream_timeshift_url(const xtream_t *x, int archive_stream_id,
  * portal's player_api.php?action=get_short_epg endpoint. Titles arrive
  * base64-encoded; we decode them and flag NOS Journaal entries the same way
  * the NPO parser does. Returns 0 on success, -1 on failure. Caller frees
- * with npo_epg_free (same struct). */
+ * with npo_epg_free (same struct).
+ *
+ * NB: "short" is literal — this only returns ~4 upcoming entries. For past
+ * or historical data use xtream_fetch_epg_full below. */
 int xtream_fetch_epg(const xtream_t *x, int stream_id, epg_t *out);
+
+/* Full EPG via player_api.php?action=get_simple_data_table. Returns many
+ * more entries (observed: 800+ over a multi-day window including past),
+ * suitable for searching historical programs like "latest NOS Journaal".
+ * Same output shape as xtream_fetch_epg. */
+int xtream_fetch_epg_full(const xtream_t *x, int stream_id, epg_t *out);
 
 /* One entry in the portal's live-stream catalog. */
 typedef struct {

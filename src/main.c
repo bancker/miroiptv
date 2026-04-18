@@ -151,39 +151,41 @@ static journaal_hit_t find_latest_journaal(const xtream_t *portal) {
     int    best_past_ch   = -1; time_t best_past_start   = 0; time_t best_past_end   = 0;
     int    best_next_ch   = -1; time_t best_next_start   = 0; time_t best_next_end   = 0;
 
-    /* Scan BOTH live NPO EPGs (for airing-now precision) and TERUGKIJKEN
-     * catch-up EPGs (which reach further into the past AND future). The
-     * get_short_epg endpoint on the live channel IDs often drops entries
-     * older than a few hours, so without the archive sweep 'past' wins
-     * would rarely trigger. */
-    const int scan_ids[3][2] = {
-        { XTREAM_NPO_STREAM_IDS[0], XTREAM_NPO_ARCHIVE_STREAM_IDS[0] },
-        { XTREAM_NPO_STREAM_IDS[1], XTREAM_NPO_ARCHIVE_STREAM_IDS[1] },
-        { XTREAM_NPO_STREAM_IDS[2], XTREAM_NPO_ARCHIVE_STREAM_IDS[2] },
-    };
+    /* Use the FULL EPG (get_simple_data_table) on the archive IDs. The
+     * live IDs' get_short_epg only returns ~4 upcoming entries and never
+     * contains past journaals — that's why the previous version always
+     * reported "NOS Journaal not found in EPG". The archive stream has
+     * the same programme guide for its channel but the portal exposes
+     * 800+ entries spanning the full 2-day catch-up window. */
     for (int i = 0; i < 3; ++i) {
-        for (int src = 0; src < 2; ++src) {
-            epg_t e = {0};
-            if (xtream_fetch_epg(portal, scan_ids[i][src], &e) != 0) continue;
-            for (size_t j = 0; j < e.count; ++j) {
-                if (!e.entries[j].is_news) continue;
-                time_t s = e.entries[j].start, en = e.entries[j].end;
-                if (s <= now && now < en) {
-                    if (s > best_airing_start) {
-                        best_airing_ch = i; best_airing_start = s; best_airing_end = en;
-                    }
-                } else if (en <= now) {
-                    if (s > best_past_start) {
-                        best_past_ch = i; best_past_start = s; best_past_end = en;
-                    }
-                } else { /* s > now */
-                    if (best_next_ch < 0 || s < best_next_start) {
-                        best_next_ch = i; best_next_start = s; best_next_end = en;
-                    }
+        epg_t e = {0};
+        if (xtream_fetch_epg_full(portal, XTREAM_NPO_ARCHIVE_STREAM_IDS[i], &e) != 0) {
+            fprintf(stderr, "[journaal] EPG fetch failed for archive id %d\n",
+                    XTREAM_NPO_ARCHIVE_STREAM_IDS[i]);
+            continue;
+        }
+        int journaals_seen = 0;
+        for (size_t j = 0; j < e.count; ++j) {
+            if (!e.entries[j].is_news) continue;
+            journaals_seen++;
+            time_t s = e.entries[j].start, en = e.entries[j].end;
+            if (s <= now && now < en) {
+                if (s > best_airing_start) {
+                    best_airing_ch = i; best_airing_start = s; best_airing_end = en;
+                }
+            } else if (en <= now) {
+                if (s > best_past_start) {
+                    best_past_ch = i; best_past_start = s; best_past_end = en;
+                }
+            } else { /* s > now */
+                if (best_next_ch < 0 || s < best_next_start) {
+                    best_next_ch = i; best_next_start = s; best_next_end = en;
                 }
             }
-            npo_epg_free(&e);
         }
+        fprintf(stderr, "[journaal] scanned NPO %d archive: %zu entries, %d journaals\n",
+                i + 1, e.count, journaals_seen);
+        npo_epg_free(&e);
     }
 
     if (best_airing_ch >= 0) {
@@ -315,6 +317,16 @@ int main(int argc, char **argv) {
     int    pending_wheel_delta = 0;
     Uint32 last_wheel_ts = 0;
     const Uint32 WHEEL_DEBOUNCE_MS = 350;
+
+    /* Diagnostic: if TV_TEST_JOURNAAL env var is set, call the Journaal
+     * search once at startup and log the result. Lets automated smoke
+     * tests verify the lookup works without synthesizing key events. */
+    if (portal.host && getenv("TV_TEST_JOURNAAL")) {
+        journaal_hit_t h = find_latest_journaal(&portal);
+        fprintf(stderr, "[test-journaal] ch=%d airing=%d past=%d future=%d start=%ld end=%ld\n",
+                h.channel_idx, h.is_airing, h.is_past, (h.channel_idx >= 0 && !h.is_airing && !h.is_past) ? 1 : 0,
+                (long)h.start, (long)h.end);
+    }
 
     if (portal.host) {
         if (xtream_fetch_live_list(&portal, NULL, &live_list) == 0) {
