@@ -2,12 +2,24 @@
 #include "player.h"
 #include "npo.h"
 #include "sync.h"
+#include "xtream.h"
 #include <SDL2/SDL.h>
 #include <curl/curl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/* Build the URL for channel index 0..2 using these precedence rules:
+ *   1. if xtream portal configured -> xtream stream URL for that channel
+ *   2. if argv[1] direct URL given -> that URL (same URL for all channels; restart on switch)
+ *   3. otherwise NULL -> playback_open falls through to the (broken) NPO resolver
+ * Returned string is malloc'd and caller frees, OR NULL if no source. */
+static char *build_channel_url(int ch_idx, const xtream_t *portal, const char *direct_url) {
+    if (portal && portal->host) return xtream_stream_url(portal, XTREAM_NPO_STREAM_IDS[ch_idx]);
+    if (direct_url)             return strdup(direct_url);
+    return NULL;
+}
 
 typedef struct {
     player_t     player;
@@ -82,18 +94,41 @@ static const npo_channel_t *key_to_channel(SDL_Keycode k) {
 int main(int argc, char **argv) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    const char *override_url = (argc > 1) ? argv[1] : NULL;
-    if (override_url) printf("stream (override): %s\n", override_url);
+    /* Parse CLI: supports `--xtream user:pass@host[:port]` OR a bare URL as argv[1]. */
+    xtream_t portal = {0};
+    const char *direct_url = NULL;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--xtream") == 0 && i + 1 < argc) {
+            if (xtream_parse(argv[++i], &portal) != 0) {
+                fprintf(stderr, "bad --xtream spec (expected user:pass@host[:port])\n");
+                return 2;
+            }
+        } else if (!direct_url) {
+            direct_url = argv[i];
+        }
+    }
+    if (portal.host) {
+        printf("xtream portal: %s:%d user=%s\n", portal.host, portal.port, portal.user);
+    } else if (direct_url) {
+        printf("direct URL: %s\n", direct_url);
+    }
 
     render_t r;
     if (render_init(&r, 960, 540, "tv - booting") != 0) return 1;
 
+    /* Initial channel = NPO 1 (index 0). */
+    char *initial_url = build_channel_url(0, &portal, direct_url);
     playback_t pb;
-    if (playback_open(&pb, &r, &NPO_CHANNELS[0], override_url) != 0) {
-        fputs("initial playback_open failed - pass a working HLS URL as argv[1]\n", stderr);
+    if (playback_open(&pb, &r, &NPO_CHANNELS[0], initial_url) != 0) {
+        fputs("initial playback_open failed\n"
+              "  try: ./tv.exe --xtream user:pass@host:port\n"
+              "  or:  ./tv.exe https://some/stream.m3u8\n", stderr);
+        free(initial_url);
+        xtream_free(&portal);
         render_shutdown(&r);
         return 2;
     }
+    free(initial_url);
 
     overlay_t ov;
     if (overlay_init(&ov, "assets/DejaVuSans.ttf") != 0) {
@@ -130,8 +165,10 @@ int main(int argc, char **argv) {
             else {
                 const npo_channel_t *nch = key_to_channel(k);
                 if (nch && nch != pb.channel) {
+                    int ch_idx = (int)(nch - &NPO_CHANNELS[0]);
+                    char *switch_url = build_channel_url(ch_idx, &portal, direct_url);
                     playback_t new_pb;
-                    if (playback_open(&new_pb, &r, nch, override_url) == 0) {
+                    if (playback_open(&new_pb, &r, nch, switch_url) == 0) {
                         playback_close(&pb);
                         pb = new_pb;
                         paused       = 0;
@@ -142,6 +179,7 @@ int main(int argc, char **argv) {
                         fprintf(stderr, "channel switch to %s failed - staying on %s\n",
                                 nch->display, pb.channel->display);
                     }
+                    free(switch_url);
                 }
             }
         }
@@ -188,6 +226,7 @@ int main(int argc, char **argv) {
     playback_close(&pb);
     overlay_shutdown(&ov);
     render_shutdown(&r);
+    xtream_free(&portal);
     curl_global_cleanup();
     return 0;
 }
