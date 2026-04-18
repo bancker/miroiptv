@@ -151,12 +151,17 @@ int main(int argc, char **argv) {
     int paused         = 0;
     int have_texture   = 0;
     video_frame_t *pending_vf = NULL;  /* held across iterations when not yet due */
+    Uint32 last_frame_ts = SDL_GetTicks();
 
     /* Sync tolerances (seconds):
      *  DUE_WINDOW  — how "early" a frame can be to count as due-now (one vsync @ 60Hz ≈ 16ms)
      *  DROP_LATE   — how late a frame can be before we drop it (80ms ≈ 2 frames at 25fps) */
-    const double DUE_WINDOW = 0.010;
-    const double DROP_LATE  = 0.080;
+    const double DUE_WINDOW    = 0.010;
+    const double DROP_LATE     = 0.080;
+    /* Stall detection: if we've had a texture up and no new frame arrives for
+     * STALL_MS, assume the decoder thread died (network drop, HLS sequence
+     * reset, portal timeout) and restart the same channel. */
+    const Uint32 STALL_MS      = 3000;
 
     while (running) {
         /* 1) Events first, every iteration — keeps UI responsive regardless of decode state. */
@@ -205,6 +210,7 @@ int main(int argc, char **argv) {
 
         /* 2) Try to grab a new frame if we don't have one pending. */
         if (!pending_vf) pending_vf = queue_try_pop(&pb->player.video_q);
+        if (pending_vf) last_frame_ts = SDL_GetTicks();
 
         /* 3) If we have a pending frame, decide what to do with it. */
         if (pending_vf) {
@@ -224,6 +230,32 @@ int main(int argc, char **argv) {
                 pending_vf = NULL;
             }
             /* else: hold for next iteration — its time hasn't come yet. */
+        }
+
+        /* 3b) Stall detection + auto-restart. Only kicks in after we've seen
+         * at least one frame (have_texture) so the initial connect phase
+         * doesn't trigger it. */
+        if (have_texture && SDL_GetTicks() - last_frame_ts > STALL_MS) {
+            fprintf(stderr, "[stall] no frames for %ums on %s - restarting\n",
+                    STALL_MS, pb->channel->display);
+            int ch_idx = (int)(pb->channel - &NPO_CHANNELS[0]);
+            char *restart_url = build_channel_url(ch_idx, &portal, direct_url);
+            playback_t *new_pb = calloc(1, sizeof(*new_pb));
+            if (new_pb && playback_open(new_pb, &r, pb->channel, restart_url) == 0) {
+                playback_close(pb);
+                free(pb);
+                pb = new_pb;
+                paused       = 0;
+                have_texture = 0;
+                if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
+                overlay_mark_dirty(&ov);
+                fprintf(stderr, "[stall] restart OK\n");
+            } else {
+                free(new_pb);
+                fprintf(stderr, "[stall] restart failed - will retry in %ums\n", STALL_MS);
+            }
+            free(restart_url);
+            last_frame_ts = SDL_GetTicks();  /* reset either way */
         }
 
         /* 4) Always render. VSYNC in SDL_RenderPresent paces the loop to ~60Hz,

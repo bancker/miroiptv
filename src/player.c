@@ -25,7 +25,19 @@ int player_open(player_t *p, const char *url) {
     p->fmt->interrupt_callback.callback = io_interrupt_cb;
     p->fmt->interrupt_callback.opaque   = p;
 
-    if (avformat_open_input(&p->fmt, url, NULL, NULL) != 0) {
+    /* HTTP / HLS reconnect tuning. Live streams drop connections routinely —
+     * without these flags libav surrenders on the first hiccup and the
+     * decoder thread exits, freezing the player. */
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "reconnect",             "1", 0);
+    av_dict_set(&opts, "reconnect_streamed",    "1", 0);
+    av_dict_set(&opts, "reconnect_on_network_error", "1", 0);
+    av_dict_set(&opts, "reconnect_delay_max",   "5", 0);  /* seconds */
+    av_dict_set(&opts, "rw_timeout",            "10000000", 0);  /* 10s in us */
+
+    int rc_open = avformat_open_input(&p->fmt, url, NULL, &opts);
+    av_dict_free(&opts);
+    if (rc_open != 0) {
         fprintf(stderr, "avformat_open_input failed for %s\n", url);
         return -1;
     }
