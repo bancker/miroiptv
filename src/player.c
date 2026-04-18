@@ -27,13 +27,22 @@ int player_open(player_t *p, const char *url) {
 
     /* HTTP / HLS reconnect tuning. Live streams drop connections routinely —
      * without these flags libav surrenders on the first hiccup and the
-     * decoder thread exits, freezing the player. */
+     * decoder thread exits, freezing the player.
+     *
+     * NOTE: rw_timeout removed — a 10s cap aborted HLS playlist refreshes on
+     * slow hops, which caused the decoder to exit after one playlist (~30-60s
+     * of content). Let libav's reconnect handle real failures; io_interrupt_cb
+     * lets us still cancel the thread on shutdown. */
     AVDictionary *opts = NULL;
-    av_dict_set(&opts, "reconnect",             "1", 0);
-    av_dict_set(&opts, "reconnect_streamed",    "1", 0);
+    av_dict_set(&opts, "reconnect",                  "1", 0);
+    av_dict_set(&opts, "reconnect_streamed",         "1", 0);
     av_dict_set(&opts, "reconnect_on_network_error", "1", 0);
-    av_dict_set(&opts, "reconnect_delay_max",   "5", 0);  /* seconds */
-    av_dict_set(&opts, "rw_timeout",            "10000000", 0);  /* 10s in us */
+    av_dict_set(&opts, "reconnect_on_http_error",    "404,403,5xx", 0);
+    av_dict_set(&opts, "reconnect_delay_max",        "5", 0);  /* seconds */
+    /* HLS-specific: keep the HTTP connection alive across segment fetches
+     * (saves the portal's max_connections:1 slot) and start near live edge. */
+    av_dict_set(&opts, "http_persistent",            "1", 0);
+    av_dict_set(&opts, "live_start_index",           "-1", 0);
 
     int rc_open = avformat_open_input(&p->fmt, url, NULL, &opts);
     av_dict_free(&opts);
@@ -174,8 +183,13 @@ static void *decoder_loop(void *ud) {
     while (!p->stop) {
         int rc = av_read_frame(p->fmt, pkt);
         if (rc < 0) {
-            if (rc == AVERROR_EOF) break;
-            fprintf(stderr, "av_read_frame: %d\n", rc);
+            char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+            av_strerror(rc, errbuf, sizeof(errbuf));
+            if (rc == AVERROR_EOF) {
+                fprintf(stderr, "[decoder] EOF (rc=AVERROR_EOF) — stream ended\n");
+            } else {
+                fprintf(stderr, "[decoder] av_read_frame failed: %s (rc=%d)\n", errbuf, rc);
+            }
             break;
         }
         AVCodecContext *ctx = NULL;
