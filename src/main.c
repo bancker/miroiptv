@@ -220,32 +220,40 @@ static journaal_hit_t find_latest_journaal(const xtream_t *portal) {
     return hit;
 }
 
-/* --- Background zap preparation, 3-phase ---
+/* --- Background zap preparation, 3-phase, per-request allocation ---
  *
  * UX goal: channel name shows INSTANTLY on wheel commit, then programme
  * title is filled in as soon as the EPG comes back (~200-400ms), then the
  * stream swaps when libav finishes probing (~1-2s). Main never blocks.
  *
+ * Critical design choice: each zap request gets its OWN heap-allocated
+ * zap_prep_t. When the user cancels (fast wheel scrolling), we set
+ * state=5 on the old prep, detach its thread, and null out our pointer —
+ * the detached worker sees state=5, frees everything it holds (including
+ * the struct itself because self_owned=1), and vanishes. Main immediately
+ * allocates a fresh struct for the new request. Two workers running
+ * simultaneously is fine because they touch disjoint structs.
+ *
+ * This fixes a fast-scroll crash where the old code reused a single
+ * shared struct and the new request would stomp the old worker's state
+ * mid-flight.
+ *
  * State machine:
- *   0 idle
- *   1 running, EPG fetch in progress
- *   2 EPG ready (preload_epg valid, stream open still in progress)
- *   3 stream ready (pb valid, can swap)
- *   4 failed  (pb + preload_epg freed by worker already)
- *   5 cancelled by main (worker bails, frees whatever it has)
+ *   0 running, EPG fetch in progress     (initial after pthread_create)
+ *   2 EPG ready, stream open in progress (worker -> main signal)
+ *   3 stream ready, pb valid             (worker -> main signal)
+ *   4 failed (worker owns cleanup)
+ *   5 cancelled by main (worker owns cleanup, frees struct too)
  *
- * Ownership transitions:
- *   main → worker : url (worker frees after use)
- *   worker → main : preload_epg (when state >= 2, main consumes)
- *                 : pb (when state >= 3, main takes with swap)
- * Cancellation  : main sets state=5; worker checks and frees everything
- *                 it currently holds, then exits.
- *
- * Word-sized state writes under volatile are enough on x86-64 — no mutex
- * needed for this simple handoff. */
+ * Ownership:
+ *   - main allocates zp, fills inputs, spawns worker, assigns active_prep.
+ *   - Worker frees zp->url and owns lifetime of preload_epg + pb until
+ *     state >= 2 or 3 (handoff) OR state == 4/5 (worker deallocates).
+ *   - If self_owned, worker frees zp itself at exit. */
 typedef struct {
     pthread_t             thread;
-    volatile int          state;          /* 0..5 per comment above */
+    volatile int          state;          /* see comment above */
+    volatile int          self_owned;     /* 1 = worker frees zp on exit */
     xtream_t             *portal;
     render_t             *render;
     char                 *url;
@@ -254,20 +262,10 @@ typedef struct {
     char                  label[192];
     int                   list_idx;
 
-    /* Phase 1 output: EPG fetched without opening the stream. */
     epg_t                 preload_epg;
     int                   epg_toast_shown; /* main: "I already baked this EPG into the toast" */
-
-    /* Phase 2 output: fully opened playback ready for swap. */
     playback_t           *pb;
 } zap_prep_t;
-
-static void zap_prep_reset(zap_prep_t *zp) {
-    if (zp->pb) { playback_close(zp->pb); free(zp->pb); zp->pb = NULL; }
-    npo_epg_free(&zp->preload_epg);
-    zp->epg_toast_shown = 0;
-    zp->state = 0;
-}
 
 static void *zap_prep_worker(void *arg) {
     zap_prep_t *zp = arg;
@@ -278,13 +276,14 @@ static void *zap_prep_worker(void *arg) {
     if (zp->state == 5) {
         npo_epg_free(&ep);
         free(zp->url); zp->url = NULL;
+        if (zp->self_owned) free(zp);
         return NULL;
     }
     zp->preload_epg = ep;
-    zp->state = 2;  /* main can now flash the EPG-enriched toast */
+    zp->state = 2;
 
-    /* Phase 2: open playback. The -1 skips the internal EPG fetch because
-     * we already have one. We'll attach the preload after open. */
+    /* Phase 2: open playback. epg_stream_id=-1 skips the internal EPG
+     * fetch because we already have the EPG ready to splice in. */
     playback_t *pb = calloc(1, sizeof(*pb));
     if (!pb) goto fail;
     int rc = playback_open(pb, zp->render, zp->channel, zp->url, zp->portal, -1);
@@ -298,15 +297,18 @@ static void *zap_prep_worker(void *arg) {
 
     if (zp->state == 5) {
         playback_close(pb); free(pb);
+        if (zp->self_owned) free(zp);
         return NULL;
     }
     zp->pb    = pb;
     zp->state = 3;
+    /* Main will consume and free zp on state==3; we don't. */
     return NULL;
 
 fail:
     npo_epg_free(&zp->preload_epg);
     zp->state = 4;
+    if (zp->self_owned) free(zp);
     return NULL;
 }
 
@@ -419,8 +421,12 @@ int main(int argc, char **argv) {
     Uint32 last_wheel_ts = 0;
     const Uint32 WHEEL_DEBOUNCE_MS = 350;
 
-    /* Background zap prep: see zap_prep_t docs above. */
-    zap_prep_t zap_prep = {0};
+    /* Background zap prep: see zap_prep_t docs above. Pointer, not inline —
+     * each wheel commit that cancels a prior prep leaves the old detached
+     * worker to clean its OWN struct, and main immediately allocates a
+     * fresh one for the next prep. Two workers can coexist safely because
+     * their structs are disjoint. */
+    zap_prep_t *zap_prep = NULL;
 
     /* Diagnostic: if TV_TEST_JOURNAAL env var is set, call the Journaal
      * search once at startup and log the result. Lets automated smoke
@@ -654,8 +660,10 @@ int main(int argc, char **argv) {
                 drag_anchor_wy + (my - drag_anchor_my));
         }
 
-        /* 1c) Debounced wheel-zap: flash channel name INSTANTLY, then let a
-         * worker thread fetch EPG and open the stream in the background. */
+        /* 1c) Debounced wheel-zap: flash channel name INSTANTLY, then spawn
+         * a worker with its OWN heap-allocated zap_prep_t. Rapid scrolling
+         * just detaches the old prep (which self-destructs) and allocates a
+         * new one — no shared state to race on. */
         if (pending_wheel_delta != 0 && current_live_idx >= 0 &&
             SDL_GetTicks() - last_wheel_ts > WHEEL_DEBOUNCE_MS) {
             int new_idx = current_live_idx + pending_wheel_delta;
@@ -668,106 +676,94 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[zap] [%d/%zu] %s (id=%d)\n",
                         new_idx + 1, live_list.count, e->name, e->stream_id);
 
-                /* Cancel and drain any previous prep. */
-                if (zap_prep.state == 1 || zap_prep.state == 2) {
-                    zap_prep.state = 5;
-                    pthread_detach(zap_prep.thread);
-                    /* Detached worker will clean up its own state; we just
-                     * reset main's visible side. */
-                    memset(&zap_prep.preload_epg, 0, sizeof(zap_prep.preload_epg));
-                    zap_prep.pb = NULL;
-                    zap_prep.state = 0;
-                } else if (zap_prep.state == 3) {
-                    pthread_join(zap_prep.thread, NULL);
-                    zap_prep_reset(&zap_prep);
-                } else if (zap_prep.state == 4) {
-                    pthread_join(zap_prep.thread, NULL);
-                    zap_prep_reset(&zap_prep);
+                /* Abandon any prior prep. Worker owns self-cleanup now. */
+                if (zap_prep) {
+                    zap_prep->self_owned = 1;
+                    zap_prep->state      = 5;  /* cancel */
+                    pthread_detach(zap_prep->thread);
+                    zap_prep = NULL;
                 }
 
-                /* Fill prep + spawn. */
-                zap_prep.portal        = &portal;
-                zap_prep.render        = &r;
-                zap_prep.url           = xtream_stream_url(&portal, e->stream_id);
-                zap_prep.epg_stream_id = e->stream_id;
-                zap_prep.channel       = pb->channel;
-                zap_prep.list_idx      = new_idx;
-                zap_prep.pb            = NULL;
-                zap_prep.epg_toast_shown = 0;
-                memset(&zap_prep.preload_epg, 0, sizeof(zap_prep.preload_epg));
-                snprintf(zap_prep.label, sizeof(zap_prep.label), "%s", e->name);
+                /* Fresh per-request struct. */
+                zap_prep_t *zp = calloc(1, sizeof(*zp));
+                if (zp) {
+                    zp->portal        = &portal;
+                    zp->render        = &r;
+                    zp->url           = xtream_stream_url(&portal, e->stream_id);
+                    zp->epg_stream_id = e->stream_id;
+                    zp->channel       = pb->channel;
+                    zp->list_idx      = new_idx;
+                    snprintf(zp->label, sizeof(zp->label), "%s", e->name);
 
-                if (zap_prep.url && pthread_create(&zap_prep.thread, NULL,
-                                                   zap_prep_worker, &zap_prep) == 0) {
-                    zap_prep.state = 1;
-                } else {
-                    free(zap_prep.url); zap_prep.url = NULL;
+                    if (zp->url && pthread_create(&zp->thread, NULL,
+                                                  zap_prep_worker, zp) == 0) {
+                        zap_prep = zp;  /* track it */
+                    } else {
+                        free(zp->url); free(zp);
+                    }
                 }
 
-                /* Phase-0 toast: channel name, INSTANT. No "Tuning: " prefix —
-                 * the user just scrolled to this channel, that IS the action. */
+                /* Phase-0 toast: channel name INSTANTLY — before the worker
+                 * has even done anything. */
                 snprintf(toast_text, sizeof(toast_text), "%s", e->name);
-                toast_until_ms = SDL_GetTicks() + 8000;  /* replaced when stream arrives */
+                toast_until_ms = SDL_GetTicks() + 8000;
             }
         }
 
         /* 1d) Phase 2: EPG arrived — enrich the toast. */
-        if (zap_prep.state == 2 && !zap_prep.epg_toast_shown) {
+        if (zap_prep && zap_prep->state == 2 && !zap_prep->epg_toast_shown) {
             time_t tnow = time(NULL);
             const char *now_title = NULL;
-            for (size_t i = 0; i < zap_prep.preload_epg.count; ++i) {
-                if (zap_prep.preload_epg.entries[i].start <= tnow
-                    && tnow < zap_prep.preload_epg.entries[i].end) {
-                    now_title = zap_prep.preload_epg.entries[i].title;
+            for (size_t i = 0; i < zap_prep->preload_epg.count; ++i) {
+                if (zap_prep->preload_epg.entries[i].start <= tnow
+                    && tnow < zap_prep->preload_epg.entries[i].end) {
+                    now_title = zap_prep->preload_epg.entries[i].title;
                     break;
                 }
             }
             if (now_title && *now_title) {
                 snprintf(toast_text, sizeof(toast_text), "%s  |  %s",
-                         zap_prep.label, now_title);
+                         zap_prep->label, now_title);
                 toast_until_ms = SDL_GetTicks() + 8000;
             }
-            zap_prep.epg_toast_shown = 1;
+            zap_prep->epg_toast_shown = 1;
         }
 
         /* 1e) Phase 3: stream opened — swap playback. */
-        if (zap_prep.state == 3) {
-            /* If phase 2 happened to race past us, also show EPG info now. */
-            if (!zap_prep.epg_toast_shown) {
+        if (zap_prep && zap_prep->state == 3) {
+            if (!zap_prep->epg_toast_shown && zap_prep->pb) {
                 time_t tnow = time(NULL);
                 const char *nt = NULL;
-                for (size_t i = 0; zap_prep.pb && i < zap_prep.pb->epg.count; ++i) {
-                    if (zap_prep.pb->epg.entries[i].start <= tnow
-                        && tnow < zap_prep.pb->epg.entries[i].end) {
-                        nt = zap_prep.pb->epg.entries[i].title; break;
+                for (size_t i = 0; i < zap_prep->pb->epg.count; ++i) {
+                    if (zap_prep->pb->epg.entries[i].start <= tnow
+                        && tnow < zap_prep->pb->epg.entries[i].end) {
+                        nt = zap_prep->pb->epg.entries[i].title; break;
                     }
                 }
                 if (nt && *nt)
-                    snprintf(toast_text, sizeof(toast_text), "%s  |  %s", zap_prep.label, nt);
-                zap_prep.epg_toast_shown = 1;
+                    snprintf(toast_text, sizeof(toast_text), "%s  |  %s", zap_prep->label, nt);
+                zap_prep->epg_toast_shown = 1;
             }
-            playback_t *new_pb = zap_prep.pb;
-            pthread_join(zap_prep.thread, NULL);
+
+            playback_t *new_pb = zap_prep->pb;
+            pthread_join(zap_prep->thread, NULL);
             playback_close(pb); free(pb); pb = new_pb;
-            current_live_idx = zap_prep.list_idx;
+            current_live_idx = zap_prep->list_idx;
             paused = 0; have_texture = 0;
             if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
             overlay_mark_dirty(&ov);
 
             char title[256];
-            snprintf(title, sizeof(title), "tv - %s", zap_prep.label);
+            snprintf(title, sizeof(title), "tv - %s", zap_prep->label);
             SDL_SetWindowTitle(r.window, title);
-
-            /* Clear toast timer shortly after stream appears. */
             toast_until_ms = SDL_GetTicks() + 3000;
 
-            zap_prep.pb = NULL;
-            zap_prep.state = 0;
-        } else if (zap_prep.state == 4) {
-            pthread_join(zap_prep.thread, NULL);
-            snprintf(toast_text, sizeof(toast_text), "Tuning to %s failed", zap_prep.label);
+            free(zap_prep); zap_prep = NULL;
+        } else if (zap_prep && zap_prep->state == 4) {
+            pthread_join(zap_prep->thread, NULL);
+            snprintf(toast_text, sizeof(toast_text), "Tuning to %s failed", zap_prep->label);
             toast_until_ms = SDL_GetTicks() + 3000;
-            zap_prep_reset(&zap_prep);
+            free(zap_prep); zap_prep = NULL;
         }
 
         /* 2) Try to grab a new frame if we don't have one pending. */
@@ -857,17 +853,14 @@ int main(int argc, char **argv) {
         SDL_RenderPresent(r.renderer);  /* blocks ~16ms @ 60Hz with VSYNC */
     }
 
-    /* On quit, abandon any in-flight zap prep. Detach rather than join —
-     * the worker could be mid-network and joining would stall the exit by
-     * up to ~10s. It'll finish, free its own state, and vanish. */
-    if (zap_prep.state == 1) {
-        zap_prep.state = 4;
-        pthread_detach(zap_prep.thread);
-    } else if (zap_prep.state == 2) {
-        playback_close(zap_prep.pb); free(zap_prep.pb);
-        pthread_join(zap_prep.thread, NULL);
-    } else if (zap_prep.state == 3) {
-        pthread_join(zap_prep.thread, NULL);
+    /* On quit, hand the in-flight prep to the worker to clean itself up.
+     * Detach rather than join — worker could be mid-network and joining
+     * would stall the exit by up to ~10s. */
+    if (zap_prep) {
+        zap_prep->self_owned = 1;
+        zap_prep->state      = 5;
+        pthread_detach(zap_prep->thread);
+        zap_prep = NULL;
     }
 
     if (pending_vf) video_frame_free(pending_vf);
