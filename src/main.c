@@ -30,6 +30,9 @@ int main(int argc, char **argv) {
     if (render_init(&r, pl.vctx->width, pl.vctx->height, "tv - NPO") != 0) return 4;
     video_tex_t tex; video_tex_init(&tex);
 
+    audio_out_t ao;
+    if (audio_open(&ao, &pl.audio_q, pl.audio_sample_rate_out) != 0) return 4;
+
     bool running = true;
     while (running) {
         SDL_Event ev;
@@ -56,6 +59,7 @@ int main(int argc, char **argv) {
 
     player_stop(&pl);
     video_tex_destroy(&tex);
+    audio_close(&ao);
     render_shutdown(&r);
     player_close(&pl);
     free(url);

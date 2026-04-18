@@ -28,4 +28,19 @@ void video_tex_init(video_tex_t *t);
 int  video_tex_upload(video_tex_t *t, SDL_Renderer *r, const video_frame_t *f);
 void video_tex_destroy(video_tex_t *t);
 
+typedef struct {
+    SDL_AudioDeviceID device;
+    int               sample_rate;
+    queue_t          *q;              /* audio_chunk_t* queue we pull from */
+
+    /* partial-chunk carry-over */
+    const int16_t    *cur_samples;    /* points into cur->samples */
+    size_t            cur_remaining;  /* per channel */
+    audio_chunk_t    *cur;            /* currently consumed chunk */
+    volatile int64_t  samples_played; /* monotonically increasing, guarded by device lock */
+} audio_out_t;
+
+int  audio_open(audio_out_t *ao, queue_t *q, int sample_rate);
+void audio_close(audio_out_t *ao);
+
 #endif
