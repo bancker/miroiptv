@@ -242,6 +242,7 @@ int overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh) {
         "",
         "  1 / 2 / 3     Switch NPO 1 / 2 / 3",
         "  n             Latest NOS Journaal (most recent, any NPO channel)",
+        "  left / right  Skip -30s / +30s (during timeshift replay only)",
         "  e             Toggle EPG overlay (bottom strip)",
         "  f             Toggle fullscreen",
         "  space         Pause / resume audio",

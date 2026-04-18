@@ -229,19 +229,24 @@ void xtream_live_list_free(xtream_live_list_t *list) {
 char *xtream_timeshift_url(const xtream_t *x, int archive_stream_id,
                            time_t start_time, int duration_min) {
     if (duration_min <= 0) duration_min = 30;  /* sensible default */
-    struct tm gmt_tm;
+    /* The portal interprets the URL time as LOCAL (portal timezone =
+     * Europe/Amsterdam). Empirically confirmed: requesting .../2026-04-18:18-00/...
+     * served the 18:00 Amsterdam edition, not the 20:00 (=18:00 UTC) edition.
+     * So format in localtime, assuming the user's machine matches the portal's
+     * timezone. */
+    struct tm local_tm;
 #ifdef _WIN32
-    if (gmtime_s(&gmt_tm, &start_time) != 0) return NULL;
+    if (localtime_s(&local_tm, &start_time) != 0) return NULL;
 #else
-    if (!gmtime_r(&start_time, &gmt_tm)) return NULL;
+    if (!localtime_r(&start_time, &local_tm)) return NULL;
 #endif
     /* "YYYY-MM-DD:HH-MM" = 16 chars + NUL. Bumped to 40 so gcc stops worrying
      * about worst-case tm_year formatting (%04d can produce 5+ chars for
      * years > 9999 — irrelevant for us but the static analyzer can't tell). */
     char when[40];
     snprintf(when, sizeof(when), "%04d-%02d-%02d:%02d-%02d",
-             gmt_tm.tm_year + 1900, gmt_tm.tm_mon + 1, gmt_tm.tm_mday,
-             gmt_tm.tm_hour, gmt_tm.tm_min);
+             local_tm.tm_year + 1900, local_tm.tm_mon + 1, local_tm.tm_mday,
+             local_tm.tm_hour, local_tm.tm_min);
 
     size_t cap = strlen(x->host) + strlen(x->user) + strlen(x->pass) + 128;
     char *out = malloc(cap);

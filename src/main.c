@@ -37,6 +37,13 @@ typedef struct {
      * 1/2/3, 'n', and stall-restart all treated the prior NPO channel as the
      * "current" one even while the user was watching TROS Radar. */
     int          stream_id;
+
+    /* Timeshift state. timeshift_start != 0 means we're playing a
+     * /timeshift/.../START/STREAM.ts URL; left/right arrow shift the start
+     * by TIMESHIFT_STEP_SEC and reopen. stream_id is the archive id and
+     * timeshift_dur_min is the URL's duration segment. */
+    time_t       timeshift_start;
+    int          timeshift_dur_min;
 } playback_t;
 
 /* epg_stream_id:
@@ -398,6 +405,32 @@ int main(int argc, char **argv) {
                 SDL_PauseAudioDevice(pb->audio.device, paused);
             }
             else if (k == SDLK_e) show_overlay = !show_overlay;
+            else if ((k == SDLK_LEFT || k == SDLK_RIGHT) && pb->timeshift_start != 0) {
+                int delta = (k == SDLK_RIGHT) ? +30 : -30;
+                time_t new_start = pb->timeshift_start + delta;
+                char *u = xtream_timeshift_url(&portal, pb->stream_id, new_start,
+                                               pb->timeshift_dur_min);
+                playback_t *new_pb = calloc(1, sizeof(*new_pb));
+                if (u && new_pb && playback_open(new_pb, &r, pb->channel, u,
+                                                 &portal, pb->stream_id) == 0) {
+                    new_pb->timeshift_start   = new_start;
+                    new_pb->timeshift_dur_min = pb->timeshift_dur_min;
+                    playback_close(pb); free(pb); pb = new_pb;
+                    paused = 0; have_texture = 0;
+                    if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
+                    overlay_mark_dirty(&ov);
+                    struct tm lt = *localtime(&new_start);
+                    snprintf(toast_text, sizeof(toast_text),
+                             "%s 30s -> replay starts at %02d:%02d",
+                             delta > 0 ? "Skipped" : "Back", lt.tm_hour, lt.tm_min);
+                } else {
+                    free(new_pb);
+                    snprintf(toast_text, sizeof(toast_text),
+                             "%s 30s failed", delta > 0 ? "Skip" : "Back");
+                }
+                free(u);
+                toast_until_ms = SDL_GetTicks() + 4000;
+            }
             else if (k == SDLK_QUESTION ||
                      (k == SDLK_SLASH && (ev.key.keysym.mod & KMOD_SHIFT))) {
                 help_visible = !help_visible;
@@ -454,6 +487,12 @@ int main(int argc, char **argv) {
                         int epg_id = hit.is_past ? target_stream_id : 0;
                         if (new_pb && playback_open(new_pb, &r, target, target_url,
                                                     &portal, epg_id) == 0) {
+                            /* Stamp timeshift state so LEFT/RIGHT arrows know
+                             * the current start time and can shift it. */
+                            if (hit.is_past) {
+                                new_pb->timeshift_start    = hit.start;
+                                new_pb->timeshift_dur_min  = (int)((hit.end - hit.start) / 60);
+                            }
                             playback_close(pb); free(pb); pb = new_pb;
                             paused = 0; have_texture = 0;
                             if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }

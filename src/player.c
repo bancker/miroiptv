@@ -39,7 +39,10 @@ int player_open(player_t *p, const char *url) {
     av_dict_set(&opts, "reconnect_on_network_error", "1", 0);
     av_dict_set(&opts, "reconnect_on_http_error",    "404,403,5xx", 0);
     av_dict_set(&opts, "reconnect_delay_max",        "5", 0);  /* seconds */
-    av_dict_set(&opts, "reconnect_at_eof",           "1", 0);  /* retry when server sends EOF mid-stream */
+    /* NB: reconnect_at_eof is NOT set. For finite resources (timeshift .ts
+     * files) it caused libav to re-download the whole file after EOF and
+     * the second download's packets confused the MPEG-TS demuxer — video
+     * froze after ~60 s while audio kept playing. Let EOF be EOF. */
     av_dict_set(&opts, "reconnect_max_retries",      "10", 0);
     /* 2 MiB TCP recv buffer gives libav headroom to absorb bursty CDN
      * delivery without blocking the write side, reducing the chance the
