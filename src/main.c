@@ -107,11 +107,20 @@ static int playback_open(playback_t *pb, render_t *r, const npo_channel_t *ch,
                              &pb->audio.has_first_pts,
                              pb->audio.sample_rate);
     video_tex_init(&pb->tex);
-
-    char title[128];
-    snprintf(title, sizeof(title), "tv - %s", ch->display);
-    SDL_SetWindowTitle(r->window, title);
+    /* NB: window title is set by the caller on the main thread. We used to
+     * SDL_SetWindowTitle here, but when playback_open is called from the zap
+     * worker that SDL call happens off-main, which SDL docs forbid and which
+     * could crash on some platforms. (void)r; kept to retain the signature. */
+    (void)r;
     return 0;
+}
+
+/* Small helper so callers don't repeat the "tv - <display>" format. Must be
+ * called from the main thread. */
+static void set_window_title(render_t *r, const char *display) {
+    char title[256];
+    snprintf(title, sizeof(title), "tv - %s", display ? display : "");
+    SDL_SetWindowTitle(r->window, title);
 }
 
 static void playback_close(playback_t *pb) {
@@ -363,6 +372,7 @@ int main(int argc, char **argv) {
         render_shutdown(&r);
         return 2;
     }
+    set_window_title(&r, NPO_CHANNELS[0].display);
     free(initial_url);
 
     overlay_t ov;
@@ -523,6 +533,7 @@ int main(int argc, char **argv) {
                     new_pb->timeshift_start   = new_start;
                     new_pb->timeshift_dur_min = pb->timeshift_dur_min;
                     playback_close(pb); free(pb); pb = new_pb;
+                    set_window_title(&r, pb->channel->display);
                     paused = 0; have_texture = 0;
                     if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                     overlay_mark_dirty(&ov);
@@ -601,6 +612,7 @@ int main(int argc, char **argv) {
                                 new_pb->timeshift_dur_min  = (int)((hit.end - hit.start) / 60);
                             }
                             playback_close(pb); free(pb); pb = new_pb;
+                            set_window_title(&r, target->display);
                             paused = 0; have_texture = 0;
                             if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                             overlay_mark_dirty(&ov);
@@ -634,6 +646,7 @@ int main(int argc, char **argv) {
                         playback_close(pb);
                         free(pb);
                         pb = new_pb;
+                        set_window_title(&r, nch->display);
                         paused       = 0;
                         have_texture = 0;
                         if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
@@ -676,11 +689,30 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[zap] [%d/%zu] %s (id=%d)\n",
                         new_idx + 1, live_list.count, e->name, e->stream_id);
 
-                /* Abandon any prior prep. Worker owns self-cleanup now. */
+                /* Abandon any prior prep — per-state handling avoids leaking
+                 * a finished worker's result.
+                 *   running(0) / EPG-ready(2) -> worker still alive; detach,
+                 *     set self_owned+state=5, worker self-destructs.
+                 *   stream-ready(3)           -> worker already exited; we
+                 *     must join and destroy the pb we'll never show.
+                 *   failed(4)                 -> worker already exited; join
+                 *     and free the struct.
+                 * Before this branch was a blanket detach, which leaked the
+                 * prepared playback_t under fast-scroll. */
                 if (zap_prep) {
-                    zap_prep->self_owned = 1;
-                    zap_prep->state      = 5;  /* cancel */
-                    pthread_detach(zap_prep->thread);
+                    int st = zap_prep->state;
+                    if (st == 3) {
+                        pthread_join(zap_prep->thread, NULL);
+                        if (zap_prep->pb) { playback_close(zap_prep->pb); free(zap_prep->pb); }
+                        free(zap_prep);
+                    } else if (st == 4) {
+                        pthread_join(zap_prep->thread, NULL);
+                        free(zap_prep);
+                    } else {
+                        zap_prep->self_owned = 1;
+                        zap_prep->state      = 5;
+                        pthread_detach(zap_prep->thread);
+                    }
                     zap_prep = NULL;
                 }
 
@@ -753,9 +785,7 @@ int main(int argc, char **argv) {
             if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
             overlay_mark_dirty(&ov);
 
-            char title[256];
-            snprintf(title, sizeof(title), "tv - %s", zap_prep->label);
-            SDL_SetWindowTitle(r.window, title);
+            set_window_title(&r, zap_prep->label);
             toast_until_ms = SDL_GetTicks() + 3000;
 
             free(zap_prep); zap_prep = NULL;
@@ -800,7 +830,16 @@ int main(int argc, char **argv) {
         if (have_texture && SDL_GetTicks() - last_frame_ts > STALL_MS) {
             char *restart_url;
             int   restart_epg_id;
-            if (pb->stream_id != 0 && portal.host) {
+            if (pb->timeshift_start != 0 && portal.host) {
+                /* Timeshift replay: resume at the same start/duration so we
+                 * don't randomly switch to the archive stream's live feed. */
+                restart_url = xtream_timeshift_url(&portal, pb->stream_id,
+                                                   pb->timeshift_start,
+                                                   pb->timeshift_dur_min);
+                restart_epg_id = pb->stream_id;
+                fprintf(stderr, "[stall] timeshift id=%d start=%ld restarting\n",
+                        pb->stream_id, (long)pb->timeshift_start);
+            } else if (pb->stream_id != 0 && portal.host) {
                 restart_url    = xtream_stream_url(&portal, pb->stream_id);
                 restart_epg_id = pb->stream_id;
                 fprintf(stderr, "[stall] no frames for %ums on portal stream_id=%d - restarting\n",
@@ -814,6 +853,11 @@ int main(int argc, char **argv) {
             }
             playback_t *new_pb = calloc(1, sizeof(*new_pb));
             if (new_pb && playback_open(new_pb, &r, pb->channel, restart_url, &portal, restart_epg_id) == 0) {
+                /* Preserve timeshift state across restart. */
+                if (pb->timeshift_start != 0) {
+                    new_pb->timeshift_start   = pb->timeshift_start;
+                    new_pb->timeshift_dur_min = pb->timeshift_dur_min;
+                }
                 playback_close(pb);
                 free(pb);
                 pb = new_pb;
