@@ -30,11 +30,17 @@ void queue_destroy(queue_t *q) {
 }
 
 void queue_destroy_with(queue_t *q, void (*free_fn)(void *)) {
-    if (free_fn) queue_drain(q, free_fn);
-    free(q->slots);
-    pthread_mutex_destroy(&q->mu);
-    pthread_cond_destroy(&q->not_full);
-    pthread_cond_destroy(&q->not_empty);
+    /* Guard against destroying a never-initialized queue — main's error paths
+     * may call player_close on a half-open player_t, where only SOME of the
+     * queues were init'd. A zeroed queue has slots==NULL and no pthread state
+     * to tear down, so skip the teardown in that case. */
+    if (q->slots) {
+        if (free_fn) queue_drain(q, free_fn);
+        free(q->slots);
+        pthread_mutex_destroy(&q->mu);
+        pthread_cond_destroy(&q->not_full);
+        pthread_cond_destroy(&q->not_empty);
+    }
     memset(q, 0, sizeof(*q));
 }
 

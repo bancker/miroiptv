@@ -54,11 +54,11 @@ int player_open(player_t *p, const char *url) {
     av_dict_free(&opts);
     if (rc_open != 0) {
         fprintf(stderr, "avformat_open_input failed for %s\n", url);
-        return -1;
+        goto fail;
     }
     if (avformat_find_stream_info(p->fmt, NULL) < 0) {
         fprintf(stderr, "avformat_find_stream_info failed\n");
-        return -1;
+        goto fail;
     }
 
     for (unsigned i = 0; i < p->fmt->nb_streams; ++i) {
@@ -71,28 +71,35 @@ int player_open(player_t *p, const char *url) {
     if (p->video_idx < 0 || p->audio_idx < 0) {
         fprintf(stderr, "need both video and audio streams (v=%d a=%d)\n",
                 p->video_idx, p->audio_idx);
-        return -1;
+        goto fail;
     }
 
     /* Open video decoder */
     AVCodecParameters *vpar = p->fmt->streams[p->video_idx]->codecpar;
     const AVCodec *vc = avcodec_find_decoder(vpar->codec_id);
-    if (!vc) { fprintf(stderr, "no decoder for video codec id %d\n", vpar->codec_id); return -1; }
+    if (!vc) { fprintf(stderr, "no decoder for video codec id %d\n", vpar->codec_id); goto fail; }
     p->vctx = avcodec_alloc_context3(vc);
     avcodec_parameters_to_context(p->vctx, vpar);
-    if (avcodec_open2(p->vctx, vc, NULL) < 0) return -1;
+    if (avcodec_open2(p->vctx, vc, NULL) < 0) goto fail;
 
     /* Open audio decoder */
     AVCodecParameters *apar = p->fmt->streams[p->audio_idx]->codecpar;
     const AVCodec *ac = avcodec_find_decoder(apar->codec_id);
-    if (!ac) { fprintf(stderr, "no decoder for audio codec id %d\n", apar->codec_id); return -1; }
+    if (!ac) { fprintf(stderr, "no decoder for audio codec id %d\n", apar->codec_id); goto fail; }
     p->actx = avcodec_alloc_context3(ac);
     avcodec_parameters_to_context(p->actx, apar);
-    if (avcodec_open2(p->actx, ac, NULL) < 0) return -1;
+    if (avcodec_open2(p->actx, ac, NULL) < 0) goto fail;
 
-    if (queue_init(&p->video_q, 16) != 0) return -1;
-    if (queue_init(&p->audio_q, 32) != 0) return -1;
+    if (queue_init(&p->video_q, 16) != 0) goto fail;
+    if (queue_init(&p->audio_q, 32) != 0) goto fail;
     return 0;
+
+fail:
+    /* Undo any partial init. player_close is safe on a half-initialized
+     * player_t because every cleanup is NULL/empty-checked (and queue_destroy
+     * guards against a never-initialized queue). */
+    player_close(p);
+    return -1;
 }
 
 void player_close(player_t *p) {
