@@ -171,6 +171,16 @@ int main(int argc, char **argv) {
     video_frame_t *pending_vf = NULL;  /* held across iterations when not yet due */
     Uint32 last_frame_ts = SDL_GetTicks();
 
+    /* Right-click drag state — since the window is borderless there's no title
+     * bar to grab, so we implement window-move by: on right-button-down we
+     * snapshot the global mouse and window positions; on right-button-up we
+     * stop; every iteration while dragging we move the window by the current
+     * global mouse delta relative to the snapshot. SDL_CaptureMouse lets the
+     * drag continue even when the cursor leaves the window bounds. */
+    int drag_active = 0;
+    int drag_anchor_mx = 0, drag_anchor_my = 0;
+    int drag_anchor_wx = 0, drag_anchor_wy = 0;
+
     /* Sync tolerances (seconds):
      *  DUE_WINDOW  — how "early" a frame can be to count as due-now (one vsync @ 60Hz ≈ 16ms)
      *  DROP_LATE   — how late a frame can be before we drop it (80ms ≈ 2 frames at 25fps) */
@@ -186,6 +196,18 @@ int main(int argc, char **argv) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) { running = 0; break; }
+            if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_RIGHT) {
+                SDL_GetGlobalMouseState(&drag_anchor_mx, &drag_anchor_my);
+                SDL_GetWindowPosition(r.window, &drag_anchor_wx, &drag_anchor_wy);
+                drag_active = 1;
+                SDL_CaptureMouse(SDL_TRUE);
+                continue;
+            }
+            if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_RIGHT) {
+                drag_active = 0;
+                SDL_CaptureMouse(SDL_FALSE);
+                continue;
+            }
             if (ev.type != SDL_KEYDOWN) continue;
             SDL_Keycode k = ev.key.keysym.sym;
             if (k == SDLK_q || k == SDLK_ESCAPE) { running = 0; break; }
@@ -224,6 +246,15 @@ int main(int argc, char **argv) {
                     free(switch_url);
                 }
             }
+        }
+
+        /* 1b) Apply window drag if right-button is held. */
+        if (drag_active) {
+            int mx, my;
+            SDL_GetGlobalMouseState(&mx, &my);
+            SDL_SetWindowPosition(r.window,
+                drag_anchor_wx + (mx - drag_anchor_mx),
+                drag_anchor_wy + (my - drag_anchor_my));
         }
 
         /* 2) Try to grab a new frame if we don't have one pending. */
