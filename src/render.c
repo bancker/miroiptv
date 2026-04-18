@@ -11,7 +11,7 @@ int render_init(render_t *r, int w, int h, const char *title) {
     r->width = w; r->height = h; r->fullscreen = false;
     r->window = SDL_CreateWindow(title,
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        w, h, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+        w, h, SDL_WINDOW_SHOWN | SDL_WINDOW_BORDERLESS);
     if (!r->window) { fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return -1; }
     r->renderer = SDL_CreateRenderer(r->window, -1,
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
