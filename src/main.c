@@ -124,51 +124,75 @@ static const npo_channel_t *key_to_channel(SDL_Keycode k) {
     }
 }
 
-/* Find the NPO channel whose EPG has a NOS Journaal airing right now, or
- * whose next Journaal is soonest. Returns 0-2 on success, -1 if no Journaal
- * was found in any channel's EPG. *out_is_airing is set to 1 if the chosen
- * channel's Journaal is on air right now, 0 if it's in the future.
- * *out_seconds_until is the seconds until start (0 if airing).
+typedef struct {
+    int    channel_idx;   /* 0..2, or -1 if nothing found */
+    int    is_airing;     /* 1 if currently on air, 0 if already ended or future */
+    int    is_past;       /* 1 if the winning entry already ended */
+    time_t start;         /* start time (unix) of the winning entry */
+    time_t end;           /* end time (unix) of the winning entry */
+    long long seconds_ago;/* how long ago it started (positive = past) */
+    long long seconds_til;/* how long until start (positive = future) */
+} journaal_hit_t;
+
+/* Find the LATEST NOS Journaal across NPO 1/2/3 — i.e. the most-recently-started
+ * one. Preference:
+ *   1. currently airing  (start <= now < end) — pick the latest such entry
+ *   2. most recent past  (end <= now)         — pick the latest ended one
+ *   3. soonest upcoming  (start > now)        — only as last resort
  *
- * Fetches EPG for each NPO channel via the Xtream portal — ~3 HTTP calls,
- * completes in under a second typically. */
-static int find_next_journaal_channel(const xtream_t *portal,
-                                      int *out_is_airing,
-                                      long long *out_seconds_until) {
-    if (!portal || !portal->host) return -1;
+ * Fetches EPG for each NPO channel via the portal (~3 HTTP calls, ~1s total). */
+static journaal_hit_t find_latest_journaal(const xtream_t *portal) {
+    journaal_hit_t hit = { .channel_idx = -1 };
+    if (!portal || !portal->host) return hit;
     time_t now = time(NULL);
-    int    best_ch = -1;
-    int    best_airing = 0;
-    long long best_dt = (long long)1 << 62;  /* effectively +inf */
+
+    /* Track three candidates separately so we can pick in preference order. */
+    int    best_airing_ch = -1; time_t best_airing_start = 0; time_t best_airing_end = 0;
+    int    best_past_ch   = -1; time_t best_past_start   = 0; time_t best_past_end   = 0;
+    int    best_next_ch   = -1; time_t best_next_start   = 0; time_t best_next_end   = 0;
 
     for (int i = 0; i < 3; ++i) {
         epg_t e = {0};
         if (xtream_fetch_epg(portal, XTREAM_NPO_STREAM_IDS[i], &e) != 0) continue;
         for (size_t j = 0; j < e.count; ++j) {
             if (!e.entries[j].is_news) continue;
-            time_t s = e.entries[j].start;
-            time_t en = e.entries[j].end;
-            if (now >= s && now < en) {
-                /* On air right now — always prefer this. */
-                best_ch = i;
-                best_airing = 1;
-                best_dt = 0;
-                break;
-            } else if (s > now) {
-                long long dt = (long long)(s - now);
-                if (!best_airing && dt < best_dt) {
-                    best_dt = dt;
-                    best_ch = i;
+            time_t s = e.entries[j].start, en = e.entries[j].end;
+            if (s <= now && now < en) {
+                if (s > best_airing_start) {
+                    best_airing_ch = i; best_airing_start = s; best_airing_end = en;
+                }
+            } else if (en <= now) {
+                if (s > best_past_start) {
+                    best_past_ch = i; best_past_start = s; best_past_end = en;
+                }
+            } else { /* s > now */
+                if (best_next_ch < 0 || s < best_next_start) {
+                    best_next_ch = i; best_next_start = s; best_next_end = en;
                 }
             }
         }
         npo_epg_free(&e);
-        if (best_airing) break;
     }
 
-    if (out_is_airing)     *out_is_airing     = best_airing;
-    if (out_seconds_until) *out_seconds_until = best_ch >= 0 ? best_dt : -1;
-    return best_ch;
+    if (best_airing_ch >= 0) {
+        hit.channel_idx = best_airing_ch;
+        hit.is_airing   = 1;
+        hit.start       = best_airing_start;
+        hit.end         = best_airing_end;
+        hit.seconds_ago = (long long)(now - best_airing_start);
+    } else if (best_past_ch >= 0) {
+        hit.channel_idx = best_past_ch;
+        hit.is_past     = 1;
+        hit.start       = best_past_start;
+        hit.end         = best_past_end;
+        hit.seconds_ago = (long long)(now - best_past_end);
+    } else if (best_next_ch >= 0) {
+        hit.channel_idx = best_next_ch;
+        hit.start       = best_next_start;
+        hit.end         = best_next_end;
+        hit.seconds_til = (long long)(best_next_start - now);
+    }
+    return hit;
 }
 
 int main(int argc, char **argv) {
@@ -263,6 +287,12 @@ int main(int argc, char **argv) {
     int    help_visible  = 0;
     Uint32 hint_until_ms = SDL_GetTicks() + 8000;  /* 8 seconds after start */
 
+    /* Toast state — short message shown in the bottom-right corner for a few
+     * seconds. Written by actions like 'n' (Journaal search) so the user gets
+     * visible feedback regardless of stderr visibility. */
+    char    toast_text[192] = {0};
+    Uint32  toast_until_ms  = 0;
+
     /* Mouse-wheel zapping through ALL portal live channels. We fetch the full
      * catalog once, find our current stream_id in it, and the wheel moves the
      * index ±1 per notch. Actual switch is debounced — rapid scrolling only
@@ -346,24 +376,37 @@ int main(int argc, char **argv) {
                 hint_until_ms = 0;  /* startup hint has served its purpose */
             }
             else if (k == SDLK_n) {
-                int airing = 0;
-                long long dt = 0;
-                int idx = find_next_journaal_channel(&portal, &airing, &dt);
-                if (idx < 0) {
+                journaal_hit_t hit = find_latest_journaal(&portal);
+                if (hit.channel_idx < 0) {
+                    snprintf(toast_text, sizeof(toast_text),
+                             "NOS Journaal not found in EPG");
                     fprintf(stderr, "[journaal] no NOS Journaal in NPO 1/2/3 EPG\n");
                 } else {
-                    fprintf(stderr, "[journaal] %s: %s%s (NPO %d)\n",
-                            airing ? "airing NOW" : "next",
-                            airing ? "" : "in ",
-                            airing ? "" : (dt < 60   ? "<1min" :
-                                           dt < 3600 ? "<1h"   : "1h+"),
-                            idx + 1);
-                    const npo_channel_t *target = &NPO_CHANNELS[idx];
-                    /* Force the switch if we're currently zapped (stream_id set)
-                     * even when target matches pb->channel — because pb->channel
-                     * is the last NPO stamp, not the channel actually on screen. */
+                    /* Format the start time in local time for the toast. */
+                    struct tm lt = *localtime(&hit.start);
+                    const char *chname = NPO_CHANNELS[hit.channel_idx].display;
+                    if (hit.is_airing) {
+                        long long mins_in = hit.seconds_ago / 60;
+                        snprintf(toast_text, sizeof(toast_text),
+                                 "NOS Journaal airing on %s (started %02d:%02d, %lld min ago)",
+                                 chname, lt.tm_hour, lt.tm_min, mins_in);
+                    } else if (hit.is_past) {
+                        long long ago_m = hit.seconds_ago / 60;
+                        snprintf(toast_text, sizeof(toast_text),
+                                 "Last NOS Journaal on %s ended %lld min ago - can't replay, live only",
+                                 chname, ago_m);
+                    } else {
+                        long long til_m = hit.seconds_til / 60;
+                        snprintf(toast_text, sizeof(toast_text),
+                                 "Next NOS Journaal on %s at %02d:%02d (in %lld min)",
+                                 chname, lt.tm_hour, lt.tm_min, til_m);
+                    }
+                    fprintf(stderr, "[journaal] %s\n", toast_text);
+
+                    /* Switch channels if the winner isn't what we're watching. */
+                    const npo_channel_t *target = &NPO_CHANNELS[hit.channel_idx];
                     if (target != pb->channel || pb->stream_id != 0) {
-                        char *u = build_channel_url(idx, &portal, direct_url);
+                        char *u = build_channel_url(hit.channel_idx, &portal, direct_url);
                         playback_t *new_pb = calloc(1, sizeof(*new_pb));
                         if (new_pb && playback_open(new_pb, &r, target, u, &portal, 0) == 0) {
                             playback_close(pb); free(pb); pb = new_pb;
@@ -372,11 +415,13 @@ int main(int argc, char **argv) {
                             overlay_mark_dirty(&ov);
                         } else {
                             free(new_pb);
-                            fprintf(stderr, "[journaal] failed to open %s\n", target->display);
+                            snprintf(toast_text, sizeof(toast_text),
+                                     "Journaal switch to %s failed", target->display);
                         }
                         free(u);
                     }
                 }
+                toast_until_ms = SDL_GetTicks() + 6000;  /* 6 sec visible */
             }
             else {
                 const npo_channel_t *nch = key_to_channel(k);
@@ -532,11 +577,15 @@ int main(int argc, char **argv) {
             if (show_overlay)
                 overlay_render(&ov, r.renderer, &pb->epg, ww, wh);
         }
-        /* Help + startup hint on top of everything so they stay legible. */
-        if (help_visible)
+        /* Help + toast + startup hint on top of everything so they stay legible.
+         * Priority: help > toast > startup hint. */
+        if (help_visible) {
             overlay_render_help(&ov, r.renderer, ww, wh);
-        else if (SDL_GetTicks() < hint_until_ms)
+        } else if (SDL_GetTicks() < toast_until_ms && toast_text[0]) {
+            overlay_render_hint(&ov, r.renderer, toast_text, ww, wh);
+        } else if (SDL_GetTicks() < hint_until_ms) {
             overlay_render_hint(&ov, r.renderer, "Press ? for help", ww, wh);
+        }
         SDL_RenderPresent(r.renderer);  /* blocks ~16ms @ 60Hz with VSYNC */
     }
 

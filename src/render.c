@@ -233,7 +233,7 @@ int overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh) {
         "Keyboard",
         "",
         "  1 / 2 / 3     Switch NPO 1 / 2 / 3",
-        "  n             Next NOS Journaal (finds which NPO channel)",
+        "  n             Latest NOS Journaal (most recent, any NPO channel)",
         "  e             Toggle EPG overlay (bottom strip)",
         "  f             Toggle fullscreen",
         "  space         Pause / resume audio",
