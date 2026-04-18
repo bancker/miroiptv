@@ -104,13 +104,13 @@ static void push_video_frame(player_t *p, AVFrame *frame) {
         alloc_frame_copy_yuv(conv, vf);
         vf->pts = ts_to_seconds(conv->pts, p->fmt->streams[p->video_idx]->time_base);
         av_frame_free(&conv);
-        queue_push(&p->video_q, vf);
+        if (queue_push(&p->video_q, vf) != 0) video_frame_free(vf);
         return;
     }
     video_frame_t *vf = calloc(1, sizeof(*vf));
     alloc_frame_copy_yuv(frame, vf);
     vf->pts = ts_to_seconds(frame->pts, p->fmt->streams[p->video_idx]->time_base);
-    queue_push(&p->video_q, vf);
+    if (queue_push(&p->video_q, vf) != 0) video_frame_free(vf);
 }
 
 static void push_audio_frame(player_t *p, AVFrame *frame) {
@@ -135,7 +135,7 @@ static void push_audio_frame(player_t *p, AVFrame *frame) {
     ac->n_samples   = written;
     ac->sample_rate = p->audio_sample_rate_out;
     ac->pts         = ts_to_seconds(frame->pts, p->fmt->streams[p->audio_idx]->time_base);
-    queue_push(&p->audio_q, ac);
+    if (queue_push(&p->audio_q, ac) != 0) audio_chunk_free(ac);
 }
 
 static void *decoder_loop(void *ud) {
