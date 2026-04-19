@@ -43,6 +43,16 @@ typedef struct {
     int               n_audio_tracks;
     int               audio_track_cur;  /* index into audio_tracks[] the decoder is ON */
     volatile int      audio_track_req;  /* index into audio_tracks[] the UI wants */
+
+    /* Seek request: main sets seek_req=1 and seek_target_pts to the absolute
+     * stream pts (in AV_TIME_BASE units) to seek to, then drains the A/V
+     * queues and resets audio_out_t. Decoder thread picks up seek_req at
+     * the top of its next iteration and calls av_seek_frame. Only sensible
+     * for finite streams (VOD, series episodes) — live streams silently
+     * no-op because their containers advertise duration=0 and av_seek_frame
+     * returns an error we ignore. */
+    volatile int      seek_req;
+    volatile int64_t  seek_target_pts;   /* in AV_TIME_BASE units */
 } player_t;
 
 int  player_open(player_t *p, const char *url);

@@ -259,7 +259,7 @@ int overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh) {
         "  n             Latest NOS Journaal (most recent, any NPO channel)",
         "  r             Latest RTL Nieuws (across RTL 4/5/7/8/Z archives)",
         "  up / down     Zap to previous / next channel (same as wheel)",
-        "  left / right  Skip -30s / +30s (during timeshift replay only)",
+        "  left / right  Skip -30s / +30s (in VOD, episodes, or timeshift)",
         "  e             Toggle EPG overlay (bottom strip)",
         "  Shift+e       Full multi-day EPG, Enter replays past programme",
         "  f             Search channels + movies + series (type, up/down, Enter)",

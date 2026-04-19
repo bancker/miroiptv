@@ -291,6 +291,26 @@ static void *decoder_loop(void *ud) {
         if (p->audio_track_req != p->audio_track_cur)
             (void)switch_audio_track(p, p->audio_track_req);
 
+        /* Honour any pending seek request BEFORE reading the next packet.
+         * The queues and audio_out_t state have already been drained by
+         * main (under SDL_LockAudioDevice). Here we just reposition the
+         * demuxer and flush the codec buffers. AVSEEK_FLAG_BACKWARD so we
+         * land on the previous keyframe — otherwise the video comes back
+         * garbled until the next keyframe. */
+        if (p->seek_req) {
+            int64_t target = p->seek_target_pts;
+            int src = av_seek_frame(p->fmt, -1, target, AVSEEK_FLAG_BACKWARD);
+            if (src < 0) {
+                fprintf(stderr, "[seek] av_seek_frame failed (rc=%d) — stream may be live\n", src);
+            } else {
+                if (p->vctx) avcodec_flush_buffers(p->vctx);
+                if (p->actx) avcodec_flush_buffers(p->actx);
+                fprintf(stderr, "[seek] repositioned to %.2fs\n",
+                        (double)target / AV_TIME_BASE);
+            }
+            p->seek_req = 0;
+        }
+
         int rc = av_read_frame(p->fmt, pkt);
         if (rc < 0) {
             char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};

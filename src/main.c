@@ -1106,35 +1106,92 @@ int main(int argc, char **argv) {
                 pending_wheel_delta += (k == SDLK_UP) ? -1 : +1;
                 last_wheel_ts = SDL_GetTicks();
             }
-            else if ((k == SDLK_LEFT || k == SDLK_RIGHT) && pb->timeshift_start != 0) {
+            else if (k == SDLK_LEFT || k == SDLK_RIGHT) {
                 int delta = (k == SDLK_RIGHT) ? +30 : -30;
-                time_t new_start = pb->timeshift_start + delta;
-                char *u = xtream_timeshift_url(&portal, pb->stream_id, new_start,
-                                               pb->timeshift_dur_min);
-                playback_t *new_pb = calloc(1, sizeof(*new_pb));
-                if (u && new_pb && playback_open(new_pb, &r, pb->channel, u,
-                                                 &portal, pb->stream_id) == 0) {
-                    new_pb->timeshift_start   = new_start;
-                    new_pb->timeshift_dur_min = pb->timeshift_dur_min;
-                    playback_close(pb); free(pb); pb = new_pb;
-                    set_window_title(&r, pb->channel->display);
-                    paused = 0; have_texture = 0;
+                if (pb->timeshift_start != 0) {
+                    /* Catch-up / /timeshift/ replay — we rebuild the URL
+                     * with a new start-time anchor and reopen playback.
+                     * Can't use av_seek_frame here because the portal
+                     * bakes start time into the URL path, not the stream. */
+                    time_t new_start = pb->timeshift_start + delta;
+                    char *u = xtream_timeshift_url(&portal, pb->stream_id, new_start,
+                                                   pb->timeshift_dur_min);
+                    playback_t *new_pb = calloc(1, sizeof(*new_pb));
+                    if (u && new_pb && playback_open(new_pb, &r, pb->channel, u,
+                                                     &portal, pb->stream_id) == 0) {
+                        new_pb->timeshift_start   = new_start;
+                        new_pb->timeshift_dur_min = pb->timeshift_dur_min;
+                        playback_close(pb); free(pb); pb = new_pb;
+                        set_window_title(&r, pb->channel->display);
+                        paused = 0; have_texture = 0;
+                        if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
+                        overlay_mark_dirty(&ov);
+                        playback_open_ts = SDL_GetTicks();
+                        last_audio_progress_ts = SDL_GetTicks();
+                        prev_samples_played    = 0;
+                        struct tm lt = *localtime(&new_start);
+                        snprintf(toast_text, sizeof(toast_text),
+                                 "%s 30s -> replay starts at %02d:%02d",
+                                 delta > 0 ? "Skipped" : "Back", lt.tm_hour, lt.tm_min);
+                    } else {
+                        free(new_pb);
+                        snprintf(toast_text, sizeof(toast_text),
+                                 "%s 30s failed", delta > 0 ? "Skip" : "Back");
+                    }
+                    free(u);
+                    toast_until_ms = SDL_GetTicks() + 4000;
+                } else if (pb->player.fmt && pb->player.fmt->duration > 0) {
+                    /* In-file seek for VOD / series episodes — the container
+                     * advertises a duration so the demuxer can reposition
+                     * without a new HTTP request. We compute target time
+                     * from the current clock (relative seconds since the
+                     * stream's first audio pts) + delta.
+                     *
+                     * CRITICAL: drain the A/V queues and reset audio_out_t
+                     * BEFORE triggering the decoder seek. Otherwise the
+                     * old, pre-seek chunks play through while the demuxer
+                     * is already at the new position — the user hears a
+                     * second of old audio, then the jump. SDL_LockAudioDevice
+                     * halts the audio callback while we swap state. */
+                    double now_s    = av_clock_ready(&pb->clk) ? av_clock_now(&pb->clk) : 0.0;
+                    double target_s = now_s + (double)delta;
+                    if (target_s < 0) target_s = 0;
+                    double max_s = (double)pb->player.fmt->duration / AV_TIME_BASE;
+                    if (target_s > max_s - 1.0) target_s = max_s - 1.0;
+
+                    SDL_LockAudioDevice(pb->audio.device);
+                    if (pb->audio.cur) { audio_chunk_free(pb->audio.cur); pb->audio.cur = NULL; }
+                    pb->audio.cur_samples    = NULL;
+                    pb->audio.cur_remaining  = 0;
+                    pb->audio.samples_played = 0;
+                    pb->audio.has_first_pts  = 0;
+                    pb->audio.first_pts      = 0;
+                    SDL_UnlockAudioDevice(pb->audio.device);
+
+                    queue_drain(&pb->player.audio_q, (void(*)(void*))audio_chunk_free);
+                    queue_drain(&pb->player.video_q, (void(*)(void*))video_frame_free);
                     if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
+                    have_texture = 0;
                     overlay_mark_dirty(&ov);
-                    playback_open_ts = SDL_GetTicks();
+
+                    pb->player.seek_target_pts = (int64_t)(target_s * AV_TIME_BASE);
+                    pb->player.seek_req        = 1;
+
                     last_audio_progress_ts = SDL_GetTicks();
                     prev_samples_played    = 0;
-                    struct tm lt = *localtime(&new_start);
+                    playback_open_ts       = SDL_GetTicks();  /* restart STARTUP_MS grace */
+
+                    int mins = (int)(target_s / 60);
+                    int secs = (int)target_s % 60;
                     snprintf(toast_text, sizeof(toast_text),
-                             "%s 30s -> replay starts at %02d:%02d",
-                             delta > 0 ? "Skipped" : "Back", lt.tm_hour, lt.tm_min);
+                             "%s 30s -> %d:%02d",
+                             delta > 0 ? "Skipped" : "Back", mins, secs);
+                    toast_until_ms = SDL_GetTicks() + 3000;
                 } else {
-                    free(new_pb);
                     snprintf(toast_text, sizeof(toast_text),
-                             "%s 30s failed", delta > 0 ? "Skip" : "Back");
+                             "Seeking is only supported on VOD + catch-up");
+                    toast_until_ms = SDL_GetTicks() + 2500;
                 }
-                free(u);
-                toast_until_ms = SDL_GetTicks() + 4000;
             }
             else if (k == SDLK_QUESTION ||
                      (k == SDLK_SLASH && (ev.key.keysym.mod & KMOD_SHIFT))) {
