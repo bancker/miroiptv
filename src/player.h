@@ -53,6 +53,17 @@ typedef struct {
      * returns an error we ignore. */
     volatile int      seek_req;
     volatile int64_t  seek_target_pts;   /* in AV_TIME_BASE units */
+
+    /* Post-seek diagnostics / range-not-supported detection. Some portals
+     * don't honour HTTP Range requests — av_seek_frame reports success
+     * (byte offset sent in header) but the server returns 200 OK from
+     * byte 0, leaving the demuxer reading pre-seek packets. Detect by
+     * recording the pts of the first packet decoded after a seek and
+     * comparing to target. seek_verify_pending is set on seek, cleared
+     * by the decoder after verifying (or giving up). */
+    volatile int      seek_verify_pending;
+    volatile double   seek_verify_target_s;
+    volatile double   seek_verify_actual_s;
 } player_t;
 
 int  player_open(player_t *p, const char *url);

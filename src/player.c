@@ -239,6 +239,17 @@ static void push_audio_frame(player_t *p, AVFrame *frame) {
     ac->n_samples   = written;
     ac->sample_rate = p->audio_sample_rate_out;
     ac->pts         = stream_rel_seconds(frame->pts, p->fmt->streams[p->audio_idx]);
+    /* First audio chunk after a seek request: record its pts so main can
+     * verify that av_seek_frame actually moved the demuxer. If it didn't
+     * (portal 403/200-OK on Range), the pts here will be very close to
+     * the pre-seek value. Main adjusts first_pts and toasts the user. */
+    if (p->seek_verify_pending) {
+        p->seek_verify_actual_s = ac->pts;
+        p->seek_verify_pending  = 0;
+        fprintf(stderr, "[seek] verify: first post-seek audio pts=%.2fs (target %.2fs, delta %.2fs)\n",
+                ac->pts, p->seek_verify_target_s,
+                ac->pts - p->seek_verify_target_s);
+    }
     if (queue_push(&p->audio_q, ac) != 0) audio_chunk_free(ac);
 }
 
@@ -294,20 +305,36 @@ static void *decoder_loop(void *ud) {
         /* Honour any pending seek request BEFORE reading the next packet.
          * The queues and audio_out_t state have already been drained by
          * main (under SDL_LockAudioDevice). Here we just reposition the
-         * demuxer and flush the codec buffers. AVSEEK_FLAG_BACKWARD so we
-         * land on the previous keyframe — otherwise the video comes back
-         * garbled until the next keyframe. */
+         * demuxer, flush the codec buffers, and drain any packet that
+         * main missed (we were mid-av_read_frame when main set seek_req;
+         * the packet we handed back carried pre-seek pts). */
         if (p->seek_req) {
             int64_t target = p->seek_target_pts;
+            double  target_s = (double)target / AV_TIME_BASE;
+            fprintf(stderr, "[seek] requesting av_seek_frame target=%.2fs\n", target_s);
             int src = av_seek_frame(p->fmt, -1, target, AVSEEK_FLAG_BACKWARD);
             if (src < 0) {
-                fprintf(stderr, "[seek] av_seek_frame failed (rc=%d) — stream may be live\n", src);
+                char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+                av_strerror(src, errbuf, sizeof(errbuf));
+                fprintf(stderr, "[seek] FAILED rc=%d (%s) — server may not support Range; "
+                                "reopening stream as fallback\n", src, errbuf);
             } else {
                 if (p->vctx) avcodec_flush_buffers(p->vctx);
                 if (p->actx) avcodec_flush_buffers(p->actx);
-                fprintf(stderr, "[seek] repositioned to %.2fs\n",
-                        (double)target / AV_TIME_BASE);
+                /* Drain anything that slipped into the queues between main's
+                 * own drain and this point. Main's drain runs BEFORE the
+                 * decoder sees seek_req, but the decoder was likely mid-
+                 * av_read_frame at that moment and pushed one pre-seek
+                 * packet afterwards. Second drain clears that straggler
+                 * so audio post-seek hears only new-timeline content. */
+                queue_drain(&p->audio_q, (void(*)(void*))audio_chunk_free);
+                queue_drain(&p->video_q, (void(*)(void*))video_frame_free);
+                fprintf(stderr, "[seek] av_seek_frame OK — queues redrained, target=%.2fs\n",
+                        target_s);
             }
+            p->seek_verify_target_s = target_s;
+            p->seek_verify_actual_s = -1.0;
+            p->seek_verify_pending  = 1;
             p->seek_req = 0;
         }
 

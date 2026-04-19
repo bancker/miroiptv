@@ -1621,6 +1621,35 @@ int main(int argc, char **argv) {
             last_audio_progress_ts = tnow_ms;
         }
 
+        /* Post-seek verification. After the decoder completes a seek it
+         * records the first post-seek audio pts in seek_verify_actual_s.
+         * If that value is far from target, the portal didn't honour our
+         * Range request — the stream is still playing from the pre-seek
+         * position. Our pre-seeded clock (anchored at target) now
+         * disagrees with the actual stream pts, which would drop every
+         * video frame. Rebase first_pts to match actual so audio+video
+         * stay consistent at the real position, and toast the user. */
+        if (!pb->player.seek_req && pb->player.seek_verify_actual_s >= 0.0) {
+            double target = pb->player.seek_verify_target_s;
+            double actual = pb->player.seek_verify_actual_s;
+            double drift  = actual - target;
+            if (drift < -5.0 || drift > 5.0) {
+                SDL_LockAudioDevice(pb->audio.device);
+                pb->audio.first_pts = actual -
+                                      (double)pb->audio.samples_played /
+                                      (double)pb->audio.sample_rate;
+                SDL_UnlockAudioDevice(pb->audio.device);
+                fprintf(stderr, "[seek] portal ignored Range (drift=%.1fs) — "
+                                "clock rebased to actual pts=%.1fs\n", drift, actual);
+                snprintf(toast_text, sizeof(toast_text),
+                         "Seek not supported by portal — skipping only works on catch-up");
+                toast_until_ms = SDL_GetTicks() + 4500;
+            }
+            /* One-shot check: mark as consumed. */
+            pb->player.seek_verify_actual_s = -1.0;
+            pb->player.seek_verify_target_s = 0.0;
+        }
+
         /* Heartbeat — liveness ping. */
         if (tnow_ms - last_heartbeat >= HEARTBEAT_MS) {
             fprintf(stderr, "[heartbeat] vq=%zu aq=%zu samples=%lld clk=%.1f vframes=%lld aframes=%lld\n",
