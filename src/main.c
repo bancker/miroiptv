@@ -1659,7 +1659,19 @@ int main(int argc, char **argv) {
                             SDL_GetTicks() - last_audio_progress_ts > STALL_MS;
         int never_started = !pb->audio.has_first_pts &&
                             startup_elapsed > (int)STARTUP_MS;
-        if (!paused && (audio_stalled || never_started)) {
+        /* Skip stall-restart on finite sources (VOD, series episodes). They
+         * don't have a "restart URL" in the channel sense — pb->stream_id
+         * is 0 and pb->timeshift_start is 0, so the existing fallback would
+         * build build_channel_url(ch_idx=0) = NPO 1, which is exactly the
+         * bug the user hit after pressing right-arrow on a movie: seek +
+         * HTTP rebuffer took > STARTUP_MS, stall fired, the player
+         * "restarted" onto NPO 1. For VOD the right behavior is to wait
+         * out the rebuffer; if the file is truly broken the decoder will
+         * hit EOF or av_read_frame failure and audio will silently stop —
+         * user can press q or zap to move on. */
+        int is_vod = pb->timeshift_start == 0 && pb->stream_id == 0 &&
+                     pb->player.fmt && pb->player.fmt->duration > 0;
+        if (!paused && !is_vod && (audio_stalled || never_started)) {
             if (never_started)
                 fprintf(stderr, "[stall] audio never started after %dms — restarting\n",
                         startup_elapsed);
