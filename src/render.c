@@ -279,7 +279,7 @@ int overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh) {
     const int line_h = 24;
     const int pad_x  = 28;
     const int pad_y  = 20;
-    const int box_w  = 580;
+    const int box_w  = 680;
     const int box_h  = N * line_h + pad_y * 2;
     SDL_Rect box = { (ww - box_w) / 2, (wh - box_h) / 2, box_w, box_h };
 
@@ -329,7 +329,13 @@ int overlay_render_search(overlay_t *o, SDL_Renderer *r, const char *query,
     (void)wh;  /* box is anchored to the top; we don't need the window height */
     const int pad      = 14;
     const int line_h   = 26;
-    const int box_w    = ww < 620 ? ww - 40 : 620;
+    /* Widen so longer EPG labels ("NU Vandaag 18:00  NOS Journaal extra …")
+     * fit without eliding. Capped at 760 so the box doesn't span the whole
+     * screen at 3x/4x zoom; 40px side gutters keep it off small windows'
+     * edges. */
+    int box_w = ww - 40;
+    if (box_w > 760) box_w = 760;
+    if (box_w < 200) box_w = 200;
     const int box_h    = pad * 3 + line_h + (n > 0 ? line_h * n + pad : 0);
     SDL_Rect box = { (ww - box_w) / 2, 40, box_w, box_h };
 
