@@ -74,17 +74,44 @@ int player_open(player_t *p, const char *url) {
         goto fail;
     }
 
+    /* Enumerate: first video stream, ALL audio streams (up to the cap).
+     * Previously we only kept the first audio stream, which is how a
+     * multi-dub VOD like "No Time to Die" ended up playing the French
+     * track despite the catalog entry saying (NL) — "first" in the TS
+     * stream order isn't guaranteed to match the advertised language. */
     for (unsigned i = 0; i < p->fmt->nb_streams; ++i) {
         AVStream *s = p->fmt->streams[i];
-        if (s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && p->video_idx < 0)
+        if (s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && p->video_idx < 0) {
             p->video_idx = (int)i;
-        else if (s->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && p->audio_idx < 0)
-            p->audio_idx = (int)i;
+        } else if (s->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+                   p->n_audio_tracks < PLAYER_MAX_AUDIO_TRACKS) {
+            p->audio_tracks[p->n_audio_tracks] = (int)i;
+            /* Best-effort language label. Missing on some TS files;
+             * UI falls back to "Track N" when empty. */
+            AVDictionaryEntry *lang = av_dict_get(s->metadata, "language", NULL, 0);
+            if (lang && lang->value)
+                snprintf(p->audio_lang[p->n_audio_tracks],
+                         sizeof(p->audio_lang[0]), "%s", lang->value);
+            else
+                p->audio_lang[p->n_audio_tracks][0] = '\0';
+            p->n_audio_tracks++;
+        }
     }
-    if (p->video_idx < 0 || p->audio_idx < 0) {
+    if (p->video_idx < 0 || p->n_audio_tracks == 0) {
         fprintf(stderr, "need both video and audio streams (v=%d a=%d)\n",
-                p->video_idx, p->audio_idx);
+                p->video_idx, p->n_audio_tracks);
         goto fail;
+    }
+    p->audio_track_cur = 0;
+    p->audio_track_req = 0;
+    p->audio_idx       = p->audio_tracks[0];
+
+    if (p->n_audio_tracks > 1) {
+        fprintf(stderr, "[audio] %d tracks:", p->n_audio_tracks);
+        for (int t = 0; t < p->n_audio_tracks; ++t)
+            fprintf(stderr, " %d=%s", t,
+                    p->audio_lang[t][0] ? p->audio_lang[t] : "(no-lang)");
+        fprintf(stderr, "  (press 'a' to cycle)\n");
     }
 
     /* Open video decoder */
@@ -215,12 +242,55 @@ static void push_audio_frame(player_t *p, AVFrame *frame) {
     if (queue_push(&p->audio_q, ac) != 0) audio_chunk_free(ac);
 }
 
+/* Tear down the current audio codec context + resampler and reopen them for
+ * the newly-selected audio stream. Also drains the audio queue so the user
+ * doesn't keep hearing the previous language fade out for a second or two.
+ * Called only from the decoder thread (own actx / swr). */
+static int switch_audio_track(player_t *p, int new_track) {
+    if (new_track < 0 || new_track >= p->n_audio_tracks) return -1;
+    int new_idx = p->audio_tracks[new_track];
+    if (new_idx == p->audio_idx) return 0;
+
+    /* Flush the in-flight codec to release any buffered frames. */
+    if (p->actx) {
+        avcodec_flush_buffers(p->actx);
+        avcodec_free_context(&p->actx);
+    }
+    if (p->swr) swr_free(&p->swr);
+
+    AVCodecParameters *apar = p->fmt->streams[new_idx]->codecpar;
+    const AVCodec *ac = avcodec_find_decoder(apar->codec_id);
+    if (!ac) { fprintf(stderr, "[audio] no decoder for track %d\n", new_track); return -1; }
+    p->actx = avcodec_alloc_context3(ac);
+    avcodec_parameters_to_context(p->actx, apar);
+    if (avcodec_open2(p->actx, ac, NULL) < 0) {
+        avcodec_free_context(&p->actx);
+        fprintf(stderr, "[audio] avcodec_open2 failed for track %d\n", new_track);
+        return -1;
+    }
+    p->audio_idx       = new_idx;
+    p->audio_track_cur = new_track;
+    /* Drain any already-decoded chunks of the old track so the switchover
+     * is audible immediately instead of after the 1-2s queue backlog. */
+    queue_drain(&p->audio_q, (void(*)(void*))audio_chunk_free);
+    fprintf(stderr, "[audio] switched to track %d lang=%s\n",
+            new_track,
+            p->audio_lang[new_track][0] ? p->audio_lang[new_track] : "(no-lang)");
+    return 0;
+}
+
 static void *decoder_loop(void *ud) {
     player_t *p = ud;
     AVPacket *pkt = av_packet_alloc();
     AVFrame  *fr  = av_frame_alloc();
 
     while (!p->stop) {
+        /* Honour any pending audio-track switch before reading the next
+         * packet so demuxed-but-unread packets of the new audio PID get
+         * routed to the freshly-initialised decoder. */
+        if (p->audio_track_req != p->audio_track_cur)
+            (void)switch_audio_track(p, p->audio_track_req);
+
         int rc = av_read_frame(p->fmt, pkt);
         if (rc < 0) {
             char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
@@ -284,4 +354,13 @@ void player_stop(player_t *p) {
     queue_close(&p->video_q);
     queue_close(&p->audio_q);
     pthread_join(p->thread, NULL);
+}
+
+int player_set_audio_track(player_t *p, int track_idx) {
+    if (!p || track_idx < 0 || track_idx >= p->n_audio_tracks) return -1;
+    /* Just record the request — the decoder thread picks it up on its next
+     * iteration and does the actual codec swap. volatile write so the main
+     * thread's update is visible to the decoder without a mutex. */
+    p->audio_track_req = track_idx;
+    return 0;
 }

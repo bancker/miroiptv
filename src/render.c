@@ -265,6 +265,7 @@ int overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh) {
         "  f             Search channels + movies + series (type, up/down, Enter)",
         "  F11           Toggle fullscreen",
         "  t             Toggle always-on-top",
+        "  a             Cycle audio track (NL / FR / EN / …)",
         "  space         Pause / resume audio",
         "  ?             Toggle this help",
         "  q / Esc       Quit",

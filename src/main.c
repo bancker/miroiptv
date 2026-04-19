@@ -1080,6 +1080,25 @@ int main(int argc, char **argv) {
                          "Always on top: %s", always_on_top ? "ON" : "OFF");
                 toast_until_ms = SDL_GetTicks() + 2500;
             }
+            else if (k == SDLK_a) {
+                /* Cycle audio tracks. Only makes sense when there's more
+                 * than one — lots of live channels ship a single track, so
+                 * the toast tells the user when there's nothing to switch. */
+                int n = pb->player.n_audio_tracks;
+                if (n <= 1) {
+                    snprintf(toast_text, sizeof(toast_text),
+                             "Only one audio track on this stream");
+                } else {
+                    int next = (pb->player.audio_track_cur + 1) % n;
+                    player_set_audio_track(&pb->player, next);
+                    const char *lang = pb->player.audio_lang[next];
+                    snprintf(toast_text, sizeof(toast_text),
+                             "Audio: %s (%d/%d)",
+                             lang[0] ? lang : "track",
+                             next + 1, n);
+                }
+                toast_until_ms = SDL_GetTicks() + 3000;
+            }
             else if ((k == SDLK_UP || k == SDLK_DOWN) && current_live_idx >= 0) {
                 /* Same pipeline as mouse wheel: accumulate into pending_wheel_delta
                  * and let the WHEEL_DEBOUNCE_MS commit it through the async zap
