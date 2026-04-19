@@ -106,13 +106,13 @@ int player_open(player_t *p, const char *url) {
     p->audio_track_req = 0;
     p->audio_idx       = p->audio_tracks[0];
 
-    if (p->n_audio_tracks > 1) {
-        fprintf(stderr, "[audio] %d tracks:", p->n_audio_tracks);
-        for (int t = 0; t < p->n_audio_tracks; ++t)
-            fprintf(stderr, " %d=%s", t,
-                    p->audio_lang[t][0] ? p->audio_lang[t] : "(no-lang)");
-        fprintf(stderr, "  (press 'a' to cycle)\n");
-    }
+    fprintf(stderr, "[audio] %d track%s:", p->n_audio_tracks,
+            p->n_audio_tracks == 1 ? "" : "s");
+    for (int t = 0; t < p->n_audio_tracks; ++t)
+        fprintf(stderr, " %d=%s", t,
+                p->audio_lang[t][0] ? p->audio_lang[t] : "(no-lang)");
+    if (p->n_audio_tracks > 1) fprintf(stderr, "  (press 'a' to cycle)");
+    fprintf(stderr, "\n");
 
     /* Open video decoder */
     AVCodecParameters *vpar = p->fmt->streams[p->video_idx]->codecpar;

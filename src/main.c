@@ -240,6 +240,74 @@ static const char *relative_day_label(time_t t, time_t now, char *buf, size_t bu
     return buf;
 }
 
+/* Parse a language tag from a VOD / series catalog title's trailing
+ * parenthesized suffix — "No Time to Die (NL)" → "nld", "Casino Royale
+ * (FR)" → "fra", "Jachtseizoen (NL)" → "nld". Xtream catalogs commonly
+ * duplicate popular titles with different audio dubs and tag each entry
+ * this way; picking the track matching the tag at playback-open is the
+ * difference between a user clicking "(NL)" and actually hearing Dutch
+ * vs. having to press 'a' to find it.
+ *
+ * Returns an ISO 639-2 (3-letter) code suitable for matching AVStream
+ * metadata["language"], or NULL when no recognisable tag is present.
+ * The 2-letter tags are ISO 3166 country codes, mapped here to the
+ * corresponding language — pragmatic and matches what these catalogs
+ * actually use. Already-3-letter tags pass through lowercased. */
+static const char *lang_code_from_title(const char *title) {
+    if (!title) return NULL;
+    const char *open = NULL;
+    for (const char *p = title; *p; ++p) if (*p == '(') open = p;
+    if (!open) return NULL;
+    const char *close = strchr(open, ')');
+    if (!close) return NULL;
+    size_t n = (size_t)(close - open - 1);
+    if (n < 2 || n > 3) return NULL;
+    char tag[4] = {0};
+    for (size_t i = 0; i < n; ++i) tag[i] = (char)toupper((unsigned char)open[1+i]);
+
+    if (n == 2) {
+        if (!strcmp(tag, "NL")) return "nld";
+        if (!strcmp(tag, "FR")) return "fra";
+        if (!strcmp(tag, "EN") || !strcmp(tag, "UK") || !strcmp(tag, "US")) return "eng";
+        if (!strcmp(tag, "DE")) return "deu";
+        if (!strcmp(tag, "ES")) return "spa";
+        if (!strcmp(tag, "IT")) return "ita";
+        if (!strcmp(tag, "PT") || !strcmp(tag, "BR")) return "por";
+        if (!strcmp(tag, "PL")) return "pol";
+        if (!strcmp(tag, "TR")) return "tur";
+        if (!strcmp(tag, "AR")) return "ara";
+        if (!strcmp(tag, "RU")) return "rus";
+        return NULL;
+    }
+    /* 3-letter — assume already ISO 639-2, just lowercase it. */
+    static _Thread_local char iso[4];
+    for (int i = 0; i < 3; ++i) iso[i] = (char)tolower((unsigned char)tag[i]);
+    iso[3] = '\0';
+    return iso;
+}
+
+/* Try to switch to the audio track matching `want_lang` (ISO 639-2) if one
+ * is present. Called after opening a VOD / episode so that "(NL)"-tagged
+ * catalog entries immediately play Dutch instead of whichever track the
+ * demuxer happened to list first. Silently does nothing when the track
+ * isn't found (user can still cycle via 'a'). */
+static void apply_preferred_audio_track(player_t *pl, const char *want_lang) {
+    if (!pl || !want_lang) return;
+    for (int i = 0; i < pl->n_audio_tracks; ++i) {
+        if (strcmp(pl->audio_lang[i], want_lang) == 0) {
+            if (i != pl->audio_track_cur) {
+                fprintf(stderr, "[audio] auto-selecting track %d (%s) to match title\n",
+                        i, want_lang);
+                player_set_audio_track(pl, i);
+            }
+            return;
+        }
+    }
+    fprintf(stderr, "[audio] title requests '%s' but no matching track "
+                    "(n_tracks=%d) — cycle with 'a'\n",
+            want_lang, pl->n_audio_tracks);
+}
+
 /* Case-insensitive strstr — portable replacement for GNU's strcasestr, which
  * isn't in MinGW's libc. Used by the search prompt to do a substring match
  * of the user's query against each live-list entry's name. */
@@ -909,6 +977,12 @@ int main(int argc, char **argv) {
                                 last_audio_progress_ts = SDL_GetTicks();
                                 prev_samples_played    = 0;
                                 current_live_idx = -1;   /* not a live channel any more */
+                                /* Series titles sometimes carry the same
+                                 * "(NL)"/"(FR)" language tags as VOD (e.g.
+                                 * "Jachtseizoen (NL)"). Apply the same
+                                 * preference so episodes play the right dub. */
+                                apply_preferred_audio_track(&pb->player,
+                                                            lang_code_from_title(episode_series_name));
                             } else {
                                 free(new_pb);
                                 snprintf(toast_text, sizeof(toast_text),
@@ -999,6 +1073,28 @@ int main(int argc, char **argv) {
                                     last_audio_progress_ts = SDL_GetTicks();
                                     prev_samples_played    = 0;
                                     current_live_idx = -1;
+                                    /* Honour the "(NL)"/"(FR)" suffix in the
+                                     * catalog entry — user picked that one
+                                     * because they want that language. */
+                                    apply_preferred_audio_track(&pb->player,
+                                                                lang_code_from_title(v->name));
+                                    /* Surface the actual playing track so
+                                     * the user can spot mislabeled catalog
+                                     * entries immediately (file says "(NL)"
+                                     * but only has French audio — they'll
+                                     * see "audio: fra" and know to pick a
+                                     * different one). */
+                                    const char *cur_lang =
+                                        pb->player.n_audio_tracks > 0
+                                        ? pb->player.audio_lang[pb->player.audio_track_cur]
+                                        : "";
+                                    snprintf(toast_text, sizeof(toast_text),
+                                             "Playing %s  —  audio: %s%s",
+                                             v->name,
+                                             cur_lang[0] ? cur_lang : "unknown",
+                                             pb->player.n_audio_tracks > 1
+                                             ? " (press 'a' to switch)" : "");
+                                    toast_until_ms = SDL_GetTicks() + 6000;
                                 } else {
                                     free(new_pb);
                                     snprintf(toast_text, sizeof(toast_text),
