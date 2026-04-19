@@ -163,11 +163,19 @@ static const epg_entry_t *find_current(const epg_t *epg, time_t now) {
     return NULL;
 }
 
-int overlay_render(overlay_t *o, SDL_Renderer *r, const epg_t *epg, int ww, int wh) {
+int overlay_render(overlay_t *o, SDL_Renderer *r, const epg_t *epg,
+                   time_t ref_time, int ww, int wh) {
     const int pad = 12, line_h = 26, max_lines = 4, overlay_h = pad * 2 + line_h * max_lines;
     const int overlay_w = ww;
 
-    if (o->dirty || !o->cached || o->cached_w != overlay_w || o->cached_h != overlay_h) {
+    /* Quantize to 15-second buckets so the overlay picks up time progress
+     * (new "Nu:" as programme boundaries cross) without rebuilding the
+     * SDL texture 60 times a second. */
+    time_t nowref = ref_time ? ref_time : time(NULL);
+    int time_bucket = (int)(nowref / 15);
+
+    if (o->dirty || !o->cached || o->cached_w != overlay_w || o->cached_h != overlay_h
+        || time_bucket != o->cached_time_bucket) {
         if (o->cached) SDL_DestroyTexture(o->cached);
         o->cached = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA8888,
                                       SDL_TEXTUREACCESS_TARGET, overlay_w, overlay_h);
@@ -179,7 +187,7 @@ int overlay_render(overlay_t *o, SDL_Renderer *r, const epg_t *epg, int ww, int 
         SDL_SetRenderDrawColor(r, 0, 0, 0, 180);
         SDL_RenderClear(r);
 
-        time_t now = time(NULL);
+        time_t now = nowref;
         const epg_entry_t *cur = find_current(epg, now);
 
         SDL_Color white = { 235, 235, 235, 255 };
@@ -231,9 +239,10 @@ int overlay_render(overlay_t *o, SDL_Renderer *r, const epg_t *epg, int ww, int 
         }
 
         SDL_SetRenderTarget(r, NULL);
-        o->cached_w = overlay_w;
-        o->cached_h = overlay_h;
-        o->dirty = 0;
+        o->cached_w           = overlay_w;
+        o->cached_h           = overlay_h;
+        o->cached_time_bucket = time_bucket;
+        o->dirty              = 0;
     }
 
     SDL_Rect dst = { 0, wh - o->cached_h, o->cached_w, o->cached_h };
@@ -248,6 +257,7 @@ int overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh) {
         "",
         "  1 / 2 / 3     Switch NPO 1 / 2 / 3",
         "  n             Latest NOS Journaal (most recent, any NPO channel)",
+        "  r             Latest RTL Nieuws (across RTL 4/5/7/8/Z archives)",
         "  up / down     Zap to previous / next channel (same as wheel)",
         "  left / right  Skip -30s / +30s (during timeshift replay only)",
         "  e             Toggle EPG overlay (bottom strip)",

@@ -31,6 +31,11 @@ extern const int XTREAM_NPO_STREAM_IDS[3];
  * provisions catch-up on a distinct channel number. 2-day window. */
 extern const int XTREAM_NPO_ARCHIVE_STREAM_IDS[3];
 
+/* RTL catch-up streams (RTL 4, 5, 7, 8, Z). Same 2-day window. Used by the
+ * 'r' hotkey to find the latest RTL Nieuws broadcast across all of them. */
+extern const int XTREAM_RTL_ARCHIVE_STREAM_IDS[5];
+extern const char * const XTREAM_RTL_CHANNEL_NAMES[5];
+
 /* Builds an Xtream Codes timeshift URL for a past event:
  *   http://HOST:PORT/timeshift/USER/PASS/DURATION_MIN/YYYY-MM-DD:HH-MM/ID.ts
  * start_time is a unix timestamp; the URL uses UTC wall-clock format. */

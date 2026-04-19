@@ -142,6 +142,29 @@ static void render_status_frame(render_t *r, overlay_t *ov,
     SDL_PumpEvents();
 }
 
+/* Describes a "news programme" that lives across multiple portal catch-up
+ * channels — used by the 'n' (NOS Journaal) and 'r' (RTL Nieuws) hotkeys.
+ * The search logic scans each archive channel's full EPG for entries whose
+ * title starts with title_prefix (case-insensitive) and picks the latest
+ * one, preferring airing-now > most-recent-past > soonest-upcoming. */
+typedef struct {
+    const char          *display_name;   /* shown in toasts: "NOS Journaal" / "RTL Nieuws" */
+    const char          *title_prefix;   /* case-insensitive prefix match on EPG titles */
+    size_t               prefix_len;     /* strlen(title_prefix) */
+    const int           *archive_ids;    /* array of portal archive-stream IDs */
+    const char * const  *channel_names;  /* human-readable channel names (same length) */
+    int                  n_channels;
+} news_programme_t;
+
+/* Outcome of find_latest_news: which channel wins + timing flags. */
+typedef struct {
+    int    channel_idx;    /* -1 if nothing matched */
+    int    is_airing;
+    int    is_past;
+    time_t start;
+    time_t end;
+} news_hit_t;
+
 static void playback_close(playback_t *pb) {
     if (pb->url) {
         player_stop(&pb->player);
@@ -592,44 +615,77 @@ int main(int argc, char **argv) {
                 help_visible = !help_visible;
                 hint_until_ms = 0;  /* startup hint has served its purpose */
             }
-            else if (k == SDLK_n) {
-                /* Step-by-step NOS Journaal search, rendered live so the user
-                 * sees each phase instead of a frozen window. Each HTTP call
-                 * still blocks main for a few hundred ms; between them we
-                 * flash progress via render_status_frame. */
+            else if (k == SDLK_n || k == SDLK_r) {
+                /* Shared step-by-step news-programme search — 'n' is NOS
+                 * Journaal across NPO 1/2/3, 'r' is RTL Nieuws across
+                 * RTL 4/5/7/8/Z. Identical UX: toast updates per phase,
+                 * single frame flushed between each blocking HTTP call. */
+                static const news_programme_t PROG_NOS = {
+                    .display_name  = "NOS Journaal",
+                    .title_prefix  = "NOS Journaal",
+                    .prefix_len    = 12,
+                    .archive_ids   = XTREAM_NPO_ARCHIVE_STREAM_IDS,
+                    .channel_names = NULL,  /* fallback to NPO_CHANNELS below */
+                    .n_channels    = 3,
+                };
+                static const news_programme_t PROG_RTL = {
+                    .display_name  = "RTL Nieuws",
+                    .title_prefix  = "RTL Nieuws",
+                    .prefix_len    = 10,
+                    .archive_ids   = XTREAM_RTL_ARCHIVE_STREAM_IDS,
+                    .channel_names = XTREAM_RTL_CHANNEL_NAMES,
+                    .n_channels    = 5,
+                };
+                const news_programme_t *prog = (k == SDLK_n) ? &PROG_NOS : &PROG_RTL;
+
                 SDL_Texture *cur_tex = have_texture ? pb->tex.texture : NULL;
 
                 snprintf(toast_text, sizeof(toast_text),
-                         "NOS Journaal: scanning NPO 1/2/3 archive EPG...");
+                         "%s: scanning %d archive channel%s...",
+                         prog->display_name, prog->n_channels,
+                         prog->n_channels == 1 ? "" : "s");
                 render_status_frame(&r, &ov, cur_tex, toast_text);
 
-                /* Fetch all three archive EPGs, counting journaal entries. */
-                epg_t epgs[3] = {{0}};
-                int   jcount[3] = {0};
-                for (int i = 0; i < 3; ++i) {
+                /* Per-channel EPG fetch with toast updates between each. */
+                epg_t *epgs = calloc((size_t)prog->n_channels, sizeof(epg_t));
+                int   *jcount = calloc((size_t)prog->n_channels, sizeof(int));
+                if (!epgs || !jcount) {
+                    free(epgs); free(jcount);
+                    snprintf(toast_text, sizeof(toast_text), "out of memory");
+                    toast_until_ms = SDL_GetTicks() + 3000;
+                    break;
+                }
+                const size_t pfxlen = prog->prefix_len;
+                for (int i = 0; i < prog->n_channels; ++i) {
+                    const char *chn = prog->channel_names
+                                    ? prog->channel_names[i]
+                                    : NPO_CHANNELS[i].display;
                     snprintf(toast_text, sizeof(toast_text),
-                             "Step %d/3: fetching NPO %d archive EPG...", i + 1, i + 1);
+                             "Step %d/%d: fetching %s archive EPG...",
+                             i + 1, prog->n_channels, chn);
                     render_status_frame(&r, &ov, cur_tex, toast_text);
-                    if (xtream_fetch_epg_full(&portal,
-                            XTREAM_NPO_ARCHIVE_STREAM_IDS[i], &epgs[i]) == 0) {
-                        for (size_t j = 0; j < epgs[i].count; ++j)
-                            if (epgs[i].entries[j].is_news) jcount[i]++;
+                    if (xtream_fetch_epg_full(&portal, prog->archive_ids[i], &epgs[i]) == 0) {
+                        for (size_t j = 0; j < epgs[i].count; ++j) {
+                            const char *t = epgs[i].entries[j].title;
+                            if (t && strncasecmp(t, prog->title_prefix, pfxlen) == 0)
+                                jcount[i]++;
+                        }
                     }
                     snprintf(toast_text, sizeof(toast_text),
-                             "NPO %d: %d Journaal entries found", i + 1, jcount[i]);
+                             "%s: %d %s entries", chn, jcount[i], prog->display_name);
                     render_status_frame(&r, &ov, cur_tex, toast_text);
                 }
 
-                /* Pick the latest (airing > past > future preference) from
-                 * the union of the three EPGs. */
+                /* Pick the latest (airing > past > future) across the union. */
                 time_t tnow = time(NULL);
                 int best_airing_ch = -1, best_past_ch = -1, best_next_ch = -1;
                 time_t best_airing_s = 0, best_airing_e = 0;
                 time_t best_past_s   = 0, best_past_e   = 0;
                 time_t best_next_s   = 0, best_next_e   = 0;
-                for (int i = 0; i < 3; ++i) {
+                for (int i = 0; i < prog->n_channels; ++i) {
                     for (size_t j = 0; j < epgs[i].count; ++j) {
-                        if (!epgs[i].entries[j].is_news) continue;
+                        const char *t = epgs[i].entries[j].title;
+                        if (!t || strncasecmp(t, prog->title_prefix, pfxlen) != 0) continue;
                         time_t s = epgs[i].entries[j].start, e = epgs[i].entries[j].end;
                         if (s <= tnow && tnow < e) {
                             if (s > best_airing_s) {
@@ -663,44 +719,57 @@ int main(int argc, char **argv) {
 
                 if (ch_idx < 0) {
                     snprintf(toast_text, sizeof(toast_text),
-                             "No NOS Journaal in any archive EPG");
+                             "No %s in any archive EPG", prog->display_name);
                 } else {
                     struct tm lt = *localtime(&hit_s);
-                    const char *chname = NPO_CHANNELS[ch_idx].display;
+                    const char *chname = prog->channel_names
+                                       ? prog->channel_names[ch_idx]
+                                       : NPO_CHANNELS[ch_idx].display;
                     const char *kind = is_airing ? "airing NOW"
                                                  : (is_past ? "last ended"
                                                             : "next at");
                     snprintf(toast_text, sizeof(toast_text),
-                             "Winner: NOS Journaal %s %02d:%02d on %s",
-                             kind, lt.tm_hour, lt.tm_min, chname);
+                             "Winner: %s %s %02d:%02d on %s",
+                             prog->display_name, kind, lt.tm_hour, lt.tm_min, chname);
                     render_status_frame(&r, &ov, cur_tex, toast_text);
 
-                    /* Build URL. */
-                    char *target_url = NULL;
+                    /* Build URL. Timeshift uses the archive id (replay);
+                     * live/future paths need a "live" URL — for NPO that's
+                     * build_channel_url, for RTL we fall back to the archive
+                     * stream's live endpoint since the portal serves it OK. */
+                    char *target_url      = NULL;
                     int   target_stream_id = 0;
-                    if (is_airing) {
-                        target_url = build_channel_url(ch_idx, &portal, direct_url);
+                    if (is_airing || !is_past) {
+                        if (prog == &PROG_NOS) {
+                            target_url = build_channel_url(ch_idx, &portal, direct_url);
+                        } else {
+                            /* RTL live: use xtream_stream_url on the archive id —
+                             * the same stream serves both live and timeshift. */
+                            target_url = xtream_stream_url(&portal, prog->archive_ids[ch_idx]);
+                            target_stream_id = prog->archive_ids[ch_idx];
+                        }
                         snprintf(toast_text, sizeof(toast_text),
-                                 "Tuning to live NPO %d for current Journaal...", ch_idx + 1);
-                    } else if (is_past) {
+                                 "Tuning live to %s%s...", chname,
+                                 is_airing ? " for current broadcast" : " (wait for start)");
+                    } else {
                         int dur_min = (int)((hit_e - hit_s) / 60);
-                        target_stream_id = XTREAM_NPO_ARCHIVE_STREAM_IDS[ch_idx];
+                        target_stream_id = prog->archive_ids[ch_idx];
                         target_url = xtream_timeshift_url(&portal, target_stream_id,
                                                           hit_s, dur_min);
                         snprintf(toast_text, sizeof(toast_text),
                                  "Opening timeshift: /timeshift/.../%02d-%02d/%d.m3u8",
                                  lt.tm_hour, lt.tm_min, target_stream_id);
-                    } else {
-                        target_url = build_channel_url(ch_idx, &portal, direct_url);
-                        snprintf(toast_text, sizeof(toast_text),
-                                 "Tuning to live NPO %d (wait for start)...", ch_idx + 1);
                     }
                     render_status_frame(&r, &ov, cur_tex, toast_text);
 
                     if (target_url) {
-                        const npo_channel_t *target = &NPO_CHANNELS[ch_idx];
+                        /* pb->channel must stay a valid npo_channel_t*; for RTL
+                         * we stamp NPO_CHANNELS[0] as a vestigial holder. */
+                        const npo_channel_t *target = (prog == &PROG_NOS)
+                                                    ? &NPO_CHANNELS[ch_idx]
+                                                    : &NPO_CHANNELS[0];
                         playback_t *new_pb = calloc(1, sizeof(*new_pb));
-                        int epg_id = is_past ? target_stream_id : 0;
+                        int epg_id = (is_past || prog == &PROG_RTL) ? target_stream_id : 0;
                         if (new_pb && playback_open(new_pb, &r, target, target_url,
                                                     &portal, epg_id) == 0) {
                             if (is_past) {
@@ -708,7 +777,7 @@ int main(int argc, char **argv) {
                                 new_pb->timeshift_dur_min = (int)((hit_e - hit_s) / 60);
                             }
                             playback_close(pb); free(pb); pb = new_pb;
-                            set_window_title(&r, target->display);
+                            set_window_title(&r, chname);
                             paused = 0; have_texture = 0;
                             if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                             overlay_mark_dirty(&ov);
@@ -716,30 +785,34 @@ int main(int argc, char **argv) {
                             if (is_past) {
                                 long long ago_m = (tnow - hit_e) / 60;
                                 snprintf(toast_text, sizeof(toast_text),
-                                         "Replaying NOS Journaal %02d:%02d on %s (ended %lldm ago)",
-                                         lt.tm_hour, lt.tm_min, chname, ago_m);
+                                         "Replaying %s %02d:%02d on %s (ended %lldm ago)",
+                                         prog->display_name, lt.tm_hour, lt.tm_min, chname, ago_m);
                             } else if (is_airing) {
                                 long long in_m = (tnow - hit_s) / 60;
                                 snprintf(toast_text, sizeof(toast_text),
-                                         "NOS Journaal airing on %s (started %02d:%02d, %lldm in)",
-                                         chname, lt.tm_hour, lt.tm_min, in_m);
+                                         "%s airing on %s (started %02d:%02d, %lldm in)",
+                                         prog->display_name, chname,
+                                         lt.tm_hour, lt.tm_min, in_m);
                             } else {
                                 long long til_m = (hit_s - tnow) / 60;
                                 snprintf(toast_text, sizeof(toast_text),
-                                         "Next NOS Journaal at %02d:%02d on %s (in %lldm)",
+                                         "Next %s at %02d:%02d on %s (in %lldm)",
+                                         prog->display_name,
                                          lt.tm_hour, lt.tm_min, chname, til_m);
                             }
                         } else {
                             free(new_pb);
                             snprintf(toast_text, sizeof(toast_text),
-                                     "Open failed for %s Journaal on %s",
-                                     is_past ? "replay" : "live", target->display);
+                                     "Open failed for %s %s on %s",
+                                     is_past ? "replay" : "live",
+                                     prog->display_name, chname);
                         }
                         free(target_url);
                     }
                 }
-                for (int i = 0; i < 3; ++i) npo_epg_free(&epgs[i]);
-                toast_until_ms = SDL_GetTicks() + 8000;  /* 8 sec visible for the final line */
+                for (int i = 0; i < prog->n_channels; ++i) npo_epg_free(&epgs[i]);
+                free(epgs); free(jcount);
+                toast_until_ms = SDL_GetTicks() + 8000;
             }
             else {
                 const npo_channel_t *nch = key_to_channel(k);
@@ -1027,8 +1100,18 @@ int main(int argc, char **argv) {
         SDL_GetRendererOutputSize(r.renderer, &ww, &wh);
         if (have_texture) {
             SDL_RenderCopy(r.renderer, pb->tex.texture, NULL, NULL);
-            if (show_overlay)
-                overlay_render(&ov, r.renderer, &pb->epg, ww, wh);
+            if (show_overlay) {
+                /* Reference time: for timeshift replay we're showing content
+                 * from pb->timeshift_start + (time-since-playback-began).
+                 * Approximation: timeshift_start + samples_played/sample_rate.
+                 * For live streams, wallclock is correct. */
+                time_t ref = 0;
+                if (pb->timeshift_start != 0 && pb->audio.sample_rate > 0) {
+                    ref = pb->timeshift_start +
+                          (time_t)(pb->audio.samples_played / pb->audio.sample_rate);
+                }
+                overlay_render(&ov, r.renderer, &pb->epg, ref, ww, wh);
+            }
         }
         /* Help + toast + startup hint on top of everything so they stay legible.
          * Priority: help > toast > startup hint. */

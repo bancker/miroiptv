@@ -22,6 +22,16 @@ const int XTREAM_NPO_STREAM_IDS[3] = { 755880, 755881, 755882 };
  * streams mirrored with timeshift support. */
 const int XTREAM_NPO_ARCHIVE_STREAM_IDS[3] = { 1124362, 1124363, 1124364 };
 
+/* RTL catch-up: RTL4 HD, RTL5 HD, RTL7 HD, RTL8 HD, RTLZ HD. All have
+ * tv_archive=1 and live in category_id 1550 like NPO. Discovered via
+ * get_live_streams&category_id=1550 on m.hnlol.com. */
+const int XTREAM_RTL_ARCHIVE_STREAM_IDS[5] = {
+    1124365, 1124366, 1124369, 1124372, 1124375
+};
+const char * const XTREAM_RTL_CHANNEL_NAMES[5] = {
+    "RTL 4", "RTL 5", "RTL 7", "RTL 8", "RTL Z"
+};
+
 int xtream_parse(const char *spec, xtream_t *out) {
     memset(out, 0, sizeof(*out));
     if (!spec || !*spec) return -1;

@@ -61,13 +61,20 @@ typedef struct {
     int          cached_w;
     int          cached_h;
     int          dirty;
+    /* Quantized ref_time of last render — rebucket every 15 s so the
+     * overlay refreshes ~4x per minute without re-rendering at 60 Hz. */
+    int          cached_time_bucket;
 } overlay_t;
 
 int  overlay_init(overlay_t *o, const char *font_path);
 void overlay_shutdown(overlay_t *o);
 void overlay_mark_dirty(overlay_t *o);
-int  overlay_render(overlay_t *o, SDL_Renderer *r,
-                    const epg_t *epg, int window_w, int window_h);
+/* ref_time is the "now" we compare EPG entries against — pass time(NULL) for
+ * live streams, or (timeshift_start + samples_played/sample_rate) for a
+ * timeshift replay so the overlay shows the programme the user is actually
+ * watching instead of what's airing on real-world NPO. */
+int  overlay_render(overlay_t *o, SDL_Renderer *r, const epg_t *epg,
+                    time_t ref_time, int window_w, int window_h);
 
 /* Full keybinding cheat sheet, centered on screen with a translucent box. */
 int  overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh);
