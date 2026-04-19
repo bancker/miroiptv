@@ -148,6 +148,20 @@ static double ts_to_seconds(int64_t pts, AVRational tb) {
     return (double)pts * tb.num / tb.den;
 }
 
+/* Seconds since the stream's first packet. Different PIDs in an MPEG-TS can
+ * advertise wildly different absolute pts origins (observed: audio ~8876s vs
+ * video ~2630s on NPO1 live), because the demuxer records each stream's first
+ * pts in stream->start_time and the playback container expects consumers to
+ * subtract it. Without this normalization, av_clock (seeded from audio pts)
+ * sits at 8876s while video frames arrive at 2630s, so every video frame
+ * looks 6246s late and gets DROP_LATE'd — audio-only playback forever. */
+static double stream_rel_seconds(int64_t pts, AVStream *s) {
+    if (pts == AV_NOPTS_VALUE) return 0.0;
+    int64_t rel = pts;
+    if (s->start_time != AV_NOPTS_VALUE) rel -= s->start_time;
+    return (double)rel * s->time_base.num / s->time_base.den;
+}
+
 static void push_video_frame(player_t *p, AVFrame *frame) {
     if (frame->format != AV_PIX_FMT_YUV420P) {
         if (!p->sws) {
@@ -165,14 +179,14 @@ static void push_video_frame(player_t *p, AVFrame *frame) {
         conv->pts = frame->pts;
         video_frame_t *vf = calloc(1, sizeof(*vf));
         alloc_frame_copy_yuv(conv, vf);
-        vf->pts = ts_to_seconds(conv->pts, p->fmt->streams[p->video_idx]->time_base);
+        vf->pts = stream_rel_seconds(conv->pts, p->fmt->streams[p->video_idx]);
         av_frame_free(&conv);
         if (queue_push(&p->video_q, vf) != 0) video_frame_free(vf);
         return;
     }
     video_frame_t *vf = calloc(1, sizeof(*vf));
     alloc_frame_copy_yuv(frame, vf);
-    vf->pts = ts_to_seconds(frame->pts, p->fmt->streams[p->video_idx]->time_base);
+    vf->pts = stream_rel_seconds(frame->pts, p->fmt->streams[p->video_idx]);
     if (queue_push(&p->video_q, vf) != 0) video_frame_free(vf);
 }
 
@@ -197,7 +211,7 @@ static void push_audio_frame(player_t *p, AVFrame *frame) {
     ac->samples     = out_buf;
     ac->n_samples   = written;
     ac->sample_rate = p->audio_sample_rate_out;
-    ac->pts         = ts_to_seconds(frame->pts, p->fmt->streams[p->audio_idx]->time_base);
+    ac->pts         = stream_rel_seconds(frame->pts, p->fmt->streams[p->audio_idx]);
     if (queue_push(&p->audio_q, ac) != 0) audio_chunk_free(ac);
 }
 
@@ -235,15 +249,17 @@ static void *decoder_loop(void *ud) {
                     push_video_frame(p, fr);
                     p->video_frames_pushed++;
                     if (p->video_frames_pushed == 1)
-                        fprintf(stderr, "[decoder] first video frame decoded (%dx%d, pts=%.2fs)\n",
+                        fprintf(stderr, "[decoder] first video frame decoded (%dx%d, rel_pts=%.2fs, abs_pts=%.2fs)\n",
                                 fr->width, fr->height,
-                                (double)fr->pts * p->fmt->streams[p->video_idx]->time_base.num
-                                / p->fmt->streams[p->video_idx]->time_base.den);
+                                stream_rel_seconds(fr->pts, p->fmt->streams[p->video_idx]),
+                                ts_to_seconds(fr->pts, p->fmt->streams[p->video_idx]->time_base));
                 } else {
                     push_audio_frame(p, fr);
                     p->audio_frames_pushed++;
                     if (p->audio_frames_pushed == 1)
-                        fprintf(stderr, "[decoder] first audio frame decoded\n");
+                        fprintf(stderr, "[decoder] first audio frame decoded (rel_pts=%.2fs, abs_pts=%.2fs)\n",
+                                stream_rel_seconds(fr->pts, p->fmt->streams[p->audio_idx]),
+                                ts_to_seconds(fr->pts, p->fmt->streams[p->audio_idx]->time_base));
                 }
                 av_frame_unref(fr);
             }

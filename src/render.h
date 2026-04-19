@@ -83,4 +83,12 @@ int  overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh);
 int  overlay_render_hint(overlay_t *o, SDL_Renderer *r, const char *text,
                          int ww, int wh);
 
+/* Search overlay: translucent panel top-centered with the query box and up
+ * to `visible_n` match rows beneath. `sel` is an index into `names[0..n-1]`
+ * and gets a highlighted background. Caller is responsible for keeping
+ * `sel` within [0, n) and for capping `n` to what it wants visible. */
+int  overlay_render_search(overlay_t *o, SDL_Renderer *r, const char *query,
+                           const char *const *names, int n, int sel,
+                           int ww, int wh);
+
 #endif

@@ -261,7 +261,8 @@ int overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh) {
         "  up / down     Zap to previous / next channel (same as wheel)",
         "  left / right  Skip -30s / +30s (during timeshift replay only)",
         "  e             Toggle EPG overlay (bottom strip)",
-        "  f             Toggle fullscreen",
+        "  f             Search channels (type, up/down, Enter, Esc)",
+        "  F11           Toggle fullscreen",
         "  t             Toggle always-on-top",
         "  space         Pause / resume audio",
         "  ?             Toggle this help",
@@ -318,5 +319,70 @@ int overlay_render_hint(overlay_t *o, SDL_Renderer *r, const char *text, int ww,
     SDL_RenderCopy(r, t, NULL, &dst);
     SDL_DestroyTexture(t);
     SDL_FreeSurface(s);
+    return 0;
+}
+
+int overlay_render_search(overlay_t *o, SDL_Renderer *r, const char *query,
+                          const char *const *names, int n, int sel,
+                          int ww, int wh) {
+    (void)wh;  /* box is anchored to the top; we don't need the window height */
+    const int pad      = 14;
+    const int line_h   = 26;
+    const int box_w    = ww < 620 ? ww - 40 : 620;
+    const int box_h    = pad * 3 + line_h + (n > 0 ? line_h * n + pad : 0);
+    SDL_Rect box = { (ww - box_w) / 2, 40, box_w, box_h };
+
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 220);
+    SDL_RenderFillRect(r, &box);
+
+    const SDL_Color white  = { 240, 240, 240, 255 };
+    const SDL_Color yellow = { 255, 220,  80, 255 };
+    const SDL_Color dim    = { 180, 180, 180, 255 };
+
+    char q[256];
+    snprintf(q, sizeof(q), "Search:  %s_", query ? query : "");
+    SDL_Surface *qs = TTF_RenderUTF8_Blended(o->font_bold, q, yellow);
+    if (qs) {
+        SDL_Texture *qt = SDL_CreateTextureFromSurface(r, qs);
+        SDL_Rect dst = { box.x + pad, box.y + pad, qs->w, qs->h };
+        SDL_RenderCopy(r, qt, NULL, &dst);
+        SDL_DestroyTexture(qt);
+        SDL_FreeSurface(qs);
+    }
+
+    if (n == 0) {
+        /* Two distinct empty states: no query yet (just opened the prompt) vs.
+         * query typed but no channel matches. Different messages so the user
+         * knows whether to type more or try different text. */
+        const char *hint = (query && *query)
+            ? "(no matches — try different text, or Esc to cancel)"
+            : "(type to search channels — up/down + Enter to pick, Esc to cancel)";
+        SDL_Surface *ns = TTF_RenderUTF8_Blended(o->font_regular, hint, dim);
+        if (ns) {
+            SDL_Texture *nt = SDL_CreateTextureFromSurface(r, ns);
+            SDL_Rect dst = { box.x + pad, box.y + pad + line_h + 4, ns->w, ns->h };
+            SDL_RenderCopy(r, nt, NULL, &dst);
+            SDL_DestroyTexture(nt);
+            SDL_FreeSurface(ns);
+        }
+        return 0;
+    }
+
+    int y = box.y + pad + line_h + pad;
+    for (int i = 0; i < n; ++i, y += line_h) {
+        if (i == sel) {
+            SDL_Rect hl = { box.x + 4, y - 2, box_w - 8, line_h };
+            SDL_SetRenderDrawColor(r, 60, 90, 140, 220);
+            SDL_RenderFillRect(r, &hl);
+        }
+        SDL_Surface *s = TTF_RenderUTF8_Blended(o->font_regular, names[i] ? names[i] : "", white);
+        if (!s) continue;
+        SDL_Texture *t = SDL_CreateTextureFromSurface(r, s);
+        SDL_Rect dst = { box.x + pad, y, s->w, s->h };
+        SDL_RenderCopy(r, t, NULL, &dst);
+        SDL_DestroyTexture(t);
+        SDL_FreeSurface(s);
+    }
     return 0;
 }

@@ -5,6 +5,7 @@
 #include "xtream.h"
 #include <SDL2/SDL.h>
 #include <curl/curl.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +54,12 @@ typedef struct {
 static int playback_open(playback_t *pb, render_t *r, const npo_channel_t *ch,
                          const char *override_url, const xtream_t *portal,
                          int epg_stream_id) {
+    /* Every playback_open is a significant event — log it so we can see which
+     * path triggered each reopen from the diagnostic log (initial boot vs zap
+     * worker vs stall restart vs channel switch vs arrow seek vs news handler). */
+    fprintf(stderr, "[playback_open] ch=%s epg_id=%d url=%.80s\n",
+            ch ? ch->display : "(null)", epg_stream_id,
+            override_url ? override_url : "(derived)");
     memset(pb, 0, sizeof(*pb));
     pb->channel   = ch;
     /* Persist the stream identity (used later by stall-restart and the
@@ -187,6 +194,43 @@ static const npo_channel_t *key_to_channel(SDL_Keycode k) {
         case SDLK_3: return &NPO_CHANNELS[2];
         default: return NULL;
     }
+}
+
+/* Case-insensitive strstr — portable replacement for GNU's strcasestr, which
+ * isn't in MinGW's libc. Used by the search prompt to do a substring match
+ * of the user's query against each live-list entry's name. */
+static int icase_contains(const char *hay, const char *needle) {
+    if (!needle || !*needle) return 1;
+    if (!hay) return 0;
+    size_t nlen = strlen(needle);
+    for (const char *p = hay; *p; ++p) {
+        size_t i = 0;
+        while (i < nlen && p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i]))
+            ++i;
+        if (i == nlen) return 1;
+    }
+    return 0;
+}
+
+/* Refresh *hits_out / *n_out with the first `cap` indices of live_list whose
+ * name matches `query` (case-insensitive substring). Empty query = zero hits
+ * so we don't dump all 15000 channels as a pile of text. Caller owns
+ * *hits_out and must realloc as needed — we grow it in-place. */
+static void search_refresh(const xtream_live_list_t *list, const char *query,
+                           int cap, int **hits_out, int *n_out) {
+    if (!*query) { *n_out = 0; return; }
+    if (!*hits_out) {
+        *hits_out = malloc(sizeof(int) * (size_t)cap);
+        if (!*hits_out) { *n_out = 0; return; }
+    }
+    int found = 0;
+    for (size_t i = 0; i < list->count && found < cap; ++i) {
+        if (icase_contains(list->entries[i].name, query)) {
+            (*hits_out)[found++] = (int)i;
+        }
+    }
+    *n_out = found;
 }
 
 typedef struct {
@@ -440,11 +484,24 @@ int main(int argc, char **argv) {
     int64_t prev_samples_played      = 0;
     Uint32  last_audio_progress_ts   = SDL_GetTicks();
 
+    /* Timestamp of the most recent successful playback_open (initial boot,
+     * stall-restart, zap swap, channel switch, etc.). Used by the stall
+     * detector to apply a grace period before declaring "audio never started"
+     * on a fresh playback — it takes a few seconds for libav to probe and
+     * the decoder thread to push the first audio chunk. */
+    Uint32  playback_open_ts         = SDL_GetTicks();
+
     /* Heartbeat: log state every HEARTBEAT_MS so we can see in the log
      * exactly when main stops making progress. If the heartbeat pauses,
      * main thread is blocked somewhere. */
     Uint32 last_heartbeat = SDL_GetTicks();
     const Uint32 HEARTBEAT_MS = 15000;
+    /* If no audio progress (has_first_pts stays 0) after STARTUP_MS on a fresh
+     * playback, something went wrong during open (decode stalled, network
+     * died mid-probe). Restart to recover. 10s is comfortably above the
+     * normal first-frame latency (2-4s observed) but well below the user's
+     * "did it crash?" threshold. */
+    const Uint32 STARTUP_MS   = 10000;
 
     /* Right-click drag state — since the window is borderless there's no title
      * bar to grab, so we implement window-move by: on right-button-down we
@@ -476,6 +533,18 @@ int main(int argc, char **argv) {
      * visible feedback regardless of stderr visibility. */
     char    toast_text[512] = {0};  /* room for channel + " | " + programme title */
     Uint32  toast_until_ms  = 0;
+
+    /* Search prompt ('f' key). search_active toggles text-input mode; every
+     * keystroke refreshes search_hits by substring-matching against live_list.
+     * search_sel is the highlighted result row; Enter picks it via the same
+     * async zap_prep pipeline the wheel uses. */
+    int   search_active    = 0;
+    char  search_query[128] = {0};
+    int   search_query_len  = 0;
+    int  *search_hits       = NULL;    /* indices into live_list.entries */
+    int   search_hits_count = 0;
+    int   search_sel        = 0;
+    const int SEARCH_VISIBLE = 12;     /* rows shown in the result list */
 
     /* Mouse-wheel zapping through ALL portal live channels. We fetch the full
      * catalog once, find our current stream_id in it, and the wheel moves the
@@ -556,16 +625,82 @@ int main(int argc, char **argv) {
                 SDL_CaptureMouse(SDL_FALSE);
                 continue;
             }
-            if (ev.type == SDL_MOUSEWHEEL && current_live_idx >= 0) {
+            if (ev.type == SDL_MOUSEWHEEL && current_live_idx >= 0 && !search_active) {
                 /* wheel up (positive y) = previous channel; down = next channel */
                 pending_wheel_delta -= ev.wheel.y;
                 last_wheel_ts = SDL_GetTicks();
                 continue;
             }
+
+            /* Search mode intercepts text input and most keys so typed
+             * characters don't quit/fullscreen/toggle things by accident. */
+            if (search_active) {
+                if (ev.type == SDL_TEXTINPUT) {
+                    size_t add = strlen(ev.text.text);
+                    if (search_query_len + add < sizeof(search_query) - 1) {
+                        memcpy(search_query + search_query_len, ev.text.text, add);
+                        search_query_len += (int)add;
+                        search_query[search_query_len] = '\0';
+                        search_refresh(&live_list, search_query, SEARCH_VISIBLE,
+                                       &search_hits, &search_hits_count);
+                        search_sel = 0;
+                    }
+                    continue;
+                }
+                if (ev.type == SDL_KEYDOWN) {
+                    SDL_Keycode sk = ev.key.keysym.sym;
+                    if (sk == SDLK_ESCAPE) {
+                        search_active = 0;
+                        SDL_StopTextInput();
+                    } else if (sk == SDLK_BACKSPACE) {
+                        if (search_query_len > 0) {
+                            /* UTF-8 safe: drop trailing continuation bytes
+                             * until we hit the lead byte. */
+                            --search_query_len;
+                            while (search_query_len > 0 &&
+                                   (search_query[search_query_len] & 0xC0) == 0x80)
+                                --search_query_len;
+                            search_query[search_query_len] = '\0';
+                            search_refresh(&live_list, search_query, SEARCH_VISIBLE,
+                                           &search_hits, &search_hits_count);
+                            search_sel = 0;
+                        }
+                    } else if (sk == SDLK_UP) {
+                        if (search_hits_count > 0)
+                            search_sel = (search_sel - 1 + search_hits_count) % search_hits_count;
+                    } else if (sk == SDLK_DOWN) {
+                        if (search_hits_count > 0)
+                            search_sel = (search_sel + 1) % search_hits_count;
+                    } else if (sk == SDLK_RETURN || sk == SDLK_KP_ENTER) {
+                        if (search_hits_count > 0 && search_sel < search_hits_count) {
+                            int li = search_hits[search_sel];
+                            /* Route through the same async zap pipeline the
+                             * wheel uses: spawn a worker for this channel, UI
+                             * stays responsive while the stream probes. */
+                            pending_wheel_delta = li - current_live_idx;
+                            last_wheel_ts = SDL_GetTicks();
+                        }
+                        search_active = 0;
+                        SDL_StopTextInput();
+                    }
+                }
+                continue;
+            }
+
             if (ev.type != SDL_KEYDOWN) continue;
             SDL_Keycode k = ev.key.keysym.sym;
             if (k == SDLK_q || k == SDLK_ESCAPE) { running = 0; break; }
-            else if (k == SDLK_f) render_toggle_fullscreen(&r);
+            else if (k == SDLK_f) {
+                /* Remapped in 2026-04-18: 'f' opens the search prompt (was
+                 * fullscreen). Fullscreen moved to F11. */
+                search_active = 1;
+                search_query[0] = '\0';
+                search_query_len = 0;
+                search_hits_count = 0;
+                search_sel = 0;
+                SDL_StartTextInput();
+            }
+            else if (k == SDLK_F11) render_toggle_fullscreen(&r);
             else if (k == SDLK_SPACE) {
                 paused = !paused;
                 SDL_PauseAudioDevice(pb->audio.device, paused);
@@ -601,6 +736,9 @@ int main(int argc, char **argv) {
                     paused = 0; have_texture = 0;
                     if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                     overlay_mark_dirty(&ov);
+                    playback_open_ts = SDL_GetTicks();
+                    last_audio_progress_ts = SDL_GetTicks();
+                    prev_samples_played    = 0;
                     struct tm lt = *localtime(&new_start);
                     snprintf(toast_text, sizeof(toast_text),
                              "%s 30s -> replay starts at %02d:%02d",
@@ -788,6 +926,9 @@ int main(int argc, char **argv) {
                             paused = 0; have_texture = 0;
                             if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                             overlay_mark_dirty(&ov);
+                            playback_open_ts = SDL_GetTicks();
+                            last_audio_progress_ts = SDL_GetTicks();
+                            prev_samples_played    = 0;
 
                             if (is_past) {
                                 long long ago_m = (tnow - hit_e) / 60;
@@ -845,6 +986,9 @@ int main(int argc, char **argv) {
                         have_texture = 0;
                         if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                         overlay_mark_dirty(&ov);
+                        playback_open_ts = SDL_GetTicks();
+                        last_audio_progress_ts = SDL_GetTicks();
+                        prev_samples_played    = 0;
                         fprintf(stderr, "[switch] swap complete, now on %s\n", pb->channel->display);
                     } else {
                         free(new_pb);
@@ -978,6 +1122,9 @@ int main(int argc, char **argv) {
             paused = 0; have_texture = 0;
             if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
             overlay_mark_dirty(&ov);
+            playback_open_ts = SDL_GetTicks();
+            last_audio_progress_ts = SDL_GetTicks();
+            prev_samples_played    = 0;
 
             set_window_title(&r, zap_prep->label);
             toast_until_ms = SDL_GetTicks() + 3000;
@@ -1039,18 +1186,33 @@ int main(int argc, char **argv) {
             /* else: hold for next iteration — its time hasn't come yet. */
         }
 
-        /* 3b) Stall detection + auto-restart. We only trigger restart when
-         * AUDIO has stopped progressing — measured via samples_played not
-         * advancing — because that indicates SDL's audio callback has died
-         * (a known Windows glitch that also freezes our clock, which freezes
-         * video as a side effect). Brief video-only hiccups during HLS
-         * segment boundaries don't fire the restart: as long as audio keeps
-         * playing, the user keeps hearing the stream and video will catch up.
+        /* 3b) Stall detection + auto-restart. Two trigger conditions:
          *
-         * Gates: must be unpaused, must have presented at least one frame
-         * already, and audio must have previously progressed (has_first_pts). */
-        if (have_texture && !paused && pb->audio.has_first_pts &&
-            SDL_GetTicks() - last_audio_progress_ts > STALL_MS) {
+         *  (a) audio WAS progressing but stopped (samples_played stuck for
+         *      STALL_MS) — SDL's audio callback died mid-playback, or the
+         *      decoder stopped pushing chunks because av_read_frame is
+         *      wedged on a dead TCP connection.
+         *
+         *  (b) audio NEVER started (has_first_pts==0) more than STARTUP_MS
+         *      after playback_open returned. This catches the "open succeeded
+         *      but first-packet probe never emitted a usable frame" path, which
+         *      presents as a permanent black window with no audio — genuinely
+         *      indistinguishable from a crash to the user.
+         *
+         * The have_texture gate was removed in 2026-04-18 after diagnosing a
+         * 150s test failure: MPEG-TS pts desync dropped every video frame, so
+         * have_texture stayed 0 forever, so the stall detector never ran, so
+         * the player froze silently. have_texture wasn't protecting anything —
+         * the AUDIO progress check is the real signal of liveness. */
+        int startup_elapsed = (int)(SDL_GetTicks() - playback_open_ts);
+        int audio_stalled = pb->audio.has_first_pts &&
+                            SDL_GetTicks() - last_audio_progress_ts > STALL_MS;
+        int never_started = !pb->audio.has_first_pts &&
+                            startup_elapsed > (int)STARTUP_MS;
+        if (!paused && (audio_stalled || never_started)) {
+            if (never_started)
+                fprintf(stderr, "[stall] audio never started after %dms — restarting\n",
+                        startup_elapsed);
             char *restart_url;
             int   restart_epg_id;
             if (pb->timeshift_start != 0 && portal.host) {
@@ -1088,6 +1250,7 @@ int main(int argc, char **argv) {
                 have_texture = 0;
                 if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                 overlay_mark_dirty(&ov);
+                playback_open_ts = SDL_GetTicks();
                 fprintf(stderr, "[stall] restart OK\n");
             } else {
                 free(new_pb);
@@ -1120,9 +1283,19 @@ int main(int argc, char **argv) {
                 overlay_render(&ov, r.renderer, &pb->epg, ref, ww, wh);
             }
         }
-        /* Help + toast + startup hint on top of everything so they stay legible.
-         * Priority: help > toast > startup hint. */
-        if (help_visible) {
+        /* Help + search + toast + startup hint on top of everything so they
+         * stay legible. Priority: search > help > toast > startup hint.
+         * Search takes top priority because the user is actively typing and
+         * needs to see their query + results without other overlays stealing
+         * attention. */
+        if (search_active) {
+            const char *names[32];
+            int nshow = search_hits_count < SEARCH_VISIBLE ? search_hits_count : SEARCH_VISIBLE;
+            for (int i = 0; i < nshow; ++i)
+                names[i] = live_list.entries[search_hits[i]].name;
+            overlay_render_search(&ov, r.renderer, search_query, names,
+                                  nshow, search_sel, ww, wh);
+        } else if (help_visible) {
             overlay_render_help(&ov, r.renderer, ww, wh);
         } else if (SDL_GetTicks() < toast_until_ms && toast_text[0]) {
             overlay_render_hint(&ov, r.renderer, toast_text, ww, wh);
@@ -1145,6 +1318,7 @@ int main(int argc, char **argv) {
     if (pending_vf) video_frame_free(pending_vf);
     playback_close(pb);
     free(pb);
+    free(search_hits);
     overlay_shutdown(&ov);
     render_shutdown(&r);
     xtream_live_list_free(&live_list);
