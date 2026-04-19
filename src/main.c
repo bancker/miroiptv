@@ -657,6 +657,12 @@ int main(int argc, char **argv) {
     search_hit_t  *search_hits       = NULL;
     int            search_hits_count = 0;
     int            search_sel        = 0;
+    /* SDL fires SDL_TEXTINPUT for the same 'f' keypress that opens the
+     * search prompt (we enable text input mid-dispatch, and the OS has
+     * already queued the 'f' character). Without this flag the search box
+     * opens with "f" already typed. Set on 'f'-down, honoured-and-cleared
+     * by the next TEXTINPUT event. */
+    int            search_swallow_next_text = 0;
     const int SEARCH_VISIBLE = 12;     /* rows shown in the result list */
 
     /* Episode-picker sub-mode: opened by Enter on a SERIES hit. We fetch
@@ -903,6 +909,12 @@ int main(int argc, char **argv) {
              * characters don't quit/fullscreen/toggle things by accident. */
             if (search_active) {
                 if (ev.type == SDL_TEXTINPUT) {
+                    if (search_swallow_next_text) {
+                        /* Drop the TEXTINPUT that SDL queued for the 'f'
+                         * key which opened this prompt. */
+                        search_swallow_next_text = 0;
+                        continue;
+                    }
                     size_t add = strlen(ev.text.text);
                     if (search_query_len + add < sizeof(search_query) - 1) {
                         memcpy(search_query + search_query_len, ev.text.text, add);
@@ -1023,6 +1035,7 @@ int main(int argc, char **argv) {
                 search_query_len = 0;
                 search_hits_count = 0;
                 search_sel = 0;
+                search_swallow_next_text = 1;
                 SDL_StartTextInput();
             }
             else if (k == SDLK_F11) render_toggle_fullscreen(&r);
@@ -1164,8 +1177,21 @@ int main(int argc, char **argv) {
                     pb->audio.cur_samples    = NULL;
                     pb->audio.cur_remaining  = 0;
                     pb->audio.samples_played = 0;
-                    pb->audio.has_first_pts  = 0;
-                    pb->audio.first_pts      = 0;
+                    /* Pre-seed the clock at target_s instead of leaving
+                     * has_first_pts=0 to let the callback seed itself. The
+                     * latter raced against a pre-seek audio chunk that can
+                     * sneak into the queue between main's drain and the
+                     * decoder's av_seek_frame (decoder was mid-packet-read
+                     * when we set seek_req). That stray chunk carries the
+                     * OLD timeline's pts, so the callback would latch first_pts
+                     * ≈ pre-seek time, then post-seek video (pts == target_s)
+                     * looks 30s in the future and never displays —
+                     * exactly the "stream crashes after arrow" symptom.
+                     * By seeding first_pts = target_s here, any later chunk
+                     * (pre- or post-seek) just plays without affecting the
+                     * clock mapping. */
+                    pb->audio.first_pts      = target_s;
+                    pb->audio.has_first_pts  = 1;
                     SDL_UnlockAudioDevice(pb->audio.device);
 
                     queue_drain(&pb->player.audio_q, (void(*)(void*))audio_chunk_free);
