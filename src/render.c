@@ -340,9 +340,10 @@ int overlay_render_search(overlay_t *o, SDL_Renderer *r, const char *query,
     const SDL_Color yellow = { 255, 220,  80, 255 };
     const SDL_Color dim    = { 180, 180, 180, 255 };
 
-    char q[256];
-    snprintf(q, sizeof(q), "Search:  %s_", query ? query : "");
-    SDL_Surface *qs = TTF_RenderUTF8_Blended(o->font_bold, q, yellow);
+    /* The caller supplies the header verbatim — so the main search overlay
+     * sends "Search:  <query>_" (with trailing cursor) and the episode-picker
+     * reuse sends "SeriesName — Enter to play, Esc to go back". */
+    SDL_Surface *qs = TTF_RenderUTF8_Blended(o->font_bold, query ? query : "", yellow);
     if (qs) {
         SDL_Texture *qt = SDL_CreateTextureFromSurface(r, qs);
         SDL_Rect dst = { box.x + pad, box.y + pad, qs->w, qs->h };

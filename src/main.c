@@ -1517,7 +1517,9 @@ int main(int argc, char **argv) {
                                  labels[i], sizeof(labels[i]));
                 names[i] = labels[i];
             }
-            overlay_render_search(&ov, r.renderer, search_query, names,
+            char hdr[256];
+            snprintf(hdr, sizeof(hdr), "Search:  %s_", search_query);
+            overlay_render_search(&ov, r.renderer, hdr, names,
                                   nshow, search_sel, ww, wh);
         } else if (help_visible) {
             overlay_render_help(&ov, r.renderer, ww, wh);
