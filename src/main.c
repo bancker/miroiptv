@@ -151,7 +151,10 @@ typedef struct {
     const char          *display_name;   /* shown in toasts: "NOS Journaal" / "RTL Nieuws" */
     const char          *title_prefix;   /* case-insensitive prefix match on EPG titles */
     size_t               prefix_len;     /* strlen(title_prefix) */
-    const int           *archive_ids;    /* array of portal archive-stream IDs */
+    const int           *archive_ids;    /* portal archive-stream IDs (EPG + timeshift) */
+    const int           *live_ids;       /* NULL = use NPO live resolution via
+                                          * build_channel_url; non-NULL = live IDs
+                                          * to use for airing-now / future paths */
     const char * const  *channel_names;  /* human-readable channel names (same length) */
     int                  n_channels;
 } news_programme_t;
@@ -625,7 +628,8 @@ int main(int argc, char **argv) {
                     .title_prefix  = "NOS Journaal",
                     .prefix_len    = 12,
                     .archive_ids   = XTREAM_NPO_ARCHIVE_STREAM_IDS,
-                    .channel_names = NULL,  /* fallback to NPO_CHANNELS below */
+                    .live_ids      = NULL,          /* NPO uses build_channel_url */
+                    .channel_names = NULL,
                     .n_channels    = 3,
                 };
                 static const news_programme_t PROG_RTL = {
@@ -633,6 +637,7 @@ int main(int argc, char **argv) {
                     .title_prefix  = "RTL Nieuws",
                     .prefix_len    = 10,
                     .archive_ids   = XTREAM_RTL_ARCHIVE_STREAM_IDS,
+                    .live_ids      = XTREAM_RTL_LIVE_STREAM_IDS,
                     .channel_names = XTREAM_RTL_CHANNEL_NAMES,
                     .n_channels    = 5,
                 };
@@ -740,13 +745,15 @@ int main(int argc, char **argv) {
                     char *target_url      = NULL;
                     int   target_stream_id = 0;
                     if (is_airing || !is_past) {
-                        if (prog == &PROG_NOS) {
-                            target_url = build_channel_url(ch_idx, &portal, direct_url);
+                        if (prog->live_ids) {
+                            /* Explicit LIVE stream IDs (e.g. RTL) — the archive
+                             * IDs return 502 on /live/. */
+                            target_stream_id = prog->live_ids[ch_idx];
+                            target_url       = xtream_stream_url(&portal, target_stream_id);
                         } else {
-                            /* RTL live: use xtream_stream_url on the archive id —
-                             * the same stream serves both live and timeshift. */
-                            target_url = xtream_stream_url(&portal, prog->archive_ids[ch_idx]);
-                            target_stream_id = prog->archive_ids[ch_idx];
+                            /* NPO: use the existing NPO URL resolver. */
+                            target_url = build_channel_url(ch_idx, &portal, direct_url);
+                            target_stream_id = 0;
                         }
                         snprintf(toast_text, sizeof(toast_text),
                                  "Tuning live to %s%s...", chname,

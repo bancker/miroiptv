@@ -31,8 +31,15 @@ extern const int XTREAM_NPO_STREAM_IDS[3];
  * provisions catch-up on a distinct channel number. 2-day window. */
 extern const int XTREAM_NPO_ARCHIVE_STREAM_IDS[3];
 
-/* RTL catch-up streams (RTL 4, 5, 7, 8, Z). Same 2-day window. Used by the
- * 'r' hotkey to find the latest RTL Nieuws broadcast across all of them. */
+/* RTL channel identifiers come in two flavours on this portal:
+ *  - LIVE stream IDs (category "NL | NEDERLAND") serve /live/USER/PASS/ID.ts
+ *    and are used when we want CURRENT playback. Archive IDs return 502 on
+ *    /live/ so they can't substitute.
+ *  - ARCHIVE stream IDs (category "NL | TERUGKIJKEN", tv_archive=1) support
+ *    the /timeshift/.../START/ID.m3u8 endpoint and 2-day catch-up.
+ * Used together by the 'r' hotkey: archive IDs for EPG scan + timeshift
+ * URL on past hits, live IDs for airing-now / future hits. */
+extern const int XTREAM_RTL_LIVE_STREAM_IDS[5];
 extern const int XTREAM_RTL_ARCHIVE_STREAM_IDS[5];
 extern const char * const XTREAM_RTL_CHANNEL_NAMES[5];
 

@@ -22,11 +22,20 @@ const int XTREAM_NPO_STREAM_IDS[3] = { 755880, 755881, 755882 };
  * streams mirrored with timeshift support. */
 const int XTREAM_NPO_ARCHIVE_STREAM_IDS[3] = { 1124362, 1124363, 1124364 };
 
-/* RTL catch-up: RTL4 HD, RTL5 HD, RTL7 HD, RTL8 HD, RTLZ HD. All have
- * tv_archive=1 and live in category_id 1550 like NPO. Discovered via
- * get_live_streams&category_id=1550 on m.hnlol.com. */
+/* RTL LIVE IDs (category "NL | NEDERLAND" cat 23, tv_archive=0). These
+ * serve /live/.../ID.ts and must be used for airing-now and future hits.
+ * The archive IDs return HTTP 502 on /live/.
+ *
+ * RTL ARCHIVE IDs (category "NL | TERUGKIJKEN" cat 1550, tv_archive=1).
+ * These serve /timeshift/.../ID.m3u8 and must be used for past hits.
+ * They ALSO serve EPG via get_simple_data_table (800+ entries spanning
+ * the full 2-day catch-up window) — the live IDs' get_short_epg only
+ * returns a handful of upcoming entries. */
+const int XTREAM_RTL_LIVE_STREAM_IDS[5] = {
+    755883, 755886, 755918, 755930, 1124375  /* RTL4 5 7 8 Z HD */
+};
 const int XTREAM_RTL_ARCHIVE_STREAM_IDS[5] = {
-    1124365, 1124366, 1124369, 1124372, 1124375
+    1124365, 1124366, 1124369, 1124372, 1124375  /* same 5 channels in TERUGKIJKEN */
 };
 const char * const XTREAM_RTL_CHANNEL_NAMES[5] = {
     "RTL 4", "RTL 5", "RTL 7", "RTL 8", "RTL Z"
