@@ -548,19 +548,16 @@ static void *zap_prep_worker(void *arg) {
     zp->preload_epg = ep;
     zp->state = 2;
 
-    /* Phase 1.5: liveness probe. A HEAD request on the stream URL tells us
-     * in 1-2s whether the channel is actually serving right now. Without
-     * this, a dead channel lets playback_open block for 15-30s while libav
-     * reconnects + retries, then finally returns an error — terrible UX.
-     * 3-second timeout is aggressive enough to keep fast zapping snappy
-     * while tolerating a slow-but-working CDN hop. */
-    if (npo_http_probe(zp->url, 3) != 0) {
-        zp->probe_failed = 1;
-        goto fail;
-    }
-
-    /* Phase 2: open playback. epg_stream_id=-1 skips the internal EPG
-     * fetch because we already have the EPG ready to splice in. */
+    /* No pre-flight probe. The probe added in bb17e5e was supposed to fail
+     * fast on dead channels, but in practice it added 1-2s of latency to
+     * EVERY zap (probe runs sequentially before playback_open) AND timed
+     * out on slow-but-working channels — flagging them as "unavailable"
+     * and triggering the auto-skip past good content. User feedback was
+     * unanimous: zapping became "very very slow ... skips normal channels".
+     * Reverted: just go straight to playback_open. Common case (working
+     * channel) is now ~2s instead of ~5s; rare case (dead channel) takes
+     * the libav reconnect-and-fail path which IS slow (15-30s) but
+     * doesn't penalise everyday zapping. */
     playback_t *pb = calloc(1, sizeof(*pb));
     if (!pb) goto fail;
     int rc = playback_open(pb, zp->render, zp->channel, zp->url, zp->portal, -1);
@@ -714,15 +711,6 @@ int main(int argc, char **argv) {
      * audio-only streams / broken video decoders). Reset on every pb swap. */
     int    audio_warmed              = 0;
     const Uint32 AUDIO_WARMUP_MAX_MS = 3000;
-
-    /* Zap state: direction of the last committed wheel delta (±1), used by
-     * the state==4 path to auto-advance past dead channels in the same
-     * direction instead of parking the user on "X unavailable". zap_skip
-     * bounds the auto-advance chain so a run of 50 dead channels doesn't
-     * zap forever; reset on a successful state==3 swap. */
-    int    zap_direction             = 0;
-    int    zap_skip_count            = 0;
-    const int ZAP_SKIP_LIMIT         = 20;
 
     /* Right-click drag state — since the window is borderless there's no title
      * bar to grab, so we implement window-move by: on right-button-down we
@@ -1683,12 +1671,6 @@ int main(int argc, char **argv) {
          * new one — no shared state to race on. */
         if (pending_wheel_delta != 0 && current_live_idx >= 0 &&
             SDL_GetTicks() - last_wheel_ts > WHEEL_DEBOUNCE_MS) {
-            /* Remember the commit direction so state==4 auto-skip can step
-             * PAST a dead channel in the same direction the user was zapping,
-             * instead of stopping on "X unavailable" and making them press
-             * up/down again. */
-            if (pending_wheel_delta > 0) zap_direction = +1;
-            else if (pending_wheel_delta < 0) zap_direction = -1;
             int new_idx = current_live_idx + pending_wheel_delta;
             if (new_idx < 0) new_idx = 0;
             if (new_idx >= (int)live_list.count) new_idx = (int)live_list.count - 1;
@@ -1791,7 +1773,6 @@ int main(int argc, char **argv) {
             pthread_join(zap_prep->thread, NULL);
             playback_close(pb); free(pb); pb = new_pb;
             current_live_idx = zap_prep->list_idx;
-            zap_skip_count = 0;   /* got a working channel — reset the chain */
             paused = 0; have_texture = 0;
             if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
             overlay_mark_dirty(&ov);
@@ -1805,46 +1786,9 @@ int main(int argc, char **argv) {
             free(zap_prep); zap_prep = NULL;
         } else if (zap_prep && zap_prep->state == 4) {
             pthread_join(zap_prep->thread, NULL);
-            fprintf(stderr, "[zap] fail label=%s probe_failed=%d skip_count=%d\n",
-                    zap_prep->label, zap_prep->probe_failed, zap_skip_count);
-            /* Auto-advance past dead channels in the same direction the user
-             * was zapping. Before this, one probe failure would park the
-             * user on "X unavailable" and make them press the arrow again
-             * — and if the NEXT channel was also dead, same thing, so
-             * zapping through a patch of dead channels felt broken.
-             *
-             * Only advance on probe_failed (definite 403/502/timeout) — a
-             * generic open-failure could mean the channel IS reachable but
-             * libav rejected it, which we don't want to chain past. Bound
-             * the chain with ZAP_SKIP_LIMIT so a completely-broken portal
-             * doesn't zap the user to the end of the catalog silently. */
-            if (zap_prep->probe_failed && zap_direction != 0 &&
-                zap_skip_count < ZAP_SKIP_LIMIT) {
-                zap_skip_count++;
-                /* CRITICAL: advance current_live_idx past the failed slot
-                 * before re-issuing delta. Otherwise next commit computes
-                 * new_idx = current(still 49) + delta(+1) = 50 = same dead
-                 * channel, and we infinite-loop. Advancing to list_idx
-                 * makes delta move PAST the failed entry. Visually
-                 * current_live_idx briefly points to a dead slot until
-                 * the next successful state==3 resets it, but the
-                 * displayed video stays on the last-known-good pb — no
-                 * visible glitch, just a number briefly off. */
-                current_live_idx = zap_prep->list_idx;
-                pending_wheel_delta = zap_direction;
-                last_wheel_ts = SDL_GetTicks() - WHEEL_DEBOUNCE_MS - 1;
-                snprintf(toast_text, sizeof(toast_text),
-                         "%s unavailable — trying next (%d)",
-                         zap_prep->label, zap_skip_count);
-            } else if (zap_prep->probe_failed) {
-                snprintf(toast_text, sizeof(toast_text),
-                         "%s is unavailable — stopped after %d tries",
-                         zap_prep->label, zap_skip_count);
-                zap_skip_count = 0;
-            } else {
-                snprintf(toast_text, sizeof(toast_text),
-                         "Tuning to %s failed", zap_prep->label);
-            }
+            fprintf(stderr, "[zap] failed: %s\n", zap_prep->label);
+            snprintf(toast_text, sizeof(toast_text),
+                     "Tuning to %s failed", zap_prep->label);
             toast_until_ms = SDL_GetTicks() + 3000;
             free(zap_prep); zap_prep = NULL;
         }
