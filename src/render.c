@@ -118,7 +118,13 @@ int audio_open(audio_out_t *ao, queue_t *q, int sample_rate) {
         fprintf(stderr, "SDL_OpenAudioDevice: %s\n", SDL_GetError());
         return -1;
     }
-    SDL_PauseAudioDevice(ao->device, 0);
+    /* Start PAUSED so audio doesn't play the first second-or-so of content
+     * before the video decoder has produced its first frame. Main unpauses
+     * when video_frames_pushed >= 1 (or after a 3s timeout). This makes
+     * post-zap A/V sync accurate: the audio callback's first_pts seeding
+     * happens while video is already ready, so the clock tracks the actual
+     * wall-clock instant where both streams start, not the audio head-start. */
+    SDL_PauseAudioDevice(ao->device, 1);
     return 0;
 }
 

@@ -612,11 +612,15 @@ int main(int argc, char **argv) {
     double autoseek_at   = getenv("TV_AUTOSEEK_AT_S")     ? atof(getenv("TV_AUTOSEEK_AT_S"))     : 0.0;
     double test_exit_at  = getenv("TV_TEST_EXIT_AFTER_S") ? atof(getenv("TV_TEST_EXIT_AFTER_S")) : 0.0;
     int    test_hb_ms    = getenv("TV_TEST_HEARTBEAT_MS") ? atoi(getenv("TV_TEST_HEARTBEAT_MS")) : 0;
+    int    autozap_count = getenv("TV_AUTOZAP_DOWN")      ? atoi(getenv("TV_AUTOZAP_DOWN"))      : 0;
+    double autozap_start = getenv("TV_AUTOZAP_AT_S")      ? atof(getenv("TV_AUTOZAP_AT_S"))      : 5.0;
+    double autozap_spacing_s = 1.5;  /* > WHEEL_DEBOUNCE_MS so each press is a distinct zap */
+    int    autozap_fired = 0;
     Uint32 test_launch_ms = SDL_GetTicks();
     int    autoseek_fired = 0;
-    if (autoseek_at > 0 || test_exit_at > 0)
-        fprintf(stderr, "[test] autoseek=%.1fs exit=%.1fs hb=%dms\n",
-                autoseek_at, test_exit_at, test_hb_ms);
+    if (autoseek_at > 0 || test_exit_at > 0 || autozap_count > 0)
+        fprintf(stderr, "[test] autoseek=%.1fs autozap=%dx(at %.1fs) exit=%.1fs hb=%dms\n",
+                autoseek_at, autozap_count, autozap_start, test_exit_at, test_hb_ms);
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
@@ -699,6 +703,22 @@ int main(int argc, char **argv) {
      * normal first-frame latency (2-4s observed) but well below the user's
      * "did it crash?" threshold. */
     const Uint32 STARTUP_MS   = 10000;
+
+    /* Audio warmup. SDL audio device starts paused (see audio_open). Main
+     * unpauses when the decoder has pushed at least one video frame OR
+     * AUDIO_WARMUP_MAX_MS have elapsed since playback_open (failsafe for
+     * audio-only streams / broken video decoders). Reset on every pb swap. */
+    int    audio_warmed              = 0;
+    const Uint32 AUDIO_WARMUP_MAX_MS = 3000;
+
+    /* Zap state: direction of the last committed wheel delta (±1), used by
+     * the state==4 path to auto-advance past dead channels in the same
+     * direction instead of parking the user on "X unavailable". zap_skip
+     * bounds the auto-advance chain so a run of 50 dead channels doesn't
+     * zap forever; reset on a successful state==3 swap. */
+    int    zap_direction             = 0;
+    int    zap_skip_count            = 0;
+    const int ZAP_SKIP_LIMIT         = 20;
 
     /* Right-click drag state — since the window is borderless there's no title
      * bar to grab, so we implement window-move by: on right-button-down we
@@ -920,7 +940,7 @@ int main(int argc, char **argv) {
                                 paused = 0; have_texture = 0;
                                 if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                                 overlay_mark_dirty(&ov);
-                                playback_open_ts = SDL_GetTicks();
+                                playback_open_ts = SDL_GetTicks(); audio_warmed = 0;
                                 last_audio_progress_ts = SDL_GetTicks();
                                 prev_samples_played    = 0;
                             } else {
@@ -973,7 +993,7 @@ int main(int argc, char **argv) {
                                 paused = 0; have_texture = 0;
                                 if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                                 overlay_mark_dirty(&ov);
-                                playback_open_ts = SDL_GetTicks();
+                                playback_open_ts = SDL_GetTicks(); audio_warmed = 0;
                                 last_audio_progress_ts = SDL_GetTicks();
                                 prev_samples_played    = 0;
                                 current_live_idx = -1;   /* not a live channel any more */
@@ -1069,7 +1089,7 @@ int main(int argc, char **argv) {
                                     paused = 0; have_texture = 0;
                                     if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                                     overlay_mark_dirty(&ov);
-                                    playback_open_ts = SDL_GetTicks();
+                                    playback_open_ts = SDL_GetTicks(); audio_warmed = 0;
                                     last_audio_progress_ts = SDL_GetTicks();
                                     prev_samples_played    = 0;
                                     current_live_idx = -1;
@@ -1277,7 +1297,7 @@ int main(int argc, char **argv) {
                         paused = 0; have_texture = 0;
                         if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                         overlay_mark_dirty(&ov);
-                        playback_open_ts = SDL_GetTicks();
+                        playback_open_ts = SDL_GetTicks(); audio_warmed = 0;
                         last_audio_progress_ts = SDL_GetTicks();
                         prev_samples_played    = 0;
                         struct tm lt = *localtime(&new_start);
@@ -1540,7 +1560,7 @@ int main(int argc, char **argv) {
                             paused = 0; have_texture = 0;
                             if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                             overlay_mark_dirty(&ov);
-                            playback_open_ts = SDL_GetTicks();
+                            playback_open_ts = SDL_GetTicks(); audio_warmed = 0;
                             last_audio_progress_ts = SDL_GetTicks();
                             prev_samples_played    = 0;
 
@@ -1600,7 +1620,7 @@ int main(int argc, char **argv) {
                         have_texture = 0;
                         if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                         overlay_mark_dirty(&ov);
-                        playback_open_ts = SDL_GetTicks();
+                        playback_open_ts = SDL_GetTicks(); audio_warmed = 0;
                         last_audio_progress_ts = SDL_GetTicks();
                         prev_samples_played    = 0;
                         fprintf(stderr, "[switch] swap complete, now on %s\n", pb->channel->display);
@@ -1631,6 +1651,12 @@ int main(int argc, char **argv) {
          * new one — no shared state to race on. */
         if (pending_wheel_delta != 0 && current_live_idx >= 0 &&
             SDL_GetTicks() - last_wheel_ts > WHEEL_DEBOUNCE_MS) {
+            /* Remember the commit direction so state==4 auto-skip can step
+             * PAST a dead channel in the same direction the user was zapping,
+             * instead of stopping on "X unavailable" and making them press
+             * up/down again. */
+            if (pending_wheel_delta > 0) zap_direction = +1;
+            else if (pending_wheel_delta < 0) zap_direction = -1;
             int new_idx = current_live_idx + pending_wheel_delta;
             if (new_idx < 0) new_idx = 0;
             if (new_idx >= (int)live_list.count) new_idx = (int)live_list.count - 1;
@@ -1733,10 +1759,11 @@ int main(int argc, char **argv) {
             pthread_join(zap_prep->thread, NULL);
             playback_close(pb); free(pb); pb = new_pb;
             current_live_idx = zap_prep->list_idx;
+            zap_skip_count = 0;   /* got a working channel — reset the chain */
             paused = 0; have_texture = 0;
             if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
             overlay_mark_dirty(&ov);
-            playback_open_ts = SDL_GetTicks();
+            playback_open_ts = SDL_GetTicks(); audio_warmed = 0;
             last_audio_progress_ts = SDL_GetTicks();
             prev_samples_played    = 0;
 
@@ -1746,11 +1773,42 @@ int main(int argc, char **argv) {
             free(zap_prep); zap_prep = NULL;
         } else if (zap_prep && zap_prep->state == 4) {
             pthread_join(zap_prep->thread, NULL);
-            /* Differentiate probe-failure (channel is dead / portal 403/502)
-             * from generic open-failure so the toast is actionable. */
-            if (zap_prep->probe_failed) {
+            fprintf(stderr, "[zap] fail label=%s probe_failed=%d skip_count=%d\n",
+                    zap_prep->label, zap_prep->probe_failed, zap_skip_count);
+            /* Auto-advance past dead channels in the same direction the user
+             * was zapping. Before this, one probe failure would park the
+             * user on "X unavailable" and make them press the arrow again
+             * — and if the NEXT channel was also dead, same thing, so
+             * zapping through a patch of dead channels felt broken.
+             *
+             * Only advance on probe_failed (definite 403/502/timeout) — a
+             * generic open-failure could mean the channel IS reachable but
+             * libav rejected it, which we don't want to chain past. Bound
+             * the chain with ZAP_SKIP_LIMIT so a completely-broken portal
+             * doesn't zap the user to the end of the catalog silently. */
+            if (zap_prep->probe_failed && zap_direction != 0 &&
+                zap_skip_count < ZAP_SKIP_LIMIT) {
+                zap_skip_count++;
+                /* CRITICAL: advance current_live_idx past the failed slot
+                 * before re-issuing delta. Otherwise next commit computes
+                 * new_idx = current(still 49) + delta(+1) = 50 = same dead
+                 * channel, and we infinite-loop. Advancing to list_idx
+                 * makes delta move PAST the failed entry. Visually
+                 * current_live_idx briefly points to a dead slot until
+                 * the next successful state==3 resets it, but the
+                 * displayed video stays on the last-known-good pb — no
+                 * visible glitch, just a number briefly off. */
+                current_live_idx = zap_prep->list_idx;
+                pending_wheel_delta = zap_direction;
+                last_wheel_ts = SDL_GetTicks() - WHEEL_DEBOUNCE_MS - 1;
                 snprintf(toast_text, sizeof(toast_text),
-                         "%s is unavailable — skipped", zap_prep->label);
+                         "%s unavailable — trying next (%d)",
+                         zap_prep->label, zap_skip_count);
+            } else if (zap_prep->probe_failed) {
+                snprintf(toast_text, sizeof(toast_text),
+                         "%s is unavailable — stopped after %d tries",
+                         zap_prep->label, zap_skip_count);
+                zap_skip_count = 0;
             } else {
                 snprintf(toast_text, sizeof(toast_text),
                          "Tuning to %s failed", zap_prep->label);
@@ -1796,6 +1854,27 @@ int main(int argc, char **argv) {
             pb->player.seek_verify_target_s = 0.0;
         }
 
+        /* Audio warmup: unpause the SDL audio device as soon as the decoder
+         * has pushed at least one video frame, OR after AUDIO_WARMUP_MAX_MS
+         * (audio-only streams / broken video decoders). Without this, every
+         * zap swap had audio starting ~300-800ms before video; the clock
+         * would seed from audio's head-start and later a video-resync would
+         * rebase it — producing persistent A/V desync even after the
+         * resync "corrected" the clock. By starting audio paused and only
+         * unpausing when video is ready, first_pts seeds at the moment both
+         * streams genuinely begin. */
+        if (!audio_warmed && !paused) {
+            if (pb->player.video_frames_pushed > 0 ||
+                tnow_ms - playback_open_ts > AUDIO_WARMUP_MAX_MS) {
+                SDL_PauseAudioDevice(pb->audio.device, 0);
+                audio_warmed = 1;
+                fprintf(stderr, "[warmup] audio unpaused at t=%ums "
+                                "(vframes=%lld)\n",
+                        (unsigned)(tnow_ms - playback_open_ts),
+                        pb->player.video_frames_pushed);
+            }
+        }
+
         /* Heartbeat — liveness ping. Override interval when the test harness
          * env var is set so we get fine-grained logs around the auto-seek. */
         Uint32 hb_interval = (test_hb_ms > 0) ? (Uint32)test_hb_ms : HEARTBEAT_MS;
@@ -1827,6 +1906,19 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[test] exit deadline at t=%.2fs\n",
                     (tnow_ms - test_launch_ms) / 1000.0);
             running = 0;
+        }
+        if (autozap_count > 0 && autozap_fired < autozap_count) {
+            double t_now = (tnow_ms - test_launch_ms) / 1000.0;
+            double t_expected = autozap_start + autozap_fired * autozap_spacing_s;
+            if (t_now >= t_expected) {
+                SDL_Event e = {0};
+                e.type = SDL_KEYDOWN;
+                e.key.keysym.sym = SDLK_DOWN;
+                SDL_PushEvent(&e);
+                autozap_fired++;
+                fprintf(stderr, "[test] injected SDLK_DOWN #%d at t=%.2fs (current_live_idx=%d)\n",
+                        autozap_fired, t_now, current_live_idx);
+            }
         }
 
         /* 2) Try to grab a new frame if we don't have one pending. */
@@ -1978,7 +2070,7 @@ int main(int argc, char **argv) {
                 have_texture = 0;
                 if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
                 overlay_mark_dirty(&ov);
-                playback_open_ts = SDL_GetTicks();
+                playback_open_ts = SDL_GetTicks(); audio_warmed = 0;
                 fprintf(stderr, "[stall] restart OK\n");
             } else {
                 free(new_pb);

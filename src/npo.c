@@ -89,46 +89,45 @@ int npo_http_get(const char *url, const char *const *extra_headers,
     return 0;
 }
 
+/* Discard callback for the probe. We only want the response code, not the
+ * actual bytes — curl needs a write-function when NOBODY is off though. */
+static size_t probe_discard(char *p, size_t sz, size_t n, void *ud) {
+    (void)p; (void)ud; return sz * n;
+}
+
 int npo_http_probe(const char *url, int timeout_s) {
     CURL *c = curl_easy_init();
     if (!c) return -1;
 
+    /* Plain GET with a tiny Range, NOT HEAD. Early versions used HEAD +
+     * fallback-to-GET-on-405/501, but the m.hnlol.com portal returns 502
+     * on HEAD for /live/ URLs (nginx rejects HEAD on its stream proxy),
+     * and 502 isn't in the fallback set. Result: probe rejected every
+     * working channel. A plain GET with CURLOPT_FOLLOWLOCATION chases the
+     * portal's 302-to-origin redirect and the origin answers 200 OK —
+     * that's our success signal. We discard the response body via a
+     * throwaway write callback; the kernel is still faster than opening
+     * a full libav probe + connection. */
     curl_easy_setopt(c, CURLOPT_URL, url);
-    curl_easy_setopt(c, CURLOPT_NOBODY, 1L);           /* HEAD */
-    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);   /* portal 302s /live/ → origin */
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, (long)timeout_s);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, (long)(timeout_s > 1 ? timeout_s - 1 : 1));
     curl_easy_setopt(c, CURLOPT_USERAGENT, "tv/0.1 (+probe)");
-    /* Some portals 405 on HEAD; fall through to a tiny GET that we abort
-     * after receiving the first byte so we don't download a whole stream
-     * just to check reachability. */
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(c, CURLOPT_RANGE, "0-0");           /* at most 1 byte */
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, probe_discard);
 
     CURLcode rc = curl_easy_perform(c);
     long code = 0;
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-
-    int ok = (rc == CURLE_OK && code >= 200 && code < 400);
-
-    /* HEAD 405 / 501 on live endpoints is common — retry as a 1-byte GET. */
-    if (!ok && rc == CURLE_OK && (code == 405 || code == 501)) {
-        curl_easy_setopt(c, CURLOPT_NOBODY, 0L);
-        curl_easy_setopt(c, CURLOPT_RANGE, "0-0");
-        curl_easy_setopt(c, CURLOPT_WRITEFUNCTION,
-                         (size_t (*)(char *, size_t, size_t, void *))fwrite);
-        /* /dev/null target to discard the byte we get back. */
-        FILE *devnull = fopen("NUL", "wb");            /* Windows */
-        if (!devnull) devnull = fopen("/dev/null", "wb");
-        if (devnull) {
-            curl_easy_setopt(c, CURLOPT_WRITEDATA, devnull);
-            rc = curl_easy_perform(c);
-            fclose(devnull);
-        }
-        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-        ok = (rc == CURLE_OK && code >= 200 && code < 400);
-    }
-
     curl_easy_cleanup(c);
+
+    /* Accept 2xx and 3xx (some servers don't honour Range, returning 200
+     * — that's fine, stream is reachable). Also accept 206 Partial
+     * Content. 4xx/5xx means the channel is actually dead. */
+    int ok = (rc == CURLE_OK && code >= 200 && code < 400);
+    if (!ok)
+        fprintf(stderr, "[probe] %s → rc=%d code=%ld\n", url, rc, code);
     return ok ? 0 : -1;
 }
 
