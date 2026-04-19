@@ -297,3 +297,229 @@ char *xtream_stream_url(const xtream_t *x, int stream_id) {
              x->host, x->port, x->user, x->pass, stream_id);
     return out;
 }
+
+/* VOD fetch / VOD URL. Shape of the response:
+ *   [{"stream_id":..., "name":"...", "num":..., "container_extension":"mkv"}, ...] */
+int xtream_fetch_vod_list(const xtream_t *x, const char *category_id,
+                          xtream_vod_list_t *out) {
+    memset(out, 0, sizeof(*out));
+    char url[512];
+    if (category_id) {
+        snprintf(url, sizeof(url),
+            "http://%s:%d/player_api.php?username=%s&password=%s&action=get_vod_streams&category_id=%s",
+            x->host, x->port, x->user, x->pass, category_id);
+    } else {
+        snprintf(url, sizeof(url),
+            "http://%s:%d/player_api.php?username=%s&password=%s&action=get_vod_streams",
+            x->host, x->port, x->user, x->pass);
+    }
+
+    char *body = NULL; size_t len = 0;
+    if (npo_http_get(url, NULL, &body, &len) != 0) return -1;
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!cJSON_IsArray(root)) { if (root) cJSON_Delete(root); return -1; }
+
+    size_t n = cJSON_GetArraySize(root);
+    out->entries = calloc(n, sizeof(xtream_vod_entry_t));
+    if (!out->entries) { cJSON_Delete(root); return -1; }
+
+    size_t w = 0;
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, root) {
+        cJSON *id_j   = cJSON_GetObjectItemCaseSensitive(item, "stream_id");
+        cJSON *name_j = cJSON_GetObjectItemCaseSensitive(item, "name");
+        cJSON *num_j  = cJSON_GetObjectItemCaseSensitive(item, "num");
+        cJSON *ext_j  = cJSON_GetObjectItemCaseSensitive(item, "container_extension");
+        if (!cJSON_IsNumber(id_j)) continue;
+        if (!cJSON_IsString(name_j) || !name_j->valuestring) continue;
+
+        out->entries[w].stream_id = id_j->valueint;
+        out->entries[w].num       = cJSON_IsNumber(num_j) ? num_j->valueint : (int)(w + 1);
+        out->entries[w].name      = strdup(name_j->valuestring);
+        out->entries[w].extension = (cJSON_IsString(ext_j) && ext_j->valuestring)
+                                    ? strdup(ext_j->valuestring) : NULL;
+        if (!out->entries[w].name) continue;
+        w++;
+    }
+    out->count = w;
+    cJSON_Delete(root);
+    return 0;
+}
+
+void xtream_vod_list_free(xtream_vod_list_t *list) {
+    if (!list) return;
+    for (size_t i = 0; i < list->count; ++i) {
+        free(list->entries[i].name);
+        free(list->entries[i].extension);
+    }
+    free(list->entries);
+    memset(list, 0, sizeof(*list));
+}
+
+char *xtream_vod_url(const xtream_t *x, int stream_id, const char *extension) {
+    /* Portal serves VOD at /movie/USER/PASS/ID.ext — unlike live, the
+     * extension must be part of the URL. Fall back to "mp4" when the
+     * catalog entry didn't advertise one (observed on a handful of older
+     * catalog rows; portal tolerates .mp4 as default). */
+    const char *ext = (extension && *extension) ? extension : "mp4";
+    size_t cap = strlen(x->host) + strlen(x->user) + strlen(x->pass) + strlen(ext) + 64;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    snprintf(out, cap, "http://%s:%d/movie/%s/%s/%d.%s",
+             x->host, x->port, x->user, x->pass, stream_id, ext);
+    return out;
+}
+
+/* Series list — same wire format as live/VOD but with "series_id" instead
+ * of "stream_id", and no container_extension (episodes carry that). */
+int xtream_fetch_series_list(const xtream_t *x, const char *category_id,
+                             xtream_series_list_t *out) {
+    memset(out, 0, sizeof(*out));
+    char url[512];
+    if (category_id) {
+        snprintf(url, sizeof(url),
+            "http://%s:%d/player_api.php?username=%s&password=%s&action=get_series&category_id=%s",
+            x->host, x->port, x->user, x->pass, category_id);
+    } else {
+        snprintf(url, sizeof(url),
+            "http://%s:%d/player_api.php?username=%s&password=%s&action=get_series",
+            x->host, x->port, x->user, x->pass);
+    }
+
+    char *body = NULL; size_t len = 0;
+    if (npo_http_get(url, NULL, &body, &len) != 0) return -1;
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!cJSON_IsArray(root)) { if (root) cJSON_Delete(root); return -1; }
+
+    size_t n = cJSON_GetArraySize(root);
+    out->entries = calloc(n, sizeof(xtream_series_entry_t));
+    if (!out->entries) { cJSON_Delete(root); return -1; }
+
+    size_t w = 0;
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, root) {
+        cJSON *id_j   = cJSON_GetObjectItemCaseSensitive(item, "series_id");
+        cJSON *name_j = cJSON_GetObjectItemCaseSensitive(item, "name");
+        cJSON *num_j  = cJSON_GetObjectItemCaseSensitive(item, "num");
+        if (!cJSON_IsNumber(id_j)) continue;
+        if (!cJSON_IsString(name_j) || !name_j->valuestring) continue;
+
+        out->entries[w].series_id = id_j->valueint;
+        out->entries[w].num       = cJSON_IsNumber(num_j) ? num_j->valueint : (int)(w + 1);
+        out->entries[w].name      = strdup(name_j->valuestring);
+        if (!out->entries[w].name) continue;
+        w++;
+    }
+    out->count = w;
+    cJSON_Delete(root);
+    return 0;
+}
+
+void xtream_series_list_free(xtream_series_list_t *list) {
+    if (!list) return;
+    for (size_t i = 0; i < list->count; ++i) free(list->entries[i].name);
+    free(list->entries);
+    memset(list, 0, sizeof(*list));
+}
+
+/* get_series_info response is an object like:
+ *   {
+ *     "seasons": [...],
+ *     "info":    {...},
+ *     "episodes": {
+ *       "1": [ {"id":"nnn", "episode_num":"1", "title":"...",
+ *               "container_extension":"mkv", ...}, ... ],
+ *       "2": [ ... ]
+ *     }
+ *   }
+ * Some portals return episode_num and id as strings, others as numbers —
+ * cJSON_GetStringValue / valueint handle that, but we double-check. */
+int xtream_fetch_series_info(const xtream_t *x, int series_id,
+                             xtream_episodes_t *out) {
+    memset(out, 0, sizeof(*out));
+    char url[512];
+    snprintf(url, sizeof(url),
+        "http://%s:%d/player_api.php?username=%s&password=%s&action=get_series_info&series_id=%d",
+        x->host, x->port, x->user, x->pass, series_id);
+
+    char *body = NULL; size_t len = 0;
+    if (npo_http_get(url, NULL, &body, &len) != 0) return -1;
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!cJSON_IsObject(root)) { if (root) cJSON_Delete(root); return -1; }
+
+    cJSON *episodes_obj = cJSON_GetObjectItemCaseSensitive(root, "episodes");
+    if (!cJSON_IsObject(episodes_obj)) { cJSON_Delete(root); return -1; }
+
+    /* First pass: count episodes so we can allocate once. */
+    size_t total = 0;
+    cJSON *season_arr = NULL;
+    cJSON_ArrayForEach(season_arr, episodes_obj)
+        if (cJSON_IsArray(season_arr)) total += cJSON_GetArraySize(season_arr);
+    if (total == 0) { cJSON_Delete(root); return -1; }
+
+    out->entries = calloc(total, sizeof(xtream_episode_entry_t));
+    if (!out->entries) { cJSON_Delete(root); return -1; }
+
+    size_t w = 0;
+    cJSON_ArrayForEach(season_arr, episodes_obj) {
+        if (!cJSON_IsArray(season_arr)) continue;
+        /* Key is the season number as string ("1", "2", ...). */
+        int season_n = atoi(season_arr->string ? season_arr->string : "0");
+
+        cJSON *ep = NULL;
+        cJSON_ArrayForEach(ep, season_arr) {
+            cJSON *id_j    = cJSON_GetObjectItemCaseSensitive(ep, "id");
+            cJSON *epn_j   = cJSON_GetObjectItemCaseSensitive(ep, "episode_num");
+            cJSON *title_j = cJSON_GetObjectItemCaseSensitive(ep, "title");
+            cJSON *ext_j   = cJSON_GetObjectItemCaseSensitive(ep, "container_extension");
+
+            int ep_id = 0;
+            if (cJSON_IsNumber(id_j)) ep_id = id_j->valueint;
+            else if (cJSON_IsString(id_j) && id_j->valuestring) ep_id = atoi(id_j->valuestring);
+            if (ep_id == 0) continue;
+
+            int ep_num = 0;
+            if (cJSON_IsNumber(epn_j)) ep_num = epn_j->valueint;
+            else if (cJSON_IsString(epn_j) && epn_j->valuestring) ep_num = atoi(epn_j->valuestring);
+
+            out->entries[w].id            = ep_id;
+            out->entries[w].season_num    = season_n;
+            out->entries[w].episode_num   = ep_num;
+            out->entries[w].title         = (cJSON_IsString(title_j) && title_j->valuestring)
+                                          ? strdup(title_j->valuestring) : strdup("(untitled)");
+            out->entries[w].extension     = (cJSON_IsString(ext_j) && ext_j->valuestring)
+                                          ? strdup(ext_j->valuestring) : NULL;
+            w++;
+        }
+    }
+    out->count = w;
+    cJSON_Delete(root);
+    return 0;
+}
+
+void xtream_episodes_free(xtream_episodes_t *list) {
+    if (!list) return;
+    for (size_t i = 0; i < list->count; ++i) {
+        free(list->entries[i].title);
+        free(list->entries[i].extension);
+    }
+    free(list->entries);
+    memset(list, 0, sizeof(*list));
+}
+
+char *xtream_series_episode_url(const xtream_t *x, int episode_id,
+                                const char *extension) {
+    const char *ext = (extension && *extension) ? extension : "mp4";
+    size_t cap = strlen(x->host) + strlen(x->user) + strlen(x->pass) + strlen(ext) + 64;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    snprintf(out, cap, "http://%s:%d/series/%s/%s/%d.%s",
+             x->host, x->port, x->user, x->pass, episode_id, ext);
+    return out;
+}

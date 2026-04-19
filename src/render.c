@@ -261,7 +261,7 @@ int overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh) {
         "  up / down     Zap to previous / next channel (same as wheel)",
         "  left / right  Skip -30s / +30s (during timeshift replay only)",
         "  e             Toggle EPG overlay (bottom strip)",
-        "  f             Search channels (type, up/down, Enter, Esc)",
+        "  f             Search channels + movies + series (type, up/down, Enter)",
         "  F11           Toggle fullscreen",
         "  t             Toggle always-on-top",
         "  space         Pause / resume audio",

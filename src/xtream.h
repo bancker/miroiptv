@@ -84,4 +84,68 @@ int  xtream_fetch_live_list(const xtream_t *x, const char *category_id,
                             xtream_live_list_t *out);
 void xtream_live_list_free(xtream_live_list_t *list);
 
+/* One entry in the portal's VOD catalog (individual movies / specials /
+ * standalone releases). Each has its own stream_id and a container
+ * extension (mp4/mkv/avi) that must be included in the playback URL. */
+typedef struct {
+    int   stream_id;
+    int   num;
+    char *name;           /* malloc'd, free via xtream_vod_list_free */
+    char *extension;      /* "mp4" / "mkv" / etc — NULL means portal
+                           * omitted it and caller should assume "mp4". */
+} xtream_vod_entry_t;
+
+typedef struct {
+    xtream_vod_entry_t *entries;
+    size_t              count;
+} xtream_vod_list_t;
+
+int  xtream_fetch_vod_list(const xtream_t *x, const char *category_id,
+                           xtream_vod_list_t *out);
+void xtream_vod_list_free(xtream_vod_list_t *list);
+
+/* One series (the "season + episodes" aggregate has its own dedicated
+ * endpoint — this list just enumerates series by name). */
+typedef struct {
+    int   series_id;
+    int   num;
+    char *name;           /* malloc'd */
+} xtream_series_entry_t;
+
+typedef struct {
+    xtream_series_entry_t *entries;
+    size_t                 count;
+} xtream_series_list_t;
+
+int  xtream_fetch_series_list(const xtream_t *x, const char *category_id,
+                              xtream_series_list_t *out);
+void xtream_series_list_free(xtream_series_list_t *list);
+
+/* One episode of a series — flattened across all seasons. season_num and
+ * episode_num let the UI build the "S1E03 - Title" label. */
+typedef struct {
+    int   id;             /* episode stream-id for /series/... URL */
+    int   season_num;
+    int   episode_num;
+    char *title;          /* malloc'd */
+    char *extension;      /* malloc'd, see xtream_vod_entry_t */
+} xtream_episode_entry_t;
+
+typedef struct {
+    xtream_episode_entry_t *entries;
+    size_t                  count;
+} xtream_episodes_t;
+
+/* Fetches all episodes for a series, flattened across seasons. Response
+ * from player_api.php?action=get_series_info has one object key per
+ * season ("1", "2", ...) each holding an array of episode objects. */
+int  xtream_fetch_series_info(const xtream_t *x, int series_id,
+                              xtream_episodes_t *out);
+void xtream_episodes_free(xtream_episodes_t *list);
+
+/* URL builders for VOD movies and series episodes. extension may be NULL —
+ * we fall back to "mp4" which the portal accepts for most catalogs. */
+char *xtream_vod_url(const xtream_t *x, int stream_id, const char *extension);
+char *xtream_series_episode_url(const xtream_t *x, int episode_id, const char *extension);
+
 #endif

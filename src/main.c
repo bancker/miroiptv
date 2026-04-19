@@ -213,24 +213,79 @@ static int icase_contains(const char *hay, const char *needle) {
     return 0;
 }
 
-/* Refresh *hits_out / *n_out with the first `cap` indices of live_list whose
- * name matches `query` (case-insensitive substring). Empty query = zero hits
- * so we don't dump all 15000 channels as a pile of text. Caller owns
- * *hits_out and must realloc as needed — we grow it in-place. */
-static void search_refresh(const xtream_live_list_t *list, const char *query,
-                           int cap, int **hits_out, int *n_out) {
+/* Search-hit type: search results merge three distinct catalog kinds so
+ * the UI can dispatch differently on Enter. Live hits zap via the async
+ * zap pipeline; VOD hits open the /movie/ URL directly; series hits open
+ * an episode-picker sub-prompt instead of starting playback. */
+typedef enum {
+    SEARCH_HIT_LIVE   = 0,
+    SEARCH_HIT_VOD    = 1,
+    SEARCH_HIT_SERIES = 2,
+} search_hit_kind_t;
+
+typedef struct {
+    search_hit_kind_t kind;
+    int               idx;   /* index into the corresponding catalog list */
+} search_hit_t;
+
+/* Refresh hits by matching `query` (case-insensitive substring) across live
+ * channels, VOD, and series lists. Search is capped at `cap` total results
+ * to keep the overlay readable and to avoid wasting work on e.g. single-
+ * letter queries. Match order matches dispatch priority: live first
+ * (most common user intent), then series, then VOD — so a query like "the"
+ * surfaces channels at the top rather than drowning them in VOD. */
+static void search_refresh(const xtream_live_list_t    *live,
+                           const xtream_vod_list_t     *vods,
+                           const xtream_series_list_t  *series,
+                           const char *query, int cap,
+                           search_hit_t **hits_out, int *n_out) {
     if (!*query) { *n_out = 0; return; }
     if (!*hits_out) {
-        *hits_out = malloc(sizeof(int) * (size_t)cap);
+        *hits_out = malloc(sizeof(search_hit_t) * (size_t)cap);
         if (!*hits_out) { *n_out = 0; return; }
     }
     int found = 0;
-    for (size_t i = 0; i < list->count && found < cap; ++i) {
-        if (icase_contains(list->entries[i].name, query)) {
-            (*hits_out)[found++] = (int)i;
+    for (size_t i = 0; live && i < live->count && found < cap; ++i) {
+        if (icase_contains(live->entries[i].name, query)) {
+            (*hits_out)[found].kind = SEARCH_HIT_LIVE;
+            (*hits_out)[found].idx  = (int)i;
+            found++;
+        }
+    }
+    for (size_t i = 0; series && i < series->count && found < cap; ++i) {
+        if (icase_contains(series->entries[i].name, query)) {
+            (*hits_out)[found].kind = SEARCH_HIT_SERIES;
+            (*hits_out)[found].idx  = (int)i;
+            found++;
+        }
+    }
+    for (size_t i = 0; vods && i < vods->count && found < cap; ++i) {
+        if (icase_contains(vods->entries[i].name, query)) {
+            (*hits_out)[found].kind = SEARCH_HIT_VOD;
+            (*hits_out)[found].idx  = (int)i;
+            found++;
         }
     }
     *n_out = found;
+}
+
+/* Render-time helper: derives the display label for a search hit.
+ * We prefix the catalog-kind so the user can tell at a glance whether
+ * Enter will zap, play a VOD, or open an episode picker. */
+static const char *search_hit_label(const search_hit_t *h,
+                                    const xtream_live_list_t *live,
+                                    const xtream_vod_list_t  *vods,
+                                    const xtream_series_list_t *series,
+                                    char *buf, size_t buflen) {
+    const char *name = "";
+    const char *tag  = "";
+    switch (h->kind) {
+    case SEARCH_HIT_LIVE:   tag = "[LIVE]  "; name = live->entries[h->idx].name;   break;
+    case SEARCH_HIT_VOD:    tag = "[MOVIE] "; name = vods->entries[h->idx].name;   break;
+    case SEARCH_HIT_SERIES: tag = "[SERIES] "; name = series->entries[h->idx].name; break;
+    }
+    snprintf(buf, buflen, "%s%s", tag, name);
+    return buf;
 }
 
 typedef struct {
@@ -535,23 +590,36 @@ int main(int argc, char **argv) {
     Uint32  toast_until_ms  = 0;
 
     /* Search prompt ('f' key). search_active toggles text-input mode; every
-     * keystroke refreshes search_hits by substring-matching against live_list.
-     * search_sel is the highlighted result row; Enter picks it via the same
-     * async zap_prep pipeline the wheel uses. */
-    int   search_active    = 0;
-    char  search_query[128] = {0};
-    int   search_query_len  = 0;
-    int  *search_hits       = NULL;    /* indices into live_list.entries */
-    int   search_hits_count = 0;
-    int   search_sel        = 0;
+     * keystroke refreshes search_hits by substring-matching across live
+     * channels + VOD + series. Enter dispatches per hit kind:
+     *   LIVE   -> zap via pending_wheel_delta
+     *   VOD    -> fetch /movie URL + playback_open directly
+     *   SERIES -> drop into EPISODE_PICKER with the series's episode list */
+    int            search_active    = 0;
+    char           search_query[128] = {0};
+    int            search_query_len  = 0;
+    search_hit_t  *search_hits       = NULL;
+    int            search_hits_count = 0;
+    int            search_sel        = 0;
     const int SEARCH_VISIBLE = 12;     /* rows shown in the result list */
+
+    /* Episode-picker sub-mode: opened by Enter on a SERIES hit. We fetch
+     * get_series_info synchronously (only ~200-500 ms for a typical series),
+     * show the flat episode list, and handle it with the same nav keys as
+     * the main search. Esc returns to the search results the user was on. */
+    int                  episode_picker_active = 0;
+    xtream_episodes_t    episodes              = {0};
+    int                  episode_sel           = 0;
+    char                 episode_series_name[256] = {0};
 
     /* Mouse-wheel zapping through ALL portal live channels. We fetch the full
      * catalog once, find our current stream_id in it, and the wheel moves the
      * index ±1 per notch. Actual switch is debounced — rapid scrolling only
      * triggers one playback_open after the wheel stops for WHEEL_DEBOUNCE_MS,
      * which matters because the portal caps concurrent connections at 1. */
-    xtream_live_list_t live_list = {0};
+    xtream_live_list_t    live_list   = {0};
+    xtream_vod_list_t     vod_list    = {0};
+    xtream_series_list_t  series_list = {0};
     int    current_live_idx = -1;
     int    pending_wheel_delta = 0;
     Uint32 last_wheel_ts = 0;
@@ -586,6 +654,18 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "[zap] failed to fetch live channel list — wheel disabled\n");
         }
+        /* VOD + series are used only by the 'f' search prompt. A fetch
+         * failure (portal 403 on un-subscribed catalogs, brief 5xx) is
+         * non-fatal — the lists stay empty and search just returns fewer
+         * results. Don't gate live-TV startup on these. */
+        if (xtream_fetch_vod_list(&portal, NULL, &vod_list) == 0)
+            fprintf(stderr, "[search] loaded %zu VOD entries from portal\n", vod_list.count);
+        else
+            fprintf(stderr, "[search] VOD catalog unavailable — search will skip VOD\n");
+        if (xtream_fetch_series_list(&portal, NULL, &series_list) == 0)
+            fprintf(stderr, "[search] loaded %zu series from portal\n", series_list.count);
+        else
+            fprintf(stderr, "[search] series catalog unavailable — search will skip series\n");
     }
 
     /* Sync tolerances (seconds):
@@ -632,6 +712,61 @@ int main(int argc, char **argv) {
                 continue;
             }
 
+            /* Episode picker: active after pressing Enter on a SERIES hit.
+             * Takes precedence over search so we don't get confusing key
+             * dispatch while the user is drilling into a series. */
+            if (episode_picker_active) {
+                if (ev.type == SDL_KEYDOWN) {
+                    SDL_Keycode sk = ev.key.keysym.sym;
+                    if (sk == SDLK_ESCAPE) {
+                        /* Back to search results. */
+                        episode_picker_active = 0;
+                        xtream_episodes_free(&episodes);
+                        search_active = 1;
+                        SDL_StartTextInput();
+                    } else if (sk == SDLK_UP) {
+                        if (episodes.count > 0)
+                            episode_sel = (int)((episode_sel - 1 + (int)episodes.count)
+                                                % (int)episodes.count);
+                    } else if (sk == SDLK_DOWN) {
+                        if (episodes.count > 0)
+                            episode_sel = (int)((episode_sel + 1) % (int)episodes.count);
+                    } else if (sk == SDLK_RETURN || sk == SDLK_KP_ENTER) {
+                        if (episodes.count > 0 && episode_sel < (int)episodes.count) {
+                            xtream_episode_entry_t *ep = &episodes.entries[episode_sel];
+                            char *url = xtream_series_episode_url(&portal, ep->id, ep->extension);
+                            snprintf(toast_text, sizeof(toast_text),
+                                     "Opening %s S%dE%d %s",
+                                     episode_series_name, ep->season_num, ep->episode_num,
+                                     ep->title ? ep->title : "");
+                            toast_until_ms = SDL_GetTicks() + 5000;
+
+                            playback_t *new_pb = calloc(1, sizeof(*new_pb));
+                            if (url && new_pb && playback_open(new_pb, &r,
+                                                               pb->channel, url,
+                                                               &portal, -1) == 0) {
+                                playback_close(pb); free(pb); pb = new_pb;
+                                paused = 0; have_texture = 0;
+                                if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
+                                overlay_mark_dirty(&ov);
+                                playback_open_ts = SDL_GetTicks();
+                                last_audio_progress_ts = SDL_GetTicks();
+                                prev_samples_played    = 0;
+                                current_live_idx = -1;   /* not a live channel any more */
+                            } else {
+                                free(new_pb);
+                                snprintf(toast_text, sizeof(toast_text),
+                                         "Failed to open episode");
+                            }
+                            free(url);
+                        }
+                        episode_picker_active = 0;
+                        xtream_episodes_free(&episodes);
+                    }
+                }
+                continue;
+            }
+
             /* Search mode intercepts text input and most keys so typed
              * characters don't quit/fullscreen/toggle things by accident. */
             if (search_active) {
@@ -641,7 +776,8 @@ int main(int argc, char **argv) {
                         memcpy(search_query + search_query_len, ev.text.text, add);
                         search_query_len += (int)add;
                         search_query[search_query_len] = '\0';
-                        search_refresh(&live_list, search_query, SEARCH_VISIBLE,
+                        search_refresh(&live_list, &vod_list, &series_list,
+                                       search_query, SEARCH_VISIBLE,
                                        &search_hits, &search_hits_count);
                         search_sel = 0;
                     }
@@ -661,7 +797,8 @@ int main(int argc, char **argv) {
                                    (search_query[search_query_len] & 0xC0) == 0x80)
                                 --search_query_len;
                             search_query[search_query_len] = '\0';
-                            search_refresh(&live_list, search_query, SEARCH_VISIBLE,
+                            search_refresh(&live_list, &vod_list, &series_list,
+                                           search_query, SEARCH_VISIBLE,
                                            &search_hits, &search_hits_count);
                             search_sel = 0;
                         }
@@ -673,18 +810,71 @@ int main(int argc, char **argv) {
                             search_sel = (search_sel + 1) % search_hits_count;
                     } else if (sk == SDLK_RETURN || sk == SDLK_KP_ENTER) {
                         if (search_hits_count > 0 && search_sel < search_hits_count) {
-                            int li = search_hits[search_sel];
-                            /* Route through the same async zap pipeline the
-                             * wheel uses: spawn a worker for this channel, UI
-                             * stays responsive while the stream probes. We
-                             * back-date last_wheel_ts so the debounce window
-                             * is already elapsed and the zap fires on the
-                             * very next iteration — no 350ms UX dead time. */
-                            pending_wheel_delta = li - current_live_idx;
-                            last_wheel_ts = SDL_GetTicks() - 400;
+                            search_hit_t h = search_hits[search_sel];
+                            if (h.kind == SEARCH_HIT_LIVE) {
+                                /* Route through the same async zap pipeline
+                                 * the wheel uses. Back-date last_wheel_ts so
+                                 * the debounce is already elapsed and the
+                                 * zap fires on the very next iteration. */
+                                pending_wheel_delta = h.idx - current_live_idx;
+                                last_wheel_ts = SDL_GetTicks() - 400;
+                                search_active = 0;
+                                SDL_StopTextInput();
+                            } else if (h.kind == SEARCH_HIT_VOD) {
+                                xtream_vod_entry_t *v = &vod_list.entries[h.idx];
+                                char *url = xtream_vod_url(&portal, v->stream_id, v->extension);
+                                snprintf(toast_text, sizeof(toast_text), "Opening %s", v->name);
+                                toast_until_ms = SDL_GetTicks() + 5000;
+                                playback_t *new_pb = calloc(1, sizeof(*new_pb));
+                                if (url && new_pb && playback_open(new_pb, &r,
+                                                                   pb->channel, url,
+                                                                   &portal, -1) == 0) {
+                                    playback_close(pb); free(pb); pb = new_pb;
+                                    paused = 0; have_texture = 0;
+                                    if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
+                                    overlay_mark_dirty(&ov);
+                                    playback_open_ts = SDL_GetTicks();
+                                    last_audio_progress_ts = SDL_GetTicks();
+                                    prev_samples_played    = 0;
+                                    current_live_idx = -1;
+                                } else {
+                                    free(new_pb);
+                                    snprintf(toast_text, sizeof(toast_text),
+                                             "Failed to open %s", v->name);
+                                }
+                                free(url);
+                                search_active = 0;
+                                SDL_StopTextInput();
+                            } else if (h.kind == SEARCH_HIT_SERIES) {
+                                xtream_series_entry_t *s = &series_list.entries[h.idx];
+                                /* Synchronous fetch — typically 200-500ms.
+                                 * Quick toast first so the frame after Enter
+                                 * shows "Loading…" instead of a frozen UI. */
+                                snprintf(toast_text, sizeof(toast_text),
+                                         "Loading %s episodes…", s->name);
+                                render_status_frame(&r, &ov, pb->tex.texture, toast_text);
+                                xtream_episodes_free(&episodes);
+                                if (xtream_fetch_series_info(&portal, s->series_id,
+                                                              &episodes) == 0 &&
+                                    episodes.count > 0) {
+                                    snprintf(episode_series_name,
+                                             sizeof(episode_series_name), "%s", s->name);
+                                    episode_sel = 0;
+                                    episode_picker_active = 1;
+                                    search_active = 0;
+                                    SDL_StopTextInput();
+                                } else {
+                                    snprintf(toast_text, sizeof(toast_text),
+                                             "No episodes found for %s", s->name);
+                                    toast_until_ms = SDL_GetTicks() + 4000;
+                                    search_active = 0;
+                                    SDL_StopTextInput();
+                                }
+                            }
+                        } else {
+                            search_active = 0;
+                            SDL_StopTextInput();
                         }
-                        search_active = 0;
-                        SDL_StopTextInput();
                     }
                 }
                 continue;
@@ -1291,11 +1481,42 @@ int main(int argc, char **argv) {
          * Search takes top priority because the user is actively typing and
          * needs to see their query + results without other overlays stealing
          * attention. */
-        if (search_active) {
+        if (episode_picker_active) {
+            /* Episode list overlay — same visual as the search overlay so
+             * the user sees one consistent UI. We build "S#E# - Title"
+             * labels into a scratch buffer and pass pointers in. */
+            static char ep_labels[32][192];
+            const char *ep_names[32];
+            int nshow = (int)episodes.count < SEARCH_VISIBLE
+                        ? (int)episodes.count : SEARCH_VISIBLE;
+            /* Center the window around the selection so a long episode
+             * list still keeps the chosen row in view. */
+            int start_i = episode_sel - nshow / 2;
+            if (start_i < 0) start_i = 0;
+            if (start_i + nshow > (int)episodes.count)
+                start_i = (int)episodes.count - nshow;
+            if (start_i < 0) start_i = 0;
+            for (int i = 0; i < nshow; ++i) {
+                xtream_episode_entry_t *ep = &episodes.entries[start_i + i];
+                snprintf(ep_labels[i], sizeof(ep_labels[i]), "S%02dE%02d  %s",
+                         ep->season_num, ep->episode_num,
+                         ep->title ? ep->title : "");
+                ep_names[i] = ep_labels[i];
+            }
+            char title[280];
+            snprintf(title, sizeof(title), "%s  —  Enter to play, Esc to go back",
+                     episode_series_name);
+            overlay_render_search(&ov, r.renderer, title, ep_names, nshow,
+                                  episode_sel - start_i, ww, wh);
+        } else if (search_active) {
+            static char labels[32][256];
             const char *names[32];
             int nshow = search_hits_count < SEARCH_VISIBLE ? search_hits_count : SEARCH_VISIBLE;
-            for (int i = 0; i < nshow; ++i)
-                names[i] = live_list.entries[search_hits[i]].name;
+            for (int i = 0; i < nshow; ++i) {
+                search_hit_label(&search_hits[i], &live_list, &vod_list, &series_list,
+                                 labels[i], sizeof(labels[i]));
+                names[i] = labels[i];
+            }
             overlay_render_search(&ov, r.renderer, search_query, names,
                                   nshow, search_sel, ww, wh);
         } else if (help_visible) {
@@ -1322,9 +1543,12 @@ int main(int argc, char **argv) {
     playback_close(pb);
     free(pb);
     free(search_hits);
+    xtream_episodes_free(&episodes);
     overlay_shutdown(&ov);
     render_shutdown(&r);
     xtream_live_list_free(&live_list);
+    xtream_vod_list_free(&vod_list);
+    xtream_series_list_free(&series_list);
     xtream_free(&portal);
     curl_global_cleanup();
     return 0;
