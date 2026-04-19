@@ -676,9 +676,12 @@ int main(int argc, char **argv) {
                             int li = search_hits[search_sel];
                             /* Route through the same async zap pipeline the
                              * wheel uses: spawn a worker for this channel, UI
-                             * stays responsive while the stream probes. */
+                             * stays responsive while the stream probes. We
+                             * back-date last_wheel_ts so the debounce window
+                             * is already elapsed and the zap fires on the
+                             * very next iteration — no 350ms UX dead time. */
                             pending_wheel_delta = li - current_live_idx;
-                            last_wheel_ts = SDL_GetTicks();
+                            last_wheel_ts = SDL_GetTicks() - 400;
                         }
                         search_active = 0;
                         SDL_StopTextInput();
