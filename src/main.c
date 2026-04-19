@@ -532,6 +532,24 @@ int main(int argc, char **argv) {
      * [decoder]/[stall] fprintf(stderr, ...) lines are untouched. */
     av_log_set_level(AV_LOG_WARNING);
 
+    /* Test-harness env vars for the seek-bug ralph loop:
+     *   TV_AUTOSEEK_AT_S       — seconds after launch to inject a right-arrow
+     *                            keypress (simulates user pressing skip +30s).
+     *   TV_TEST_EXIT_AFTER_S   — seconds after launch to auto-quit, so the
+     *                            harness can cap test duration.
+     *   TV_TEST_HEARTBEAT_MS   — override the normal 15s heartbeat cadence
+     *                            for finer-grained logs during the test.
+     * When any of these are set, we also dump decoder state on every frame
+     * for the 20s window around the seek. */
+    double autoseek_at   = getenv("TV_AUTOSEEK_AT_S")     ? atof(getenv("TV_AUTOSEEK_AT_S"))     : 0.0;
+    double test_exit_at  = getenv("TV_TEST_EXIT_AFTER_S") ? atof(getenv("TV_TEST_EXIT_AFTER_S")) : 0.0;
+    int    test_hb_ms    = getenv("TV_TEST_HEARTBEAT_MS") ? atoi(getenv("TV_TEST_HEARTBEAT_MS")) : 0;
+    Uint32 test_launch_ms = SDL_GetTicks();
+    int    autoseek_fired = 0;
+    if (autoseek_at > 0 || test_exit_at > 0)
+        fprintf(stderr, "[test] autoseek=%.1fs exit=%.1fs hb=%dms\n",
+                autoseek_at, test_exit_at, test_hb_ms);
+
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
     /* Parse CLI: supports `--xtream user:pass@host[:port]` OR a bare URL as argv[1]. */
@@ -1154,18 +1172,21 @@ int main(int argc, char **argv) {
                     free(u);
                     toast_until_ms = SDL_GetTicks() + 4000;
                 } else if (pb->player.fmt && pb->player.fmt->duration > 0) {
-                    /* In-file seek for VOD / series episodes — the container
-                     * advertises a duration so the demuxer can reposition
-                     * without a new HTTP request. We compute target time
-                     * from the current clock (relative seconds since the
-                     * stream's first audio pts) + delta.
-                     *
-                     * CRITICAL: drain the A/V queues and reset audio_out_t
-                     * BEFORE triggering the decoder seek. Otherwise the
-                     * old, pre-seek chunks play through while the demuxer
-                     * is already at the new position — the user hears a
-                     * second of old audio, then the jump. SDL_LockAudioDevice
-                     * halts the audio callback while we swap state. */
+                    /* In-file seek for VOD / series episodes. Execution must
+                     * happen under SDL_LockAudioDevice held for the ENTIRE
+                     * seek: reset audio_out_t, drain queues, set seek_req,
+                     * and spin-wait for the decoder to complete the seek +
+                     * drain before releasing the lock. This makes the seek
+                     * atomic from the audio callback's perspective: it
+                     * wakes up after the lock is released with has_first_pts
+                     * cleared and only POST-seek chunks in the queue, so the
+                     * first chunk it pulls correctly seeds first_pts at the
+                     * actual post-seek stream position (which may differ
+                     * from target by a few seconds due to keyframe rounding
+                     * under AVSEEK_FLAG_BACKWARD — letting the callback seed
+                     * from reality is more robust than pre-seeding from
+                     * target). Up to SEEK_WAIT_MS of user-visible lag. */
+                    const int SEEK_WAIT_MS = 300;
                     double now_s    = av_clock_ready(&pb->clk) ? av_clock_now(&pb->clk) : 0.0;
                     double target_s = now_s + (double)delta;
                     if (target_s < 0) target_s = 0;
@@ -1177,22 +1198,8 @@ int main(int argc, char **argv) {
                     pb->audio.cur_samples    = NULL;
                     pb->audio.cur_remaining  = 0;
                     pb->audio.samples_played = 0;
-                    /* Pre-seed the clock at target_s instead of leaving
-                     * has_first_pts=0 to let the callback seed itself. The
-                     * latter raced against a pre-seek audio chunk that can
-                     * sneak into the queue between main's drain and the
-                     * decoder's av_seek_frame (decoder was mid-packet-read
-                     * when we set seek_req). That stray chunk carries the
-                     * OLD timeline's pts, so the callback would latch first_pts
-                     * ≈ pre-seek time, then post-seek video (pts == target_s)
-                     * looks 30s in the future and never displays —
-                     * exactly the "stream crashes after arrow" symptom.
-                     * By seeding first_pts = target_s here, any later chunk
-                     * (pre- or post-seek) just plays without affecting the
-                     * clock mapping. */
-                    pb->audio.first_pts      = target_s;
-                    pb->audio.has_first_pts  = 1;
-                    SDL_UnlockAudioDevice(pb->audio.device);
+                    pb->audio.has_first_pts  = 0;
+                    pb->audio.first_pts      = 0;
 
                     queue_drain(&pb->player.audio_q, (void(*)(void*))audio_chunk_free);
                     queue_drain(&pb->player.video_q, (void(*)(void*))video_frame_free);
@@ -1202,6 +1209,25 @@ int main(int argc, char **argv) {
 
                     pb->player.seek_target_pts = (int64_t)(target_s * AV_TIME_BASE);
                     pb->player.seek_req        = 1;
+
+                    /* Spin-wait (callback is locked; user feels ~100-300ms
+                     * of UI freeze on arrow-press). Decoder wakes from
+                     * queue_push via the drain's not_full broadcast, sees
+                     * seek_req, calls av_seek_frame, flushes, does its own
+                     * drain to kill anything it pushed between our drain
+                     * and its seek, clears seek_req. */
+                    int waited = 0;
+                    while (pb->player.seek_req && waited < SEEK_WAIT_MS) {
+                        SDL_Delay(5);
+                        waited += 5;
+                    }
+                    if (pb->player.seek_req)
+                        fprintf(stderr, "[seek] decoder didn't ack in %dms — unlocking anyway\n",
+                                SEEK_WAIT_MS);
+                    else
+                        fprintf(stderr, "[seek] decoder acked after %dms\n", waited);
+
+                    SDL_UnlockAudioDevice(pb->audio.device);
 
                     last_audio_progress_ts = SDL_GetTicks();
                     prev_samples_played    = 0;
@@ -1650,14 +1676,37 @@ int main(int argc, char **argv) {
             pb->player.seek_verify_target_s = 0.0;
         }
 
-        /* Heartbeat — liveness ping. */
-        if (tnow_ms - last_heartbeat >= HEARTBEAT_MS) {
-            fprintf(stderr, "[heartbeat] vq=%zu aq=%zu samples=%lld clk=%.1f vframes=%lld aframes=%lld\n",
+        /* Heartbeat — liveness ping. Override interval when the test harness
+         * env var is set so we get fine-grained logs around the auto-seek. */
+        Uint32 hb_interval = (test_hb_ms > 0) ? (Uint32)test_hb_ms : HEARTBEAT_MS;
+        if (tnow_ms - last_heartbeat >= hb_interval) {
+            fprintf(stderr, "[heartbeat] t=%.2fs vq=%zu aq=%zu samples=%lld clk=%.1f vframes=%lld aframes=%lld have_tex=%d\n",
+                    (SDL_GetTicks() - test_launch_ms) / 1000.0,
                     pb->player.video_q.count, pb->player.audio_q.count,
                     (long long)pb->audio.samples_played,
                     av_clock_ready(&pb->clk) ? av_clock_now(&pb->clk) : 0.0,
-                    pb->player.video_frames_pushed, pb->player.audio_frames_pushed);
+                    pb->player.video_frames_pushed, pb->player.audio_frames_pushed,
+                    have_texture);
             last_heartbeat = tnow_ms;
+        }
+
+        /* Test-harness triggers: auto-seek + auto-exit. */
+        if (autoseek_at > 0 && !autoseek_fired &&
+            (tnow_ms - test_launch_ms) / 1000.0 >= autoseek_at) {
+            SDL_Event e = {0};
+            e.type = SDL_KEYDOWN;
+            e.key.keysym.sym = SDLK_RIGHT;
+            e.key.keysym.mod = 0;
+            SDL_PushEvent(&e);
+            fprintf(stderr, "[test] injected SDLK_RIGHT at t=%.2fs (clock=%.2fs)\n",
+                    (tnow_ms - test_launch_ms) / 1000.0,
+                    av_clock_ready(&pb->clk) ? av_clock_now(&pb->clk) : 0.0);
+            autoseek_fired = 1;
+        }
+        if (test_exit_at > 0 && (tnow_ms - test_launch_ms) / 1000.0 >= test_exit_at) {
+            fprintf(stderr, "[test] exit deadline at t=%.2fs\n",
+                    (tnow_ms - test_launch_ms) / 1000.0);
+            running = 0;
         }
 
         /* 2) Try to grab a new frame if we don't have one pending. */
@@ -1694,7 +1743,19 @@ int main(int argc, char **argv) {
              * first chunk) and only reads it during that write — after
              * has_first_pts is set, the clock value is purely a function
              * of (first_pts, samples_played), both of which main may
-             * modify without coordinating with the callback further. */
+             * modify without coordinating with the callback further.
+             *
+             * BUT cap the resync at STARTUP_RESYNC_MAX_S. Anything beyond
+             * that is almost certainly a stale pre-seek frame that slipped
+             * past main's drain: the decoder was blocked in queue_push
+             * when main drained, got unblocked by the drain signal, and
+             * pushed its blocked-packet-worth of data onto the now-empty
+             * queue BEFORE it iterated and saw seek_req. That stale frame
+             * carries the OLD pts and rebasing to it traps every valid
+             * post-seek frame in "future" limbo (diff > 0, held forever,
+             * queue fills, decoder blocks, black screen). Discard-and-wait
+             * is safer: a valid post-seek frame will arrive within a few
+             * hundred ms. */
             if (!have_texture && -diff > DROP_LATE) {
                 double new_first = pending_vf->pts -
                                    (double)pb->audio.samples_played /

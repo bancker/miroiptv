@@ -97,5 +97,12 @@ void queue_drain(queue_t *q, void (*free_fn)(void *)) {
         q->count--;
         if (free_fn) free_fn(item);
     }
+    /* CRITICAL: wake producers waiting on not_full. Without this, a decoder
+     * thread blocked in queue_push (because the queue was full when the
+     * seek/zap handler started) stays blocked after we empty the queue —
+     * and since it's blocked, it can't reach the top of its loop to notice
+     * seek_req. Symptom: post-seek vq/aq stay at 0 forever, vframes and
+     * aframes don't advance, screen stays black. */
+    pthread_cond_broadcast(&q->not_full);
     pthread_mutex_unlock(&q->mu);
 }
