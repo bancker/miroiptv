@@ -1622,6 +1622,36 @@ int main(int argc, char **argv) {
             double now  = av_clock_now(&pb->clk);
             double diff = pending_vf->pts - now;
 
+            /* Startup A/V resync. On VOD mp4 the H.264 decoder needs to see
+             * an IDR before producing its first frame, which often lags
+             * 300-800ms behind the first audio chunk. Audio seeds the
+             * clock immediately, samples_played advances with wall-time,
+             * and when the first video frame finally arrives its pts is
+             * "that far behind" the clock — so DROP_LATE throws it away,
+             * and every subsequent frame too (because pts advance at
+             * real-time rate while the clock keeps running). The whole
+             * movie plays as audio-only.
+             *
+             * Fix: before we've ever displayed a frame, if the first one
+             * looks past-due by more than DROP_LATE, rebase the clock so
+             * THIS frame is due now. We can safely overwrite first_pts
+             * because the audio callback only writes it once (on the
+             * first chunk) and only reads it during that write — after
+             * has_first_pts is set, the clock value is purely a function
+             * of (first_pts, samples_played), both of which main may
+             * modify without coordinating with the callback further. */
+            if (!have_texture && -diff > DROP_LATE) {
+                double new_first = pending_vf->pts -
+                                   (double)pb->audio.samples_played /
+                                   (double)pb->audio.sample_rate;
+                pb->audio.first_pts = new_first;
+                fprintf(stderr, "[sync] VOD startup resync: clock "
+                                "rebased to video pts=%.2fs (audio was %.2fs ahead)\n",
+                        pending_vf->pts, -diff);
+                now  = av_clock_now(&pb->clk);
+                diff = pending_vf->pts - now;
+            }
+
             if (diff < DUE_WINDOW) {
                 /* Due now (or past due). Either upload-for-display, or drop if way late. */
                 if (-diff > DROP_LATE) {
