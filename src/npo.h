@@ -17,6 +17,17 @@
 int npo_http_get(const char *url, const char *const *extra_headers,
                  char **out, size_t *out_len);
 
+/* Liveness probe: HEAD (then GET-fallback) on `url` with a short timeout.
+ * Returns 0 if the server responded with a 2xx/3xx status (stream is
+ * reachable and the portal hasn't returned 403/502/5xx), -1 otherwise.
+ * Used before committing a zap so a dead channel surfaces as a toast
+ * instead of a silent black window + stall restart cycle.
+ *
+ * `timeout_s` is the hard deadline — keep short (2-3s) so fast-scroll
+ * zap doesn't pile up; probe runs on the zap worker thread so it doesn't
+ * block main but it still steals that worker's wall time. */
+int npo_http_probe(const char *url, int timeout_s);
+
 /* ---- EPG parsing ---- */
 
 typedef struct {

@@ -196,6 +196,50 @@ static const npo_channel_t *key_to_channel(SDL_Keycode k) {
     }
 }
 
+/* Resolve the portal archive stream id to use for /timeshift/ replay on the
+ * currently-playing channel. The portal serves live and catch-up through
+ * distinct IDs: NPO 1/2/3 have the XTREAM_NPO_ARCHIVE_STREAM_IDS mapping,
+ * RTL 4/5/7/8/Z have XTREAM_RTL_ARCHIVE_STREAM_IDS. For any other channel
+ * we fall back to pb->stream_id — which works for many portals but can
+ * return HTTP 502 if the stream lacks tv_archive support (the resulting
+ * playback_open failure surfaces as a toast instead of a silent freeze). */
+static int resolve_archive_stream_id(const playback_t *pb) {
+    if (!pb || !pb->channel) return pb ? pb->stream_id : 0;
+    for (int i = 0; i < 3; ++i) {
+        if (pb->channel == &NPO_CHANNELS[i] ||
+            pb->stream_id == XTREAM_NPO_STREAM_IDS[i] ||
+            pb->stream_id == XTREAM_NPO_ARCHIVE_STREAM_IDS[i])
+            return XTREAM_NPO_ARCHIVE_STREAM_IDS[i];
+    }
+    for (int i = 0; i < 5; ++i) {
+        if (pb->stream_id == XTREAM_RTL_LIVE_STREAM_IDS[i] ||
+            pb->stream_id == XTREAM_RTL_ARCHIVE_STREAM_IDS[i])
+            return XTREAM_RTL_ARCHIVE_STREAM_IDS[i];
+    }
+    return pb->stream_id;   /* best-effort — may 502 if no tv_archive. */
+}
+
+/* Human-readable relative day label for an EPG entry's start time. Dutch
+ * labels where they fit ("Vandaag"/"Gisteren"/"Morgen"), localised short
+ * weekday + date otherwise. Returned pointer is into a static buffer
+ * (caller copies out). Keeps the full-EPG list readable when it spans
+ * 2-3 days. */
+static const char *relative_day_label(time_t t, time_t now, char *buf, size_t buflen) {
+    struct tm lt = *localtime(&t);
+    struct tm nt = *localtime(&now);
+    int lday = lt.tm_year * 400 + lt.tm_yday;
+    int nday = nt.tm_year * 400 + nt.tm_yday;
+    int diff = lday - nday;
+    if (diff == 0)      snprintf(buf, buflen, "Vandaag");
+    else if (diff == -1) snprintf(buf, buflen, "Gisteren");
+    else if (diff == 1)  snprintf(buf, buflen, "Morgen");
+    else {
+        static const char *wd[] = { "Zo","Ma","Di","Wo","Do","Vr","Za" };
+        snprintf(buf, buflen, "%s %d/%d", wd[lt.tm_wday], lt.tm_mday, lt.tm_mon + 1);
+    }
+    return buf;
+}
+
 /* Case-insensitive strstr — portable replacement for GNU's strcasestr, which
  * isn't in MinGW's libc. Used by the search prompt to do a substring match
  * of the user's query against each live-list entry's name. */
@@ -418,6 +462,7 @@ typedef struct {
     epg_t                 preload_epg;
     int                   epg_toast_shown; /* main: "I already baked this EPG into the toast" */
     playback_t           *pb;
+    int                   probe_failed;    /* 1 if health probe rejected the URL */
 } zap_prep_t;
 
 static void *zap_prep_worker(void *arg) {
@@ -434,6 +479,17 @@ static void *zap_prep_worker(void *arg) {
     }
     zp->preload_epg = ep;
     zp->state = 2;
+
+    /* Phase 1.5: liveness probe. A HEAD request on the stream URL tells us
+     * in 1-2s whether the channel is actually serving right now. Without
+     * this, a dead channel lets playback_open block for 15-30s while libav
+     * reconnects + retries, then finally returns an error — terrible UX.
+     * 3-second timeout is aggressive enough to keep fast zapping snappy
+     * while tolerating a slow-but-working CDN hop. */
+    if (npo_http_probe(zp->url, 3) != 0) {
+        zp->probe_failed = 1;
+        goto fail;
+    }
 
     /* Phase 2: open playback. epg_stream_id=-1 skips the internal EPG
      * fetch because we already have the EPG ready to splice in. */
@@ -612,6 +668,17 @@ int main(int argc, char **argv) {
     int                  episode_sel           = 0;
     char                 episode_series_name[256] = {0};
 
+    /* Full-EPG list overlay: Shift+e opens a scrollable multi-day guide for
+     * the current channel (via xtream_fetch_epg_full ~ 800 entries over the
+     * 2-day catch-up window). Enter on a past entry plays /timeshift at that
+     * start time; Enter on the airing-now entry is a no-op; Enter on a
+     * future entry shows a "not aired yet" toast. */
+    int       epg_full_active     = 0;
+    epg_t     epg_full            = {0};
+    int       epg_full_sel        = 0;
+    int       epg_full_archive_id = 0;
+    char      epg_full_channel_name[128] = {0};
+
     /* Mouse-wheel zapping through ALL portal live channels. We fetch the full
      * catalog once, find our current stream_id in it, and the wheel moves the
      * index ±1 per notch. Actual switch is debounced — rapid scrolling only
@@ -709,6 +776,71 @@ int main(int argc, char **argv) {
                 /* wheel up (positive y) = previous channel; down = next channel */
                 pending_wheel_delta -= ev.wheel.y;
                 last_wheel_ts = SDL_GetTicks();
+                continue;
+            }
+
+            /* Full-EPG overlay (Shift+e). Catches keys before search/episode
+             * modes so Enter / arrows route to EPG navigation. */
+            if (epg_full_active) {
+                if (ev.type == SDL_KEYDOWN) {
+                    SDL_Keycode sk = ev.key.keysym.sym;
+                    int n = (int)epg_full.count;
+                    if (sk == SDLK_ESCAPE) {
+                        epg_full_active = 0;
+                    } else if (sk == SDLK_UP && n > 0) {
+                        epg_full_sel = (epg_full_sel - 1 + n) % n;
+                    } else if (sk == SDLK_DOWN && n > 0) {
+                        epg_full_sel = (epg_full_sel + 1) % n;
+                    } else if ((sk == SDLK_PAGEUP || sk == SDLK_PAGEDOWN) && n > 0) {
+                        int delta = sk == SDLK_PAGEUP ? -10 : +10;
+                        epg_full_sel = epg_full_sel + delta;
+                        if (epg_full_sel < 0) epg_full_sel = 0;
+                        if (epg_full_sel >= n) epg_full_sel = n - 1;
+                    } else if ((sk == SDLK_RETURN || sk == SDLK_KP_ENTER) &&
+                               epg_full_sel < n) {
+                        epg_entry_t *e = &epg_full.entries[epg_full_sel];
+                        time_t tnow = time(NULL);
+                        if (e->start > tnow) {
+                            snprintf(toast_text, sizeof(toast_text),
+                                     "Programme hasn't started yet");
+                            toast_until_ms = SDL_GetTicks() + 3000;
+                        } else {
+                            /* Past or currently-airing — open via timeshift so
+                             * a long-running live programme also rewinds to its
+                             * own start. Duration rounded up to nearest min. */
+                            int dur_min = (int)((e->end - e->start + 59) / 60);
+                            if (dur_min < 5) dur_min = 5;
+                            char *url = xtream_timeshift_url(&portal,
+                                                             epg_full_archive_id,
+                                                             e->start, dur_min);
+                            snprintf(toast_text, sizeof(toast_text),
+                                     "Playing %s", e->title ? e->title : "(programme)");
+                            toast_until_ms = SDL_GetTicks() + 5000;
+
+                            playback_t *new_pb = calloc(1, sizeof(*new_pb));
+                            if (url && new_pb && playback_open(new_pb, &r,
+                                                               pb->channel, url,
+                                                               &portal,
+                                                               epg_full_archive_id) == 0) {
+                                new_pb->timeshift_start   = e->start;
+                                new_pb->timeshift_dur_min = dur_min;
+                                playback_close(pb); free(pb); pb = new_pb;
+                                paused = 0; have_texture = 0;
+                                if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
+                                overlay_mark_dirty(&ov);
+                                playback_open_ts = SDL_GetTicks();
+                                last_audio_progress_ts = SDL_GetTicks();
+                                prev_samples_played    = 0;
+                            } else {
+                                free(new_pb);
+                                snprintf(toast_text, sizeof(toast_text),
+                                         "Couldn't open catch-up stream");
+                            }
+                            free(url);
+                            epg_full_active = 0;
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -898,7 +1030,48 @@ int main(int argc, char **argv) {
                 paused = !paused;
                 SDL_PauseAudioDevice(pb->audio.device, paused);
             }
-            else if (k == SDLK_e) show_overlay = !show_overlay;
+            else if (k == SDLK_e) {
+                /* Shift+e opens the full multi-day EPG list (catch-up + future).
+                 * Plain 'e' toggles the compact bottom-strip overlay. */
+                if (ev.key.keysym.mod & KMOD_SHIFT) {
+                    int archive_id = resolve_archive_stream_id(pb);
+                    if (archive_id <= 0 || !portal.host) {
+                        snprintf(toast_text, sizeof(toast_text),
+                                 "Full EPG not available on this channel");
+                        toast_until_ms = SDL_GetTicks() + 3000;
+                    } else {
+                        snprintf(toast_text, sizeof(toast_text),
+                                 "Loading full EPG…");
+                        render_status_frame(&r, &ov, pb->tex.texture, toast_text);
+                        npo_epg_free(&epg_full);
+                        if (xtream_fetch_epg_full(&portal, archive_id, &epg_full) == 0
+                            && epg_full.count > 0) {
+                            /* Start the selection on the currently-airing
+                             * entry if we can find one, else at index 0. */
+                            time_t tnow = time(NULL);
+                            epg_full_sel = 0;
+                            for (size_t i = 0; i < epg_full.count; ++i) {
+                                if (epg_full.entries[i].start <= tnow &&
+                                    tnow < epg_full.entries[i].end) {
+                                    epg_full_sel = (int)i;
+                                    break;
+                                }
+                            }
+                            epg_full_archive_id = archive_id;
+                            snprintf(epg_full_channel_name,
+                                     sizeof(epg_full_channel_name), "%s",
+                                     pb->channel ? pb->channel->display : "");
+                            epg_full_active = 1;
+                        } else {
+                            snprintf(toast_text, sizeof(toast_text),
+                                     "Couldn't load EPG for this channel");
+                            toast_until_ms = SDL_GetTicks() + 3000;
+                        }
+                    }
+                } else {
+                    show_overlay = !show_overlay;
+                }
+            }
             else if (k == SDLK_t) {
                 static int always_on_top = 0;
                 always_on_top = !always_on_top;
@@ -1325,7 +1498,15 @@ int main(int argc, char **argv) {
             free(zap_prep); zap_prep = NULL;
         } else if (zap_prep && zap_prep->state == 4) {
             pthread_join(zap_prep->thread, NULL);
-            snprintf(toast_text, sizeof(toast_text), "Tuning to %s failed", zap_prep->label);
+            /* Differentiate probe-failure (channel is dead / portal 403/502)
+             * from generic open-failure so the toast is actionable. */
+            if (zap_prep->probe_failed) {
+                snprintf(toast_text, sizeof(toast_text),
+                         "%s is unavailable — skipped", zap_prep->label);
+            } else {
+                snprintf(toast_text, sizeof(toast_text),
+                         "Tuning to %s failed", zap_prep->label);
+            }
             toast_until_ms = SDL_GetTicks() + 3000;
             free(zap_prep); zap_prep = NULL;
         }
@@ -1481,7 +1662,46 @@ int main(int argc, char **argv) {
          * Search takes top priority because the user is actively typing and
          * needs to see their query + results without other overlays stealing
          * attention. */
-        if (episode_picker_active) {
+        if (epg_full_active) {
+            /* Multi-day EPG list. Labels: "Vandaag 18:00  NOS Journaal".
+             * Past entries dimmed visually would be nice but we keep one
+             * color for now — the highlight row plus the day label is
+             * enough orientation. Window recenters around selection so
+             * scrolling a 800-entry list still shows you what you just
+             * arrowed to. */
+            static char epg_labels[32][256];
+            const char *epg_names[32];
+            int nshow = (int)epg_full.count < SEARCH_VISIBLE
+                        ? (int)epg_full.count : SEARCH_VISIBLE;
+            int start_i = epg_full_sel - nshow / 2;
+            if (start_i < 0) start_i = 0;
+            if (start_i + nshow > (int)epg_full.count)
+                start_i = (int)epg_full.count - nshow;
+            if (start_i < 0) start_i = 0;
+            time_t tnow = time(NULL);
+            for (int i = 0; i < nshow; ++i) {
+                epg_entry_t *e = &epg_full.entries[start_i + i];
+                struct tm lt_s = *localtime(&e->start);
+                char daybuf[32];
+                relative_day_label(e->start, tnow, daybuf, sizeof(daybuf));
+                const char *marker = "   ";
+                if (e->end <= tnow)       marker = "   ";  /* past */
+                else if (e->start <= tnow) marker = "NU ";  /* airing */
+                else                       marker = "-> ";  /* future */
+                snprintf(epg_labels[i], sizeof(epg_labels[i]),
+                         "%s%-9s %02d:%02d  %s",
+                         marker, daybuf,
+                         lt_s.tm_hour, lt_s.tm_min,
+                         e->title ? e->title : "");
+                epg_names[i] = epg_labels[i];
+            }
+            char hdr[280];
+            snprintf(hdr, sizeof(hdr),
+                     "EPG — %s  (Enter=play, up/down/PgUp/PgDn, Esc=close)",
+                     epg_full_channel_name);
+            overlay_render_search(&ov, r.renderer, hdr, epg_names, nshow,
+                                  epg_full_sel - start_i, ww, wh);
+        } else if (episode_picker_active) {
             /* Episode list overlay — same visual as the search overlay so
              * the user sees one consistent UI. We build "S#E# - Title"
              * labels into a scratch buffer and pass pointers in. */
@@ -1545,6 +1765,7 @@ int main(int argc, char **argv) {
     playback_close(pb);
     free(pb);
     free(search_hits);
+    npo_epg_free(&epg_full);
     xtream_episodes_free(&episodes);
     overlay_shutdown(&ov);
     render_shutdown(&r);

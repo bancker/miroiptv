@@ -89,6 +89,49 @@ int npo_http_get(const char *url, const char *const *extra_headers,
     return 0;
 }
 
+int npo_http_probe(const char *url, int timeout_s) {
+    CURL *c = curl_easy_init();
+    if (!c) return -1;
+
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_NOBODY, 1L);           /* HEAD */
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);   /* portal 302s /live/ → origin */
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, (long)timeout_s);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, (long)(timeout_s > 1 ? timeout_s - 1 : 1));
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "tv/0.1 (+probe)");
+    /* Some portals 405 on HEAD; fall through to a tiny GET that we abort
+     * after receiving the first byte so we don't download a whole stream
+     * just to check reachability. */
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+
+    CURLcode rc = curl_easy_perform(c);
+    long code = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+
+    int ok = (rc == CURLE_OK && code >= 200 && code < 400);
+
+    /* HEAD 405 / 501 on live endpoints is common — retry as a 1-byte GET. */
+    if (!ok && rc == CURLE_OK && (code == 405 || code == 501)) {
+        curl_easy_setopt(c, CURLOPT_NOBODY, 0L);
+        curl_easy_setopt(c, CURLOPT_RANGE, "0-0");
+        curl_easy_setopt(c, CURLOPT_WRITEFUNCTION,
+                         (size_t (*)(char *, size_t, size_t, void *))fwrite);
+        /* /dev/null target to discard the byte we get back. */
+        FILE *devnull = fopen("NUL", "wb");            /* Windows */
+        if (!devnull) devnull = fopen("/dev/null", "wb");
+        if (devnull) {
+            curl_easy_setopt(c, CURLOPT_WRITEDATA, devnull);
+            rc = curl_easy_perform(c);
+            fclose(devnull);
+        }
+        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+        ok = (rc == CURLE_OK && code >= 200 && code < 400);
+    }
+
+    curl_easy_cleanup(c);
+    return ok ? 0 : -1;
+}
+
 /* ---- EPG parsing ---- */
 
 /* Parses "2026-04-18T18:00:00+02:00" into a UTC time_t. Returns 0 on success.
