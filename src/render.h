@@ -91,4 +91,10 @@ int  overlay_render_search(overlay_t *o, SDL_Renderer *r, const char *query,
                            const char *const *names, int n, int sel,
                            int ww, int wh);
 
+/* Subtitle line: center-bottom, black box behind white text. Handles
+ * word-wrap at the box edge. Call once per frame with the current text;
+ * caller decides whether to call (timing is tracked externally). */
+int  overlay_render_subtitle(overlay_t *o, SDL_Renderer *r, const char *text,
+                             int ww, int wh);
+
 #endif

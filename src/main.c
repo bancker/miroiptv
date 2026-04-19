@@ -1226,6 +1226,30 @@ int main(int argc, char **argv) {
                 }
                 toast_until_ms = SDL_GetTicks() + 3000;
             }
+            else if (k == SDLK_s) {
+                /* Cycle subtitles: off -> track 0 -> track 1 -> ... -> off.
+                 * Toast always shows what the user landed on (even "off")
+                 * so the cycle is visible without looking at the video. */
+                int n = pb->player.n_subtitle_tracks;
+                if (n == 0) {
+                    snprintf(toast_text, sizeof(toast_text),
+                             "No subtitle tracks on this stream");
+                } else {
+                    int cur  = pb->player.subtitle_track_cur;  /* -1..n-1 */
+                    int next = (cur + 2) % (n + 1) - 1;         /* cycles through -1..n-1 */
+                    player_set_subtitle_track(&pb->player, next);
+                    if (next < 0) {
+                        snprintf(toast_text, sizeof(toast_text), "Subs: off");
+                    } else {
+                        const char *lang = pb->player.subtitle_lang[next];
+                        snprintf(toast_text, sizeof(toast_text),
+                                 "Subs: %s (%d/%d)",
+                                 lang[0] ? lang : "track",
+                                 next + 1, n);
+                    }
+                }
+                toast_until_ms = SDL_GetTicks() + 3000;
+            }
             else if ((k == SDLK_UP || k == SDLK_DOWN) && current_live_idx >= 0) {
                 /* Same pipeline as mouse wheel: accumulate into pending_wheel_delta
                  * and let the WHEEL_DEBOUNCE_MS commit it through the async zap
@@ -2078,6 +2102,21 @@ int main(int argc, char **argv) {
         } else if (SDL_GetTicks() < hint_until_ms) {
             overlay_render_hint(&ov, r.renderer, "Press ? for help", ww, wh);
         }
+
+        /* Subtitle rendering. Read under player_t.sub_mu so the decoder
+         * can't free the string mid-TTF_Render. Only display while the
+         * clock is within the current entry's time window. */
+        if (pb->player.subtitle_track_cur >= 0 && pb->player.sub_mu_init &&
+            av_clock_ready(&pb->clk)) {
+            double now_s = av_clock_now(&pb->clk);
+            pthread_mutex_lock(&pb->player.sub_mu);
+            if (pb->player.sub_text &&
+                now_s >= pb->player.sub_start && now_s < pb->player.sub_end) {
+                overlay_render_subtitle(&ov, r.renderer, pb->player.sub_text, ww, wh);
+            }
+            pthread_mutex_unlock(&pb->player.sub_mu);
+        }
+
         SDL_RenderPresent(r.renderer);  /* blocks ~16ms @ 60Hz with VSYNC */
     }
 

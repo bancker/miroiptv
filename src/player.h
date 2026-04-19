@@ -9,6 +9,7 @@
 #include <pthread.h>
 
 #define PLAYER_MAX_AUDIO_TRACKS 8
+#define PLAYER_MAX_SUBTITLE_TRACKS 8
 
 typedef struct {
     AVFormatContext  *fmt;
@@ -64,6 +65,26 @@ typedef struct {
     volatile int      seek_verify_pending;
     volatile double   seek_verify_target_s;
     volatile double   seek_verify_actual_s;
+
+    /* Subtitle tracks. Same request/current volatile pair as audio, with
+     * -1 meaning "subs off" and 0..n_subtitle_tracks-1 meaning a specific
+     * track. Only text-shaped subtitles are supported for rendering
+     * (subrip, mov_text, webvtt, ass, text). Bitmap subs (PGS, DVD, DVB)
+     * decode but we can't blit them — the toast warns the user. Decoded
+     * text lives in sub_* under sub_mu and is displayed by main while
+     * the clock is within [sub_start, sub_end). */
+    int               subtitle_tracks[PLAYER_MAX_SUBTITLE_TRACKS];
+    char              subtitle_lang[PLAYER_MAX_SUBTITLE_TRACKS][16];
+    int               n_subtitle_tracks;
+    int               subtitle_track_cur;   /* -1 = off */
+    volatile int      subtitle_track_req;   /* -1 = off */
+    AVCodecContext   *sctx;                 /* subtitle decoder (or NULL) */
+
+    pthread_mutex_t   sub_mu;
+    int               sub_mu_init;          /* guards sub_mu destroy */
+    char             *sub_text;             /* malloc'd, NULL = no active sub */
+    double            sub_start;            /* in stream-relative seconds */
+    double            sub_end;
 } player_t;
 
 int  player_open(player_t *p, const char *url);
@@ -76,5 +97,10 @@ void player_stop(player_t *p);             /* signals stop, joins */
  * The switch is asynchronous; audio audibly changes after the current
  * audio queue drains (~300ms typical). */
 int  player_set_audio_track(player_t *p, int track_idx);
+
+/* Request the decoder thread switch to subtitle_tracks[track_idx], or
+ * turn subs off with track_idx = -1. The decoder reopens sctx for the
+ * new stream on its next loop iteration and clears any pending text. */
+int  player_set_subtitle_track(player_t *p, int track_idx);
 
 #endif

@@ -266,6 +266,7 @@ int overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh) {
         "  F11           Toggle fullscreen",
         "  t             Toggle always-on-top",
         "  a             Cycle audio track (NL / FR / EN / …)",
+        "  s             Cycle subtitles: off / each language track",
         "  space         Pause / resume audio",
         "  ?             Toggle this help",
         "  q / Esc       Quit",
@@ -318,6 +319,39 @@ int overlay_render_hint(overlay_t *o, SDL_Renderer *r, const char *text, int ww,
     SDL_RenderFillRect(r, &box);
     SDL_Texture *t = SDL_CreateTextureFromSurface(r, s);
     SDL_Rect dst = { box.x + pad, box.y + pad, s->w, s->h };
+    SDL_RenderCopy(r, t, NULL, &dst);
+    SDL_DestroyTexture(t);
+    SDL_FreeSurface(s);
+    return 0;
+}
+
+int overlay_render_subtitle(overlay_t *o, SDL_Renderer *r, const char *text,
+                            int ww, int wh) {
+    if (!text || !*text) return 0;
+    const SDL_Color white = { 245, 245, 245, 255 };
+
+    /* Render as one blended line. TTF_RenderUTF8_Blended doesn't wrap, but
+     * most subtitle lines are short and fit a 960-1920px window. If it
+     * overflows we let SDL clip — better than juggling multi-line layout
+     * for a cosmetic feature. */
+    SDL_Surface *s = TTF_RenderUTF8_Blended(o->font_bold, text, white);
+    if (!s) return -1;
+
+    const int pad_x = 14;
+    const int pad_y = 6;
+    /* Max width: 80% of window. Scale down via destination rect if needed. */
+    int max_w = (int)(ww * 0.8);
+    int w = s->w, h = s->h;
+    if (w > max_w) { h = h * max_w / w; w = max_w; }
+
+    SDL_Rect box = { (ww - w) / 2 - pad_x, wh - h - pad_y * 2 - 36,
+                     w + pad_x * 2, h + pad_y * 2 };
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 170);
+    SDL_RenderFillRect(r, &box);
+
+    SDL_Texture *t = SDL_CreateTextureFromSurface(r, s);
+    SDL_Rect dst = { box.x + pad_x, box.y + pad_y, w, h };
     SDL_RenderCopy(r, t, NULL, &dst);
     SDL_DestroyTexture(t);
     SDL_FreeSurface(s);

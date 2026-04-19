@@ -106,6 +106,35 @@ int player_open(player_t *p, const char *url) {
     p->audio_track_req = 0;
     p->audio_idx       = p->audio_tracks[0];
 
+    /* Subtitle enumeration — second pass over the streams so we don't
+     * interleave the bookkeeping with audio. Off by default; user taps 's'. */
+    for (unsigned i = 0; i < p->fmt->nb_streams; ++i) {
+        AVStream *s = p->fmt->streams[i];
+        if (s->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) continue;
+        if (p->n_subtitle_tracks >= PLAYER_MAX_SUBTITLE_TRACKS) break;
+        p->subtitle_tracks[p->n_subtitle_tracks] = (int)i;
+        AVDictionaryEntry *lang = av_dict_get(s->metadata, "language", NULL, 0);
+        if (lang && lang->value)
+            snprintf(p->subtitle_lang[p->n_subtitle_tracks],
+                     sizeof(p->subtitle_lang[0]), "%s", lang->value);
+        else
+            p->subtitle_lang[p->n_subtitle_tracks][0] = '\0';
+        p->n_subtitle_tracks++;
+    }
+    p->subtitle_track_cur = -1;   /* off by default */
+    p->subtitle_track_req = -1;
+    pthread_mutex_init(&p->sub_mu, NULL);
+    p->sub_mu_init = 1;
+
+    if (p->n_subtitle_tracks > 0) {
+        fprintf(stderr, "[subs] %d track%s:", p->n_subtitle_tracks,
+                p->n_subtitle_tracks == 1 ? "" : "s");
+        for (int t = 0; t < p->n_subtitle_tracks; ++t)
+            fprintf(stderr, " %d=%s", t,
+                    p->subtitle_lang[t][0] ? p->subtitle_lang[t] : "(no-lang)");
+        fprintf(stderr, "  (press 's' to cycle, off by default)\n");
+    }
+
     fprintf(stderr, "[audio] %d track%s:", p->n_audio_tracks,
             p->n_audio_tracks == 1 ? "" : "s");
     for (int t = 0; t < p->n_audio_tracks; ++t)
@@ -147,9 +176,15 @@ void player_close(player_t *p) {
     if (p->swr) swr_free(&p->swr);
     if (p->vctx) avcodec_free_context(&p->vctx);
     if (p->actx) avcodec_free_context(&p->actx);
+    if (p->sctx) avcodec_free_context(&p->sctx);
     if (p->fmt)  avformat_close_input(&p->fmt);
     queue_destroy_with(&p->video_q, (void(*)(void*))video_frame_free);
     queue_destroy_with(&p->audio_q, (void(*)(void*))audio_chunk_free);
+    /* Subtitle scratch — mu is only init'd after the enumeration pass, so
+     * a player_open failure before that point leaves sub_mu uninitialized.
+     * sub_mu_init flag tells us whether pthread_mutex_destroy is safe. */
+    if (p->sub_text) { free(p->sub_text); p->sub_text = NULL; }
+    if (p->sub_mu_init) pthread_mutex_destroy(&p->sub_mu);
     memset(p, 0, sizeof(*p));
 }
 
@@ -290,6 +325,130 @@ static int switch_audio_track(player_t *p, int new_track) {
     return 0;
 }
 
+/* Tear down + reopen the subtitle decoder for a new stream (or turn subs off
+ * when new_track == -1). Also clears any currently-displayed sub text so the
+ * old language doesn't linger for a few seconds after the user hits 's'. */
+static int switch_subtitle_track(player_t *p, int new_track) {
+    if (p->sctx) {
+        avcodec_flush_buffers(p->sctx);
+        avcodec_free_context(&p->sctx);
+    }
+    pthread_mutex_lock(&p->sub_mu);
+    free(p->sub_text); p->sub_text = NULL;
+    p->sub_start = p->sub_end = 0;
+    pthread_mutex_unlock(&p->sub_mu);
+
+    if (new_track < 0) {
+        p->subtitle_track_cur = -1;
+        fprintf(stderr, "[subs] off\n");
+        return 0;
+    }
+    if (new_track >= p->n_subtitle_tracks) return -1;
+    int idx = p->subtitle_tracks[new_track];
+    AVCodecParameters *spar = p->fmt->streams[idx]->codecpar;
+    const AVCodec *sc = avcodec_find_decoder(spar->codec_id);
+    if (!sc) {
+        fprintf(stderr, "[subs] no decoder for track %d codec_id=%d\n",
+                new_track, spar->codec_id);
+        p->subtitle_track_cur = -1;
+        return -1;
+    }
+    p->sctx = avcodec_alloc_context3(sc);
+    avcodec_parameters_to_context(p->sctx, spar);
+    if (avcodec_open2(p->sctx, sc, NULL) < 0) {
+        avcodec_free_context(&p->sctx);
+        fprintf(stderr, "[subs] avcodec_open2 failed for track %d\n", new_track);
+        p->subtitle_track_cur = -1;
+        return -1;
+    }
+    p->subtitle_track_cur = new_track;
+    fprintf(stderr, "[subs] switched to track %d lang=%s codec=%s\n",
+            new_track,
+            p->subtitle_lang[new_track][0] ? p->subtitle_lang[new_track] : "(no-lang)",
+            sc->name);
+    return 0;
+}
+
+/* ASS/SSA subtitles use a pipe-delimited "Dialogue" format where the actual
+ * spoken text is the last field. Strip the header so the renderer just gets
+ * the line the user cares about. Plain text (subrip, mov_text, webvtt) comes
+ * through unchanged. Also strips inline ASS override tags like {\an8}. */
+static char *strip_subtitle_markup(const char *in) {
+    if (!in) return NULL;
+    /* If it's an ASS Dialogue line, grab everything after the 9th comma. */
+    const char *text = in;
+    if (strncmp(in, "Dialogue:", 9) == 0) {
+        const char *p = in;
+        int commas = 0;
+        while (*p && commas < 9) { if (*p++ == ',') commas++; }
+        if (*p) text = p;
+    }
+    size_t n = strlen(text);
+    char *out = malloc(n + 1);
+    if (!out) return NULL;
+    size_t w = 0;
+    int depth = 0;
+    for (size_t i = 0; i < n; ++i) {
+        char c = text[i];
+        if (c == '{') { depth++; continue; }
+        if (c == '}') { if (depth > 0) depth--; continue; }
+        if (depth) continue;
+        /* Turn ASS \N newlines into spaces. */
+        if (c == '\\' && i + 1 < n && (text[i+1] == 'N' || text[i+1] == 'n')) {
+            out[w++] = ' '; i++; continue;
+        }
+        /* Collapse CR/LF to space. */
+        if (c == '\r' || c == '\n') { out[w++] = ' '; continue; }
+        out[w++] = c;
+    }
+    /* Trim trailing space. */
+    while (w > 0 && out[w-1] == ' ') w--;
+    out[w] = '\0';
+    return out;
+}
+
+/* Decode one subtitle packet and stash the resulting text under sub_mu.
+ * Only TEXT subtitle formats produce useful output — bitmap (PGS, DVD,
+ * DVB) decode fine but we'd need a pixel compositor we don't have.
+ * For those, we log once and the renderer just shows nothing. */
+static void push_subtitle(player_t *p, AVPacket *pkt) {
+    AVSubtitle sub = {0};
+    int got = 0;
+    int rc = avcodec_decode_subtitle2(p->sctx, &sub, &got, pkt);
+    if (rc < 0 || !got) { avsubtitle_free(&sub); return; }
+
+    /* Scan for a text-shaped rect. */
+    char *text = NULL;
+    for (unsigned r = 0; r < sub.num_rects && !text; ++r) {
+        AVSubtitleRect *sr = sub.rects[r];
+        if (sr->type == SUBTITLE_TEXT && sr->text)      text = strip_subtitle_markup(sr->text);
+        else if (sr->type == SUBTITLE_ASS  && sr->ass)  text = strip_subtitle_markup(sr->ass);
+    }
+
+    /* pts timing: AVSubtitle.pts is in AV_TIME_BASE units (microseconds) and
+     * start/end_display_time are milliseconds relative to that pts. The
+     * packet's pts, if present, is in the subtitle stream's time_base. For
+     * consistency with video/audio we normalise via stream_rel_seconds. */
+    double pkt_s = stream_rel_seconds(pkt->pts,
+        p->fmt->streams[p->subtitle_tracks[p->subtitle_track_cur]]);
+    double start_s = pkt_s + sub.start_display_time / 1000.0;
+    double end_s   = pkt_s + (sub.end_display_time ? sub.end_display_time : 5000) / 1000.0;
+
+    if (text && *text) {
+        pthread_mutex_lock(&p->sub_mu);
+        free(p->sub_text);
+        p->sub_text  = text;
+        p->sub_start = start_s;
+        p->sub_end   = end_s;
+        pthread_mutex_unlock(&p->sub_mu);
+    } else {
+        free(text);
+        /* No text produced (bitmap format, empty rect). Don't change the
+         * currently-displayed sub — just let it time out naturally. */
+    }
+    avsubtitle_free(&sub);
+}
+
 static void *decoder_loop(void *ud) {
     player_t *p = ud;
     AVPacket *pkt = av_packet_alloc();
@@ -301,6 +460,10 @@ static void *decoder_loop(void *ud) {
          * routed to the freshly-initialised decoder. */
         if (p->audio_track_req != p->audio_track_cur)
             (void)switch_audio_track(p, p->audio_track_req);
+
+        /* Same for subtitles. req == -1 means turn subs off. */
+        if (p->subtitle_track_req != p->subtitle_track_cur)
+            (void)switch_subtitle_track(p, p->subtitle_track_req);
 
         /* Honour any pending seek request BEFORE reading the next packet.
          * The queues and audio_out_t state have already been drained by
@@ -348,6 +511,15 @@ static void *decoder_loop(void *ud) {
                 fprintf(stderr, "[decoder] av_read_frame failed: %s (rc=%d)\n", errbuf, rc);
             }
             break;
+        }
+        /* Subtitle packets take the avcodec_decode_subtitle2 path (their
+         * frame model is an AVSubtitle, not an AVFrame). Handled separately
+         * and consumed before falling through to the video/audio dispatch. */
+        if (p->sctx && p->subtitle_track_cur >= 0 &&
+            pkt->stream_index == p->subtitle_tracks[p->subtitle_track_cur]) {
+            push_subtitle(p, pkt);
+            av_packet_unref(pkt);
+            continue;
         }
         AVCodecContext *ctx = NULL;
         int is_video = 0;
@@ -409,5 +581,13 @@ int player_set_audio_track(player_t *p, int track_idx) {
      * iteration and does the actual codec swap. volatile write so the main
      * thread's update is visible to the decoder without a mutex. */
     p->audio_track_req = track_idx;
+    return 0;
+}
+
+int player_set_subtitle_track(player_t *p, int track_idx) {
+    if (!p) return -1;
+    /* -1 = off; 0..n-1 = track. Anything else is invalid. */
+    if (track_idx < -1 || track_idx >= p->n_subtitle_tracks) return -1;
+    p->subtitle_track_req = track_idx;
     return 0;
 }
