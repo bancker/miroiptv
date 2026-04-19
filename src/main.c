@@ -614,8 +614,12 @@ int main(int argc, char **argv) {
     int    test_hb_ms    = getenv("TV_TEST_HEARTBEAT_MS") ? atoi(getenv("TV_TEST_HEARTBEAT_MS")) : 0;
     int    autozap_count = getenv("TV_AUTOZAP_DOWN")      ? atoi(getenv("TV_AUTOZAP_DOWN"))      : 0;
     double autozap_start = getenv("TV_AUTOZAP_AT_S")      ? atof(getenv("TV_AUTOZAP_AT_S"))      : 5.0;
+    double autopress1_at = getenv("TV_AUTO_PRESS_1_AT_S") ? atof(getenv("TV_AUTO_PRESS_1_AT_S")) : 0.0;
+    double force_vod_at  = getenv("TV_TEST_FORCE_VOD_AT_S") ? atof(getenv("TV_TEST_FORCE_VOD_AT_S")) : 0.0;
     double autozap_spacing_s = 1.5;  /* > WHEEL_DEBOUNCE_MS so each press is a distinct zap */
     int    autozap_fired = 0;
+    int    autopress1_fired = 0;
+    int    force_vod_fired = 0;
     Uint32 test_launch_ms = SDL_GetTicks();
     int    autoseek_fired = 0;
     if (autoseek_at > 0 || test_exit_at > 0 || autozap_count > 0)
@@ -1598,10 +1602,21 @@ int main(int argc, char **argv) {
             }
             else {
                 const npo_channel_t *nch = key_to_channel(k);
-                /* Same "force-on-zap" rule as the 'n' handler: if the user
-                 * pressed 1/2/3 while zapped, pb->channel is a stale NPO stamp;
-                 * use stream_id to detect that we're actually elsewhere. */
-                if (nch && (nch != pb->channel || pb->stream_id != 0)) {
+                /* Switch when:
+                 *   - user picked a different NPO channel, OR
+                 *   - pb is a portal zap (stream_id > 0), OR
+                 *   - pb is a timeshift replay, OR
+                 *   - pb is a VOD/episode (fmt->duration > 0).
+                 * Without the last two, "start movie, press 1, up/down"
+                 * was a no-op: VOD inherits NPO_CHANNELS[0] as the vestigial
+                 * channel stamp (so nch == pb->channel) and VOD has
+                 * stream_id=0, so the original gate (nch!=channel || sid!=0)
+                 * evaluated false and nothing happened. */
+                int is_live_npo =
+                    nch && nch == pb->channel &&
+                    pb->stream_id == 0 && pb->timeshift_start == 0 &&
+                    pb->player.fmt && pb->player.fmt->duration <= 0;
+                if (nch && !is_live_npo) {
                     int ch_idx = (int)(nch - &NPO_CHANNELS[0]);
                     fprintf(stderr, "[switch] %s -> %s (idx=%d)\n",
                             pb->channel->display, nch->display, ch_idx);
@@ -1623,7 +1638,24 @@ int main(int argc, char **argv) {
                         playback_open_ts = SDL_GetTicks(); audio_warmed = 0;
                         last_audio_progress_ts = SDL_GetTicks();
                         prev_samples_played    = 0;
-                        fprintf(stderr, "[switch] swap complete, now on %s\n", pb->channel->display);
+                        /* Restore current_live_idx so subsequent up/down
+                         * zap works. Previously, if the user had been on a
+                         * VOD or episode (where we set current_live_idx=-1
+                         * to disable wheel-zap on non-live playback),
+                         * pressing 1/2/3 swapped pb back to a live channel
+                         * but left current_live_idx=-1 — gating the next
+                         * SDLK_UP / SDLK_DOWN keydown out of the zap path
+                         * entirely. Map the NPO stream_id back to its slot
+                         * in live_list. */
+                        int npo_id = XTREAM_NPO_STREAM_IDS[ch_idx];
+                        for (size_t li = 0; li < live_list.count; ++li) {
+                            if (live_list.entries[li].stream_id == npo_id) {
+                                current_live_idx = (int)li;
+                                break;
+                            }
+                        }
+                        fprintf(stderr, "[switch] swap complete, now on %s (live_idx=%d)\n",
+                                pb->channel->display, current_live_idx);
                     } else {
                         free(new_pb);
                         fprintf(stderr, "channel switch to %s failed - staying on %s\n",
@@ -1919,6 +1951,26 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[test] injected SDLK_DOWN #%d at t=%.2fs (current_live_idx=%d)\n",
                         autozap_fired, t_now, current_live_idx);
             }
+        }
+        if (autopress1_at > 0 && !autopress1_fired &&
+            (tnow_ms - test_launch_ms) / 1000.0 >= autopress1_at) {
+            SDL_Event e = {0};
+            e.type = SDL_KEYDOWN;
+            e.key.keysym.sym = SDLK_1;
+            SDL_PushEvent(&e);
+            autopress1_fired = 1;
+            fprintf(stderr, "[test] injected SDLK_1 at t=%.2fs (current_live_idx=%d)\n",
+                    (tnow_ms - test_launch_ms) / 1000.0, current_live_idx);
+        }
+        if (force_vod_at > 0 && !force_vod_fired &&
+            (tnow_ms - test_launch_ms) / 1000.0 >= force_vod_at) {
+            /* Simulate "user is currently on a VOD" state: set
+             * current_live_idx=-1 so subsequent 1/2/3 can test the
+             * VOD-to-live-NPO swap path. */
+            current_live_idx = -1;
+            force_vod_fired = 1;
+            fprintf(stderr, "[test] forced current_live_idx=-1 at t=%.2fs\n",
+                    (tnow_ms - test_launch_ms) / 1000.0);
         }
 
         /* 2) Try to grab a new frame if we don't have one pending. */
