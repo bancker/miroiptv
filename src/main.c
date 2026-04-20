@@ -1276,6 +1276,30 @@ int main(int argc, char **argv) {
                 }
                 toast_until_ms = SDL_GetTicks() + 3000;
             }
+            else if (k == SDLK_ASTERISK ||
+                     (k == SDLK_8 && (ev.key.keysym.mod & KMOD_SHIFT))) {
+                /* '*' on US keyboards is Shift+8. Some layouts send SDLK_ASTERISK
+                 * directly (numpad *, other layouts). Accept both. */
+                if (current_live_idx < 0 || current_live_idx >= (int)live_list.count) {
+                    snprintf(toast_text, sizeof(toast_text),
+                             "Favorites only work on live portal channels");
+                    toast_until_ms = SDL_GetTicks() + 2500;
+                } else {
+                    xtream_live_entry_t *e = &live_list.entries[current_live_idx];
+                    int was_fav = favorites_is_favorite(&favorites, e->stream_id);
+                    int rc = favorites_toggle(&favorites, e->stream_id, e->num, e->name);
+                    if (rc == 0) {
+                        snprintf(toast_text, sizeof(toast_text),
+                                 "%s %s favorites",
+                                 was_fav ? "\xe2\x98\x86" : "\xe2\x98\x85",  /* ☆ / ★ */
+                                 was_fav ? "Removed from" : "Added to");
+                    } else {
+                        snprintf(toast_text, sizeof(toast_text),
+                                 "Couldn't save favorites (still toggled in memory)");
+                    }
+                    toast_until_ms = SDL_GetTicks() + 2500;
+                }
+            }
             else if ((k == SDLK_UP || k == SDLK_DOWN) && current_live_idx >= 0) {
                 /* Same pipeline as mouse wheel: accumulate into pending_wheel_delta
                  * and let the WHEEL_DEBOUNCE_MS commit it through the async zap
@@ -1743,7 +1767,11 @@ int main(int argc, char **argv) {
 
                 /* Phase-0 toast: channel name INSTANTLY — before the worker
                  * has even done anything. */
-                snprintf(toast_text, sizeof(toast_text), "%s", e->name);
+                int is_fav = favorites_is_favorite(&favorites, e->stream_id);
+                snprintf(toast_text, sizeof(toast_text),
+                         "%s%s",
+                         is_fav ? "\xe2\x98\x85 " : "",
+                         e->name);
                 toast_until_ms = SDL_GetTicks() + 8000;
             }
         }
@@ -1760,7 +1788,10 @@ int main(int argc, char **argv) {
                 }
             }
             if (now_title && *now_title) {
-                snprintf(toast_text, sizeof(toast_text), "%s  |  %s",
+                int is_fav = favorites_is_favorite(&favorites, zap_prep->epg_stream_id);
+                snprintf(toast_text, sizeof(toast_text),
+                         "%s%s  |  %s",
+                         is_fav ? "\xe2\x98\x85 " : "",
                          zap_prep->label, now_title);
                 toast_until_ms = SDL_GetTicks() + 8000;
             }
