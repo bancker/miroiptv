@@ -18,6 +18,10 @@ any portal works.
 - **EPG + catch-up** — `e` for a compact bottom-strip overlay, `Shift+e`
   for a scrollable multi-day guide. Enter on a past entry replays it via
   the portal's `/timeshift/` endpoint.
+- **Favorites** — `*` toggles the current live channel (also works on any
+  `[LIVE]` row in `f`-search); `Shift+F` opens the favorites list, Enter
+  zaps, Del removes. Persisted to `%APPDATA%\miroiptv\favorites.json` on
+  Windows / `$XDG_CONFIG_HOME/miroiptv/favorites.json` on Linux.
 - **News shortcuts** — `n` finds the latest NOS Journaal across NPO
   1/2/3 archives and starts it from the beginning; `r` does the same for
   RTL Nieuws across RTL 4/5/7/8/Z.
