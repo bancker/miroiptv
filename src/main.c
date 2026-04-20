@@ -3,6 +3,7 @@
 #include "npo.h"
 #include "sync.h"
 #include "xtream.h"
+#include "favorites.h"
 #include "update_check.h"
 #include <SDL2/SDL.h>
 #include <curl/curl.h>
@@ -800,6 +801,7 @@ int main(int argc, char **argv) {
     xtream_live_list_t    live_list   = {0};
     xtream_vod_list_t     vod_list    = {0};
     xtream_series_list_t  series_list = {0};
+    favorites_t           favorites   = {0};
     int    current_live_idx = -1;
     int    pending_wheel_delta = 0;
     Uint32 last_wheel_ts = 0;
@@ -834,6 +836,9 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "[zap] failed to fetch live channel list — wheel disabled\n");
         }
+        favorites_init(&favorites, &live_list);
+        fprintf(stderr, "[favorites] %zu loaded (%zu visible)\n",
+                favorites.count, favorites_visible_count(&favorites));
         /* VOD + series are used only by the 'f' search prompt. A fetch
          * failure (portal 403 on un-subscribed catalogs, brief 5xx) is
          * non-fatal — the lists stay empty and search just returns fewer
@@ -2249,6 +2254,7 @@ int main(int argc, char **argv) {
     xtream_episodes_free(&episodes);
     overlay_shutdown(&ov);
     render_shutdown(&r);
+    favorites_free(&favorites);
     xtream_live_list_free(&live_list);
     xtream_vod_list_free(&vod_list);
     xtream_series_list_free(&series_list);
