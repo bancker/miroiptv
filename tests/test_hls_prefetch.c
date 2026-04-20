@@ -1,5 +1,5 @@
 /*
- * Unit tests for hls_prefetch module — Task 2: ring buffer (10 tests).
+ * Unit tests for hls_prefetch module — Tasks 2-5.
  * Build: see Makefile target PREFETCH_TEST_BIN.
  */
 
@@ -11,9 +11,173 @@
 #include <pthread.h>
 #include <stdint.h>
 
+/* Winsock2 for the test HTTP server (MinGW / Windows). */
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 /* ---- helpers ------------------------------------------------------------ */
 
 #define OK(name)  puts("OK " name)
+
+/* =========================================================================
+ * Minimal test HTTP server (Task 5)
+ *
+ * Listens on 127.0.0.1:0 (OS-assigned port) in a background pthread.
+ * Supports a small route table: register a path → response callback.
+ * Used by Tasks 5, 10, 11.
+ * ========================================================================= */
+
+#define TEST_SERVER_MAX_ROUTES 16
+
+/* A route: path (e.g. "/seg.ts") → handler that writes the full HTTP
+ * response into the accepted socket and returns. */
+typedef void (*route_handler_t)(SOCKET client_sock, void *userdata);
+
+typedef struct {
+    const char      *path;
+    route_handler_t  handler;
+    void            *userdata;
+} route_t;
+
+typedef struct {
+    SOCKET    listen_sock;
+    int       port;          /* OS-assigned, set after bind */
+    volatile int stop;       /* set 1 to signal shutdown */
+
+    route_t   routes[TEST_SERVER_MAX_ROUTES];
+    int       n_routes;
+
+    pthread_t thread;
+} test_server_t;
+
+/* Send a minimal HTTP/1.0 response. */
+static void server_send_response(SOCKET s, int status,
+                                 const char *status_text,
+                                 const unsigned char *body, size_t body_len) {
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+                        "HTTP/1.0 %d %s\r\n"
+                        "Content-Length: %zu\r\n"
+                        "Connection: close\r\n"
+                        "\r\n",
+                        status, status_text, body_len);
+    send(s, hdr, hlen, 0);
+    if (body && body_len > 0) {
+        size_t sent = 0;
+        while (sent < body_len) {
+            int n = (int)send(s, (const char *)body + sent,
+                              (int)(body_len - sent), 0);
+            if (n <= 0) break;
+            sent += (size_t)n;
+        }
+    }
+}
+
+static void *server_thread(void *arg) {
+    test_server_t *srv = (test_server_t *)arg;
+
+    while (!srv->stop) {
+        /* Use select with a short timeout so we can check srv->stop */
+        fd_set rset;
+        FD_ZERO(&rset);
+        FD_SET(srv->listen_sock, &rset);
+        struct timeval tv = { 0, 100000 }; /* 100 ms */
+        int sel = select((int)srv->listen_sock + 1, &rset, NULL, NULL, &tv);
+        if (sel <= 0) continue;
+
+        struct sockaddr_in caddr;
+        int caddrlen = sizeof(caddr);
+        SOCKET client = accept(srv->listen_sock,
+                               (struct sockaddr *)&caddr, &caddrlen);
+        if (client == INVALID_SOCKET) continue;
+
+        /* Read request line (up to 1 KB) */
+        char req[1024];
+        int nread = recv(client, req, sizeof(req) - 1, 0);
+        if (nread <= 0) { closesocket(client); continue; }
+        req[nread] = '\0';
+
+        /* Extract the path from "GET /path HTTP/1.x" */
+        char path[512] = "/";
+        sscanf(req, "%*s %511s", path);
+
+        /* Find matching route */
+        int matched = 0;
+        for (int i = 0; i < srv->n_routes; i++) {
+            if (strcmp(srv->routes[i].path, path) == 0) {
+                srv->routes[i].handler(client, srv->routes[i].userdata);
+                matched = 1;
+                break;
+            }
+        }
+        if (!matched) {
+            server_send_response(client, 404, "Not Found", NULL, 0);
+        }
+
+        closesocket(client);
+    }
+    return NULL;
+}
+
+/* Start the server. Returns a heap-allocated test_server_t with port set.
+ * Caller must call test_server_stop() when done. */
+static test_server_t *test_server_start(void) {
+    /* WSAStartup — idempotent, safe to call multiple times */
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    test_server_t *srv = calloc(1, sizeof(*srv));
+    if (!srv) return NULL;
+
+    srv->listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (srv->listen_sock == INVALID_SOCKET) { free(srv); return NULL; }
+
+    /* Allow rapid reuse in tests */
+    int yes = 1;
+    setsockopt(srv->listen_sock, SOL_SOCKET, SO_REUSEADDR,
+               (const char *)&yes, sizeof(yes));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;  /* OS assigns */
+
+    if (bind(srv->listen_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        closesocket(srv->listen_sock); free(srv); return NULL;
+    }
+    if (listen(srv->listen_sock, 8) != 0) {
+        closesocket(srv->listen_sock); free(srv); return NULL;
+    }
+
+    /* Retrieve the OS-assigned port */
+    int alen = sizeof(addr);
+    getsockname(srv->listen_sock, (struct sockaddr *)&addr, &alen);
+    srv->port = ntohs(addr.sin_port);
+
+    pthread_create(&srv->thread, NULL, server_thread, srv);
+    return srv;
+}
+
+/* Register a route. Must be called before any request arrives (single-threaded
+ * setup phase). */
+static void test_server_add_route(test_server_t *srv, const char *path,
+                                  route_handler_t handler, void *userdata) {
+    assert(srv->n_routes < TEST_SERVER_MAX_ROUTES);
+    srv->routes[srv->n_routes].path     = path;
+    srv->routes[srv->n_routes].handler  = handler;
+    srv->routes[srv->n_routes].userdata = userdata;
+    srv->n_routes++;
+}
+
+/* Stop the server pthread cleanly and free. */
+static void test_server_stop(test_server_t *srv) {
+    if (!srv) return;
+    srv->stop = 1;
+    pthread_join(srv->thread, NULL);
+    closesocket(srv->listen_sock);
+    free(srv);
+}
 
 /* ---- test 1 ------------------------------------------------------------- */
 
@@ -638,14 +802,14 @@ static void test_segments_queue_cap(void) {
             m.segments[i].fetched = 0;
         }
 
-        int enqueued = _pf_enqueue_new_segments_for_test(pf, &m);
+        (void)_pf_enqueue_new_segments_for_test(pf, &m);
         manifest_free(&m);
 
         size_t count = _pf_segment_count_for_test(pf);
         /* After batch 0: 5 segs. After batch 1: 10. After batch 2: 15.
          * After batch 3: cap at 16 (oldest drop) */
         if (batch < 3) {
-            assert(count == (batch + 1) * 5);
+            assert(count == (size_t)(batch + 1) * 5);
         } else {
             assert(count == 16);  /* Capped */
         }
@@ -653,6 +817,102 @@ static void test_segments_queue_cap(void) {
 
     _pf_free_for_test(pf);
     OK("test_segments_queue_cap");
+}
+
+/* =========================================================================
+ * Task 5: segment fetcher tests
+ * ========================================================================= */
+
+/* Route handler: respond 200 + a 4096-byte body */
+#define SEG_BODY_SIZE 4096
+static unsigned char g_seg_body[SEG_BODY_SIZE];
+
+static void handler_200_4k(SOCKET s, void *userdata) {
+    (void)userdata;
+    server_send_response(s, 200, "OK", g_seg_body, SEG_BODY_SIZE);
+}
+
+/* Route handler: respond 404 */
+static void handler_404(SOCKET s, void *userdata) {
+    (void)userdata;
+    server_send_response(s, 404, "Not Found", NULL, 0);
+}
+
+/* Route handler: close socket immediately without sending anything */
+static void handler_drop_connection(SOCKET s, void *userdata) {
+    (void)userdata;
+    /* Just return — the caller will closesocket(client) immediately,
+     * so curl sees a connection reset before any data arrives. */
+    (void)s;
+}
+
+/* ---- test 21 ------------------------------------------------------------ */
+
+static void test_fetch_segment_basic(void) {
+    /* Fill body with a recognisable pattern */
+    for (int i = 0; i < SEG_BODY_SIZE; i++)
+        g_seg_body[i] = (unsigned char)(i & 0xFF);
+
+    test_server_t *srv = test_server_start();
+    assert(srv != NULL);
+    test_server_add_route(srv, "/seg.ts", handler_200_4k, NULL);
+
+    /* Build URL */
+    char url[64];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%d/seg.ts", srv->port);
+
+    ring_buf_t *r = ring_new(SEG_BODY_SIZE + 1024);
+    assert(r != NULL);
+
+    int rc = _pf_fetch_segment_for_test(url, r);
+    assert(rc == 0);
+    assert(ring_count(r) == SEG_BODY_SIZE);
+
+    test_server_stop(srv);
+    ring_free(r);
+    OK("test_fetch_segment_basic");
+}
+
+/* ---- test 22 ------------------------------------------------------------ */
+
+static void test_fetch_segment_404_fails(void) {
+    test_server_t *srv = test_server_start();
+    assert(srv != NULL);
+    test_server_add_route(srv, "/seg.ts", handler_404, NULL);
+
+    char url[64];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%d/seg.ts", srv->port);
+
+    ring_buf_t *r = ring_new(8192);
+    assert(r != NULL);
+
+    int rc = _pf_fetch_segment_for_test(url, r);
+    assert(rc == -1);
+
+    test_server_stop(srv);
+    ring_free(r);
+    OK("test_fetch_segment_404_fails");
+}
+
+/* ---- test 23 ------------------------------------------------------------ */
+
+static void test_fetch_segment_drops_connection_fails(void) {
+    test_server_t *srv = test_server_start();
+    assert(srv != NULL);
+    test_server_add_route(srv, "/seg.ts", handler_drop_connection, NULL);
+
+    char url[64];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%d/seg.ts", srv->port);
+
+    ring_buf_t *r = ring_new(8192);
+    assert(r != NULL);
+
+    int rc = _pf_fetch_segment_for_test(url, r);
+    assert(rc == -1);
+
+    test_server_stop(srv);
+    ring_free(r);
+    OK("test_fetch_segment_drops_connection_fails");
 }
 
 /* ---- main --------------------------------------------------------------- */
@@ -686,6 +946,11 @@ int main(void) {
     test_segments_dedup_on_subsequent_manifest();
     test_segments_skip_stale();
     test_segments_queue_cap();
+
+    /* Task 5: segment fetcher + test HTTP server */
+    test_fetch_segment_basic();
+    test_fetch_segment_404_fails();
+    test_fetch_segment_drops_connection_fails();
 
     return 0;
 }

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <pthread.h>
+#include <curl/curl.h>
 
 /* ---------------------------------------------------------------------------
  * Ring buffer — bounded byte FIFO with blocking producer/consumer discipline.
@@ -492,4 +493,53 @@ void _pf_free_for_test(hls_prefetch_t *pf) {
         seg_queue_free(pf->queue);
     }
     free(pf);
+}
+
+/* ---------------------------------------------------------------------------
+ * Segment fetcher test helper (Task 5)
+ * --------------------------------------------------------------------------- */
+
+/* curl write callback: push received bytes into the ring buffer.
+ * Returns 0 (not nmemb) on ring_write failure so curl aborts. */
+static size_t ring_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    ring_buf_t *r = (ring_buf_t *)userdata;
+    size_t total = size * nmemb;
+    if (total == 0) return 0;
+    int written = ring_write(r, (const unsigned char *)ptr, total);
+    if (written < 0) return 0;   /* signal curl to abort */
+    return (size_t)written;
+}
+
+int _pf_fetch_segment_for_test(const char *url, ring_buf_t *r) {
+    if (!url || !r) return -1;
+
+    CURL *c = curl_easy_init();
+    if (!c) return -1;
+
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 15L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, ring_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, r);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "Lavf/58.76.100");
+    /* Fail fast on HTTP errors (4xx/5xx) */
+    curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L);
+
+    CURLcode rc = curl_easy_perform(c);
+
+    long status = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_cleanup(c);
+
+    if (rc != CURLE_OK) {
+        fprintf(stderr, "[fetch_segment_test] curl error: %s (url=%s)\n",
+                curl_easy_strerror(rc), url);
+        return -1;
+    }
+    if (status != 200) {
+        fprintf(stderr, "[fetch_segment_test] HTTP %ld (url=%s)\n", status, url);
+        return -1;
+    }
+    return 0;
 }

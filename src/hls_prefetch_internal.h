@@ -61,4 +61,10 @@ int _pf_get_segment_url_for_test(const hls_prefetch_t *pf,
 /* Free a test-created prefetch session */
 void _pf_free_for_test(hls_prefetch_t *pf);
 
+/* Fetch one segment by URL and push its bytes into ring r.
+ * Uses curl; streaming write callback calls ring_write.
+ * Returns 0 on success (HTTP 200, no curl error),
+ * -1 on any failure (non-200 status, curl error, write error). */
+int _pf_fetch_segment_for_test(const char *url, ring_buf_t *r);
+
 #endif
