@@ -203,12 +203,17 @@ static const npo_channel_t *key_to_channel(SDL_Keycode k) {
  * RTL 4/5/7/8/Z have XTREAM_RTL_ARCHIVE_STREAM_IDS. For any other channel
  * we fall back to pb->stream_id — which works for many portals but can
  * return HTTP 502 if the stream lacks tv_archive support (the resulting
- * playback_open failure surfaces as a toast instead of a silent freeze). */
+ * playback_open failure surfaces as a toast instead of a silent freeze).
+ *
+ * pb->channel stays sticky after a wheel/f-search zap (see pb.stream_id
+ * docstring) so it is NOT authoritative for "what is playing now" — only
+ * pb->stream_id is. The pb->channel fallback is reserved for NPO mode
+ * without portal (stream_id == 0). */
 static int resolve_archive_stream_id(const playback_t *pb) {
-    if (!pb || !pb->channel) return pb ? pb->stream_id : 0;
+    if (!pb) return 0;
+
     for (int i = 0; i < 3; ++i) {
-        if (pb->channel == &NPO_CHANNELS[i] ||
-            pb->stream_id == XTREAM_NPO_STREAM_IDS[i] ||
+        if (pb->stream_id == XTREAM_NPO_STREAM_IDS[i] ||
             pb->stream_id == XTREAM_NPO_ARCHIVE_STREAM_IDS[i])
             return XTREAM_NPO_ARCHIVE_STREAM_IDS[i];
     }
@@ -217,6 +222,13 @@ static int resolve_archive_stream_id(const playback_t *pb) {
             pb->stream_id == XTREAM_RTL_ARCHIVE_STREAM_IDS[i])
             return XTREAM_RTL_ARCHIVE_STREAM_IDS[i];
     }
+
+    if (pb->stream_id == 0 && pb->channel) {
+        for (int i = 0; i < 3; ++i)
+            if (pb->channel == &NPO_CHANNELS[i])
+                return XTREAM_NPO_ARCHIVE_STREAM_IDS[i];
+    }
+
     return pb->stream_id;   /* best-effort — may 502 if no tv_archive. */
 }
 
