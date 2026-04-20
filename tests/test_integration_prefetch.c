@@ -452,6 +452,7 @@ static void test_survives_509_storm(void) {
     hls_prefetch_stats_t pre_storm;
     hls_prefetch_get_stats(pf, &pre_storm);
     assert(pre_storm.manifest_errors == 0);
+    assert(pre_storm.bytes_buffered > 0);   /* buffer has data before storm */
 
     /* Phase 2: inject 5 consecutive 509s */
     mock_server_inject_manifest_failures(ms, 5, 509);
@@ -510,6 +511,8 @@ static void test_survives_dropped_segment_connection(void) {
 
     /* At least 3 segments successfully fetched despite the drop */
     assert(stats.segments_fetched >= 3);
+
+    assert(mock_server_segments_served(ms) >= 2);  /* server saw requests */
 
     hls_prefetch_close(pf);
     mock_server_stop(ms);

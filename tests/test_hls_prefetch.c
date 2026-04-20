@@ -1031,10 +1031,10 @@ static void test_prefetch_open_close(void) {
 /* ---- test 25 (task 6, test 2) ------------------------------------------ */
 
 static void test_prefetch_open_invalid_url(void) {
-    /* Port 65535 on loopback — nothing should be listening there.
-     * hls_prefetch_open returns non-NULL (thread spawns fine), the thread
-     * fails to connect, logs, backs off, retries — but close() must join
-     * cleanly without hanging. */
+    /* Port 1 on loopback — reserved; no OS process will ever listen there.
+     * With pre-flight enabled, hls_prefetch_open now returns NULL fast
+     * (within the 1-second connect timeout) rather than spawning a thread
+     * that retries forever. */
 
     /* Small ring again */
     char ring_env[32];
@@ -1045,20 +1045,9 @@ static void test_prefetch_open_invalid_url(void) {
     setenv("TV_PREBUFFER_BYTES", ring_env, 1);
 #endif
 
-    hls_prefetch_t *pf = hls_prefetch_open(
-        "http://127.0.0.1:65535/fake.m3u8");
-    assert(pf != NULL);
+    hls_prefetch_t *pf = hls_prefetch_open("http://127.0.0.1:1/fake.m3u8");
+    assert(pf == NULL);   /* pre-flight fails fast on unreachable port */
 
-    /* Give it a moment to attempt (and fail) the first fetch */
-    msleep(200);
-
-    /* close() must return quickly — thread sees stop=1 mid-backoff or
-     * on the next iteration.  nanosleep inside msleep is not
-     * signal-interrupted on Windows, but the thread will be in a short
-     * backoff (500 ms) — worst case close takes ~500 ms.  Still fine. */
-    hls_prefetch_close(pf);
-
-    /* If we reach here without hanging, the test passes. */
 #ifdef _WIN32
     _putenv_s("TV_PREBUFFER_BYTES", "");
 #else

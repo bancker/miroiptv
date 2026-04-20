@@ -308,6 +308,7 @@ int manifest_parse(const char *text, size_t len, const char *base_url,
                             expect_url = 0;
                         } else {
                             free(resolved_url);
+                            manifest_free(out);   /* frees any partial segments */
                             free(buf);
                             return -1;
                         }
@@ -684,6 +685,47 @@ hls_prefetch_t *hls_prefetch_open(const char *manifest_url) {
         return NULL;
     }
 
+    /* Pre-flight: synchronous single manifest fetch with short timeout.
+     * A permanently-unreachable URL (wrong hostname, bad port, 404) is
+     * detected here and propagated as open-failure rather than silently
+     * retrying forever in the background. 1-second timeout keeps the
+     * zap-latency cost invisible on healthy channels. */
+    manifest_t m_preflight = {0};
+    CURL *preflight = curl_easy_init();
+    if (!preflight) {
+        /* existing cleanup path: free ring, free queue, free manifest_url, free pf */
+        goto preflight_fail;
+    }
+    grow_buf_t gb = {0};
+    curl_easy_setopt(preflight, CURLOPT_URL, manifest_url);
+    curl_easy_setopt(preflight, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(preflight, CURLOPT_TIMEOUT, 1L);
+    curl_easy_setopt(preflight, CURLOPT_CONNECTTIMEOUT, 1L);
+    curl_easy_setopt(preflight, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(preflight, CURLOPT_WRITEFUNCTION, grow_buf_write_cb);
+    curl_easy_setopt(preflight, CURLOPT_WRITEDATA, &gb);
+    curl_easy_setopt(preflight, CURLOPT_USERAGENT, "Lavf/58.76.100");
+    CURLcode crc = curl_easy_perform(preflight);
+    curl_easy_cleanup(preflight);
+    if (crc != CURLE_OK) {
+        fprintf(stderr, "hls_prefetch: pre-flight fetch failed: %s\n",
+                curl_easy_strerror(crc));
+        free(gb.buf);
+        goto preflight_fail;
+    }
+    int mrc = manifest_parse(gb.buf, gb.len, manifest_url, &m_preflight);
+    free(gb.buf);
+    if (mrc != 0) {
+        fprintf(stderr, "hls_prefetch: pre-flight manifest parse failed\n");
+        goto preflight_fail;
+    }
+    /* We have a valid first manifest. Seed the segment queue so the
+     * first segment fetches start immediately after pthread_create. */
+    seg_queue_enqueue(pf->queue, &m_preflight);
+    manifest_free(&m_preflight);
+    pf->manifest_refreshes++;
+    pf->last_refresh_ms = (unsigned int)get_ticks_ms();
+
     /* Spawn the worker thread */
     if (pthread_create(&pf->thread, NULL, prefetch_thread, pf) != 0) {
         seg_queue_free(pf->queue);
@@ -694,6 +736,14 @@ hls_prefetch_t *hls_prefetch_open(const char *manifest_url) {
     }
 
     return pf;
+
+preflight_fail:
+    manifest_free(&m_preflight);
+    seg_queue_free(pf->queue);
+    ring_free(pf->ring);
+    free(pf->manifest_url);
+    free(pf);
+    return NULL;
 }
 
 /* ---------------------------------------------------------------------------
@@ -719,8 +769,13 @@ static int avio_read_packet(void *opaque, uint8_t *buf, int buf_size) {
     /* 200 ms timeout — keeps libav from deadlocking on a temporarily
      * empty ring while the prefetch thread is fetching the next segment. */
     int got = ring_read(pf->ring, buf, buf_size, 200);
-    /* ring_read returns 0 on timeout or closed-empty.
-     * Returning 0 here causes libav to map this to AVERROR_EOF. */
+    /* ring_read returns 0 on timeout or closed-empty. libav's fill_buffer
+     * retries when read_packet returns 0 (ffmpeg >= 7.x), so 0 is
+     * effectively "no data yet, try again". A closed+empty ring will
+     * spin at the ring_read timeout (200ms) per call until
+     * io_interrupt_cb fires (p->stop=1). Returning AVERROR_EOF here
+     * would stop the decoder immediately — we deliberately do NOT, so
+     * the decoder survives normal segment gaps of 2-6s. */
     return got;
 }
 
