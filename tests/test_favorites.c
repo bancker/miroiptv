@@ -880,6 +880,193 @@ static void test_journey_random_ops_oracle(void) {
     puts("OK test_journey_random_ops_oracle");
 }
 
+/* ---- new tests (phase 2) ---- */
+
+static void test_favorites_free_on_zeroed_struct(void) {
+    favorites_t fv = {0};
+    favorites_free(&fv);   /* must not crash */
+    puts("OK test_favorites_free_on_zeroed_struct");
+}
+
+static void test_save_load_1000_entries(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/big1k.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    favorites_t fv = {0};
+    favorites_init(&fv, NULL);
+    for (int i = 1; i <= 1000; ++i) {
+        char name[32]; snprintf(name, sizeof(name), "Ch%d", i);
+        assert(favorites_toggle(&fv, i, i, name) == 0);
+    }
+    assert(fv.count == 1000);
+    favorites_free(&fv);
+
+    /* Reload and spot-check 5 ids. */
+    favorites_t fv2 = {0};
+    favorites_init(&fv2, NULL);
+    assert(fv2.count == 1000);
+    assert(favorites_is_favorite(&fv2, 1));
+    assert(favorites_is_favorite(&fv2, 250));
+    assert(favorites_is_favorite(&fv2, 500));
+    assert(favorites_is_favorite(&fv2, 750));
+    assert(favorites_is_favorite(&fv2, 1000));
+    favorites_free(&fv2);
+
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_save_load_1000_entries");
+}
+
+static void test_toggle_same_id_100_times(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/parity.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    favorites_t fv = {0};
+    favorites_init(&fv, NULL);
+    for (int i = 0; i < 100; ++i)
+        favorites_toggle(&fv, 42, 1, "X");
+    /* 100 toggles (even) -> absent */
+    assert(favorites_is_favorite(&fv, 42) == 0);
+    assert(fv.count == 0);
+
+    favorites_toggle(&fv, 42, 1, "X");
+    /* 101 toggles (odd) -> present */
+    assert(favorites_is_favorite(&fv, 42) == 1);
+    assert(fv.count == 1);
+
+    favorites_free(&fv);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_toggle_same_id_100_times");
+}
+
+static void test_reconcile_preserves_order_after_restart(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/order.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    /* Seed with nums 50, 30, 10 (insertion order: 50 first). */
+    favorites_t seed = {0};
+    fav_push_for_test(&seed, 10, 50, "Ch50");
+    fav_push_for_test(&seed, 20, 30, "Ch30");
+    fav_push_for_test(&seed, 30, 10, "Ch10");
+    favorites_save_to_path(&seed, path);
+    favorites_free(&seed);
+
+    /* Catalog with matching ids, same nums. */
+    int ids[]           = {10, 20, 30};
+    int nums[]          = {50, 30, 10};
+    const char *names[] = {"Ch50", "Ch30", "Ch10"};
+    xtream_live_list_t cat = {0};
+    mk_catalog(&cat, ids, nums, names, 3);
+
+    favorites_t fv = {0};
+    favorites_init(&fv, &cat);
+    assert(fv.count == 3);
+    /* After reconcile, entries are sorted by num ascending: 10, 30, 50. */
+    assert(favorites_visible_at(&fv, 0)->num == 10);
+    assert(favorites_visible_at(&fv, 1)->num == 30);
+    assert(favorites_visible_at(&fv, 2)->num == 50);
+
+    free_catalog(&cat);
+    favorites_free(&fv);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_reconcile_preserves_order_after_restart");
+}
+
+static void test_is_favorite_after_reconcile_name_fallback(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/namefb.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    /* Seed with id=100 name="X". */
+    favorites_t seed = {0};
+    fav_push_for_test(&seed, 100, 1, "X");
+    favorites_save_to_path(&seed, path);
+    favorites_free(&seed);
+
+    /* Catalog: id=999 name="X" (id mismatch, name match -> rewrite). */
+    int ids[]           = {999};
+    int nums[]          = {1};
+    const char *names[] = {"X"};
+    xtream_live_list_t cat = {0};
+    mk_catalog(&cat, ids, nums, names, 1);
+
+    favorites_t fv = {0};
+    favorites_init(&fv, &cat);
+    /* After name-fallback reconcile, stream_id was rewritten to 999. */
+    assert(favorites_is_favorite(&fv, 999) == 1);
+    assert(favorites_is_favorite(&fv, 100) == 0);
+
+    free_catalog(&cat);
+    favorites_free(&fv);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_is_favorite_after_reconcile_name_fallback");
+}
+
+static void test_visible_count_excludes_hidden(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/vis.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    /* Seed 3 favorites. */
+    favorites_t seed = {0};
+    fav_push_for_test(&seed, 100, 1, "Found");
+    fav_push_for_test(&seed, 200, 2, "Ghost1");
+    fav_push_for_test(&seed, 300, 3, "Ghost2");
+    favorites_save_to_path(&seed, path);
+    favorites_free(&seed);
+
+    /* Catalog only has id=100 — the other two will be hidden. */
+    int ids[]           = {100};
+    int nums[]          = {1};
+    const char *names[] = {"Found"};
+    xtream_live_list_t cat = {0};
+    mk_catalog(&cat, ids, nums, names, 1);
+
+    favorites_t fv = {0};
+    favorites_init(&fv, &cat);
+    assert(fv.count == 3);
+    assert(favorites_visible_count(&fv) == 1);
+    assert(favorites_visible_at(&fv, 0)->stream_id == 100);
+
+    free_catalog(&cat);
+    favorites_free(&fv);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_visible_count_excludes_hidden");
+}
+
+static void test_path_env_override_with_unicode(void) {
+    /* UTF-8 encoded path with non-ASCII characters. favorites_path() must
+     * return it verbatim — it does strdup(getenv("TV_FAVORITES_PATH")).
+     *
+     * Split string literals break hex escape parsing: \xNN stops at the
+     * boundary of each literal so the compiler doesn't consume extra hex
+     * digits from the following character. The runtime concatenates them. */
+    const char *upath =
+        "/tmp/"
+        "\xc3\xbc"   /* ü */
+        "n"
+        "\xc3\xaf"   /* ï */
+        "\xc3\xa7"   /* ç */
+        "\xc3\xb8"   /* ø */
+        "d"
+        "\xc3\xa9"   /* é */
+        "-test.json";
+    setenv_portable("TV_FAVORITES_PATH", upath);
+    char *p = favorites_path();
+    assert(p);
+    assert(strcmp(p, upath) == 0);
+    free(p);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    puts("OK test_path_env_override_with_unicode");
+}
+
 int main(void) {
     test_path_env_override();
     test_path_defaults_nonnull();
@@ -918,5 +1105,12 @@ int main(void) {
     test_journey_random_ops_oracle();
     test_stress_10k_entries();
     test_unicode_and_long_name();
+    test_favorites_free_on_zeroed_struct();
+    test_save_load_1000_entries();
+    test_toggle_same_id_100_times();
+    test_reconcile_preserves_order_after_restart();
+    test_is_favorite_after_reconcile_name_fallback();
+    test_visible_count_excludes_hidden();
+    test_path_env_override_with_unicode();
     return 0;
 }

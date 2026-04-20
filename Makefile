@@ -31,6 +31,12 @@ TEST_BIN = build/test_npo_parse.exe
 FAV_TEST_SRC = tests/test_favorites.c src/favorites.c
 FAV_TEST_BIN = build/test_favorites.exe
 
+QUEUE_TEST_SRC = tests/test_queue.c src/queue.c
+QUEUE_TEST_BIN = build/test_queue.exe
+
+XTREAM_TEST_SRC = tests/test_xtream_parse.c src/xtream.c src/npo.c src/queue.c
+XTREAM_TEST_BIN = build/test_xtream_parse.exe
+
 .PHONY: all run test clean
 
 all: $(BIN)
@@ -47,15 +53,23 @@ build:
 run: $(BIN)
 	./$(BIN)
 
-test: $(TEST_BIN) $(FAV_TEST_BIN)
+test: $(TEST_BIN) $(FAV_TEST_BIN) $(QUEUE_TEST_BIN) $(XTREAM_TEST_BIN)
 	./$(TEST_BIN)
 	./$(FAV_TEST_BIN)
+	./$(QUEUE_TEST_BIN)
+	./$(XTREAM_TEST_BIN)
 
 $(TEST_BIN): $(TEST_SRC) | build
 	$(CC) $(CFLAGS) -Isrc $(TEST_SRC) -o $@ $(LDLIBS)
 
 $(FAV_TEST_BIN): $(FAV_TEST_SRC) | build
 	$(CC) $(CFLAGS) -Isrc $(FAV_TEST_SRC) -o $@ $(LDLIBS)
+
+$(QUEUE_TEST_BIN): $(QUEUE_TEST_SRC) | build
+	$(CC) $(CFLAGS) -Isrc $(QUEUE_TEST_SRC) -o $@ $(LDLIBS)
+
+$(XTREAM_TEST_BIN): $(XTREAM_TEST_SRC) | build
+	$(CC) $(CFLAGS) -Isrc $(XTREAM_TEST_SRC) -o $@ $(LDLIBS)
 
 clean:
 	rm -rf build
