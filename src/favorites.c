@@ -296,9 +296,11 @@ static void favorites_reconcile(favorites_t *fv, const xtream_live_list_t *cat) 
         favorite_t *e = &fv->entries[i];
         int ci = catalog_find_by_id(cat, e->stream_id);
         if (ci >= 0) {
-            /* Match. Refresh cached num + name (portal is source of truth). */
             e->hidden = 0;
-            e->num    = cat->entries[ci].num;
+            if (e->num != cat->entries[ci].num) {
+                e->num = cat->entries[ci].num;
+                any_rewrite = 1;
+            }
             if (cat->entries[ci].name &&
                 (!e->name || strcmp(e->name, cat->entries[ci].name) != 0)) {
                 free(e->name);

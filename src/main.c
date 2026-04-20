@@ -917,7 +917,8 @@ int main(int argc, char **argv) {
             if (fav_overlay_active) {
                 if (ev.type == SDL_KEYDOWN) {
                     SDL_Keycode sk = ev.key.keysym.sym;
-                    int n = (int)favorites_visible_count(&favorites);
+                    int n_all = (int)favorites_visible_count(&favorites);
+                    int n = n_all < 64 ? n_all : 64;   /* match render cap so highlight tracks cursor */
                     if (sk == SDLK_ESCAPE) {
                         fav_overlay_active = 0;
                     } else if (sk == SDLK_f && (ev.key.keysym.mod & KMOD_SHIFT)) {
@@ -954,7 +955,12 @@ int main(int argc, char **argv) {
                                                                     (size_t)fav_overlay_sel);
                         if (fe) {
                             int removed_id = fe->stream_id;
-                            favorites_remove(&favorites, removed_id);
+                            int rrc = favorites_remove(&favorites, removed_id);
+                            if (rrc == -2) {
+                                snprintf(toast_text, sizeof(toast_text),
+                                         "Couldn't save favorites (still removed in memory)");
+                                toast_until_ms = SDL_GetTicks() + 2500;
+                            }
                             /* Clamp selection after removal. */
                             int n2 = (int)favorites_visible_count(&favorites);
                             if (fav_overlay_sel >= n2) fav_overlay_sel = n2 > 0 ? n2 - 1 : 0;
@@ -1144,7 +1150,12 @@ int main(int argc, char **argv) {
                             search_hit_t h = search_hits[search_sel];
                             if (h.kind == SEARCH_HIT_LIVE && h.idx < (int)live_list.count) {
                                 xtream_live_entry_t *e = &live_list.entries[h.idx];
-                                favorites_toggle(&favorites, e->stream_id, e->num, e->name);
+                                int rc = favorites_toggle(&favorites, e->stream_id, e->num, e->name);
+                                if (rc != 0) {
+                                    snprintf(toast_text, sizeof(toast_text),
+                                             "Couldn't save favorites (still toggled in memory)");
+                                    toast_until_ms = SDL_GetTicks() + 2500;
+                                }
                                 /* Swallow the TEXTINPUT that follows. */
                                 search_swallow_next_text = 1;
                             }
@@ -1896,8 +1907,11 @@ int main(int argc, char **argv) {
                         nt = zap_prep->pb->epg.entries[i].title; break;
                     }
                 }
-                if (nt && *nt)
-                    snprintf(toast_text, sizeof(toast_text), "%s  |  %s", zap_prep->label, nt);
+                if (nt && *nt) {
+                    int is_fav = favorites_is_favorite(&favorites, zap_prep->epg_stream_id);
+                    snprintf(toast_text, sizeof(toast_text), "%s%s  |  %s",
+                             is_fav ? "\xe2\x98\x85 " : "", zap_prep->label, nt);
+                }
                 zap_prep->epg_toast_shown = 1;
             }
 

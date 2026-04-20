@@ -393,8 +393,7 @@ static void test_write_is_atomic_on_existing_file(void) {
 
 static void test_malformed_backs_up_and_resets(void) {
     char *dir = make_tempdir();
-    char src[512], orig[512];
-    snprintf(src,  sizeof(src),  "%s/malformed_src.json", dir);
+    char orig[512];
     snprintf(orig, sizeof(orig), "%s/favorites.json",     dir);
 
     /* Copy the malformed fixture into the scratch dir so the test can
@@ -441,7 +440,6 @@ static void test_malformed_backs_up_and_resets(void) {
 
     favorites_free(&fv);
     free(dir);
-    (void)src;
     puts("OK test_malformed_backs_up_and_resets");
 }
 
