@@ -269,6 +269,8 @@ int overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh) {
         "  e             Toggle EPG overlay (bottom strip)",
         "  Shift+e       Full multi-day EPG, Enter replays past programme",
         "  f             Search channels + movies + series (type, up/down, Enter)",
+        "  *             Toggle favorite on current channel (also works in 'f' search)",
+        "  Shift+f       Favorites list (Enter zaps, Del removes)",
         "  F11           Toggle fullscreen",
         "  t             Toggle always-on-top",
         "  a             Cycle audio track (NL / FR / EN / …)",

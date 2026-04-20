@@ -28,6 +28,9 @@ BIN      = build/miroiptv.exe
 TEST_SRC = tests/test_npo_parse.c src/npo.c src/queue.c
 TEST_BIN = build/test_npo_parse.exe
 
+FAV_TEST_SRC = tests/test_favorites.c src/favorites.c
+FAV_TEST_BIN = build/test_favorites.exe
+
 .PHONY: all run test clean
 
 all: $(BIN)
@@ -44,11 +47,15 @@ build:
 run: $(BIN)
 	./$(BIN)
 
-test: $(TEST_BIN)
+test: $(TEST_BIN) $(FAV_TEST_BIN)
 	./$(TEST_BIN)
+	./$(FAV_TEST_BIN)
 
 $(TEST_BIN): $(TEST_SRC) | build
 	$(CC) $(CFLAGS) -Isrc $(TEST_SRC) -o $@ $(LDLIBS)
+
+$(FAV_TEST_BIN): $(FAV_TEST_SRC) | build
+	$(CC) $(CFLAGS) -Isrc $(FAV_TEST_SRC) -o $@ $(LDLIBS)
 
 clean:
 	rm -rf build

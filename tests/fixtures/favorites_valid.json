@@ -1,0 +1,5 @@
+[
+  {"stream_id": 1234, "num": 101, "name": "NPO 1 HD"},
+  {"stream_id": 5678, "num": 201, "name": "Eurosport 1"},
+  {"stream_id": 9012, "num": 301, "name": "Discovery"}
+]

@@ -1,0 +1,8 @@
+[
+  {"stream_id": 1111, "num": 1, "name": "Unicode ★ 🎬 HD", "color": "red"},
+  {"num": 2, "name": "Missing stream_id"},
+  {"stream_id": 0, "num": 3, "name": "Zero id"},
+  {"stream_id": -5, "num": 4, "name": "Negative id"},
+  {"stream_id": 2222, "num": 5, "name": "Keep me"},
+  {"stream_id": 2222, "num": 6, "name": "Duplicate id"}
+]

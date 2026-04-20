@@ -3,6 +3,7 @@
 #include "npo.h"
 #include "sync.h"
 #include "xtream.h"
+#include "favorites.h"
 #include "update_check.h"
 #include <SDL2/SDL.h>
 #include <curl/curl.h>
@@ -401,15 +402,26 @@ static const char *search_hit_label(const search_hit_t *h,
                                     const xtream_live_list_t *live,
                                     const xtream_vod_list_t  *vods,
                                     const xtream_series_list_t *series,
+                                    const favorites_t *fav,
                                     char *buf, size_t buflen) {
     const char *name = "";
     const char *tag  = "";
+    int starred = 0;
     switch (h->kind) {
-    case SEARCH_HIT_LIVE:   tag = "[LIVE]  "; name = live->entries[h->idx].name;   break;
+    case SEARCH_HIT_LIVE:
+        tag = "[LIVE]  ";
+        name = live->entries[h->idx].name;
+        starred = fav && favorites_is_favorite(fav, live->entries[h->idx].stream_id);
+        break;
     case SEARCH_HIT_VOD:    tag = "[MOVIE] "; name = vods->entries[h->idx].name;   break;
     case SEARCH_HIT_SERIES: tag = "[SERIES] "; name = series->entries[h->idx].name; break;
     }
-    snprintf(buf, buflen, "%s%s", tag, name);
+    if (starred) {
+        /* Insert the star between the tag and the name. */
+        snprintf(buf, buflen, "%s\xe2\x98\x85 %s", tag, name);
+    } else {
+        snprintf(buf, buflen, "%s%s", tag, name);
+    }
     return buf;
 }
 
@@ -804,6 +816,10 @@ int main(int argc, char **argv) {
     int       epg_full_archive_id = 0;
     char      epg_full_channel_name[128] = {0};
 
+    /* Favorites overlay (Shift+F): browse the user's shortlist and zap on Enter. */
+    int  fav_overlay_active = 0;
+    int  fav_overlay_sel    = 0;
+
     /* Mouse-wheel zapping through ALL portal live channels. We fetch the full
      * catalog once, find our current stream_id in it, and the wheel moves the
      * index ±1 per notch. Actual switch is debounced — rapid scrolling only
@@ -812,6 +828,7 @@ int main(int argc, char **argv) {
     xtream_live_list_t    live_list   = {0};
     xtream_vod_list_t     vod_list    = {0};
     xtream_series_list_t  series_list = {0};
+    favorites_t           favorites   = {0};
     int    current_live_idx = -1;
     int    pending_wheel_delta = 0;
     Uint32 last_wheel_ts = 0;
@@ -846,6 +863,9 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "[zap] failed to fetch live channel list — wheel disabled\n");
         }
+        favorites_init(&favorites, &live_list);
+        fprintf(stderr, "[favorites] %zu loaded (%zu visible)\n",
+                favorites.count, favorites_visible_count(&favorites));
         /* VOD + series are used only by the 'f' search prompt. A fetch
          * failure (portal 403 on un-subscribed catalogs, brief 5xx) is
          * non-fatal — the lists stay empty and search just returns fewer
@@ -901,6 +921,64 @@ int main(int argc, char **argv) {
                 /* wheel up (positive y) = previous channel; down = next channel */
                 pending_wheel_delta -= ev.wheel.y;
                 last_wheel_ts = SDL_GetTicks();
+                continue;
+            }
+
+            /* Favorites overlay (Shift+F). Intercepts keys before search /
+             * episode / EPG modes so arrows + Enter route to favorites. */
+            if (fav_overlay_active) {
+                if (ev.type == SDL_KEYDOWN) {
+                    SDL_Keycode sk = ev.key.keysym.sym;
+                    int n_all = (int)favorites_visible_count(&favorites);
+                    int n = n_all < 64 ? n_all : 64;   /* match render cap so highlight tracks cursor */
+                    if (sk == SDLK_ESCAPE) {
+                        fav_overlay_active = 0;
+                    } else if (sk == SDLK_f && (ev.key.keysym.mod & KMOD_SHIFT)) {
+                        fav_overlay_active = 0;   /* toggle off on Shift+F */
+                    } else if (sk == SDLK_UP && n > 0) {
+                        fav_overlay_sel = (fav_overlay_sel - 1 + n) % n;
+                    } else if (sk == SDLK_DOWN && n > 0) {
+                        fav_overlay_sel = (fav_overlay_sel + 1) % n;
+                    } else if ((sk == SDLK_PAGEUP || sk == SDLK_PAGEDOWN) && n > 0) {
+                        int delta = (sk == SDLK_PAGEUP) ? -10 : +10;
+                        fav_overlay_sel += delta;
+                        if (fav_overlay_sel < 0) fav_overlay_sel = 0;
+                        if (fav_overlay_sel >= n) fav_overlay_sel = n - 1;
+                    } else if ((sk == SDLK_RETURN || sk == SDLK_KP_ENTER) &&
+                               n > 0 && fav_overlay_sel < n) {
+                        const favorite_t *fe = favorites_visible_at(&favorites,
+                                                                    (size_t)fav_overlay_sel);
+                        if (fe && current_live_idx >= 0) {
+                            /* Find the catalog index by stream_id; reuse wheel pipeline. */
+                            int target_idx = -1;
+                            for (size_t i = 0; i < live_list.count; ++i) {
+                                if (live_list.entries[i].stream_id == fe->stream_id) {
+                                    target_idx = (int)i; break;
+                                }
+                            }
+                            if (target_idx >= 0) {
+                                pending_wheel_delta = target_idx - current_live_idx;
+                                last_wheel_ts       = SDL_GetTicks() - 400;  /* fire immediately */
+                            }
+                        }
+                        fav_overlay_active = 0;
+                    } else if (sk == SDLK_DELETE && n > 0 && fav_overlay_sel < n) {
+                        const favorite_t *fe = favorites_visible_at(&favorites,
+                                                                    (size_t)fav_overlay_sel);
+                        if (fe) {
+                            int removed_id = fe->stream_id;
+                            int rrc = favorites_remove(&favorites, removed_id);
+                            if (rrc == -2) {
+                                snprintf(toast_text, sizeof(toast_text),
+                                         "Couldn't save favorites (still removed in memory)");
+                                toast_until_ms = SDL_GetTicks() + 2500;
+                            }
+                            /* Clamp selection after removal. */
+                            int n2 = (int)favorites_visible_count(&favorites);
+                            if (fav_overlay_sel >= n2) fav_overlay_sel = n2 > 0 ? n2 - 1 : 0;
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -1077,6 +1155,24 @@ int main(int argc, char **argv) {
                     } else if (sk == SDLK_DOWN) {
                         if (search_hits_count > 0)
                             search_sel = (search_sel + 1) % search_hits_count;
+                    } else if (sk == SDLK_ASTERISK ||
+                               (sk == SDLK_8 && (ev.key.keysym.mod & KMOD_SHIFT))) {
+                        /* Only meaningful on [LIVE] rows — leave VOD/series alone. */
+                        if (search_hits_count > 0 && search_sel < search_hits_count) {
+                            search_hit_t h = search_hits[search_sel];
+                            if (h.kind == SEARCH_HIT_LIVE && h.idx < (int)live_list.count) {
+                                xtream_live_entry_t *e = &live_list.entries[h.idx];
+                                int rc = favorites_toggle(&favorites, e->stream_id, e->num, e->name);
+                                if (rc != 0) {
+                                    snprintf(toast_text, sizeof(toast_text),
+                                             "Couldn't save favorites (still toggled in memory)");
+                                    toast_until_ms = SDL_GetTicks() + 2500;
+                                }
+                                /* Swallow the TEXTINPUT that follows. */
+                                search_swallow_next_text = 1;
+                            }
+                        }
+                        continue;
                     } else if (sk == SDLK_RETURN || sk == SDLK_KP_ENTER) {
                         if (search_hits_count > 0 && search_sel < search_hits_count) {
                             search_hit_t h = search_hits[search_sel];
@@ -1175,15 +1271,22 @@ int main(int argc, char **argv) {
             SDL_Keycode k = ev.key.keysym.sym;
             if (k == SDLK_q || k == SDLK_ESCAPE) { running = 0; break; }
             else if (k == SDLK_f) {
-                /* Remapped in 2026-04-18: 'f' opens the search prompt (was
-                 * fullscreen). Fullscreen moved to F11. */
-                search_active = 1;
-                search_query[0] = '\0';
-                search_query_len = 0;
-                search_hits_count = 0;
-                search_sel = 0;
-                search_swallow_next_text = 1;
-                SDL_StartTextInput();
+                if (ev.key.keysym.mod & KMOD_SHIFT) {
+                    /* Shift+F: favorites overlay. No async work — just flip the
+                     * state bit and let the render branch pick up the list. */
+                    fav_overlay_active   = 1;
+                    fav_overlay_sel      = 0;
+                    hint_until_ms        = 0;
+                } else {
+                    /* Plain f: search prompt. Fullscreen moved to F11 in 2026-04-18. */
+                    search_active = 1;
+                    search_query[0] = '\0';
+                    search_query_len = 0;
+                    search_hits_count = 0;
+                    search_sel = 0;
+                    search_swallow_next_text = 1;
+                    SDL_StartTextInput();
+                }
             }
             else if (k == SDLK_F11) render_toggle_fullscreen(&r);
             else if (k == SDLK_SPACE) {
@@ -1282,6 +1385,30 @@ int main(int argc, char **argv) {
                     }
                 }
                 toast_until_ms = SDL_GetTicks() + 3000;
+            }
+            else if (k == SDLK_ASTERISK ||
+                     (k == SDLK_8 && (ev.key.keysym.mod & KMOD_SHIFT))) {
+                /* '*' on US keyboards is Shift+8. Some layouts send SDLK_ASTERISK
+                 * directly (numpad *, other layouts). Accept both. */
+                if (current_live_idx < 0 || current_live_idx >= (int)live_list.count) {
+                    snprintf(toast_text, sizeof(toast_text),
+                             "Favorites only work on live portal channels");
+                    toast_until_ms = SDL_GetTicks() + 2500;
+                } else {
+                    xtream_live_entry_t *e = &live_list.entries[current_live_idx];
+                    int was_fav = favorites_is_favorite(&favorites, e->stream_id);
+                    int rc = favorites_toggle(&favorites, e->stream_id, e->num, e->name);
+                    if (rc == 0) {
+                        snprintf(toast_text, sizeof(toast_text),
+                                 "%s %s favorites",
+                                 was_fav ? "\xe2\x98\x86" : "\xe2\x98\x85",  /* ☆ / ★ */
+                                 was_fav ? "Removed from" : "Added to");
+                    } else {
+                        snprintf(toast_text, sizeof(toast_text),
+                                 "Couldn't save favorites (still toggled in memory)");
+                    }
+                    toast_until_ms = SDL_GetTicks() + 2500;
+                }
             }
             else if ((k == SDLK_UP || k == SDLK_DOWN) && current_live_idx >= 0) {
                 /* Same pipeline as mouse wheel: accumulate into pending_wheel_delta
@@ -1750,7 +1877,11 @@ int main(int argc, char **argv) {
 
                 /* Phase-0 toast: channel name INSTANTLY — before the worker
                  * has even done anything. */
-                snprintf(toast_text, sizeof(toast_text), "%s", e->name);
+                int is_fav = favorites_is_favorite(&favorites, e->stream_id);
+                snprintf(toast_text, sizeof(toast_text),
+                         "%s%s",
+                         is_fav ? "\xe2\x98\x85 " : "",
+                         e->name);
                 toast_until_ms = SDL_GetTicks() + 8000;
             }
         }
@@ -1767,7 +1898,10 @@ int main(int argc, char **argv) {
                 }
             }
             if (now_title && *now_title) {
-                snprintf(toast_text, sizeof(toast_text), "%s  |  %s",
+                int is_fav = favorites_is_favorite(&favorites, zap_prep->epg_stream_id);
+                snprintf(toast_text, sizeof(toast_text),
+                         "%s%s  |  %s",
+                         is_fav ? "\xe2\x98\x85 " : "",
                          zap_prep->label, now_title);
                 toast_until_ms = SDL_GetTicks() + 8000;
             }
@@ -1785,8 +1919,11 @@ int main(int argc, char **argv) {
                         nt = zap_prep->pb->epg.entries[i].title; break;
                     }
                 }
-                if (nt && *nt)
-                    snprintf(toast_text, sizeof(toast_text), "%s  |  %s", zap_prep->label, nt);
+                if (nt && *nt) {
+                    int is_fav = favorites_is_favorite(&favorites, zap_prep->epg_stream_id);
+                    snprintf(toast_text, sizeof(toast_text), "%s%s  |  %s",
+                             is_fav ? "\xe2\x98\x85 " : "", zap_prep->label, nt);
+                }
                 zap_prep->epg_toast_shown = 1;
             }
 
@@ -2205,13 +2342,37 @@ int main(int argc, char **argv) {
                      episode_series_name);
             overlay_render_search(&ov, r.renderer, title, ep_names, nshow,
                                   episode_sel - start_i, ww, wh);
+        } else if (fav_overlay_active) {
+            size_t n = favorites_visible_count(&favorites);
+            if (n == 0) {
+                const char *hdr = "Favorites — press * while watching a channel to add it";
+                overlay_render_search(&ov, r.renderer, hdr, NULL, 0, 0, ww, wh);
+            } else {
+                static char fav_labels[64][128];
+                const char *names[64];
+                int show = (int)(n < 64 ? n : 64);
+                int sel = fav_overlay_sel;
+                if (sel >= show) sel = show - 1;
+                for (int i = 0; i < show; ++i) {
+                    const favorite_t *fe = favorites_visible_at(&favorites, (size_t)i);
+                    if (fe) {
+                        snprintf(fav_labels[i], sizeof(fav_labels[i]),
+                                 "%4d  %s", fe->num, fe->name ? fe->name : "");
+                    } else {
+                        fav_labels[i][0] = '\0';
+                    }
+                    names[i] = fav_labels[i];
+                }
+                const char *hdr = "Favorites — Enter zaps, Del removes, Esc closes";
+                overlay_render_search(&ov, r.renderer, hdr, names, show, sel, ww, wh);
+            }
         } else if (search_active) {
             static char labels[32][256];
             const char *names[32];
             int nshow = search_hits_count < SEARCH_VISIBLE ? search_hits_count : SEARCH_VISIBLE;
             for (int i = 0; i < nshow; ++i) {
                 search_hit_label(&search_hits[i], &live_list, &vod_list, &series_list,
-                                 labels[i], sizeof(labels[i]));
+                                 &favorites, labels[i], sizeof(labels[i]));
                 names[i] = labels[i];
             }
             char hdr[256];
@@ -2261,6 +2422,7 @@ int main(int argc, char **argv) {
     xtream_episodes_free(&episodes);
     overlay_shutdown(&ov);
     render_shutdown(&r);
+    favorites_free(&favorites);
     xtream_live_list_free(&live_list);
     xtream_vod_list_free(&vod_list);
     xtream_series_list_free(&series_list);
