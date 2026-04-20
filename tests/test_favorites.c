@@ -883,6 +883,12 @@ static void test_journey_random_ops_oracle(void) {
 int main(void) {
     test_path_env_override();
     test_path_defaults_nonnull();
+#ifdef _WIN32
+    test_path_windows_appdata();
+#else
+    test_path_linux_xdg();
+    test_path_linux_xdg_fallback();
+#endif
     test_missing_file_is_empty();
     test_empty_file_is_empty();
     test_empty_array_is_empty();
