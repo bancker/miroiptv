@@ -109,6 +109,11 @@ static int playback_open(playback_t *pb, render_t *r, const npo_channel_t *ch,
         npo_epg_free(&pb->epg); player_stop(&pb->player); player_close(&pb->player);
         free(pb->url); pb->url = NULL; return -1;
     }
+    /* Let the audio callback freeze samples_played when the decoder exits
+     * so the watchdog in main fires and triggers auto-reopen for live
+     * streams (portal closes the HLS/TS feed after ~20-30s; without this
+     * the user sees frozen video + silence with no recovery). */
+    pb->audio.halt_on_miss = &pb->player.decoder_done;
 
     av_clock_init_from_audio(&pb->clk,
                              &pb->audio.samples_played,
@@ -725,6 +730,24 @@ int main(int argc, char **argv) {
      * on a fresh playback — it takes a few seconds for libav to probe and
      * the decoder thread to push the first audio chunk. */
     Uint32  playback_open_ts         = SDL_GetTicks();
+
+    /* Debug HUD: toggled by 'd'. When 0, zero cost — the watchdog still
+     * runs (cheap) but the on-screen overlay and denser heartbeat are
+     * skipped. When 1, top-left overlay shows live stats and stderr
+     * heartbeat drops from 15s to 2s. */
+    int      debug_mode = getenv("TV_DEBUG") ? 1 : 0;
+    Uint32   last_debug_render = 0;
+    char     debug_buf[160] = {0};
+
+    /* Watchdog restart escalation. 3 restarts within 30s that fail to
+     * produce has_first_pts means the channel is genuinely unreachable —
+     * fall back to NPO 1. Resets to 0 whenever a fresh playback lands
+     * audio (has_first_pts flips 1). */
+    int      restart_attempts    = 0;
+    Uint32   restart_window_start = 0;
+    int      prev_has_first_pts  = 0;
+    const int   RESTART_ATTEMPT_CAP = 3;
+    const Uint32 RESTART_WINDOW_MS  = 30000;
 
     /* Heartbeat: log state every HEARTBEAT_MS so we can see in the log
      * exactly when main stops making progress. If the heartbeat pauses,
@@ -1530,6 +1553,14 @@ int main(int argc, char **argv) {
                 help_visible = !help_visible;
                 hint_until_ms = 0;  /* startup hint has served its purpose */
             }
+            else if (k == SDLK_d) {
+                debug_mode = !debug_mode;
+                snprintf(toast_text, sizeof(toast_text),
+                         "Debug %s", debug_mode ? "ON — top-left HUD active" : "OFF");
+                toast_until_ms = SDL_GetTicks() + 2500;
+                /* Force a fresh render of the debug HUD on next frame. */
+                last_debug_render = 0;
+            }
             else if (k == SDLK_n || k == SDLK_r) {
                 /* Shared step-by-step news-programme search — 'n' is NOS
                  * Journaal across NPO 1/2/3, 'r' is RTL Nieuws across
@@ -2024,17 +2055,25 @@ int main(int argc, char **argv) {
         }
 
         /* Heartbeat — liveness ping. Override interval when the test harness
-         * env var is set so we get fine-grained logs around the auto-seek. */
-        Uint32 hb_interval = (test_hb_ms > 0) ? (Uint32)test_hb_ms : HEARTBEAT_MS;
+         * env var is set so we get fine-grained logs around the auto-seek.
+         * debug_mode also drops the cadence to 2s for live diagnostics. */
+        Uint32 hb_interval = (test_hb_ms > 0) ? (Uint32)test_hb_ms
+                           : debug_mode        ? 2000
+                           :                     HEARTBEAT_MS;
         if (tnow_ms - last_heartbeat >= hb_interval) {
-            fprintf(stderr, "[heartbeat] t=%.2fs vq=%zu aq=%zu samples=%lld clk=%.1f vframes=%lld aframes=%lld have_tex=%d\n",
+            last_heartbeat = tnow_ms;
+            unsigned int dec_age = pb->player.decoder_last_read_ms
+                                 ? SDL_GetTicks() - pb->player.decoder_last_read_ms
+                                 : 0;
+            fprintf(stderr, "[heartbeat] t=%.2fs vq=%zu aq=%zu samples=%lld "
+                            "clk=%.1f vframes=%lld aframes=%lld have_tex=%d "
+                            "dec_age=%ums dec_done=%d\n",
                     (SDL_GetTicks() - test_launch_ms) / 1000.0,
                     pb->player.video_q.count, pb->player.audio_q.count,
                     (long long)pb->audio.samples_played,
                     av_clock_ready(&pb->clk) ? av_clock_now(&pb->clk) : 0.0,
                     pb->player.video_frames_pushed, pb->player.audio_frames_pushed,
-                    have_texture);
-            last_heartbeat = tnow_ms;
+                    have_texture, dec_age, pb->player.decoder_done);
         }
 
         /* Test-harness triggers: auto-seek + auto-exit. */
@@ -2185,6 +2224,23 @@ int main(int argc, char **argv) {
                             SDL_GetTicks() - last_audio_progress_ts > STALL_MS;
         int never_started = !pb->audio.has_first_pts &&
                             startup_elapsed > (int)STARTUP_MS;
+
+        /* Watchdog: decoder has exited (EOF / error break). Silence-fill would
+         * otherwise hide this forever. */
+        int decoder_exited = pb->player.decoder_done && !paused;
+
+        /* Watchdog: decoder is alive but hasn't read a packet in DECODER_STALL_MS.
+         * Only meaningful once the decoder has read at least one packet
+         * (decoder_last_read_ms != 0, guards against startup). */
+        const Uint32 DECODER_STALL_MS = 5000;
+        unsigned int decoder_age = pb->player.decoder_last_read_ms
+                                 ? SDL_GetTicks() - pb->player.decoder_last_read_ms
+                                 : 0;
+        int decoder_wedged = pb->player.decoder_last_read_ms != 0 &&
+                             decoder_age > DECODER_STALL_MS &&
+                             !pb->player.decoder_done &&
+                             !paused;
+
         /* Skip stall-restart on finite sources (VOD, series episodes). They
          * don't have a "restart URL" in the channel sense — pb->stream_id
          * is 0 and pb->timeshift_start is 0, so the existing fallback would
@@ -2197,54 +2253,91 @@ int main(int argc, char **argv) {
          * user can press q or zap to move on. */
         int is_vod = pb->timeshift_start == 0 && pb->stream_id == 0 &&
                      pb->player.fmt && pb->player.fmt->duration > 0;
-        if (!paused && !is_vod && (audio_stalled || never_started)) {
-            if (never_started)
-                fprintf(stderr, "[stall] audio never started after %dms — restarting\n",
-                        startup_elapsed);
-            char *restart_url;
-            int   restart_epg_id;
-            if (pb->timeshift_start != 0 && portal.host) {
-                /* Timeshift replay: resume at the same start/duration so we
-                 * don't randomly switch to the archive stream's live feed. */
-                restart_url = xtream_timeshift_url(&portal, pb->stream_id,
-                                                   pb->timeshift_start,
-                                                   pb->timeshift_dur_min);
-                restart_epg_id = pb->stream_id;
-                fprintf(stderr, "[stall] timeshift id=%d start=%ld restarting\n",
-                        pb->stream_id, (long)pb->timeshift_start);
-            } else if (pb->stream_id != 0 && portal.host) {
-                restart_url    = xtream_stream_url(&portal, pb->stream_id);
-                restart_epg_id = pb->stream_id;
-                fprintf(stderr, "[stall] no frames for %ums on portal stream_id=%d - restarting\n",
-                        STALL_MS, pb->stream_id);
-            } else {
-                int ch_idx = (int)(pb->channel - &NPO_CHANNELS[0]);
-                restart_url    = build_channel_url(ch_idx, &portal, direct_url);
-                restart_epg_id = 0;
-                fprintf(stderr, "[stall] no frames for %ums on %s - restarting\n",
-                        STALL_MS, pb->channel->display);
+
+        /* Reset escalation counter whenever a fresh playback successfully
+         * lands audio (0 -> 1 transition on has_first_pts). */
+        if (pb->audio.has_first_pts && !prev_has_first_pts) {
+            restart_attempts = 0;
+            restart_window_start = SDL_GetTicks();
+        }
+        prev_has_first_pts = pb->audio.has_first_pts;
+
+        if (!paused && !is_vod && (audio_stalled || never_started ||
+                                   decoder_exited || decoder_wedged)) {
+            fprintf(stderr, "[watchdog] trigger: audio_stalled=%d never_started=%d "
+                            "decoder_exited=%d decoder_wedged=%d (dec_age=%ums) "
+                            "vq=%zu aq=%zu samples=%lld clk=%.1f\n",
+                    audio_stalled, never_started, decoder_exited, decoder_wedged,
+                    decoder_age, pb->player.video_q.count, pb->player.audio_q.count,
+                    (long long)pb->audio.samples_played,
+                    av_clock_ready(&pb->clk) ? av_clock_now(&pb->clk) : 0.0);
+
+            Uint32 now_ms = SDL_GetTicks();
+            if (now_ms - restart_window_start > RESTART_WINDOW_MS) {
+                restart_window_start = now_ms;
+                restart_attempts = 0;
             }
-            playback_t *new_pb = calloc(1, sizeof(*new_pb));
-            if (new_pb && playback_open(new_pb, &r, pb->channel, restart_url, &portal, restart_epg_id) == 0) {
-                /* Preserve timeshift state across restart. */
-                if (pb->timeshift_start != 0) {
-                    new_pb->timeshift_start   = pb->timeshift_start;
-                    new_pb->timeshift_dur_min = pb->timeshift_dur_min;
+            int escalate = (++restart_attempts > RESTART_ATTEMPT_CAP &&
+                            current_live_idx >= 0 && current_live_idx != 0 &&
+                            live_list.count > 0);
+            if (escalate) {
+                fprintf(stderr, "[watchdog] escalation: %d restarts failed in %ums — "
+                                "zapping to NPO 1 (channel 0)\n",
+                        restart_attempts, RESTART_WINDOW_MS);
+                pending_wheel_delta = -current_live_idx;
+                last_wheel_ts       = SDL_GetTicks() - 400;
+                restart_attempts    = 0;
+                restart_window_start = now_ms;
+                /* skip the normal restart this tick — wheel pipeline takes over */
+            } else {
+                if (never_started)
+                    fprintf(stderr, "[stall] audio never started after %dms — restarting\n",
+                            startup_elapsed);
+                char *restart_url;
+                int   restart_epg_id;
+                if (pb->timeshift_start != 0 && portal.host) {
+                    /* Timeshift replay: resume at the same start/duration so we
+                     * don't randomly switch to the archive stream's live feed. */
+                    restart_url = xtream_timeshift_url(&portal, pb->stream_id,
+                                                       pb->timeshift_start,
+                                                       pb->timeshift_dur_min);
+                    restart_epg_id = pb->stream_id;
+                    fprintf(stderr, "[stall] timeshift id=%d start=%ld restarting\n",
+                            pb->stream_id, (long)pb->timeshift_start);
+                } else if (pb->stream_id != 0 && portal.host) {
+                    restart_url    = xtream_stream_url(&portal, pb->stream_id);
+                    restart_epg_id = pb->stream_id;
+                    fprintf(stderr, "[stall] no frames for %ums on portal stream_id=%d - restarting\n",
+                            STALL_MS, pb->stream_id);
+                } else {
+                    int ch_idx = (int)(pb->channel - &NPO_CHANNELS[0]);
+                    restart_url    = build_channel_url(ch_idx, &portal, direct_url);
+                    restart_epg_id = 0;
+                    fprintf(stderr, "[stall] no frames for %ums on %s - restarting\n",
+                            STALL_MS, pb->channel->display);
                 }
-                playback_close(pb);
-                free(pb);
-                pb = new_pb;
-                paused       = 0;
-                have_texture = 0;
-                if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
-                overlay_mark_dirty(&ov);
-                playback_open_ts = SDL_GetTicks(); audio_warmed = 0;
-                fprintf(stderr, "[stall] restart OK\n");
-            } else {
-                free(new_pb);
-                fprintf(stderr, "[stall] restart failed - will retry in %ums\n", STALL_MS);
+                playback_t *new_pb = calloc(1, sizeof(*new_pb));
+                if (new_pb && playback_open(new_pb, &r, pb->channel, restart_url, &portal, restart_epg_id) == 0) {
+                    /* Preserve timeshift state across restart. */
+                    if (pb->timeshift_start != 0) {
+                        new_pb->timeshift_start   = pb->timeshift_start;
+                        new_pb->timeshift_dur_min = pb->timeshift_dur_min;
+                    }
+                    playback_close(pb);
+                    free(pb);
+                    pb = new_pb;
+                    paused       = 0;
+                    have_texture = 0;
+                    if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
+                    overlay_mark_dirty(&ov);
+                    playback_open_ts = SDL_GetTicks(); audio_warmed = 0;
+                    fprintf(stderr, "[stall] restart OK\n");
+                } else {
+                    free(new_pb);
+                    fprintf(stderr, "[stall] restart failed - will retry in %ums\n", STALL_MS);
+                }
+                free(restart_url);
             }
-            free(restart_url);
             /* Reset the audio-progress tracker so we don't fire again 3s later. */
             last_audio_progress_ts = SDL_GetTicks();
             prev_samples_played    = 0;
@@ -2399,6 +2492,29 @@ int main(int argc, char **argv) {
                 overlay_render_subtitle(&ov, r.renderer, pb->player.sub_text, ww, wh);
             }
             pthread_mutex_unlock(&pb->player.sub_mu);
+        }
+
+        if (debug_mode) {
+            /* Refresh the HUD text at most every 250ms — at 60Hz that's
+             * re-rendering text 4x/sec instead of 60x/sec. Full render
+             * every frame was visibly OK in the EPG overlay but costs
+             * more than we need here. */
+            Uint32 tnow = SDL_GetTicks();
+            if (tnow - last_debug_render > 250) {
+                last_debug_render = tnow;
+                unsigned int dec_age = pb->player.decoder_last_read_ms
+                                     ? tnow - pb->player.decoder_last_read_ms
+                                     : 0;
+                snprintf(debug_buf, sizeof(debug_buf),
+                         "DEBUG  vq=%zu/%zu aq=%zu/%zu  dec_age=%ums  "
+                         "dec_done=%d  clk=%.1fs  samples=%lld",
+                         pb->player.video_q.count, pb->player.video_q.capacity,
+                         pb->player.audio_q.count, pb->player.audio_q.capacity,
+                         dec_age, pb->player.decoder_done,
+                         av_clock_ready(&pb->clk) ? av_clock_now(&pb->clk) : 0.0,
+                         (long long)pb->audio.samples_played);
+            }
+            overlay_render_debug(&ov, r.renderer, debug_buf, ww, wh);
         }
 
         SDL_RenderPresent(r.renderer);  /* blocks ~16ms @ 60Hz with VSYNC */
