@@ -125,9 +125,90 @@ int favorites_load_from_path(favorites_t *fv, const char *path) {
     return 0;
 }
 
+static int mkdir_p(const char *path) {
+    char tmp[1024];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t len = strlen(tmp);
+    if (len == 0) return 0;
+    if (tmp[len - 1] == PATH_SEP) tmp[len - 1] = '\0';
+
+    for (char *p = tmp + 1; *p; ++p) {
+        if (*p == PATH_SEP) {
+            *p = '\0';
+#ifdef _WIN32
+            _mkdir(tmp);
+#else
+            mkdir(tmp, 0755);
+#endif
+            *p = PATH_SEP;
+        }
+    }
+#ifdef _WIN32
+    _mkdir(tmp);
+#else
+    mkdir(tmp, 0755);
+#endif
+    return 0;
+}
+
+static void ensure_parent_dir(const char *path) {
+    /* Copy up to the last PATH_SEP and mkdir_p on it. */
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *last = strrchr(dir, PATH_SEP);
+#ifdef _WIN32
+    /* Also handle '/' which MinGW accepts but strrchr won't match against
+     * PATH_SEP == '\\'. */
+    char *last2 = strrchr(dir, '/');
+    if (!last || (last2 && last2 > last)) last = last2;
+#endif
+    if (!last) return;
+    *last = '\0';
+    if (*dir) mkdir_p(dir);
+}
+
 int favorites_save_to_path(const favorites_t *fv, const char *path) {
-    (void)fv; (void)path;
-    return -1;   /* implemented in Task 6 */
+    ensure_parent_dir(path);
+
+    cJSON *root = cJSON_CreateArray();
+    if (!root) return -1;
+    for (size_t i = 0; i < fv->count; ++i) {
+        cJSON *o = cJSON_CreateObject();
+        if (!o) { cJSON_Delete(root); return -1; }
+        cJSON_AddNumberToObject(o, "stream_id", fv->entries[i].stream_id);
+        cJSON_AddNumberToObject(o, "num",       fv->entries[i].num);
+        cJSON_AddStringToObject(o, "name",
+                                fv->entries[i].name ? fv->entries[i].name : "");
+        cJSON_AddItemToArray(root, o);
+    }
+    char *text = cJSON_Print(root);   /* pretty-printed; fine at ~50 entries */
+    cJSON_Delete(root);
+    if (!text) return -1;
+
+    char tmp[1024];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { free(text); return -1; }
+    size_t n = strlen(text);
+    if (fwrite(text, 1, n, f) != n) { fclose(f); free(text); remove(tmp); return -1; }
+    fclose(f);
+    free(text);
+
+    /* Atomic replace. POSIX rename overwrites; Windows rename doesn't —
+     * remove target first, then rename. Fine because a window of a few us
+     * is acceptable: if the process crashes in that window, favorites.json
+     * is gone but favorites.json.tmp is intact. User's data survives. */
+#ifdef _WIN32
+    remove(path);
+#endif
+    if (rename(tmp, path) != 0) {
+        fprintf(stderr, "favorites: rename %s -> %s failed: %s\n",
+                tmp, path, strerror(errno));
+        remove(tmp);
+        return -1;
+    }
+    return 0;
 }
 
 char *favorites_path(void) {

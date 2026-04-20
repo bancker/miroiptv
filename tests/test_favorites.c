@@ -211,6 +211,185 @@ static int file_exists(const char *p) {
     return 1;
 }
 
+static char *slurp_for_test(const char *path, size_t *out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { *out = 0; return NULL; }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char *buf = malloc((size_t)n + 1);
+    fread(buf, 1, (size_t)n, f); buf[n] = 0; fclose(f);
+    *out = (size_t)n;
+    return buf;
+}
+
+static void fav_push_for_test(favorites_t *fv, int sid, int num, const char *name) {
+    if (fv->count == fv->cap) {
+        fv->cap = fv->cap ? fv->cap * 2 : 4;
+        fv->entries = realloc(fv->entries, fv->cap * sizeof(*fv->entries));
+    }
+    fv->entries[fv->count].stream_id = sid;
+    fv->entries[fv->count].num       = num;
+    fv->entries[fv->count].name      = strdup(name);
+    fv->entries[fv->count].hidden    = 0;
+    ++fv->count;
+}
+
+static void test_write_empty_produces_empty_array(void) {
+    char *dir = make_tempdir();
+    char path[512];
+    snprintf(path, sizeof(path), "%s/empty.json", dir);
+
+    favorites_t fv = {0};
+    int rc = favorites_save_to_path(&fv, path);
+    assert(rc == 0);
+
+    size_t n;
+    char *body = slurp_for_test(path, &n);
+    assert(body);
+    /* Allow whitespace variations: strip leading/trailing whitespace. */
+    char *s = body;
+    while (*s && (*s == ' ' || *s == '\n' || *s == '\t' || *s == '\r')) ++s;
+    assert(strncmp(s, "[]", 2) == 0);
+    free(body);
+    favorites_free(&fv);
+    free(dir);
+    puts("OK test_write_empty_produces_empty_array");
+}
+
+static void test_round_trip_write_read(void) {
+    char *dir = make_tempdir();
+    char path[512];
+    snprintf(path, sizeof(path), "%s/rt.json", dir);
+
+    favorites_t fv = {0};
+    fav_push_for_test(&fv, 1234, 101, "NPO 1 HD");
+    fav_push_for_test(&fv, 5678, 201, "Eurosport 1");
+    fav_push_for_test(&fv, 9012, 301, "Discovery");
+    assert(favorites_save_to_path(&fv, path) == 0);
+
+    favorites_t fv2 = {0};
+    assert(favorites_load_from_path(&fv2, path) == 0);
+    assert(fv2.count == 3);
+
+    favorites_free(&fv);
+    favorites_free(&fv2);
+    free(dir);
+    puts("OK test_round_trip_write_read");
+}
+
+static void test_write_escapes_json_specials(void) {
+    char *dir = make_tempdir();
+    char path[512];
+    snprintf(path, sizeof(path), "%s/esc.json", dir);
+
+    favorites_t fv = {0};
+    const char *weird = "A \"quoted\" name\nwith newline and \\ backslash";
+    fav_push_for_test(&fv, 7777, 1, weird);
+    assert(favorites_save_to_path(&fv, path) == 0);
+
+    favorites_t fv2 = {0};
+    assert(favorites_load_from_path(&fv2, path) == 0);
+    assert(fv2.count == 1);
+    assert(strcmp(fv2.entries[0].name, weird) == 0);
+
+    favorites_free(&fv);
+    favorites_free(&fv2);
+    free(dir);
+    puts("OK test_write_escapes_json_specials");
+}
+
+static void test_write_creates_parent_dir(void) {
+    char *dir = make_tempdir();
+    char path[512];
+    snprintf(path, sizeof(path), "%s/nested/subdir/fav.json", dir);
+
+    favorites_t fv = {0};
+    fav_push_for_test(&fv, 4242, 1, "Nested");
+    assert(favorites_save_to_path(&fv, path) == 0);
+    assert(file_exists(path));
+    favorites_free(&fv);
+    free(dir);
+    puts("OK test_write_creates_parent_dir");
+}
+
+static void test_write_utf8_no_bom(void) {
+    char *dir = make_tempdir();
+    char path[512];
+    snprintf(path, sizeof(path), "%s/utf.json", dir);
+
+    favorites_t fv = {0};
+    fav_push_for_test(&fv, 1, 1, "\xe2\x98\x85 Star");   /* ★ Star */
+    assert(favorites_save_to_path(&fv, path) == 0);
+
+    size_t n;
+    char *body = slurp_for_test(path, &n);
+    assert(body);
+    assert(n >= 3);
+    /* Reject UTF-8 BOM (EF BB BF) at file start. */
+    assert(!(body[0] == (char)0xEF && body[1] == (char)0xBB && body[2] == (char)0xBF));
+    /* Raw UTF-8 bytes for the star must appear somewhere in the file. */
+    assert(strstr(body, "\xe2\x98\x85") != NULL);
+    free(body);
+    favorites_free(&fv);
+    free(dir);
+    puts("OK test_write_utf8_no_bom");
+}
+
+static void test_write_fail_keeps_memory_state(void) {
+    favorites_t fv = {0};
+    fav_push_for_test(&fv, 4242, 1, "InMem");
+
+    /* Path we can't write to: a directory doesn't exist AND we can't mkdir
+     * it (root-only paths on Linux, reserved names on Windows).
+     * On Linux: /proc is read-only — writing under it fails.
+     * On Windows: NUL is a reserved device name — can't create subpaths. */
+#ifdef _WIN32
+    const char *bad = "NUL\\cannot\\write\\here.json";
+#else
+    const char *bad = "/proc/cannot/write/here.json";
+#endif
+    int rc = favorites_save_to_path(&fv, bad);
+    assert(rc == -1);
+    /* In-memory state is unchanged. */
+    assert(fv.count == 1);
+    assert(strcmp(fv.entries[0].name, "InMem") == 0);
+
+    favorites_free(&fv);
+    puts("OK test_write_fail_keeps_memory_state");
+}
+
+static void test_write_is_atomic_on_existing_file(void) {
+    /* We don't truly fault-inject between tmp-write and rename (would need
+     * to mock fopen/rename or intercept syscalls — too invasive for a C
+     * test harness). Verify the weaker but still-meaningful property:
+     * after a successful write over an existing file, the previous content
+     * is gone AND no .tmp artifact is left behind. */
+    char *dir = make_tempdir();
+    char path[512], tmp[560];
+    snprintf(path, sizeof(path), "%s/atomic.json", dir);
+    snprintf(tmp,  sizeof(tmp),  "%s.tmp", path);
+
+    /* Existing file with old content. */
+    write_file(path, "[{\"stream_id\":1,\"num\":1,\"name\":\"old\"}]");
+
+    favorites_t fv = {0};
+    fav_push_for_test(&fv, 99, 99, "new");
+    assert(favorites_save_to_path(&fv, path) == 0);
+
+    /* .tmp must be gone. */
+    assert(!file_exists(tmp));
+
+    /* Real file has the new content. */
+    favorites_t fv2 = {0};
+    assert(favorites_load_from_path(&fv2, path) == 0);
+    assert(fv2.count == 1);
+    assert(fv2.entries[0].stream_id == 99);
+
+    favorites_free(&fv);
+    favorites_free(&fv2);
+    free(dir);
+    puts("OK test_write_is_atomic_on_existing_file");
+}
+
 static void test_malformed_backs_up_and_resets(void) {
     char *dir = make_tempdir();
     char src[512], orig[512];
@@ -274,5 +453,12 @@ int main(void) {
     test_round_trip_read_valid();
     test_edge_cases();
     test_malformed_backs_up_and_resets();
+    test_write_empty_produces_empty_array();
+    test_round_trip_write_read();
+    test_write_escapes_json_specials();
+    test_write_creates_parent_dir();
+    test_write_utf8_no_bom();
+    test_write_fail_keeps_memory_state();
+    test_write_is_atomic_on_existing_file();
     return 0;
 }
