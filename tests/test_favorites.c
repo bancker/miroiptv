@@ -10,6 +10,7 @@
 #else
 #  include <unistd.h>
 #  include <sys/stat.h>
+#  include <dirent.h>
 #endif
 
 static void setenv_portable(const char *k, const char *v) {
@@ -203,6 +204,67 @@ static void test_edge_cases(void) {
     puts("OK test_edge_cases");
 }
 
+static int file_exists(const char *p) {
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static void test_malformed_backs_up_and_resets(void) {
+    char *dir = make_tempdir();
+    char src[512], orig[512];
+    snprintf(src,  sizeof(src),  "%s/malformed_src.json", dir);
+    snprintf(orig, sizeof(orig), "%s/favorites.json",     dir);
+
+    /* Copy the malformed fixture into the scratch dir so the test can
+     * mutate it without touching the fixture file. */
+    size_t len = 0;
+    char *body = NULL;
+    FILE *f = fopen("tests/fixtures/favorites_malformed.json", "rb");
+    assert(f);
+    fseek(f, 0, SEEK_END); len = ftell(f); fseek(f, 0, SEEK_SET);
+    body = malloc(len + 1);
+    fread(body, 1, len, f);
+    body[len] = 0;
+    fclose(f);
+    write_file(orig, body);
+    free(body);
+
+    favorites_t fv = {0};
+    int rc = favorites_load_from_path(&fv, orig);
+    assert(rc == 0);
+    assert(fv.count == 0);
+
+    /* Original has been renamed to favorites.json.corrupt-<timestamp>.
+     * Scan the directory for any file starting with "favorites.json.corrupt-". */
+    int found_backup = 0;
+#ifdef _WIN32
+    char pattern[512];
+    snprintf(pattern, sizeof(pattern), "%s\\favorites.json.corrupt-*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE) { found_backup = 1; FindClose(h); }
+#else
+    DIR *d = opendir(dir);
+    assert(d);
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (strncmp(ent->d_name, "favorites.json.corrupt-", 23) == 0) {
+            found_backup = 1; break;
+        }
+    }
+    closedir(d);
+#endif
+    assert(found_backup);
+    assert(!file_exists(orig));   /* original was renamed, not copied */
+
+    favorites_free(&fv);
+    free(dir);
+    (void)src;
+    puts("OK test_malformed_backs_up_and_resets");
+}
+
 int main(void) {
     test_path_env_override();
     test_path_defaults_nonnull();
@@ -211,5 +273,6 @@ int main(void) {
     test_empty_array_is_empty();
     test_round_trip_read_valid();
     test_edge_cases();
+    test_malformed_backs_up_and_resets();
     return 0;
 }

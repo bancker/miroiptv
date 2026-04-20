@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -13,7 +14,6 @@
 #else
 #  include <sys/stat.h>
 #  include <sys/types.h>
-#  include <time.h>
 #  include <unistd.h>
 #  define PATH_SEP '/'
 #endif
@@ -78,7 +78,26 @@ int favorites_load_from_path(favorites_t *fv, const char *path) {
     cJSON *root = cJSON_Parse(body);
     free(body);
     if (!root) {
-        fprintf(stderr, "favorites: malformed %s — ignoring for now\n", path);
+        time_t tnow = time(NULL);
+        struct tm lt;
+#ifdef _WIN32
+        localtime_s(&lt, &tnow);
+#else
+        localtime_r(&tnow, &lt);
+#endif
+        char backup[768];
+        snprintf(backup, sizeof(backup),
+                 "%s.corrupt-%04d%02d%02d-%02d%02d%02d",
+                 path,
+                 lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
+                 lt.tm_hour, lt.tm_min, lt.tm_sec);
+        if (rename(path, backup) != 0) {
+            fprintf(stderr, "favorites: malformed %s and rename to %s failed: %s\n",
+                    path, backup, strerror(errno));
+        } else {
+            fprintf(stderr, "favorites: malformed %s — backed up to %s\n",
+                    path, backup);
+        }
         return 0;
     }
     if (!cJSON_IsArray(root)) { cJSON_Delete(root); return 0; }
