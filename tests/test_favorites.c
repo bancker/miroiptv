@@ -444,6 +444,76 @@ static void test_malformed_backs_up_and_resets(void) {
     puts("OK test_malformed_backs_up_and_resets");
 }
 
+static void test_is_favorite_lookup(void) {
+    favorites_t fv = {0};
+    fav_push_for_test(&fv, 100, 1, "A");
+    fav_push_for_test(&fv, 200, 2, "B");
+    assert(favorites_is_favorite(&fv, 100) == 1);
+    assert(favorites_is_favorite(&fv, 200) == 1);
+    assert(favorites_is_favorite(&fv, 999) == 0);
+    favorites_free(&fv);
+    puts("OK test_is_favorite_lookup");
+}
+
+static void test_toggle_add_remove(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/f.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    favorites_t fv = {0};
+    assert(favorites_init(&fv, NULL) == 0);
+    assert(fv.count == 0);
+
+    assert(favorites_toggle(&fv, 42, 5, "Channel 42") == 0);
+    assert(favorites_is_favorite(&fv, 42) == 1);
+    assert(fv.count == 1);
+
+    assert(favorites_toggle(&fv, 42, 5, "Channel 42") == 0);
+    assert(favorites_is_favorite(&fv, 42) == 0);
+    assert(fv.count == 0);
+
+    favorites_free(&fv);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_toggle_add_remove");
+}
+
+static void test_capacity_growth(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/big.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    favorites_t fv = {0};
+    favorites_init(&fv, NULL);
+    for (int i = 1; i <= 200; ++i) {
+        char name[32]; snprintf(name, sizeof(name), "Ch %d", i);
+        assert(favorites_toggle(&fv, i, i, name) == 0);
+    }
+    assert(fv.count == 200);
+    for (int i = 1; i <= 200; ++i) assert(favorites_is_favorite(&fv, i) == 1);
+
+    favorites_free(&fv);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_capacity_growth");
+}
+
+static void test_remove_noop(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/r.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    favorites_t fv = {0};
+    favorites_init(&fv, NULL);
+    assert(favorites_remove(&fv, 999) == -1);
+    assert(fv.count == 0);
+
+    favorites_free(&fv);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_remove_noop");
+}
+
 int main(void) {
     test_path_env_override();
     test_path_defaults_nonnull();
@@ -460,5 +530,9 @@ int main(void) {
     test_write_utf8_no_bom();
     test_write_fail_keeps_memory_state();
     test_write_is_atomic_on_existing_file();
+    test_is_favorite_lookup();
+    test_toggle_add_remove();
+    test_capacity_growth();
+    test_remove_noop();
     return 0;
 }

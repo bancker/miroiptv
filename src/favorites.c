@@ -68,7 +68,13 @@ static int fav_push(favorites_t *fv, int stream_id, int num, const char *name) {
 }
 
 int favorites_load_from_path(favorites_t *fv, const char *path) {
-    memset(fv, 0, sizeof(*fv));
+    /* Don't memset here — caller owns fv->path and may have pre-populated
+     * other fields. Reset the collection fields only. */
+    for (size_t i = 0; i < fv->count; ++i) free(fv->entries[i].name);
+    free(fv->entries);
+    fv->entries = NULL;
+    fv->count   = 0;
+    fv->cap     = 0;
 
     size_t len = 0;
     char *body = slurp(path, &len);
@@ -256,6 +262,7 @@ int favorites_init(favorites_t *fv, const xtream_live_list_t *catalog) {
     (void)catalog;
     memset(fv, 0, sizeof(*fv));
     fv->path = favorites_path();
+    if (fv->path) favorites_load_from_path(fv, fv->path);
     return 0;
 }
 
@@ -275,13 +282,33 @@ int favorites_is_favorite(const favorites_t *fv, int stream_id) {
 }
 
 int favorites_toggle(favorites_t *fv, int stream_id, int num, const char *name) {
-    (void)fv; (void)stream_id; (void)num; (void)name;
-    return -1;   /* placeholder */
+    /* Present? -> remove. */
+    for (size_t i = 0; i < fv->count; ++i) {
+        if (fv->entries[i].stream_id == stream_id) {
+            free(fv->entries[i].name);
+            memmove(&fv->entries[i], &fv->entries[i + 1],
+                    (fv->count - i - 1) * sizeof(favorite_t));
+            --fv->count;
+            return favorites_save_to_path(fv, fv->path);
+        }
+    }
+    /* Absent -> add at end. Order is restored by reconcile (sorted by num);
+     * within a single session insertion order is fine. */
+    if (fav_push(fv, stream_id, num, name) < 0) return -1;
+    return favorites_save_to_path(fv, fv->path);
 }
 
 int favorites_remove(favorites_t *fv, int stream_id) {
-    (void)fv; (void)stream_id;
-    return -1;   /* placeholder */
+    for (size_t i = 0; i < fv->count; ++i) {
+        if (fv->entries[i].stream_id == stream_id) {
+            free(fv->entries[i].name);
+            memmove(&fv->entries[i], &fv->entries[i + 1],
+                    (fv->count - i - 1) * sizeof(favorite_t));
+            --fv->count;
+            return favorites_save_to_path(fv, fv->path) == 0 ? 0 : -2;
+        }
+    }
+    return -1;
 }
 
 size_t favorites_visible_count(const favorites_t *fv) {
