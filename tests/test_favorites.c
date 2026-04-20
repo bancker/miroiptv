@@ -745,6 +745,59 @@ static void test_reconcile_idempotent(void) {
     puts("OK test_reconcile_idempotent");
 }
 
+/* ---- Task 16: Stress fixtures + long-name / unicode + 10k stress ---- */
+
+static char *generate_10k_fixture(void) {
+    char *dir = make_tempdir();
+    char *path = malloc(512);
+    snprintf(path, 512, "%s/10k.json", dir);
+    FILE *f = fopen(path, "wb");
+    assert(f);
+    fprintf(f, "[\n");
+    for (int i = 0; i < 10000; ++i) {
+        fprintf(f, "  {\"stream_id\": %d, \"num\": %d, \"name\": \"Ch %d\"}%s\n",
+                i + 1, i + 1, i + 1, i == 9999 ? "" : ",");
+    }
+    fprintf(f, "]\n");
+    fclose(f);
+    free(dir);
+    return path;
+}
+
+static void test_stress_10k_entries(void) {
+    char *path = generate_10k_fixture();
+    favorites_t fv = {0};
+    int rc = favorites_load_from_path(&fv, path);
+    assert(rc == 0);
+    assert(fv.count == 10000);
+    favorites_free(&fv);
+    free(path);
+    puts("OK test_stress_10k_entries");
+}
+
+static void test_unicode_and_long_name(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/edge.json", dir);
+
+    /* 2 KB name + unicode glyph. */
+    char big[2100];
+    memset(big, 'X', 2000);
+    big[2000] = 0;
+    strcat(big, "\xe2\x98\x85");  /* star U+2605 */
+
+    FILE *f = fopen(path, "wb"); assert(f);
+    fprintf(f, "[{\"stream_id\": 1, \"num\": 1, \"name\": \"%s\"}]", big);
+    fclose(f);
+
+    favorites_t fv = {0};
+    assert(favorites_load_from_path(&fv, path) == 0);
+    assert(fv.count == 1);
+    assert(strcmp(fv.entries[0].name, big) == 0);
+    favorites_free(&fv);
+    free(dir);
+    puts("OK test_unicode_and_long_name");
+}
+
 /* ---- Task 9: End-to-end journey tests ---- */
 
 static void test_journey_save_reload(void) {
@@ -859,5 +912,7 @@ int main(void) {
     test_journey_save_reload();
     test_journey_add_remove_reload();
     test_journey_random_ops_oracle();
+    test_stress_10k_entries();
+    test_unicode_and_long_name();
     return 0;
 }
