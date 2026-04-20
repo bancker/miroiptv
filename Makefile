@@ -76,7 +76,7 @@ $(XTREAM_TEST_BIN): $(XTREAM_TEST_SRC) | build
 	$(CC) $(CFLAGS) -Isrc $(XTREAM_TEST_SRC) -o $@ $(LDLIBS)
 
 $(PREFETCH_TEST_BIN): $(PREFETCH_TEST_SRC) | build
-	$(CC) $(CFLAGS) -Isrc $(PREFETCH_TEST_SRC) -o $@ $(LDLIBS)
+	$(CC) -Wall -Wextra -Wpedantic -std=c11 -Isrc $(PREFETCH_TEST_SRC) -o $@ -pthread
 
 clean:
 	rm -rf build

@@ -1,12 +1,14 @@
 #ifndef HLS_PREFETCH_H
 #define HLS_PREFETCH_H
 
-#include <libavformat/avformat.h>
 #include <stddef.h>
 #include <pthread.h>
 
 /* Forward. Internals are opaque to callers. */
 typedef struct hls_prefetch hls_prefetch_t;
+
+/* Forward declare AVFormatContext to avoid libav dependencies in unit tests. */
+typedef struct AVFormatContext AVFormatContext;
 
 /* Open a prefetch session for a live HLS manifest URL. Spawns a
  * background thread that polls the manifest, downloads new segments,

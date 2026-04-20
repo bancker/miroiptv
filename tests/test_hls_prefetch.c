@@ -6,6 +6,7 @@
 #include "../src/hls_prefetch_internal.h"
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -317,6 +318,144 @@ static void test_ring_free_on_null_is_safe(void) {
     OK("test_ring_free_on_null_is_safe");
 }
 
+/* ---- Task 3: manifest parser tests ---------------------------------------- */
+
+/* Helper to load a fixture file from disk */
+static char *load_fixture(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); return NULL; }
+    char *buf = malloc(sz);
+    if (!buf) { fclose(f); return NULL; }
+    size_t nread = fread(buf, 1, sz, f);
+    fclose(f);
+    *out_len = nread;
+    return buf;
+}
+
+/* ---- test 11 ------------------------------------------------------------ */
+
+static void test_manifest_parse_valid(void) {
+    size_t len = 0;
+    char *text = load_fixture("tests/fixtures/manifest_valid.m3u8", &len);
+    assert(text != NULL);
+
+    manifest_t m;
+    int rc = manifest_parse(text, len, "http://example.com/live/foo.m3u8", &m);
+    assert(rc == 0);
+    assert(m.n_segments == 2);
+    assert(m.media_sequence == 448);
+    assert(m.target_duration_ms == 12000);
+
+    /* Check first segment URL resolves correctly:
+     * Original: /hls/e1462bab13d1d09d852eae4a45fec5f0/755880_448.ts
+     * Base: http://example.com/live/foo.m3u8
+     * Expected: http://example.com/hls/.../755880_448.ts
+     */
+    assert(m.segments[0].url != NULL);
+    assert(strstr(m.segments[0].url, "http://example.com") != NULL);
+    assert(strstr(m.segments[0].url, "/hls/") != NULL);
+    assert(strstr(m.segments[0].url, "755880_448.ts") != NULL);
+
+    manifest_free(&m);
+    free(text);
+    OK("test_manifest_parse_valid");
+}
+
+/* ---- test 12 ------------------------------------------------------------ */
+
+static void test_manifest_parse_empty(void) {
+    size_t len = 0;
+    char *text = load_fixture("tests/fixtures/manifest_empty.m3u8", &len);
+    assert(text != NULL);
+
+    manifest_t m;
+    int rc = manifest_parse(text, len, "http://example.com/live/foo.m3u8", &m);
+    assert(rc == 0);
+    assert(m.n_segments == 0);
+    assert(m.target_duration_ms == 10000);
+
+    manifest_free(&m);
+    free(text);
+    OK("test_manifest_parse_empty");
+}
+
+/* ---- test 13 ------------------------------------------------------------ */
+
+static void test_manifest_parse_rejects_non_m3u(void) {
+    size_t len = 0;
+    char *text = load_fixture("tests/fixtures/manifest_malformed.m3u8", &len);
+    assert(text != NULL);
+
+    manifest_t m;
+    int rc = manifest_parse(text, len, "http://example.com/live/foo.m3u8", &m);
+    assert(rc == -1);  /* must reject */
+
+    manifest_free(&m);
+    free(text);
+    OK("test_manifest_parse_rejects_non_m3u");
+}
+
+/* ---- test 14 ------------------------------------------------------------ */
+
+static void test_manifest_parse_rejects_null_text(void) {
+    manifest_t m;
+    int rc = manifest_parse(NULL, 0, NULL, &m);
+    assert(rc == -1);
+
+    rc = manifest_parse("test", 4, NULL, NULL);
+    assert(rc == -1);
+
+    OK("test_manifest_parse_rejects_null_text");
+}
+
+/* ---- test 15 ------------------------------------------------------------ */
+
+static void test_manifest_parse_absolute_url_preserved(void) {
+    /* Manifest with absolute segment URL */
+    const char *text =
+        "#EXTM3U\n"
+        "#EXT-X-MEDIA-SEQUENCE:1\n"
+        "#EXT-X-TARGETDURATION:10\n"
+        "#EXTINF:10.0,\n"
+        "http://cdn.example.com/segments/seg-001.ts\n";
+
+    manifest_t m;
+    int rc = manifest_parse(text, strlen(text),
+                           "http://example.com/live/foo.m3u8", &m);
+    assert(rc == 0);
+    assert(m.n_segments == 1);
+    assert(m.segments[0].url != NULL);
+    assert(strcmp(m.segments[0].url, "http://cdn.example.com/segments/seg-001.ts") == 0);
+
+    manifest_free(&m);
+    OK("test_manifest_parse_absolute_url_preserved");
+}
+
+/* ---- test 16 ------------------------------------------------------------ */
+
+static void test_manifest_parse_sequence_without_duration_defaults(void) {
+    /* Manifest without #EXT-X-TARGETDURATION */
+    const char *text =
+        "#EXTM3U\n"
+        "#EXT-X-MEDIA-SEQUENCE:0\n"
+        "#EXTINF:5.0,\n"
+        "/seg1.ts\n";
+
+    manifest_t m;
+    int rc = manifest_parse(text, strlen(text),
+                           "http://example.com/live/foo.m3u8", &m);
+    assert(rc == 0);
+    assert(m.target_duration_ms == 10000);  /* HLS spec default */
+    assert(m.n_segments == 1);
+
+    manifest_free(&m);
+    OK("test_manifest_parse_sequence_without_duration_defaults");
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 int main(void) {
@@ -334,5 +473,14 @@ int main(void) {
     test_ring_count_after_partial_read();
     test_ring_concurrent_stress();
     test_ring_free_on_null_is_safe();
+
+    /* Task 3: manifest parser */
+    test_manifest_parse_valid();
+    test_manifest_parse_empty();
+    test_manifest_parse_rejects_non_m3u();
+    test_manifest_parse_rejects_null_text();
+    test_manifest_parse_absolute_url_preserved();
+    test_manifest_parse_sequence_without_duration_defaults();
+
     return 0;
 }
