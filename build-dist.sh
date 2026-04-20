@@ -18,7 +18,11 @@
 set -euo pipefail
 
 REPO="${TV_REPO:-bancker/miroiptv}"
-VERSION="$(git describe --tags --dirty 2>/dev/null || echo dev)"
+# TV_VERSION can be pre-set by build-dist.cmd (which computes it via the
+# Windows-native git — MSYS2 MinGW64 doesn't ship git in its default
+# profile, so an in-shell `git describe` would fail and leave us with
+# "dev"). Fall back to an in-MSYS2 git invocation, then literal "dev".
+VERSION="${TV_VERSION:-$(git describe --tags --dirty 2>/dev/null || echo dev)}"
 DIST_DIR="dist/miroiptv-${VERSION}"
 ZIP_PATH="miroiptv-${VERSION}.zip"
 DO_RELEASE=0
