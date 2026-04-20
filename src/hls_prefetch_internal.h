@@ -34,4 +34,31 @@ void        ring_close(ring_buf_t *r);
 size_t      ring_count(const ring_buf_t *r);
 size_t      ring_capacity(const ring_buf_t *r);
 
+/* ---------------------------------------------------------------------------
+ * Test helpers for segment queue (Task 4) — expose hls_prefetch_t internals
+ * for unit test access. These are NOT part of the public API.
+ * --------------------------------------------------------------------------- */
+
+typedef struct hls_prefetch hls_prefetch_t;
+
+/* Create a new prefetch session for testing (no background thread yet) */
+hls_prefetch_t *_pf_new_for_test(void);
+
+/* Enqueue segments from a manifest, respecting dedup and capacity limits.
+ * Returns the count of new segments added. */
+int _pf_enqueue_new_segments_for_test(hls_prefetch_t *pf,
+                                      const manifest_t *m);
+
+/* Get the current number of segments in the queue */
+size_t _pf_segment_count_for_test(const hls_prefetch_t *pf);
+
+/* Retrieve a queued segment URL by index. Returns 0 on success, -1 on
+ * index out of bounds. */
+int _pf_get_segment_url_for_test(const hls_prefetch_t *pf,
+                                 size_t idx, char *buf,
+                                 size_t buflen);
+
+/* Free a test-created prefetch session */
+void _pf_free_for_test(hls_prefetch_t *pf);
+
 #endif

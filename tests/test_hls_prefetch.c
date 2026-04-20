@@ -456,6 +456,205 @@ static void test_manifest_parse_sequence_without_duration_defaults(void) {
     OK("test_manifest_parse_sequence_without_duration_defaults");
 }
 
+/* ---- Task 4: segment queue tests ----------------------------------- */
+
+/* ---- test 17 ------------------------------------------------------------ */
+
+static void test_segments_enqueued_in_sequence_order(void) {
+    hls_prefetch_t *pf = _pf_new_for_test();
+    assert(pf != NULL);
+
+    /* Create a manifest with segments at sequence 448, 449, 450 */
+    manifest_t m;
+    memset(&m, 0, sizeof(m));
+    m.n_segments = 3;
+    m.media_sequence = 448;
+    m.target_duration_ms = 12000;
+    m.segments = malloc(3 * sizeof(hls_segment_t));
+    assert(m.segments != NULL);
+
+    for (int i = 0; i < 3; i++) {
+        char url_buf[64];
+        snprintf(url_buf, sizeof(url_buf), "http://example.com/seg_%d.ts", 448 + i);
+        m.segments[i].url = malloc(strlen(url_buf) + 1);
+        strcpy(m.segments[i].url, url_buf);
+        m.segments[i].sequence = 448 + i;
+        m.segments[i].fetched = 0;
+    }
+
+    int enqueued = _pf_enqueue_new_segments_for_test(pf, &m);
+    assert(enqueued == 3);
+    assert(_pf_segment_count_for_test(pf) == 3);
+
+    /* Verify order: seq 448, 449, 450 */
+    char buf[64];
+    for (int i = 0; i < 3; i++) {
+        int rc = _pf_get_segment_url_for_test(pf, i, buf, sizeof(buf));
+        assert(rc == 0);
+        int expected_seq = 448 + i;
+        char expected_suffix[16];
+        snprintf(expected_suffix, sizeof(expected_suffix), "seg_%d.ts", expected_seq);
+        assert(strstr(buf, expected_suffix) != NULL);
+    }
+
+    manifest_free(&m);
+    _pf_free_for_test(pf);
+    OK("test_segments_enqueued_in_sequence_order");
+}
+
+/* ---- test 18 ------------------------------------------------------------ */
+
+static void test_segments_dedup_on_subsequent_manifest(void) {
+    hls_prefetch_t *pf = _pf_new_for_test();
+    assert(pf != NULL);
+
+    /* First manifest: seq 448, 449, 450 */
+    manifest_t m1;
+    memset(&m1, 0, sizeof(m1));
+    m1.n_segments = 3;
+    m1.media_sequence = 448;
+    m1.target_duration_ms = 12000;
+    m1.segments = malloc(3 * sizeof(hls_segment_t));
+    for (int i = 0; i < 3; i++) {
+        char url_buf[64];
+        snprintf(url_buf, sizeof(url_buf), "http://example.com/seg_%d.ts", 448 + i);
+        m1.segments[i].url = malloc(strlen(url_buf) + 1);
+        strcpy(m1.segments[i].url, url_buf);
+        m1.segments[i].sequence = 448 + i;
+        m1.segments[i].fetched = 0;
+    }
+
+    int enqueued1 = _pf_enqueue_new_segments_for_test(pf, &m1);
+    assert(enqueued1 == 3);
+    assert(_pf_segment_count_for_test(pf) == 3);
+
+    /* Second manifest: seq 449, 450, 451 (so 451 is new) */
+    manifest_t m2;
+    memset(&m2, 0, sizeof(m2));
+    m2.n_segments = 3;
+    m2.media_sequence = 449;
+    m2.target_duration_ms = 12000;
+    m2.segments = malloc(3 * sizeof(hls_segment_t));
+    for (int i = 0; i < 3; i++) {
+        char url_buf[64];
+        snprintf(url_buf, sizeof(url_buf), "http://example.com/seg_%d.ts", 449 + i);
+        m2.segments[i].url = malloc(strlen(url_buf) + 1);
+        strcpy(m2.segments[i].url, url_buf);
+        m2.segments[i].sequence = 449 + i;
+        m2.segments[i].fetched = 0;
+    }
+
+    int enqueued2 = _pf_enqueue_new_segments_for_test(pf, &m2);
+    /* Should only enqueue 451 (449, 450 already seen) */
+    assert(enqueued2 == 1);
+    assert(_pf_segment_count_for_test(pf) == 4);  /* 448, 449, 450, 451 */
+
+    /* Verify the new segment is 451 */
+    char buf[64];
+    int rc = _pf_get_segment_url_for_test(pf, 3, buf, sizeof(buf));
+    assert(rc == 0);
+    assert(strstr(buf, "seg_451.ts") != NULL);
+
+    manifest_free(&m1);
+    manifest_free(&m2);
+    _pf_free_for_test(pf);
+    OK("test_segments_dedup_on_subsequent_manifest");
+}
+
+/* ---- test 19 ------------------------------------------------------------ */
+
+static void test_segments_skip_stale(void) {
+    hls_prefetch_t *pf = _pf_new_for_test();
+    assert(pf != NULL);
+
+    /* First manifest: seq 500-502 (establish highest-seen = 502) */
+    manifest_t m1;
+    memset(&m1, 0, sizeof(m1));
+    m1.n_segments = 3;
+    m1.media_sequence = 500;
+    m1.target_duration_ms = 12000;
+    m1.segments = malloc(3 * sizeof(hls_segment_t));
+    for (int i = 0; i < 3; i++) {
+        char url_buf[64];
+        snprintf(url_buf, sizeof(url_buf), "http://example.com/seg_%d.ts", 500 + i);
+        m1.segments[i].url = malloc(strlen(url_buf) + 1);
+        strcpy(m1.segments[i].url, url_buf);
+        m1.segments[i].sequence = 500 + i;
+        m1.segments[i].fetched = 0;
+    }
+
+    int enqueued1 = _pf_enqueue_new_segments_for_test(pf, &m1);
+    assert(enqueued1 == 3);
+
+    /* Second manifest: seq 448-450 (all stale, below current highest) */
+    manifest_t m2;
+    memset(&m2, 0, sizeof(m2));
+    m2.n_segments = 3;
+    m2.media_sequence = 448;
+    m2.target_duration_ms = 12000;
+    m2.segments = malloc(3 * sizeof(hls_segment_t));
+    for (int i = 0; i < 3; i++) {
+        char url_buf[64];
+        snprintf(url_buf, sizeof(url_buf), "http://example.com/seg_%d.ts", 448 + i);
+        m2.segments[i].url = malloc(strlen(url_buf) + 1);
+        strcpy(m2.segments[i].url, url_buf);
+        m2.segments[i].sequence = 448 + i;
+        m2.segments[i].fetched = 0;
+    }
+
+    int enqueued2 = _pf_enqueue_new_segments_for_test(pf, &m2);
+    /* Should enqueue nothing (all below 502) */
+    assert(enqueued2 == 0);
+    assert(_pf_segment_count_for_test(pf) == 3);  /* unchanged */
+
+    manifest_free(&m1);
+    manifest_free(&m2);
+    _pf_free_for_test(pf);
+    OK("test_segments_skip_stale");
+}
+
+/* ---- test 20 ------------------------------------------------------------ */
+
+static void test_segments_queue_cap(void) {
+    hls_prefetch_t *pf = _pf_new_for_test();
+    assert(pf != NULL);
+
+    /* Push 20 segments (4 batches of 5) — queue should cap at 16 */
+    for (int batch = 0; batch < 4; batch++) {
+        manifest_t m;
+        memset(&m, 0, sizeof(m));
+        m.n_segments = 5;
+        m.media_sequence = 1 + batch * 5;
+        m.target_duration_ms = 12000;
+        m.segments = malloc(5 * sizeof(hls_segment_t));
+
+        for (int i = 0; i < 5; i++) {
+            int seq = (1 + batch * 5) + i;
+            char url_buf[64];
+            snprintf(url_buf, sizeof(url_buf), "http://example.com/seg_%d.ts", seq);
+            m.segments[i].url = malloc(strlen(url_buf) + 1);
+            strcpy(m.segments[i].url, url_buf);
+            m.segments[i].sequence = seq;
+            m.segments[i].fetched = 0;
+        }
+
+        int enqueued = _pf_enqueue_new_segments_for_test(pf, &m);
+        manifest_free(&m);
+
+        size_t count = _pf_segment_count_for_test(pf);
+        /* After batch 0: 5 segs. After batch 1: 10. After batch 2: 15.
+         * After batch 3: cap at 16 (oldest drop) */
+        if (batch < 3) {
+            assert(count == (batch + 1) * 5);
+        } else {
+            assert(count == 16);  /* Capped */
+        }
+    }
+
+    _pf_free_for_test(pf);
+    OK("test_segments_queue_cap");
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 int main(void) {
@@ -481,6 +680,12 @@ int main(void) {
     test_manifest_parse_rejects_null_text();
     test_manifest_parse_absolute_url_preserved();
     test_manifest_parse_sequence_without_duration_defaults();
+
+    /* Task 4: segment queue */
+    test_segments_enqueued_in_sequence_order();
+    test_segments_dedup_on_subsequent_manifest();
+    test_segments_skip_stale();
+    test_segments_queue_cap();
 
     return 0;
 }

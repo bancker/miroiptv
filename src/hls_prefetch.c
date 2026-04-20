@@ -329,11 +329,101 @@ void manifest_free(manifest_t *m) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Segment queue — bounded FIFO of hls_segment_t. Capacity = 16.
+ * Tracks highest-sequence-ever-seen to skip stale manifests.
+ * --------------------------------------------------------------------------- */
+
+#define HLS_SEGMENT_QUEUE_CAP 16
+
+typedef struct {
+    hls_segment_t segments[HLS_SEGMENT_QUEUE_CAP];
+    size_t        count;
+    int           highest_sequence_seen;
+    pthread_mutex_t mu;
+} segment_queue_t;
+
+static segment_queue_t *seg_queue_new(void) {
+    segment_queue_t *q = malloc(sizeof(*q));
+    if (!q) return NULL;
+    memset(q, 0, sizeof(*q));
+    q->highest_sequence_seen = -1;  /* None seen yet */
+    pthread_mutex_init(&q->mu, NULL);
+    return q;
+}
+
+static void seg_queue_free(segment_queue_t *q) {
+    if (!q) return;
+    for (size_t i = 0; i < q->count; i++) {
+        free(q->segments[i].url);
+    }
+    pthread_mutex_destroy(&q->mu);
+    free(q);
+}
+
+/* Enqueue segments from a manifest, respecting dedup and capacity.
+ * Returns the count of new segments added. */
+static int seg_queue_enqueue(segment_queue_t *q, const manifest_t *m) {
+    if (!q || !m) return 0;
+
+    pthread_mutex_lock(&q->mu);
+
+    int new_count = 0;
+    for (size_t i = 0; i < m->n_segments; i++) {
+        int seq = m->segments[i].sequence;
+
+        /* Skip if this sequence has already been seen */
+        if (seq <= q->highest_sequence_seen) {
+            continue;
+        }
+
+        /* Update highest-sequence-seen */
+        if (seq > q->highest_sequence_seen) {
+            q->highest_sequence_seen = seq;
+        }
+
+        /* If at capacity, drop the oldest (oldest is at index 0) */
+        if (q->count >= HLS_SEGMENT_QUEUE_CAP) {
+            free(q->segments[0].url);
+            memmove(&q->segments[0], &q->segments[1],
+                    (HLS_SEGMENT_QUEUE_CAP - 1) * sizeof(hls_segment_t));
+            q->count--;
+        }
+
+        /* Enqueue the new segment */
+        hls_segment_t *dst = &q->segments[q->count];
+        dst->url = malloc(strlen(m->segments[i].url) + 1);
+        if (!dst->url) {
+            pthread_mutex_unlock(&q->mu);
+            return new_count;  /* Partial enqueue on malloc failure */
+        }
+        strcpy(dst->url, m->segments[i].url);
+        dst->sequence = seq;
+        dst->fetched = 0;
+        q->count++;
+        new_count++;
+    }
+
+    pthread_mutex_unlock(&q->mu);
+    return new_count;
+}
+
+static size_t seg_queue_count(const segment_queue_t *q) {
+    if (!q) return 0;
+    return q->count;
+}
+
+static const char *seg_queue_get_url(const segment_queue_t *q, size_t idx) {
+    if (!q || idx >= q->count) return NULL;
+    return q->segments[idx].url;
+}
+
+/* ---------------------------------------------------------------------------
  * Public hls_prefetch interface — stubs (Tasks 6-7)
  * --------------------------------------------------------------------------- */
 
 struct hls_prefetch {
     char *manifest_url;
+    segment_queue_t *queue;
 };
 
 hls_prefetch_t *hls_prefetch_open(const char *manifest_url) {
@@ -354,4 +444,52 @@ void hls_prefetch_get_stats(const hls_prefetch_t *pf,
                             hls_prefetch_stats_t *out) {
     (void)pf;
     if (out) memset(out, 0, sizeof(*out));
+}
+
+/* ---------------------------------------------------------------------------
+ * Test helpers (Task 4) — expose segment queue internals for unit tests
+ * --------------------------------------------------------------------------- */
+
+hls_prefetch_t *_pf_new_for_test(void) {
+    hls_prefetch_t *pf = malloc(sizeof(*pf));
+    if (!pf) return NULL;
+    memset(pf, 0, sizeof(*pf));
+    pf->queue = seg_queue_new();
+    if (!pf->queue) {
+        free(pf);
+        return NULL;
+    }
+    return pf;
+}
+
+int _pf_enqueue_new_segments_for_test(hls_prefetch_t *pf,
+                                      const manifest_t *m) {
+    if (!pf || !pf->queue || !m) return 0;
+    return seg_queue_enqueue(pf->queue, m);
+}
+
+size_t _pf_segment_count_for_test(const hls_prefetch_t *pf) {
+    if (!pf || !pf->queue) return 0;
+    return seg_queue_count(pf->queue);
+}
+
+int _pf_get_segment_url_for_test(const hls_prefetch_t *pf,
+                                 size_t idx, char *buf,
+                                 size_t buflen) {
+    if (!pf || !pf->queue || !buf || buflen == 0) return -1;
+    const char *url = seg_queue_get_url(pf->queue, idx);
+    if (!url) return -1;
+    size_t url_len = strlen(url);
+    if (url_len >= buflen) return -1;  /* Buffer too small */
+    strcpy(buf, url);
+    return 0;
+}
+
+void _pf_free_for_test(hls_prefetch_t *pf) {
+    if (!pf) return;
+    free(pf->manifest_url);
+    if (pf->queue) {
+        seg_queue_free(pf->queue);
+    }
+    free(pf);
 }
