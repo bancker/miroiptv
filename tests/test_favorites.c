@@ -745,6 +745,90 @@ static void test_reconcile_idempotent(void) {
     puts("OK test_reconcile_idempotent");
 }
 
+/* ---- Task 9: End-to-end journey tests ---- */
+
+static void test_journey_save_reload(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/j.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    {
+        favorites_t fv = {0};
+        favorites_init(&fv, NULL);
+        favorites_toggle(&fv, 100, 1, "A");
+        favorites_toggle(&fv, 200, 2, "B");
+        favorites_toggle(&fv, 300, 3, "C");
+        favorites_free(&fv);
+    }
+
+    favorites_t fv2 = {0};
+    favorites_init(&fv2, NULL);
+    assert(fv2.count == 3);
+    assert(favorites_is_favorite(&fv2, 100));
+    assert(favorites_is_favorite(&fv2, 200));
+    assert(favorites_is_favorite(&fv2, 300));
+    favorites_free(&fv2);
+
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_journey_save_reload");
+}
+
+static void test_journey_add_remove_reload(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/j2.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    {
+        favorites_t fv = {0};
+        favorites_init(&fv, NULL);
+        favorites_toggle(&fv, 100, 1, "A");
+        favorites_toggle(&fv, 200, 2, "B");
+        favorites_toggle(&fv, 300, 3, "C");
+        favorites_toggle(&fv, 200, 2, "B");  /* remove */
+        favorites_free(&fv);
+    }
+
+    favorites_t fv2 = {0};
+    favorites_init(&fv2, NULL);
+    assert(fv2.count == 2);
+    assert(favorites_is_favorite(&fv2, 100));
+    assert(!favorites_is_favorite(&fv2, 200));
+    assert(favorites_is_favorite(&fv2, 300));
+    favorites_free(&fv2);
+
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_journey_add_remove_reload");
+}
+
+static void test_journey_random_ops_oracle(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/oracle.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    favorites_t fv = {0};
+    favorites_init(&fv, NULL);
+
+    unsigned int seed = 0xdeadbeef;
+    char oracle[200] = {0};
+    for (int i = 0; i < 400; ++i) {
+        /* Custom rand so the test is reproducible cross-platform. */
+        seed = seed * 1103515245u + 12345u;
+        int id = (int)((seed >> 8) % 200) + 1;
+        favorites_toggle(&fv, id, id, "X");
+        oracle[id - 1] ^= 1;
+    }
+    for (int i = 1; i <= 200; ++i) {
+        assert(favorites_is_favorite(&fv, i) == (int)oracle[i - 1]);
+    }
+
+    favorites_free(&fv);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_journey_random_ops_oracle");
+}
+
 int main(void) {
     test_path_env_override();
     test_path_defaults_nonnull();
@@ -772,5 +856,8 @@ int main(void) {
     test_reconcile_case_sensitive();
     test_reconcile_determinism_on_name_collision();
     test_reconcile_idempotent();
+    test_journey_save_reload();
+    test_journey_add_remove_reload();
+    test_journey_random_ops_oracle();
     return 0;
 }
