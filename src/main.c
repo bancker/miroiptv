@@ -804,6 +804,10 @@ int main(int argc, char **argv) {
     int       epg_full_archive_id = 0;
     char      epg_full_channel_name[128] = {0};
 
+    /* Favorites overlay (Shift+F): browse the user's shortlist and zap on Enter. */
+    int  fav_overlay_active = 0;
+    int  fav_overlay_sel    = 0;
+
     /* Mouse-wheel zapping through ALL portal live channels. We fetch the full
      * catalog once, find our current stream_id in it, and the wheel moves the
      * index ±1 per notch. Actual switch is debounced — rapid scrolling only
@@ -905,6 +909,58 @@ int main(int argc, char **argv) {
                 /* wheel up (positive y) = previous channel; down = next channel */
                 pending_wheel_delta -= ev.wheel.y;
                 last_wheel_ts = SDL_GetTicks();
+                continue;
+            }
+
+            /* Favorites overlay (Shift+F). Intercepts keys before search /
+             * episode / EPG modes so arrows + Enter route to favorites. */
+            if (fav_overlay_active) {
+                if (ev.type == SDL_KEYDOWN) {
+                    SDL_Keycode sk = ev.key.keysym.sym;
+                    int n = (int)favorites_visible_count(&favorites);
+                    if (sk == SDLK_ESCAPE) {
+                        fav_overlay_active = 0;
+                    } else if (sk == SDLK_f && (ev.key.keysym.mod & KMOD_SHIFT)) {
+                        fav_overlay_active = 0;   /* toggle off on Shift+F */
+                    } else if (sk == SDLK_UP && n > 0) {
+                        fav_overlay_sel = (fav_overlay_sel - 1 + n) % n;
+                    } else if (sk == SDLK_DOWN && n > 0) {
+                        fav_overlay_sel = (fav_overlay_sel + 1) % n;
+                    } else if ((sk == SDLK_PAGEUP || sk == SDLK_PAGEDOWN) && n > 0) {
+                        int delta = (sk == SDLK_PAGEUP) ? -10 : +10;
+                        fav_overlay_sel += delta;
+                        if (fav_overlay_sel < 0) fav_overlay_sel = 0;
+                        if (fav_overlay_sel >= n) fav_overlay_sel = n - 1;
+                    } else if ((sk == SDLK_RETURN || sk == SDLK_KP_ENTER) &&
+                               n > 0 && fav_overlay_sel < n) {
+                        const favorite_t *fe = favorites_visible_at(&favorites,
+                                                                    (size_t)fav_overlay_sel);
+                        if (fe && current_live_idx >= 0) {
+                            /* Find the catalog index by stream_id; reuse wheel pipeline. */
+                            int target_idx = -1;
+                            for (size_t i = 0; i < live_list.count; ++i) {
+                                if (live_list.entries[i].stream_id == fe->stream_id) {
+                                    target_idx = (int)i; break;
+                                }
+                            }
+                            if (target_idx >= 0) {
+                                pending_wheel_delta = target_idx - current_live_idx;
+                                last_wheel_ts       = SDL_GetTicks() - 400;  /* fire immediately */
+                            }
+                        }
+                        fav_overlay_active = 0;
+                    } else if (sk == SDLK_DELETE && n > 0 && fav_overlay_sel < n) {
+                        const favorite_t *fe = favorites_visible_at(&favorites,
+                                                                    (size_t)fav_overlay_sel);
+                        if (fe) {
+                            int removed_id = fe->stream_id;
+                            favorites_remove(&favorites, removed_id);
+                            /* Clamp selection after removal. */
+                            int n2 = (int)favorites_visible_count(&favorites);
+                            if (fav_overlay_sel >= n2) fav_overlay_sel = n2 > 0 ? n2 - 1 : 0;
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -1192,15 +1248,22 @@ int main(int argc, char **argv) {
             SDL_Keycode k = ev.key.keysym.sym;
             if (k == SDLK_q || k == SDLK_ESCAPE) { running = 0; break; }
             else if (k == SDLK_f) {
-                /* Remapped in 2026-04-18: 'f' opens the search prompt (was
-                 * fullscreen). Fullscreen moved to F11. */
-                search_active = 1;
-                search_query[0] = '\0';
-                search_query_len = 0;
-                search_hits_count = 0;
-                search_sel = 0;
-                search_swallow_next_text = 1;
-                SDL_StartTextInput();
+                if (ev.key.keysym.mod & KMOD_SHIFT) {
+                    /* Shift+F: favorites overlay. No async work — just flip the
+                     * state bit and let the render branch pick up the list. */
+                    fav_overlay_active   = 1;
+                    fav_overlay_sel      = 0;
+                    hint_until_ms        = 0;
+                } else {
+                    /* Plain f: search prompt. Fullscreen moved to F11 in 2026-04-18. */
+                    search_active = 1;
+                    search_query[0] = '\0';
+                    search_query_len = 0;
+                    search_hits_count = 0;
+                    search_sel = 0;
+                    search_swallow_next_text = 1;
+                    SDL_StartTextInput();
+                }
             }
             else if (k == SDLK_F11) render_toggle_fullscreen(&r);
             else if (k == SDLK_SPACE) {
