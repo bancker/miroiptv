@@ -390,15 +390,26 @@ static const char *search_hit_label(const search_hit_t *h,
                                     const xtream_live_list_t *live,
                                     const xtream_vod_list_t  *vods,
                                     const xtream_series_list_t *series,
+                                    const favorites_t *fav,
                                     char *buf, size_t buflen) {
     const char *name = "";
     const char *tag  = "";
+    int starred = 0;
     switch (h->kind) {
-    case SEARCH_HIT_LIVE:   tag = "[LIVE]  "; name = live->entries[h->idx].name;   break;
+    case SEARCH_HIT_LIVE:
+        tag = "[LIVE]  ";
+        name = live->entries[h->idx].name;
+        starred = fav && favorites_is_favorite(fav, live->entries[h->idx].stream_id);
+        break;
     case SEARCH_HIT_VOD:    tag = "[MOVIE] "; name = vods->entries[h->idx].name;   break;
     case SEARCH_HIT_SERIES: tag = "[SERIES] "; name = series->entries[h->idx].name; break;
     }
-    snprintf(buf, buflen, "%s%s", tag, name);
+    if (starred) {
+        /* Insert the star between the tag and the name. */
+        snprintf(buf, buflen, "%s\xe2\x98\x85 %s", tag, name);
+    } else {
+        snprintf(buf, buflen, "%s%s", tag, name);
+    }
     return buf;
 }
 
@@ -1070,6 +1081,19 @@ int main(int argc, char **argv) {
                     } else if (sk == SDLK_DOWN) {
                         if (search_hits_count > 0)
                             search_sel = (search_sel + 1) % search_hits_count;
+                    } else if (sk == SDLK_ASTERISK ||
+                               (sk == SDLK_8 && (ev.key.keysym.mod & KMOD_SHIFT))) {
+                        /* Only meaningful on [LIVE] rows — leave VOD/series alone. */
+                        if (search_hits_count > 0 && search_sel < search_hits_count) {
+                            search_hit_t h = search_hits[search_sel];
+                            if (h.kind == SEARCH_HIT_LIVE && h.idx < (int)live_list.count) {
+                                xtream_live_entry_t *e = &live_list.entries[h.idx];
+                                favorites_toggle(&favorites, e->stream_id, e->num, e->name);
+                                /* Swallow the TEXTINPUT that follows. */
+                                search_swallow_next_text = 1;
+                            }
+                        }
+                        continue;
                     } else if (sk == SDLK_RETURN || sk == SDLK_KP_ENTER) {
                         if (search_hits_count > 0 && search_sel < search_hits_count) {
                             search_hit_t h = search_hits[search_sel];
@@ -2235,7 +2259,7 @@ int main(int argc, char **argv) {
             int nshow = search_hits_count < SEARCH_VISIBLE ? search_hits_count : SEARCH_VISIBLE;
             for (int i = 0; i < nshow; ++i) {
                 search_hit_label(&search_hits[i], &live_list, &vod_list, &series_list,
-                                 labels[i], sizeof(labels[i]));
+                                 &favorites, labels[i], sizeof(labels[i]));
                 names[i] = labels[i];
             }
             char hdr[256];
