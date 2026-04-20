@@ -3,8 +3,67 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#  include <windows.h>
+#  include <direct.h>
+#  define PATH_SEP '\\'
+#else
+#  include <sys/stat.h>
+#  include <sys/types.h>
+#  include <unistd.h>
+#  define PATH_SEP '/'
+#endif
+
+static char *join_path(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    char *out = malloc(la + 1 + lb + 1);
+    if (!out) return NULL;
+    memcpy(out, a, la);
+    out[la] = PATH_SEP;
+    memcpy(out + la + 1, b, lb);
+    out[la + 1 + lb] = '\0';
+    return out;
+}
+
 char *favorites_path(void) {
-    return strdup("favorites.json");   /* placeholder — real impl in Task 2 */
+    const char *env = getenv("TV_FAVORITES_PATH");
+    if (env && *env) return strdup(env);
+
+#ifdef _WIN32
+    const char *appdata = getenv("APPDATA");
+    if (appdata && *appdata) {
+        char *dir = join_path(appdata, "miroiptv");
+        if (dir) {
+            char *full = join_path(dir, "favorites.json");
+            free(dir);
+            if (full) return full;
+        }
+    }
+#else
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    char *base = NULL;
+    if (xdg && *xdg) {
+        base = strdup(xdg);
+    } else {
+        const char *home = getenv("HOME");
+        if (home && *home) {
+            base = join_path(home, ".config");
+        }
+    }
+    if (base) {
+        char *dir = join_path(base, "miroiptv");
+        free(base);
+        if (dir) {
+            char *full = join_path(dir, "favorites.json");
+            free(dir);
+            if (full) return full;
+        }
+    }
+#endif
+
+    /* Last-resort: current working dir. Keeps the app working even if the
+     * env is so hostile that we can't resolve a real home directory. */
+    return strdup("favorites.json");
 }
 
 int favorites_init(favorites_t *fv, const xtream_live_list_t *catalog) {
