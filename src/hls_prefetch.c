@@ -6,6 +6,9 @@
 #include <time.h>
 #include <pthread.h>
 #include <curl/curl.h>
+#include <libavformat/avformat.h>
+#include <libavformat/avio.h>
+#include <libavutil/mem.h>
 
 /* ---------------------------------------------------------------------------
  * Ring buffer — bounded byte FIFO with blocking producer/consumer discipline.
@@ -527,6 +530,11 @@ struct hls_prefetch {
     volatile size_t  manifest_refreshes;
     volatile size_t  manifest_errors;
     volatile unsigned int last_refresh_ms;
+
+    /* AVIOContext bridge — set by hls_prefetch_attach(); freed in
+     * hls_prefetch_close() IFF the caller has not already freed it
+     * by calling avformat_close_input().  See lifecycle note below. */
+    AVIOContext    *avio;
 };
 
 /* Production curl write callback — pushes bytes into pf->ring. */
@@ -688,9 +696,63 @@ hls_prefetch_t *hls_prefetch_open(const char *manifest_url) {
     return pf;
 }
 
+/* ---------------------------------------------------------------------------
+ * AVIO bridge — §4.7
+ *
+ * Lifecycle note on avio_read_buf:
+ *   avio_alloc_context() takes OWNERSHIP of the buffer passed to it.
+ *   When avio_context_free() is called, it calls av_free(avio->buffer)
+ *   internally.  Therefore we must NOT separately free avio_read_buf
+ *   once we have handed it to avio_alloc_context — doing so would be a
+ *   double-free.  hls_prefetch_close() frees the AVIOContext via
+ *   avio_context_free(), which transitively frees the buffer.
+ *
+ * Teardown contract between hls_prefetch_close() and player.c:
+ *   hls_prefetch_close() frees pf->avio unconditionally.
+ *   player.c MUST set fmt->pb = NULL BEFORE calling
+ *   avformat_close_input(); otherwise libav would call
+ *   avio_context_free() on an already-freed pointer (double-free).
+ * --------------------------------------------------------------------------- */
+
+static int avio_read_packet(void *opaque, uint8_t *buf, int buf_size) {
+    hls_prefetch_t *pf = (hls_prefetch_t *)opaque;
+    /* 200 ms timeout — keeps libav from deadlocking on a temporarily
+     * empty ring while the prefetch thread is fetching the next segment. */
+    int got = ring_read(pf->ring, buf, buf_size, 200);
+    /* ring_read returns 0 on timeout or closed-empty.
+     * Returning 0 here causes libav to map this to AVERROR_EOF. */
+    return got;
+}
+
 int hls_prefetch_attach(hls_prefetch_t *pf, AVFormatContext *fmt) {
-    (void)pf; (void)fmt;
-    return -1;
+    if (!pf || !fmt || fmt->pb) return -1;
+
+    /* Allocate the 32 KB I/O scratch buffer libav requires.
+     * Ownership is transferred to avio_alloc_context — do NOT free
+     * avio_read_buf separately (see lifecycle note above). */
+    unsigned char *avio_read_buf = av_malloc(32768);
+    if (!avio_read_buf) return -1;
+
+    pf->avio = avio_alloc_context(
+        avio_read_buf,       /* buffer — ownership transferred to avio */
+        32768,               /* buffer size */
+        0,                   /* write_flag: 0 = read-only */
+        pf,                  /* opaque passed to read_packet */
+        avio_read_packet,    /* read callback */
+        NULL,                /* write callback: none */
+        NULL);               /* seek callback: none */
+
+    if (!pf->avio) {
+        /* avio_alloc_context failed; it doesn't free the buffer on failure,
+         * so we must free it ourselves to avoid a leak. */
+        av_free(avio_read_buf);
+        return -1;
+    }
+
+    pf->avio->seekable = 0;          /* live stream — not seekable */
+    fmt->pb    = pf->avio;
+    fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+    return 0;
 }
 
 void hls_prefetch_close(hls_prefetch_t *pf) {
@@ -699,13 +761,25 @@ void hls_prefetch_close(hls_prefetch_t *pf) {
     /* Signal the thread to stop */
     pf->stop = 1;
 
-    /* Wake the ring so the thread's ring_write doesn't block forever */
+    /* Wake the ring so the thread's ring_write / avio_read_packet don't
+     * block forever on a full or empty ring. */
     if (pf->ring) ring_close(pf->ring);
 
     /* Wait for the thread to exit */
     pthread_join(pf->thread, NULL);
 
-    /* Free everything */
+    /* Free the AVIOContext.  avio_context_free() calls av_free(avio->buffer)
+     * internally, which frees the avio_read_buf we passed to
+     * avio_alloc_context — do NOT free avio_read_buf separately.
+     *
+     * Caller contract: player.c MUST set fmt->pb = NULL before calling
+     * avformat_close_input() so libav does not double-free this avio. */
+    if (pf->avio) {
+        avio_context_free(&pf->avio);
+        pf->avio = NULL;
+    }
+
+    /* Free everything else */
     if (pf->queue) { seg_queue_free(pf->queue); pf->queue = NULL; }
     if (pf->ring)  { ring_free(pf->ring);        pf->ring  = NULL; }
     free(pf->manifest_url);
@@ -767,9 +841,11 @@ int _pf_get_segment_url_for_test(const hls_prefetch_t *pf,
 void _pf_free_for_test(hls_prefetch_t *pf) {
     if (!pf) return;
     free(pf->manifest_url);
-    if (pf->queue) {
-        seg_queue_free(pf->queue);
-    }
+    if (pf->queue) { seg_queue_free(pf->queue); }
+    if (pf->ring)  { ring_free(pf->ring); }
+    /* Note: pf->avio is intentionally NOT freed here — the test is responsible
+     * for calling avio_context_free() before _pf_free_for_test() when it has
+     * called hls_prefetch_attach(). */
     free(pf);
 }
 
@@ -787,6 +863,35 @@ static size_t ring_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata
     if (written < 0) return 0;   /* signal curl to abort */
     return (size_t)written;
 }
+
+/* ---------------------------------------------------------------------------
+ * AVIO test helpers (Task 7) — expose the read callback and struct accessors
+ * so unit tests can exercise the AVIO bridge without direct struct access.
+ * --------------------------------------------------------------------------- */
+
+int _pf_avio_read_for_test(hls_prefetch_t *pf, unsigned char *buf, int buf_size) {
+    if (!pf || !buf || buf_size <= 0) return 0;
+    return avio_read_packet(pf, buf, buf_size);
+}
+
+ring_buf_t *_pf_get_ring_for_test(hls_prefetch_t *pf) {
+    if (!pf) return NULL;
+    return pf->ring;
+}
+
+void _pf_set_ring_for_test(hls_prefetch_t *pf, ring_buf_t *r) {
+    if (!pf) return;
+    pf->ring = r;
+}
+
+struct AVIOContext *_pf_get_avio_for_test(const hls_prefetch_t *pf) {
+    if (!pf) return NULL;
+    return pf->avio;
+}
+
+/* ---------------------------------------------------------------------------
+ * Segment fetcher test helper (Task 5)
+ * --------------------------------------------------------------------------- */
 
 int _pf_fetch_segment_for_test(const char *url, ring_buf_t *r) {
     if (!url || !r) return -1;

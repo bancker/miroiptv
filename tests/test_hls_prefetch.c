@@ -1,5 +1,5 @@
 /*
- * Unit tests for hls_prefetch module — Tasks 2-5.
+ * Unit tests for hls_prefetch module — Tasks 2-7.
  * Build: see Makefile target PREFETCH_TEST_BIN.
  */
 
@@ -10,6 +10,8 @@
 #include <string.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <libavformat/avformat.h>
+#include <libavformat/avio.h>
 
 /* Winsock2 for the test HTTP server (MinGW / Windows). */
 #include <winsock2.h>
@@ -1066,6 +1068,100 @@ static void test_prefetch_open_invalid_url(void) {
     OK("test_prefetch_open_invalid_url");
 }
 
+/* =========================================================================
+ * Task 7: AVIO bridge tests
+ * ========================================================================= */
+
+/* ---- test 26: read callback returns ring bytes --------------------------- */
+
+static void test_avio_read_returns_ring_bytes(void) {
+    /* Build a minimal pf with a ring — no background thread needed. */
+    hls_prefetch_t *pf = _pf_new_for_test();
+    assert(pf != NULL);
+
+    /* Give it a ring large enough to hold 4096 bytes */
+    ring_buf_t *ring = ring_new(8192);
+    assert(ring != NULL);
+    _pf_set_ring_for_test(pf, ring);
+
+    /* Push exactly 4096 known bytes */
+    unsigned char src[4096];
+    for (int i = 0; i < 4096; i++) src[i] = (unsigned char)(i & 0xFF);
+    int wrc = ring_write(ring, src, 4096);
+    assert(wrc == 4096);
+
+    /* Read via the AVIO callback helper */
+    unsigned char dst[4096];
+    int got = _pf_avio_read_for_test(pf, dst, 4096);
+    assert(got == 4096);
+    assert(memcmp(src, dst, 4096) == 0);
+
+    /* _pf_free_for_test frees the ring we attached above */
+    _pf_free_for_test(pf);
+    OK("test_avio_read_returns_ring_bytes");
+}
+
+/* ---- test 27: read on empty closed ring returns 0 (-> EOF) -------------- */
+
+static void test_avio_read_on_empty_ring_eof(void) {
+    hls_prefetch_t *pf = _pf_new_for_test();
+    assert(pf != NULL);
+
+    ring_buf_t *ring = ring_new(4096);
+    assert(ring != NULL);
+    _pf_set_ring_for_test(pf, ring);
+
+    /* Close the ring without writing anything */
+    ring_close(ring);
+
+    unsigned char buf[256];
+    int got = _pf_avio_read_for_test(pf, buf, 256);
+    /* ring_read on a closed-empty ring returns 0;
+     * returning 0 from read_packet causes libav to treat it as EOF. */
+    assert(got == 0);
+
+    /* _pf_free_for_test frees the ring */
+    _pf_free_for_test(pf);
+    OK("test_avio_read_on_empty_ring_eof");
+}
+
+/* ---- test 28: attach sets fmt->pb and AVFMT_FLAG_CUSTOM_IO -------------- */
+
+static void test_avio_attach_sets_fmt_pb(void) {
+    hls_prefetch_t *pf = _pf_new_for_test();
+    assert(pf != NULL);
+
+    ring_buf_t *ring = ring_new(4096);
+    assert(ring != NULL);
+    _pf_set_ring_for_test(pf, ring);
+
+    AVFormatContext *fmt = avformat_alloc_context();
+    assert(fmt != NULL);
+    assert(fmt->pb == NULL);  /* freshly allocated — no pb yet */
+
+    int rc = hls_prefetch_attach(pf, fmt);
+    assert(rc == 0);
+
+    AVIOContext *avio = (AVIOContext *)_pf_get_avio_for_test(pf);
+    assert(avio != NULL);
+    assert(fmt->pb == avio);
+    assert(fmt->flags & AVFMT_FLAG_CUSTOM_IO);
+    assert(avio->seekable == 0);
+
+    /* Teardown: null out fmt->pb first so avformat_free_context doesn't
+     * double-free the AVIOContext owned by pf.
+     * Then free avio explicitly (avio_context_free also frees avio_read_buf).
+     * _pf_free_for_test frees the ring and the pf shell. */
+    fmt->pb = NULL;
+    avformat_free_context(fmt);
+
+    avio_context_free(&avio);
+    /* ring is freed by _pf_free_for_test below */
+    _pf_free_for_test(pf);
+
+    OK("test_avio_attach_sets_fmt_pb");
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 int main(void) {
@@ -1107,6 +1203,11 @@ int main(void) {
      * into test 1 as it asserts the same stats fields) */
     test_prefetch_open_close();
     test_prefetch_open_invalid_url();
+
+    /* Task 7: AVIO bridge */
+    test_avio_read_returns_ring_bytes();
+    test_avio_read_on_empty_ring_eof();
+    test_avio_attach_sets_fmt_pb();
 
     return 0;
 }

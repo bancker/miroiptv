@@ -67,4 +67,31 @@ void _pf_free_for_test(hls_prefetch_t *pf);
  * -1 on any failure (non-200 status, curl error, write error). */
 int _pf_fetch_segment_for_test(const char *url, ring_buf_t *r);
 
+/* ---------------------------------------------------------------------------
+ * Test helper for the AVIO read callback (Task 7).
+ * Calls the internal avio_read_packet() function directly against pf's ring,
+ * without going through AVFormatContext.  Use this to unit-test the read
+ * path without needing a live libav demux session.
+ *
+ * Returns the number of bytes read (>= 0), or 0 if the ring is empty/closed
+ * (libav maps 0 to AVERROR_EOF internally).
+ * --------------------------------------------------------------------------- */
+int _pf_avio_read_for_test(hls_prefetch_t *pf, unsigned char *buf, int buf_size);
+
+/* Ring accessor — tests that need to pre-load the ring or close it use this.
+ * Returns the ring_buf_t* owned by pf, or NULL if pf has none. */
+ring_buf_t *_pf_get_ring_for_test(hls_prefetch_t *pf);
+
+/* Set the ring on a test-created prefetch handle (from _pf_new_for_test).
+ * The ring becomes owned by pf and will be freed by _pf_free_for_test. */
+void _pf_set_ring_for_test(hls_prefetch_t *pf, ring_buf_t *r);
+
+/* Forward-declare AVIOContext so callers don't need to include libav headers
+ * just to retrieve the pointer.  Tests that compare fmt->pb need
+ * libavformat anyway, so this is just a lightweight forward. */
+struct AVIOContext;
+
+/* Returns pf->avio (may be NULL if hls_prefetch_attach has not been called). */
+struct AVIOContext *_pf_get_avio_for_test(const hls_prefetch_t *pf);
+
 #endif
