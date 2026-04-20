@@ -18,7 +18,7 @@ endif
 # build-dist.sh passes TV_VERSION / TV_REPO via the environment; local
 # builds fall back to "dev" + placeholder so the check no-ops.
 TV_VERSION ?= dev
-TV_REPO    ?= brnck/miroiptv
+TV_REPO    ?= bancker/miroiptv
 CFLAGS     += -DTV_VERSION=\"$(TV_VERSION)\" -DTV_UPDATE_REPO=\"$(TV_REPO)\"
 
 SRC      = $(wildcard src/*.c)

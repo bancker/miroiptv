@@ -17,7 +17,7 @@
 #   TV_REPO=user/repo ./build-dist.sh      # override default repo slug
 set -euo pipefail
 
-REPO="${TV_REPO:-brnck/miroiptv}"
+REPO="${TV_REPO:-bancker/miroiptv}"
 VERSION="$(git describe --tags --dirty 2>/dev/null || echo dev)"
 DIST_DIR="dist/miroiptv-${VERSION}"
 ZIP_PATH="miroiptv-${VERSION}.zip"
