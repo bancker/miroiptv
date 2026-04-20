@@ -7,6 +7,7 @@
 #ifdef _WIN32
 #  include <windows.h>
 #  include <direct.h>
+#  include <sys/stat.h>
 #else
 #  include <unistd.h>
 #  include <sys/stat.h>
@@ -514,6 +515,236 @@ static void test_remove_noop(void) {
     puts("OK test_remove_noop");
 }
 
+/* ---- Task 8: Reconciliation tests ---- */
+
+/* Build a synthetic catalog for tests. */
+static void mk_catalog(xtream_live_list_t *out,
+                      const int *ids, const int *nums, const char **names, size_t n) {
+    out->entries = calloc(n, sizeof(xtream_live_entry_t));
+    out->count   = n;
+    for (size_t i = 0; i < n; ++i) {
+        out->entries[i].stream_id = ids[i];
+        out->entries[i].num       = nums[i];
+        out->entries[i].name      = strdup(names[i]);
+    }
+}
+static void free_catalog(xtream_live_list_t *cat) {
+    for (size_t i = 0; i < cat->count; ++i) free(cat->entries[i].name);
+    free(cat->entries); cat->entries = NULL; cat->count = 0;
+}
+
+static void test_reconcile_id_match(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/f.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    favorites_t seed = {0};
+    fav_push_for_test(&seed, 1234, 101, "NPO 1 HD");
+    favorites_save_to_path(&seed, path);
+    favorites_free(&seed);
+
+    int ids[] = {1234}; int nums[] = {101}; const char *names[] = {"NPO 1 HD"};
+    xtream_live_list_t cat = {0};
+    mk_catalog(&cat, ids, nums, names, 1);
+
+    favorites_t fv = {0};
+    favorites_init(&fv, &cat);
+    assert(fv.count == 1);
+    assert(fv.entries[0].hidden == 0);
+    assert(fv.entries[0].stream_id == 1234);
+
+    free_catalog(&cat);
+    favorites_free(&fv);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_reconcile_id_match");
+}
+
+static void test_reconcile_name_fallback_rewrites_id(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/f.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    favorites_t seed = {0};
+    fav_push_for_test(&seed, 1234, 101, "NPO 1 HD");
+    favorites_save_to_path(&seed, path);
+    favorites_free(&seed);
+
+    /* Catalog has a channel with the same NAME but different ID. */
+    int ids[] = {9999}; int nums[] = {101}; const char *names[] = {"NPO 1 HD"};
+    xtream_live_list_t cat = {0};
+    mk_catalog(&cat, ids, nums, names, 1);
+
+    favorites_t fv = {0};
+    favorites_init(&fv, &cat);
+    assert(fv.count == 1);
+    assert(fv.entries[0].hidden == 0);
+    assert(fv.entries[0].stream_id == 9999);   /* rewritten! */
+
+    /* File should have been rewritten with new id. */
+    favorites_t fv2 = {0};
+    favorites_load_from_path(&fv2, path);
+    assert(fv2.count == 1);
+    assert(fv2.entries[0].stream_id == 9999);
+    favorites_free(&fv2);
+
+    free_catalog(&cat);
+    favorites_free(&fv);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_reconcile_name_fallback_rewrites_id");
+}
+
+static void test_reconcile_both_miss_hides_entry(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/f.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    favorites_t seed = {0};
+    fav_push_for_test(&seed, 1234, 101, "DeadChannel");
+    favorites_save_to_path(&seed, path);
+    favorites_free(&seed);
+
+    int ids[] = {5555}; int nums[] = {1}; const char *names[] = {"Something else"};
+    xtream_live_list_t cat = {0};
+    mk_catalog(&cat, ids, nums, names, 1);
+
+    favorites_t fv = {0};
+    favorites_init(&fv, &cat);
+    assert(fv.count == 1);
+    assert(fv.entries[0].hidden == 1);
+    assert(favorites_visible_count(&fv) == 0);
+
+    free_catalog(&cat);
+    favorites_free(&fv);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_reconcile_both_miss_hides_entry");
+}
+
+static void test_reconcile_catalog_empty_keeps_all_visible(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/f.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    favorites_t seed = {0};
+    fav_push_for_test(&seed, 1234, 101, "Whatever");
+    favorites_save_to_path(&seed, path);
+    favorites_free(&seed);
+
+    xtream_live_list_t cat = {0};   /* catalog load failed */
+    favorites_t fv = {0};
+    favorites_init(&fv, &cat);
+    assert(fv.count == 1);
+    assert(fv.entries[0].hidden == 0);
+    assert(fv.entries[0].stream_id == 1234);
+    assert(favorites_visible_count(&fv) == 1);
+
+    favorites_free(&fv);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_reconcile_catalog_empty_keeps_all_visible");
+}
+
+static void test_reconcile_case_sensitive(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/f.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    /* Seed with name "NPO 1 HD" under a dead id. */
+    favorites_t seed = {0};
+    fav_push_for_test(&seed, 1234, 101, "NPO 1 HD");
+    favorites_save_to_path(&seed, path);
+    favorites_free(&seed);
+
+    /* Catalog has case-only difference: "npo 1 hd". */
+    int ids[] = {9999}; int nums[] = {101}; const char *names[] = {"npo 1 hd"};
+    xtream_live_list_t cat = {0};
+    mk_catalog(&cat, ids, nums, names, 1);
+
+    favorites_t fv = {0};
+    favorites_init(&fv, &cat);
+    /* Case differs -> no name match -> hidden. */
+    assert(fv.count == 1);
+    assert(fv.entries[0].hidden == 1);
+    assert(fv.entries[0].stream_id == 1234);   /* id NOT rewritten */
+
+    free_catalog(&cat);
+    favorites_free(&fv);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_reconcile_case_sensitive");
+}
+
+static void test_reconcile_determinism_on_name_collision(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/f.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    favorites_t seed = {0};
+    fav_push_for_test(&seed, 1234, 101, "Shared Name");
+    favorites_save_to_path(&seed, path);
+    favorites_free(&seed);
+
+    /* Two catalog channels share the name. First one (lower num) wins. */
+    int ids[]           = {5001, 5002};
+    int nums[]          = {10, 20};
+    const char *names[] = {"Shared Name", "Shared Name"};
+    xtream_live_list_t cat = {0};
+    mk_catalog(&cat, ids, nums, names, 2);
+
+    favorites_t fv = {0};
+    favorites_init(&fv, &cat);
+    assert(fv.count == 1);
+    assert(fv.entries[0].hidden == 0);
+    assert(fv.entries[0].stream_id == 5001);   /* first occurrence wins */
+
+    free_catalog(&cat);
+    favorites_free(&fv);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_reconcile_determinism_on_name_collision");
+}
+
+static void test_reconcile_idempotent(void) {
+    char *dir = make_tempdir();
+    char path[512]; snprintf(path, sizeof(path), "%s/f.json", dir);
+    setenv_portable("TV_FAVORITES_PATH", path);
+
+    favorites_t seed = {0};
+    fav_push_for_test(&seed, 1234, 101, "NPO 1 HD");
+    favorites_save_to_path(&seed, path);
+    favorites_free(&seed);
+
+    int ids[] = {1234}; int nums[] = {101}; const char *names[] = {"NPO 1 HD"};
+    xtream_live_list_t cat = {0};
+    mk_catalog(&cat, ids, nums, names, 1);
+
+    /* First init — no rewrite expected (ids already match). Capture mtime. */
+    favorites_t fv = {0};
+    favorites_init(&fv, &cat);
+    struct stat s1; assert(stat(path, &s1) == 0);
+    favorites_free(&fv);
+
+    /* Wait a full second so mtime can tick (POSIX mtime is 1s granularity). */
+#ifdef _WIN32
+    Sleep(1100);
+#else
+    struct timespec ts = {1, 100 * 1000 * 1000}; nanosleep(&ts, NULL);
+#endif
+
+    favorites_t fv2 = {0};
+    favorites_init(&fv2, &cat);
+    struct stat s2; assert(stat(path, &s2) == 0);
+    assert(s1.st_mtime == s2.st_mtime);   /* no rewrite on second init */
+
+    favorites_free(&fv2);
+    free_catalog(&cat);
+    setenv_portable("TV_FAVORITES_PATH", NULL);
+    free(dir);
+    puts("OK test_reconcile_idempotent");
+}
+
 int main(void) {
     test_path_env_override();
     test_path_defaults_nonnull();
@@ -534,5 +765,12 @@ int main(void) {
     test_toggle_add_remove();
     test_capacity_growth();
     test_remove_noop();
+    test_reconcile_id_match();
+    test_reconcile_name_fallback_rewrites_id();
+    test_reconcile_both_miss_hides_entry();
+    test_reconcile_catalog_empty_keeps_all_visible();
+    test_reconcile_case_sensitive();
+    test_reconcile_determinism_on_name_collision();
+    test_reconcile_idempotent();
     return 0;
 }

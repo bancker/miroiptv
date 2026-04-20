@@ -139,7 +139,11 @@ static int mkdir_p(const char *path) {
     if (tmp[len - 1] == PATH_SEP) tmp[len - 1] = '\0';
 
     for (char *p = tmp + 1; *p; ++p) {
+#ifdef _WIN32
+        if (*p == PATH_SEP || *p == '/') {
+#else
         if (*p == PATH_SEP) {
+#endif
             *p = '\0';
 #ifdef _WIN32
             _mkdir(tmp);
@@ -258,11 +262,76 @@ char *favorites_path(void) {
     return strdup("favorites.json");
 }
 
+static int catalog_find_by_id(const xtream_live_list_t *cat, int id) {
+    if (!cat) return -1;
+    for (size_t i = 0; i < cat->count; ++i)
+        if (cat->entries[i].stream_id == id) return (int)i;
+    return -1;
+}
+
+static int catalog_find_by_name(const xtream_live_list_t *cat, const char *name) {
+    if (!cat || !name) return -1;
+    for (size_t i = 0; i < cat->count; ++i)
+        if (cat->entries[i].name && strcmp(cat->entries[i].name, name) == 0)
+            return (int)i;
+    return -1;
+}
+
+static int cmp_by_num(const void *a, const void *b) {
+    int na = ((const favorite_t *)a)->num;
+    int nb = ((const favorite_t *)b)->num;
+    return (na > nb) - (na < nb);
+}
+
+static void favorites_reconcile(favorites_t *fv, const xtream_live_list_t *cat) {
+    if (!cat || cat->count == 0) {
+        /* Catalog unavailable — keep all entries visible as-cached, do NOT
+         * rewrite file. Zapping still works (URL only needs stream_id). */
+        for (size_t i = 0; i < fv->count; ++i) fv->entries[i].hidden = 0;
+        return;
+    }
+
+    int any_rewrite = 0;
+    for (size_t i = 0; i < fv->count; ++i) {
+        favorite_t *e = &fv->entries[i];
+        int ci = catalog_find_by_id(cat, e->stream_id);
+        if (ci >= 0) {
+            /* Match. Refresh cached num + name (portal is source of truth). */
+            e->hidden = 0;
+            e->num    = cat->entries[ci].num;
+            if (cat->entries[ci].name &&
+                (!e->name || strcmp(e->name, cat->entries[ci].name) != 0)) {
+                free(e->name);
+                e->name = strdup(cat->entries[ci].name);
+                any_rewrite = 1;
+            }
+            continue;
+        }
+        ci = catalog_find_by_name(cat, e->name);
+        if (ci >= 0) {
+            fprintf(stderr, "favorites: '%s' id %d -> %d (name match)\n",
+                    e->name, e->stream_id, cat->entries[ci].stream_id);
+            e->stream_id = cat->entries[ci].stream_id;
+            e->num       = cat->entries[ci].num;
+            e->hidden    = 0;
+            any_rewrite  = 1;
+            continue;
+        }
+        fprintf(stderr, "favorites: '%s' (id=%d) not found in catalog — hiding\n",
+                e->name ? e->name : "", e->stream_id);
+        e->hidden = 1;
+    }
+
+    qsort(fv->entries, fv->count, sizeof(favorite_t), cmp_by_num);
+
+    if (any_rewrite) favorites_save_to_path(fv, fv->path);
+}
+
 int favorites_init(favorites_t *fv, const xtream_live_list_t *catalog) {
-    (void)catalog;
     memset(fv, 0, sizeof(*fv));
     fv->path = favorites_path();
     if (fv->path) favorites_load_from_path(fv, fv->path);
+    favorites_reconcile(fv, catalog);
     return 0;
 }
 
