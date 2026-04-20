@@ -70,13 +70,22 @@ static void audio_callback(void *ud, uint8_t *stream, int len) {
              * On miss, fill the remaining frame with silence and return. */
             audio_chunk_t *c = queue_try_pop(ao->q);
             if (!c) {
-                /* No audio data. Write silence AND advance samples_played so
-                 * the av_clock keeps moving — otherwise a decoder hiccup
-                 * freezes the clock, main holds the pending video frame
-                 * forever, the video queue fills to cap, the decoder blocks
-                 * on queue_push, and everything deadlocks. */
+                /* No audio data. Write silence AND (usually) advance
+                 * samples_played so the av_clock keeps moving — otherwise
+                 * a decoder hiccup freezes the clock, main holds the
+                 * pending video frame forever, the video queue fills to
+                 * cap, the decoder blocks on queue_push, and everything
+                 * deadlocks.
+                 *
+                 * EXCEPTION: when the decoder has exited (halt_on_miss
+                 * points at player.decoder_done and it's 1), stop
+                 * ticking. No deadlock risk — decoder is gone, nothing
+                 * is waiting on queue_push — and freezing the clock
+                 * lets the watchdog in main fire so live streams can
+                 * auto-reopen. */
                 memset(out, 0, (size_t)need_samples * 2 * sizeof(int16_t));
-                ao->samples_played += need_samples;
+                if (!(ao->halt_on_miss && *ao->halt_on_miss))
+                    ao->samples_played += need_samples;
                 return;
             }
             /* Seed the A/V clock baseline from the FIRST audio pts we play,
@@ -271,6 +280,7 @@ int overlay_render_help(overlay_t *o, SDL_Renderer *r, int ww, int wh) {
         "  f             Search channels + movies + series (type, up/down, Enter)",
         "  *             Toggle favorite on current channel (also works in 'f' search)",
         "  Shift+f       Favorites list (Enter zaps, Del removes)",
+        "  d             Toggle debug HUD (top-left overlay, denser stderr log)",
         "  F11           Toggle fullscreen",
         "  t             Toggle always-on-top",
         "  a             Cycle audio track (NL / FR / EN / …)",
@@ -324,6 +334,30 @@ int overlay_render_hint(overlay_t *o, SDL_Renderer *r, const char *text, int ww,
     SDL_Rect box = { ww - s->w - pad * 3, wh - s->h - pad * 3, s->w + pad * 2, s->h + pad * 2 };
     SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(r, 0, 0, 0, 180);
+    SDL_RenderFillRect(r, &box);
+    SDL_Texture *t = SDL_CreateTextureFromSurface(r, s);
+    SDL_Rect dst = { box.x + pad, box.y + pad, s->w, s->h };
+    SDL_RenderCopy(r, t, NULL, &dst);
+    SDL_DestroyTexture(t);
+    SDL_FreeSurface(s);
+    return 0;
+}
+
+int overlay_render_debug(overlay_t *o, SDL_Renderer *r, const char *text,
+                         int ww, int wh) {
+    (void)wh;
+    (void)ww;
+    if (!text || !*text) return 0;
+    /* Yellow so the user can't miss that debug mode is on. Top-left
+     * corner where nothing else lives — toast is bottom-right, help
+     * center, subs bottom-center, search top-center. No collisions. */
+    const SDL_Color yellow = { 255, 220, 80, 240 };
+    SDL_Surface *s = TTF_RenderUTF8_Blended(o->font_regular, text, yellow);
+    if (!s) return -1;
+    const int pad = 6;
+    SDL_Rect box = { pad, pad, s->w + pad * 2, s->h + pad * 2 };
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 200);
     SDL_RenderFillRect(r, &box);
     SDL_Texture *t = SDL_CreateTextureFromSurface(r, s);
     SDL_Rect dst = { box.x + pad, box.y + pad, s->w, s->h };

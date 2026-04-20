@@ -46,6 +46,13 @@ typedef struct {
      * before the first IDR video frame. */
     volatile double   first_pts;
     volatile int      has_first_pts;
+
+    /* Points at player_t.decoder_done. When non-NULL and *halt_on_miss is
+     * set, the audio callback stops advancing samples_played on queue-miss
+     * so the stall detector / watchdog in main can fire. NULL-safe — if
+     * unset, keeps the previous silence-with-tick behaviour (needed during
+     * normal network hiccups where the decoder is still alive). */
+    const volatile int *halt_on_miss;
 } audio_out_t;
 
 int  audio_open(audio_out_t *ao, queue_t *q, int sample_rate);
@@ -96,5 +103,13 @@ int  overlay_render_search(overlay_t *o, SDL_Renderer *r, const char *query,
  * caller decides whether to call (timing is tracked externally). */
 int  overlay_render_subtitle(overlay_t *o, SDL_Renderer *r, const char *text,
                              int ww, int wh);
+
+/* Debug HUD: small top-left status text on a translucent strip. Used by
+ * 'd'-toggled debug mode to surface live queue depths / decoder age /
+ * clk so the user can see, in the window, why playback is (or isn't)
+ * healthy. Caller throttles calls (suggested: re-render when the text
+ * would change, not every frame). */
+int  overlay_render_debug(overlay_t *o, SDL_Renderer *r, const char *text,
+                          int ww, int wh);
 
 #endif

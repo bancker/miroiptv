@@ -25,6 +25,17 @@ typedef struct {
 
     pthread_t         thread;
     volatile int      stop;
+
+    /* Watchdog state, written by the decoder thread, read by the audio
+     * callback and by the main-loop watchdog. Not a synchronization
+     * primitive — just "did libav give up?" and "when did we last make
+     * forward network progress?". Used to detect silent decoder death
+     * that silence-fill in the audio callback would otherwise mask
+     * forever (see audio_callback in render.c and the watchdog branch
+     * in main.c). */
+    volatile int          decoder_done;          /* 1 after EOF / error break */
+    volatile unsigned int decoder_last_read_ms;  /* SDL_GetTicks() of last ok av_read_frame */
+
     int               audio_sample_rate_out;
     long long         video_frames_pushed;
     long long         audio_frames_pushed;

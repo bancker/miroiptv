@@ -1,4 +1,5 @@
 #include "player.h"
+#include <SDL2/SDL.h>   /* SDL_GetTicks for decoder_last_read_ms */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -502,6 +503,13 @@ static void *decoder_loop(void *ud) {
         }
 
         int rc = av_read_frame(p->fmt, pkt);
+        if (rc >= 0) {
+            /* Watchdog heartbeat: last successful network read. Main uses
+             * this to detect "alive but wedged" — av_read_frame blocking
+             * on a dead TCP socket with io_interrupt_cb set to shutdown-
+             * only can sit for minutes without our watchdog here. */
+            p->decoder_last_read_ms = (unsigned int)SDL_GetTicks();
+        }
         if (rc < 0) {
             char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
             av_strerror(rc, errbuf, sizeof(errbuf));
@@ -510,6 +518,10 @@ static void *decoder_loop(void *ud) {
             } else {
                 fprintf(stderr, "[decoder] av_read_frame failed: %s (rc=%d)\n", errbuf, rc);
             }
+            /* Tell the audio callback to stop ticking samples_played on
+             * queue-miss — otherwise silence-fill keeps the clock alive
+             * and the stall detector / watchdog never fires. */
+            p->decoder_done = 1;
             break;
         }
         /* Subtitle packets take the avcodec_decode_subtitle2 path (their

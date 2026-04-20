@@ -739,16 +739,6 @@ int main(int argc, char **argv) {
     Uint32   last_debug_render = 0;
     char     debug_buf[160] = {0};
 
-    /* Watchdog restart escalation. 3 restarts within 30s that fail to
-     * produce has_first_pts means the channel is genuinely unreachable —
-     * fall back to NPO 1. Resets to 0 whenever a fresh playback lands
-     * audio (has_first_pts flips 1). */
-    int      restart_attempts    = 0;
-    Uint32   restart_window_start = 0;
-    int      prev_has_first_pts  = 0;
-    const int   RESTART_ATTEMPT_CAP = 3;
-    const Uint32 RESTART_WINDOW_MS  = 30000;
-
     /* Heartbeat: log state every HEARTBEAT_MS so we can see in the log
      * exactly when main stops making progress. If the heartbeat pauses,
      * main thread is blocked somewhere. */
@@ -2254,14 +2244,6 @@ int main(int argc, char **argv) {
         int is_vod = pb->timeshift_start == 0 && pb->stream_id == 0 &&
                      pb->player.fmt && pb->player.fmt->duration > 0;
 
-        /* Reset escalation counter whenever a fresh playback successfully
-         * lands audio (0 -> 1 transition on has_first_pts). */
-        if (pb->audio.has_first_pts && !prev_has_first_pts) {
-            restart_attempts = 0;
-            restart_window_start = SDL_GetTicks();
-        }
-        prev_has_first_pts = pb->audio.has_first_pts;
-
         if (!paused && !is_vod && (audio_stalled || never_started ||
                                    decoder_exited || decoder_wedged)) {
             fprintf(stderr, "[watchdog] trigger: audio_stalled=%d never_started=%d "
@@ -2272,72 +2254,59 @@ int main(int argc, char **argv) {
                     (long long)pb->audio.samples_played,
                     av_clock_ready(&pb->clk) ? av_clock_now(&pb->clk) : 0.0);
 
-            Uint32 now_ms = SDL_GetTicks();
-            if (now_ms - restart_window_start > RESTART_WINDOW_MS) {
-                restart_window_start = now_ms;
-                restart_attempts = 0;
-            }
-            int escalate = (++restart_attempts > RESTART_ATTEMPT_CAP &&
-                            current_live_idx >= 0 && current_live_idx != 0 &&
-                            live_list.count > 0);
-            if (escalate) {
-                fprintf(stderr, "[watchdog] escalation: %d restarts failed in %ums — "
-                                "zapping to NPO 1 (channel 0)\n",
-                        restart_attempts, RESTART_WINDOW_MS);
-                pending_wheel_delta = -current_live_idx;
-                last_wheel_ts       = SDL_GetTicks() - 400;
-                restart_attempts    = 0;
-                restart_window_start = now_ms;
-                /* skip the normal restart this tick — wheel pipeline takes over */
+            /* No escalation — always retry on the SAME channel. The
+             * previous escalation-to-idx-0 logic was removed because on
+             * flaky portals it booted the user off their chosen channel
+             * after a few drops (idx 0 is not necessarily NPO 1; portal
+             * catalogs vary). If a channel is genuinely unreachable, the
+             * user can zap manually. */
+            if (never_started)
+                fprintf(stderr, "[stall] audio never started after %dms — restarting\n",
+                        startup_elapsed);
+            char *restart_url;
+            int   restart_epg_id;
+            if (pb->timeshift_start != 0 && portal.host) {
+                /* Timeshift replay: resume at the same start/duration so we
+                 * don't randomly switch to the archive stream's live feed. */
+                restart_url = xtream_timeshift_url(&portal, pb->stream_id,
+                                                   pb->timeshift_start,
+                                                   pb->timeshift_dur_min);
+                restart_epg_id = pb->stream_id;
+                fprintf(stderr, "[stall] timeshift id=%d start=%ld restarting\n",
+                        pb->stream_id, (long)pb->timeshift_start);
+            } else if (pb->stream_id != 0 && portal.host) {
+                restart_url    = xtream_stream_url(&portal, pb->stream_id);
+                restart_epg_id = pb->stream_id;
+                fprintf(stderr, "[stall] no frames for %ums on portal stream_id=%d - restarting\n",
+                        STALL_MS, pb->stream_id);
             } else {
-                if (never_started)
-                    fprintf(stderr, "[stall] audio never started after %dms — restarting\n",
-                            startup_elapsed);
-                char *restart_url;
-                int   restart_epg_id;
-                if (pb->timeshift_start != 0 && portal.host) {
-                    /* Timeshift replay: resume at the same start/duration so we
-                     * don't randomly switch to the archive stream's live feed. */
-                    restart_url = xtream_timeshift_url(&portal, pb->stream_id,
-                                                       pb->timeshift_start,
-                                                       pb->timeshift_dur_min);
-                    restart_epg_id = pb->stream_id;
-                    fprintf(stderr, "[stall] timeshift id=%d start=%ld restarting\n",
-                            pb->stream_id, (long)pb->timeshift_start);
-                } else if (pb->stream_id != 0 && portal.host) {
-                    restart_url    = xtream_stream_url(&portal, pb->stream_id);
-                    restart_epg_id = pb->stream_id;
-                    fprintf(stderr, "[stall] no frames for %ums on portal stream_id=%d - restarting\n",
-                            STALL_MS, pb->stream_id);
-                } else {
-                    int ch_idx = (int)(pb->channel - &NPO_CHANNELS[0]);
-                    restart_url    = build_channel_url(ch_idx, &portal, direct_url);
-                    restart_epg_id = 0;
-                    fprintf(stderr, "[stall] no frames for %ums on %s - restarting\n",
-                            STALL_MS, pb->channel->display);
-                }
-                playback_t *new_pb = calloc(1, sizeof(*new_pb));
-                if (new_pb && playback_open(new_pb, &r, pb->channel, restart_url, &portal, restart_epg_id) == 0) {
-                    /* Preserve timeshift state across restart. */
-                    if (pb->timeshift_start != 0) {
-                        new_pb->timeshift_start   = pb->timeshift_start;
-                        new_pb->timeshift_dur_min = pb->timeshift_dur_min;
-                    }
-                    playback_close(pb);
-                    free(pb);
-                    pb = new_pb;
-                    paused       = 0;
-                    have_texture = 0;
-                    if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
-                    overlay_mark_dirty(&ov);
-                    playback_open_ts = SDL_GetTicks(); audio_warmed = 0;
-                    fprintf(stderr, "[stall] restart OK\n");
-                } else {
-                    free(new_pb);
-                    fprintf(stderr, "[stall] restart failed - will retry in %ums\n", STALL_MS);
-                }
-                free(restart_url);
+                int ch_idx = (int)(pb->channel - &NPO_CHANNELS[0]);
+                restart_url    = build_channel_url(ch_idx, &portal, direct_url);
+                restart_epg_id = 0;
+                fprintf(stderr, "[stall] no frames for %ums on %s - restarting\n",
+                        STALL_MS, pb->channel->display);
             }
+            playback_t *new_pb = calloc(1, sizeof(*new_pb));
+            if (new_pb && playback_open(new_pb, &r, pb->channel, restart_url, &portal, restart_epg_id) == 0) {
+                /* Preserve timeshift state across restart. */
+                if (pb->timeshift_start != 0) {
+                    new_pb->timeshift_start   = pb->timeshift_start;
+                    new_pb->timeshift_dur_min = pb->timeshift_dur_min;
+                }
+                playback_close(pb);
+                free(pb);
+                pb = new_pb;
+                paused       = 0;
+                have_texture = 0;
+                if (pending_vf) { video_frame_free(pending_vf); pending_vf = NULL; }
+                overlay_mark_dirty(&ov);
+                playback_open_ts = SDL_GetTicks(); audio_warmed = 0;
+                fprintf(stderr, "[stall] restart OK\n");
+            } else {
+                free(new_pb);
+                fprintf(stderr, "[stall] restart failed - will retry in %ums\n", STALL_MS);
+            }
+            free(restart_url);
             /* Reset the audio-progress tracker so we don't fire again 3s later. */
             last_audio_progress_ts = SDL_GetTicks();
             prev_samples_played    = 0;
