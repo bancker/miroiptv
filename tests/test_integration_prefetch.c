@@ -1,13 +1,15 @@
 /*
- * Integration test harness for hls_prefetch — Task 10.
+ * Integration test harness for hls_prefetch — Tasks 10 and 11.
  *
  * Provides a mock HTTP server with scripted failure injection:
- *   - 509-after-N-manifests
+ *   - 509-after-N-manifests (permanent threshold)
+ *   - remaining_manifest_failures (windowed: next N requests fail)
  *   - drop-connection on the Nth segment request
+ *   - remaining_segment_drops (windowed: next N segment drops)
  *   - rotating per-manifest tokens (stale tokens → 403)
  *
  * Task 10 main() just verifies the server starts and stops cleanly.
- * Task 11 will add the actual scenario tests.
+ * Task 11 adds 4 scenario tests.
  */
 
 #include <assert.h>
@@ -19,6 +21,8 @@
 /* Winsock2 for POSIX-style sockets on MinGW / Windows. */
 #include <winsock2.h>
 #include <ws2tcpip.h>
+
+#include "../src/hls_prefetch.h"
 
 /* =========================================================================
  * Mock HTTP server
@@ -38,10 +42,16 @@
 
 typedef struct mock_server {
     /* ---- configuration (set before / during the run) ---- */
-    int  serve_fail_after_n_manifests;  /* -1 = never */
+    int  serve_fail_after_n_manifests;  /* -1 = never (permanent threshold) */
     int  manifest_fail_code;            /* e.g. 509 */
-    int  drop_connection_after_n_segs;  /* -1 = never */
+    int  drop_connection_after_n_segs;  /* -1 = never (permanent threshold) */
     int  rotate_tokens;                 /* 0 = off, 1 = on */
+
+    /* ---- windowed failure injection (set mid-test via inject API) ---- */
+    volatile int remaining_manifest_failures;  /* countdown: next N manifest
+                                                * requests get fail_code */
+    volatile int remaining_segment_drops;      /* countdown: next N segment
+                                                * requests get connection drop */
 
     /* ---- stats (read after scenario) ---- */
     volatile int n_manifests_served;
@@ -98,10 +108,17 @@ static void ms_send_response(SOCKET s, int status, const char *status_text,
 static void ms_handle_manifest(SOCKET s, mock_server_t *ms) {
     int n = ms->n_manifests_served; /* read before deciding */
 
-    /* Failure injection: return manifest_fail_code after N successful serves */
+    /* Windowed failure injection: remaining_manifest_failures takes precedence
+     * over the permanent serve_fail_after_n_manifests threshold. */
+    if (ms->remaining_manifest_failures > 0) {
+        ms->remaining_manifest_failures--;
+        ms_send_response(s, ms->manifest_fail_code, "Limit Exceeded", NULL, 0);
+        return;
+    }
+
+    /* Permanent failure injection: return manifest_fail_code after N serves */
     if (ms->serve_fail_after_n_manifests >= 0 &&
         n >= ms->serve_fail_after_n_manifests) {
-        /* Send the configured failure code */
         ms_send_response(s, ms->manifest_fail_code, "Limit Exceeded", NULL, 0);
         return;
     }
@@ -164,11 +181,17 @@ static void ms_handle_segment(SOCKET s, mock_server_t *ms, const char *path) {
         }
     }
 
-    /* Drop-connection injection: close socket on the Nth segment request */
+    /* Windowed drop injection: remaining_segment_drops counts down. */
+    if (ms->remaining_segment_drops > 0) {
+        ms->remaining_segment_drops--;
+        /* Drop by closing without sending — curl sees incomplete transfer. */
+        (void)s;
+        return;
+    }
+
+    /* Permanent drop-connection injection: close socket on the Nth request */
     if (ms->drop_connection_after_n_segs >= 0 &&
         n == ms->drop_connection_after_n_segs) {
-        /* Just return — the socket gets closed by the accept loop,
-         * giving curl a connection reset / incomplete transfer. */
         (void)s;
         return;
     }
@@ -246,6 +269,8 @@ mock_server_t *mock_server_start(void) {
     ms->manifest_fail_code            = 509;
     ms->drop_connection_after_n_segs  = -1;
     ms->rotate_tokens                 = 0;
+    ms->remaining_manifest_failures   = 0;
+    ms->remaining_segment_drops       = 0;
 
     ms->listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (ms->listen_sock == INVALID_SOCKET) { free(ms); return NULL; }
@@ -307,6 +332,22 @@ void mock_server_config(mock_server_t *ms,
     ms->rotate_tokens                = rotate_tokens;
 }
 
+/* Inject a windowed manifest failure burst: the next `n` manifest requests
+ * will return `code` (regardless of serve_fail_after_n_manifests setting).
+ * Thread-safe write — int assignment is atomic on x86. */
+void mock_server_inject_manifest_failures(mock_server_t *ms, int n, int code) {
+    if (!ms) return;
+    ms->manifest_fail_code          = code;
+    ms->remaining_manifest_failures = n;
+}
+
+/* Inject a windowed segment drop burst: the next `n` segment requests will
+ * have their connection dropped mid-response (curl sees incomplete transfer). */
+void mock_server_inject_segment_drops(mock_server_t *ms, int n) {
+    if (!ms) return;
+    ms->remaining_segment_drops = n;
+}
+
 /* Stats — read after scenario completes. */
 int mock_server_manifests_served(mock_server_t *ms) {
     if (!ms) return 0;
@@ -328,15 +369,220 @@ void mock_server_stop(mock_server_t *ms) {
 }
 
 /* =========================================================================
- * Task 10 main — smoke test: server starts and stops cleanly.
- * Task 11 will add the actual integration scenarios.
+ * Helpers shared across integration tests
+ * ========================================================================= */
+
+static void msleep(int ms) {
+    if (ms <= 0) return;
+    struct timespec ts;
+    ts.tv_sec  = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+
+/* Build a full manifest URL from a mock server. Caller frees. */
+static char *make_manifest_url(mock_server_t *ms) {
+    char *url = malloc(128);
+    if (!url) return NULL;
+    snprintf(url, 128, "http://127.0.0.1:%d/stream.m3u8", ms->port);
+    return url;
+}
+
+/* =========================================================================
+ * Task 11 — Integration scenario tests
+ * ========================================================================= */
+
+/* ---------------------------------------------------------------------------
+ * test_steady_state_playback
+ *
+ * Clean server (no failures).  Open prefetch, sleep 5 s.
+ * Assert bytes_buffered > 500 KB, manifest_errors == 0, segments_fetched >= 2.
+ * --------------------------------------------------------------------------- */
+static void test_steady_state_playback(void) {
+    mock_server_t *ms = mock_server_start();
+    assert(ms != NULL);
+
+    char *manifest_url = make_manifest_url(ms);
+    assert(manifest_url != NULL);
+
+    hls_prefetch_t *pf = hls_prefetch_open(manifest_url);
+    assert(pf != NULL);
+    free(manifest_url);
+
+    /* Give the prefetcher time to fetch several manifests and segments */
+    msleep(5000);
+
+    hls_prefetch_stats_t stats;
+    hls_prefetch_get_stats(pf, &stats);
+
+    assert(stats.bytes_buffered > 500 * 1024);
+    assert(stats.manifest_errors == 0);
+    assert(stats.segments_fetched >= 2);
+
+    hls_prefetch_close(pf);
+    mock_server_stop(ms);
+
+    puts("OK test_steady_state_playback");
+}
+
+/* ---------------------------------------------------------------------------
+ * test_survives_509_storm
+ *
+ * Start clean, let prefetcher warm up for 3 s (ring fills with a few
+ * segments).  Then inject 5 consecutive 509s on manifest requests.
+ * Sleep 15 s (prefetcher backs off exponentially but eventually recovers).
+ * Assert manifest_errors >= 5 AND < manifest_refreshes (recovery happened).
+ * Assert the ring was never closed (prefetch thread still alive at the end).
+ * --------------------------------------------------------------------------- */
+static void test_survives_509_storm(void) {
+    mock_server_t *ms = mock_server_start();
+    assert(ms != NULL);
+
+    char *manifest_url = make_manifest_url(ms);
+    assert(manifest_url != NULL);
+
+    hls_prefetch_t *pf = hls_prefetch_open(manifest_url);
+    assert(pf != NULL);
+    free(manifest_url);
+
+    /* Phase 1: warm up — prefetcher fetches a few manifests + fills ring */
+    msleep(3000);
+
+    /* Verify we have some data before the storm */
+    hls_prefetch_stats_t pre_storm;
+    hls_prefetch_get_stats(pf, &pre_storm);
+    assert(pre_storm.manifest_errors == 0);
+
+    /* Phase 2: inject 5 consecutive 509s */
+    mock_server_inject_manifest_failures(ms, 5, 509);
+
+    /* Phase 3: wait out the storm + recovery.
+     * Backoff schedule (ms): 500 → 1000 → 2000 → 4000 → 5000 = ~12.5 s
+     * with 2 s sleep between successful polls → full 15 s covers it. */
+    msleep(15000);
+
+    hls_prefetch_stats_t post_storm;
+    hls_prefetch_get_stats(pf, &post_storm);
+
+    /* At least 5 manifest errors recorded */
+    assert(post_storm.manifest_errors >= 5);
+
+    /* Recovery happened: successful refreshes outnumber errors */
+    assert(post_storm.manifest_errors < post_storm.manifest_refreshes);
+
+    /* Thread is still alive: manifest_refreshes keeps growing after recovery.
+     * We know it recovered because manifest_errors < manifest_refreshes. */
+    assert(post_storm.manifest_refreshes > pre_storm.manifest_refreshes);
+
+    hls_prefetch_close(pf);
+    mock_server_stop(ms);
+
+    puts("OK test_survives_509_storm");
+}
+
+/* ---------------------------------------------------------------------------
+ * test_survives_dropped_segment_connection
+ *
+ * Inject 1 dropped segment connection (curl sees incomplete transfer).
+ * After 10 s, assert segments_fetched >= 3 (the prefetcher kept going).
+ * No crash / assert fire from the prefetch thread is the implicit assertion.
+ * --------------------------------------------------------------------------- */
+static void test_survives_dropped_segment_connection(void) {
+    mock_server_t *ms = mock_server_start();
+    assert(ms != NULL);
+
+    char *manifest_url = make_manifest_url(ms);
+    assert(manifest_url != NULL);
+
+    hls_prefetch_t *pf = hls_prefetch_open(manifest_url);
+    assert(pf != NULL);
+    free(manifest_url);
+
+    /* Let it start up, then inject a single segment connection drop */
+    msleep(1000);
+    mock_server_inject_segment_drops(ms, 1);
+
+    /* Wait for recovery and several more successful fetches */
+    msleep(9000);
+
+    hls_prefetch_stats_t stats;
+    hls_prefetch_get_stats(pf, &stats);
+
+    /* At least 3 segments successfully fetched despite the drop */
+    assert(stats.segments_fetched >= 3);
+
+    hls_prefetch_close(pf);
+    mock_server_stop(ms);
+
+    puts("OK test_survives_dropped_segment_connection");
+}
+
+/* ---------------------------------------------------------------------------
+ * test_token_rotation
+ *
+ * rotate_tokens=1: each manifest issues segment URLs with a per-manifest
+ * token (?t=N).  Server rejects stale tokens with 403.  The prefetcher
+ * must fetch segments promptly (before the next manifest refresh rotates
+ * the token away).
+ *
+ * Run for 20 s.  Assert:
+ *   - segments_fetched >= 4  (prefetcher kept up through multiple rotations)
+ *   - manifest_errors == 0   (manifests themselves always 200)
+ * --------------------------------------------------------------------------- */
+static void test_token_rotation(void) {
+    mock_server_t *ms = mock_server_start();
+    assert(ms != NULL);
+
+    /* Enable token rotation */
+    mock_server_config(ms,
+                       -1,    /* serve_fail_after_n_manifests: never */
+                       509,   /* manifest_fail_code: unused */
+                       -1,    /* drop_connection_after_n_segs: never */
+                       1);    /* rotate_tokens: on */
+
+    char *manifest_url = make_manifest_url(ms);
+    assert(manifest_url != NULL);
+
+    hls_prefetch_t *pf = hls_prefetch_open(manifest_url);
+    assert(pf != NULL);
+    free(manifest_url);
+
+    /* Run long enough for multiple manifest rotations.
+     * With target_duration=4s, sleep=2s per cycle: ~10 cycles in 20 s. */
+    msleep(20000);
+
+    hls_prefetch_stats_t stats;
+    hls_prefetch_get_stats(pf, &stats);
+
+    /* Manifests always succeeded */
+    assert(stats.manifest_errors == 0);
+
+    /* Several segments fetched with fresh tokens */
+    assert(stats.segments_fetched >= 4);
+
+    hls_prefetch_close(pf);
+    mock_server_stop(ms);
+
+    puts("OK test_token_rotation");
+}
+
+/* =========================================================================
+ * main — Task 10 smoke test + Task 11 integration scenarios
  * ========================================================================= */
 
 int main(void) {
+    /* Task 10: verify the server starts and stops cleanly */
     mock_server_t *ms = mock_server_start();
     assert(ms != NULL);
     assert(mock_server_port(ms) > 0);
     mock_server_stop(ms);
     puts("OK mock_server_starts_and_stops");
+
+    /* Task 11: integration scenarios */
+    test_steady_state_playback();
+    test_survives_509_storm();
+    test_survives_dropped_segment_connection();
+    test_token_rotation();
+
     return 0;
 }
