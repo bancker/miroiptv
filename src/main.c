@@ -2316,6 +2316,30 @@ int main(int argc, char **argv) {
                      episode_series_name);
             overlay_render_search(&ov, r.renderer, title, ep_names, nshow,
                                   episode_sel - start_i, ww, wh);
+        } else if (fav_overlay_active) {
+            size_t n = favorites_visible_count(&favorites);
+            if (n == 0) {
+                const char *hdr = "Favorites — press * while watching a channel to add it";
+                overlay_render_search(&ov, r.renderer, hdr, NULL, 0, 0, ww, wh);
+            } else {
+                static char fav_labels[64][128];
+                const char *names[64];
+                int show = (int)(n < 64 ? n : 64);
+                int sel = fav_overlay_sel;
+                if (sel >= show) sel = show - 1;
+                for (int i = 0; i < show; ++i) {
+                    const favorite_t *fe = favorites_visible_at(&favorites, (size_t)i);
+                    if (fe) {
+                        snprintf(fav_labels[i], sizeof(fav_labels[i]),
+                                 "%4d  %s", fe->num, fe->name ? fe->name : "");
+                    } else {
+                        fav_labels[i][0] = '\0';
+                    }
+                    names[i] = fav_labels[i];
+                }
+                const char *hdr = "Favorites — Enter zaps, Del removes, Esc closes";
+                overlay_render_search(&ov, r.renderer, hdr, names, show, sel, ww, wh);
+            }
         } else if (search_active) {
             static char labels[32][256];
             const char *names[32];
