@@ -61,7 +61,7 @@ int npo_http_get(const char *url, const char *const *extra_headers,
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &buf);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 15L);
-    curl_easy_setopt(c, CURLOPT_USERAGENT, "tv/0.1 (+npo-poc)");
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "miroiptv/0.1");
     if (hdrs) curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
 
     CURLcode rc = curl_easy_perform(c);
@@ -112,7 +112,7 @@ int npo_http_probe(const char *url, int timeout_s) {
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, (long)timeout_s);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, (long)(timeout_s > 1 ? timeout_s - 1 : 1));
-    curl_easy_setopt(c, CURLOPT_USERAGENT, "tv/0.1 (+probe)");
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "miroiptv/0.1 (+probe)");
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(c, CURLOPT_RANGE, "0-0");           /* at most 1 byte */
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, probe_discard);

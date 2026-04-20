@@ -3,6 +3,7 @@
 #include "npo.h"
 #include "sync.h"
 #include "xtream.h"
+#include "update_check.h"
 #include <SDL2/SDL.h>
 #include <curl/curl.h>
 #include <ctype.h>
@@ -126,7 +127,7 @@ static int playback_open(playback_t *pb, render_t *r, const npo_channel_t *ch,
  * called from the main thread. */
 static void set_window_title(render_t *r, const char *display) {
     char title[256];
-    snprintf(title, sizeof(title), "tv - %s", display ? display : "");
+    snprintf(title, sizeof(title), "miroiptv - %s", display ? display : "");
     SDL_SetWindowTitle(r->window, title);
 }
 
@@ -625,6 +626,14 @@ int main(int argc, char **argv) {
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
+    /* Kick off the one-shot GitHub "new-release available?" check on a
+     * detached worker thread. Takes 200-500ms in the background, runs in
+     * parallel with the rest of startup, and the result is harvested by
+     * update_check_take_notice() below once the main loop is up. Silent
+     * if the request fails or we're running a build newer than the
+     * latest release (e.g., dev builds between tags). */
+    update_check_start();
+
     /* Parse CLI: supports `--xtream user:pass@host[:port]` OR a bare URL as argv[1]. */
     xtream_t portal = {0};
     const char *direct_url = NULL;
@@ -645,7 +654,7 @@ int main(int argc, char **argv) {
     }
 
     render_t r;
-    if (render_init(&r, 960, 540, "tv - booting") != 0) return 1;
+    if (render_init(&r, 960, 540, "miroiptv - booting") != 0) return 1;
 
     /* IMPORTANT: playback_t is HEAP-allocated, not stack. The audio callback
      * userdata and av_clock point INTO this struct (at &pb->audio, etc.); if
@@ -655,8 +664,8 @@ int main(int argc, char **argv) {
     playback_t *pb = calloc(1, sizeof(*pb));
     if (!pb || playback_open(pb, &r, &NPO_CHANNELS[0], initial_url, &portal, 0) != 0) {
         fputs("initial playback_open failed\n"
-              "  try: ./tv.exe --xtream user:pass@host:port\n"
-              "  or:  ./tv.exe https://some/stream.m3u8\n", stderr);
+              "  try: ./miroiptv.exe --xtream user:pass@host:port\n"
+              "  or:  ./miroiptv.exe https://some/stream.m3u8\n", stderr);
         free(pb);
         free(initial_url);
         xtream_free(&portal);
@@ -1828,6 +1837,20 @@ int main(int argc, char **argv) {
             /* One-shot check: mark as consumed. */
             pb->player.seek_verify_actual_s = -1.0;
             pb->player.seek_verify_target_s = 0.0;
+        }
+
+        /* One-shot update-available notice. update_check_take_notice
+         * returns 1 exactly once after the GitHub-releases worker lands
+         * a newer tag than TV_VERSION; otherwise the call is a cheap
+         * two-volatile-reads no-op. Shown for 8s so the user has time
+         * to notice while their attention is on the channel they just
+         * tuned to. */
+        {
+            char note[160];
+            if (update_check_take_notice(note, sizeof(note))) {
+                snprintf(toast_text, sizeof(toast_text), "%s", note);
+                toast_until_ms = SDL_GetTicks() + 8000;
+            }
         }
 
         /* Audio warmup: unpause the SDL audio device as soon as the decoder

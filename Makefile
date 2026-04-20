@@ -13,9 +13,17 @@ else
 CFLAGS  += -O2
 endif
 
+# Version string + upstream-repo slug, both baked in so the in-app update
+# check can compare itself against github.com/<repo>/releases/latest.
+# build-dist.sh passes TV_VERSION / TV_REPO via the environment; local
+# builds fall back to "dev" + placeholder so the check no-ops.
+TV_VERSION ?= dev
+TV_REPO    ?= brnck/miroiptv
+CFLAGS     += -DTV_VERSION=\"$(TV_VERSION)\" -DTV_UPDATE_REPO=\"$(TV_REPO)\"
+
 SRC      = $(wildcard src/*.c)
 OBJ      = $(SRC:src/%.c=build/%.o)
-BIN      = build/tv.exe
+BIN      = build/miroiptv.exe
 
 TEST_SRC = tests/test_npo_parse.c src/npo.c src/queue.c
 TEST_BIN = build/test_npo_parse.exe
