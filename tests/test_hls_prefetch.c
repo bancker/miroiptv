@@ -19,6 +19,15 @@
 
 #define OK(name)  puts("OK " name)
 
+/* Sleep for ms milliseconds (matches hls_prefetch.c's msleep; used in tests). */
+static void msleep(int ms) {
+    if (ms <= 0) return;
+    struct timespec ts;
+    ts.tv_sec  = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+
 /* =========================================================================
  * Minimal test HTTP server (Task 5)
  *
@@ -915,6 +924,148 @@ static void test_fetch_segment_drops_connection_fails(void) {
     OK("test_fetch_segment_drops_connection_fails");
 }
 
+/* =========================================================================
+ * Task 6: prefetcher thread lifecycle tests
+ *
+ * Note: plan listed 3 tests but test 3 (stats_populated) is identical to
+ * test 1 (open_close already asserts all the same stats fields).  Collapsed
+ * to 2 distinct tests per plan's own "collapse if #3 duplicates #1" note.
+ * ========================================================================= */
+
+/* Manifest served by the test server for Task 6.
+ * Two segments at sequence 1 and 2.  URLs are absolute so the parser
+ * doesn't need a meaningful base URL from the manifest URL itself. */
+#define T6_MANIFEST_TEMPLATE \
+    "#EXTM3U\r\n" \
+    "#EXT-X-VERSION:3\r\n" \
+    "#EXT-X-MEDIA-SEQUENCE:1\r\n" \
+    "#EXT-X-TARGETDURATION:4\r\n" \
+    "#EXTINF:4.0,\r\n" \
+    "http://127.0.0.1:%d/seg1.ts\r\n" \
+    "#EXTINF:4.0,\r\n" \
+    "http://127.0.0.1:%d/seg2.ts\r\n"
+
+/* Small segment body — 512 bytes is enough */
+#define T6_SEG_SIZE 512
+
+static unsigned char g_t6_seg_body[T6_SEG_SIZE];
+
+/* Route handler: serve the manifest (port substituted at test startup) */
+typedef struct { int port; } t6_manifest_userdata_t;
+
+static void handler_t6_manifest(SOCKET s, void *userdata) {
+    t6_manifest_userdata_t *u = (t6_manifest_userdata_t *)userdata;
+    char body[512];
+    int body_len = snprintf(body, sizeof(body), T6_MANIFEST_TEMPLATE,
+                            u->port, u->port);
+    server_send_response(s, 200, "OK",
+                         (const unsigned char *)body, (size_t)body_len);
+}
+
+static void handler_t6_seg(SOCKET s, void *userdata) {
+    (void)userdata;
+    server_send_response(s, 200, "OK", g_t6_seg_body, T6_SEG_SIZE);
+}
+
+/* ---- test 24 (task 6, test 1+3 combined) -------------------------------- */
+
+static void test_prefetch_open_close(void) {
+    /* Fill segment bodies with a recognisable pattern */
+    for (int i = 0; i < T6_SEG_SIZE; i++)
+        g_t6_seg_body[i] = (unsigned char)(i & 0xFF);
+
+    test_server_t *srv = test_server_start();
+    assert(srv != NULL);
+
+    /* Userdata shares the server port for URL substitution in the manifest */
+    t6_manifest_userdata_t udata = { srv->port };
+    test_server_add_route(srv, "/live.m3u8", handler_t6_manifest, &udata);
+    test_server_add_route(srv, "/seg1.ts",   handler_t6_seg,       NULL);
+    test_server_add_route(srv, "/seg2.ts",   handler_t6_seg,       NULL);
+
+    /* Use a small ring so we don't malloc 20 MB in a unit test */
+    char ring_env[32];
+    snprintf(ring_env, sizeof(ring_env), "%d", 256 * 1024);  /* 256 KB */
+#ifdef _WIN32
+    _putenv_s("TV_PREBUFFER_BYTES", ring_env);
+#else
+    setenv("TV_PREBUFFER_BYTES", ring_env, 1);
+#endif
+
+    char manifest_url[128];
+    snprintf(manifest_url, sizeof(manifest_url),
+             "http://127.0.0.1:%d/live.m3u8", srv->port);
+
+    hls_prefetch_t *pf = hls_prefetch_open(manifest_url);
+    assert(pf != NULL);
+
+    /* Let the prefetcher run for 500 ms — enough for at least one manifest
+     * refresh and one segment fetch against the localhost test server */
+    msleep(500);
+
+    /* Snapshot stats before closing */
+    hls_prefetch_stats_t st;
+    hls_prefetch_get_stats(pf, &st);
+
+    hls_prefetch_close(pf);
+    test_server_stop(srv);
+
+    /* The stats assertions (covers plan's test 3 as well) */
+    assert(st.manifest_refreshes >= 1);
+    assert(st.segments_fetched   >= 1);
+    assert(st.last_refresh_ms    != 0);
+    assert(st.bytes_capacity     == 256 * 1024);
+
+    /* Reset env for subsequent tests */
+#ifdef _WIN32
+    _putenv_s("TV_PREBUFFER_BYTES", "");
+#else
+    unsetenv("TV_PREBUFFER_BYTES");
+#endif
+
+    OK("test_prefetch_open_close");
+}
+
+/* ---- test 25 (task 6, test 2) ------------------------------------------ */
+
+static void test_prefetch_open_invalid_url(void) {
+    /* Port 65535 on loopback — nothing should be listening there.
+     * hls_prefetch_open returns non-NULL (thread spawns fine), the thread
+     * fails to connect, logs, backs off, retries — but close() must join
+     * cleanly without hanging. */
+
+    /* Small ring again */
+    char ring_env[32];
+    snprintf(ring_env, sizeof(ring_env), "%d", 64 * 1024);
+#ifdef _WIN32
+    _putenv_s("TV_PREBUFFER_BYTES", ring_env);
+#else
+    setenv("TV_PREBUFFER_BYTES", ring_env, 1);
+#endif
+
+    hls_prefetch_t *pf = hls_prefetch_open(
+        "http://127.0.0.1:65535/fake.m3u8");
+    assert(pf != NULL);
+
+    /* Give it a moment to attempt (and fail) the first fetch */
+    msleep(200);
+
+    /* close() must return quickly — thread sees stop=1 mid-backoff or
+     * on the next iteration.  nanosleep inside msleep is not
+     * signal-interrupted on Windows, but the thread will be in a short
+     * backoff (500 ms) — worst case close takes ~500 ms.  Still fine. */
+    hls_prefetch_close(pf);
+
+    /* If we reach here without hanging, the test passes. */
+#ifdef _WIN32
+    _putenv_s("TV_PREBUFFER_BYTES", "");
+#else
+    unsetenv("TV_PREBUFFER_BYTES");
+#endif
+
+    OK("test_prefetch_open_invalid_url");
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 int main(void) {
@@ -951,6 +1102,11 @@ int main(void) {
     test_fetch_segment_basic();
     test_fetch_segment_404_fails();
     test_fetch_segment_drops_connection_fails();
+
+    /* Task 6: prefetcher thread lifecycle (2 tests, plan's test 3 collapsed
+     * into test 1 as it asserts the same stats fields) */
+    test_prefetch_open_close();
+    test_prefetch_open_invalid_url();
 
     return 0;
 }

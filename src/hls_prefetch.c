@@ -419,17 +419,273 @@ static const char *seg_queue_get_url(const segment_queue_t *q, size_t idx) {
 }
 
 /* ---------------------------------------------------------------------------
- * Public hls_prefetch interface — stubs (Tasks 6-7)
+ * msleep — sleep for ms milliseconds (no SDL dep, no extra libs)
+ * --------------------------------------------------------------------------- */
+
+static void msleep(int ms) {
+    if (ms <= 0) return;
+    struct timespec ts;
+    ts.tv_sec  = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+
+/* Return monotonic wall-clock milliseconds (used for last_refresh_ms stats).
+ * Uses clock_gettime(CLOCK_MONOTONIC) which is available in MinGW. */
+static unsigned int get_ticks_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned int)(ts.tv_sec * 1000UL + ts.tv_nsec / 1000000UL);
+}
+
+/* ---------------------------------------------------------------------------
+ * fetch_manifest — curl GET of manifest_url into a manifest_t
+ * Uses CURLOPT_FOLLOWLOCATION + CURLOPT_TIMEOUT 15.
+ * Returns 0 on success (HTTP 200, valid M3U8), -1 on any failure.
+ * --------------------------------------------------------------------------- */
+
+typedef struct {
+    char  *buf;
+    size_t len;
+    size_t cap;
+} grow_buf_t;
+
+static size_t grow_buf_write_cb(char *ptr, size_t size, size_t nmemb,
+                                void *userdata) {
+    grow_buf_t *gb = (grow_buf_t *)userdata;
+    size_t n = size * nmemb;
+    if (n == 0) return 0;
+    if (gb->len + n + 1 > gb->cap) {
+        size_t new_cap = gb->cap == 0 ? 4096 : gb->cap * 2;
+        while (new_cap < gb->len + n + 1) new_cap *= 2;
+        char *newbuf = realloc(gb->buf, new_cap);
+        if (!newbuf) return 0;  /* abort curl */
+        gb->buf = newbuf;
+        gb->cap = new_cap;
+    }
+    memcpy(gb->buf + gb->len, ptr, n);
+    gb->len += n;
+    gb->buf[gb->len] = '\0';
+    return n;
+}
+
+static int fetch_manifest(const char *url, manifest_t *out) {
+    if (!url || !out) return -1;
+
+    grow_buf_t gb = {0};
+
+    CURL *c = curl_easy_init();
+    if (!c) return -1;
+
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 15L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, grow_buf_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &gb);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "Lavf/58.76.100");
+    curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L);
+
+    CURLcode rc = curl_easy_perform(c);
+    long status = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_cleanup(c);
+
+    if (rc != CURLE_OK || status != 200) {
+        free(gb.buf);
+        return -1;
+    }
+
+    int parse_rc = manifest_parse(gb.buf, gb.len, url, out);
+    free(gb.buf);
+    return parse_rc;
+}
+
+/* ---------------------------------------------------------------------------
+ * Public hls_prefetch interface (Task 6)
+ *
+ * The struct is defined here first so that the callbacks below can access
+ * its fields by name.
  * --------------------------------------------------------------------------- */
 
 struct hls_prefetch {
-    char *manifest_url;
+    /* Immutable after open */
+    char           *manifest_url;
+
+    /* Ring buffer — owned; shared with the ring_write_cb */
+    ring_buf_t     *ring;
+
+    /* Segment queue */
     segment_queue_t *queue;
+
+    /* Thread control */
+    pthread_t       thread;
+    volatile int    stop;
+
+    /* Stats — single-writer (thread), point-read by get_stats */
+    volatile size_t  segments_fetched;
+    volatile size_t  manifest_refreshes;
+    volatile size_t  manifest_errors;
+    volatile unsigned int last_refresh_ms;
 };
 
-hls_prefetch_t *hls_prefetch_open(const char *manifest_url) {
-    (void)manifest_url;
+/* Production curl write callback — pushes bytes into pf->ring. */
+static size_t pf_ring_write_cb(char *ptr, size_t size, size_t nmemb,
+                                void *userdata) {
+    hls_prefetch_t *pf = (hls_prefetch_t *)userdata;
+    size_t total = size * nmemb;
+    if (total == 0) return 0;
+    if (pf->stop) return 0;   /* abort if closing */
+    int written = ring_write(pf->ring, (const unsigned char *)ptr, total);
+    if (written < 0) return 0;
+    return (size_t)written;
+}
+
+/* Fetch one segment URL into pf->ring. Returns 0 on success, -1 on failure. */
+static int fetch_segment_into_ring(hls_prefetch_t *pf, const char *url) {
+    if (!url || !pf) return -1;
+
+    CURL *c = curl_easy_init();
+    if (!c) return -1;
+
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 15L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, pf_ring_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, pf);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "Lavf/58.76.100");
+    curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L);
+
+    CURLcode rc = curl_easy_perform(c);
+    long status = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_cleanup(c);
+
+    if (rc != CURLE_OK || status != 200) {
+        fprintf(stderr, "[prefetch] segment fetch failed: url=%s curl=%d status=%ld\n",
+                url, (int)rc, status);
+        return -1;
+    }
+    return 0;
+}
+
+/* The prefetcher worker thread. */
+static void *prefetch_thread(void *arg) {
+    hls_prefetch_t *pf = (hls_prefetch_t *)arg;
+    int backoff_ms = 500;
+
+    while (!pf->stop) {
+        manifest_t m;
+        memset(&m, 0, sizeof(m));
+
+        int rc = fetch_manifest(pf->manifest_url, &m);
+        pf->manifest_refreshes++;
+
+        if (rc != 0) {
+            pf->manifest_errors++;
+            fprintf(stderr, "[prefetch] manifest fetch failed — retry in %d ms\n",
+                    backoff_ms);
+            msleep(backoff_ms);
+            backoff_ms = (backoff_ms * 2 > 5000) ? 5000 : backoff_ms * 2;
+            continue;
+        }
+
+        /* Successful manifest refresh */
+        backoff_ms = 500;
+        pf->last_refresh_ms = get_ticks_ms();
+
+        /* Capture target_duration before manifest_free zeros the struct */
+        int target_duration_ms = m.target_duration_ms;
+
+        /* Enqueue any segments not yet seen */
+        seg_queue_enqueue(pf->queue, &m);
+
+        /* Fetch all pending segments into the ring */
+        while (!pf->stop) {
+            /* Pop the next pending segment from the queue */
+            pthread_mutex_lock(&pf->queue->mu);
+            if (pf->queue->count == 0) {
+                pthread_mutex_unlock(&pf->queue->mu);
+                break;  /* nothing left to fetch */
+            }
+            /* Copy URL out so we can release the lock before fetching */
+            char *seg_url = malloc(strlen(pf->queue->segments[0].url) + 1);
+            if (!seg_url) {
+                pthread_mutex_unlock(&pf->queue->mu);
+                break;
+            }
+            strcpy(seg_url, pf->queue->segments[0].url);
+            /* Remove from queue (shift remaining entries left) */
+            free(pf->queue->segments[0].url);
+            memmove(&pf->queue->segments[0], &pf->queue->segments[1],
+                    (pf->queue->count - 1) * sizeof(hls_segment_t));
+            pf->queue->count--;
+            pthread_mutex_unlock(&pf->queue->mu);
+
+            int fetch_rc = fetch_segment_into_ring(pf, seg_url);
+            free(seg_url);
+            if (fetch_rc == 0) {
+                pf->segments_fetched++;
+            }
+            /* On failure, log already printed inside; just continue */
+        }
+
+        manifest_free(&m);
+
+        /* Sleep target_duration / 2, clamped 2000-6000 ms */
+        if (!pf->stop) {
+            int sleep_ms = target_duration_ms / 2;
+            if (sleep_ms < 2000) sleep_ms = 2000;
+            if (sleep_ms > 6000) sleep_ms = 6000;
+            msleep(sleep_ms);
+        }
+    }
     return NULL;
+}
+
+/* Default ring size: 20 MiB; overridable via TV_PREBUFFER_BYTES env. */
+#define DEFAULT_PREBUFFER_BYTES (20 * 1024 * 1024)
+
+hls_prefetch_t *hls_prefetch_open(const char *manifest_url) {
+    if (!manifest_url) return NULL;
+
+    hls_prefetch_t *pf = calloc(1, sizeof(*pf));
+    if (!pf) return NULL;
+
+    pf->manifest_url = malloc(strlen(manifest_url) + 1);
+    if (!pf->manifest_url) { free(pf); return NULL; }
+    strcpy(pf->manifest_url, manifest_url);
+
+    /* Ring buffer — size from env or default */
+    size_t ring_cap = DEFAULT_PREBUFFER_BYTES;
+    const char *env = getenv("TV_PREBUFFER_BYTES");
+    if (env) {
+        long v = atol(env);
+        if (v > 0) ring_cap = (size_t)v;
+    }
+    pf->ring = ring_new(ring_cap);
+    if (!pf->ring) { free(pf->manifest_url); free(pf); return NULL; }
+
+    /* Segment queue */
+    pf->queue = seg_queue_new();
+    if (!pf->queue) {
+        ring_free(pf->ring);
+        free(pf->manifest_url);
+        free(pf);
+        return NULL;
+    }
+
+    /* Spawn the worker thread */
+    if (pthread_create(&pf->thread, NULL, prefetch_thread, pf) != 0) {
+        seg_queue_free(pf->queue);
+        ring_free(pf->ring);
+        free(pf->manifest_url);
+        free(pf);
+        return NULL;
+    }
+
+    return pf;
 }
 
 int hls_prefetch_attach(hls_prefetch_t *pf, AVFormatContext *fmt) {
@@ -438,13 +694,35 @@ int hls_prefetch_attach(hls_prefetch_t *pf, AVFormatContext *fmt) {
 }
 
 void hls_prefetch_close(hls_prefetch_t *pf) {
-    (void)pf;
+    if (!pf) return;
+
+    /* Signal the thread to stop */
+    pf->stop = 1;
+
+    /* Wake the ring so the thread's ring_write doesn't block forever */
+    if (pf->ring) ring_close(pf->ring);
+
+    /* Wait for the thread to exit */
+    pthread_join(pf->thread, NULL);
+
+    /* Free everything */
+    if (pf->queue) { seg_queue_free(pf->queue); pf->queue = NULL; }
+    if (pf->ring)  { ring_free(pf->ring);        pf->ring  = NULL; }
+    free(pf->manifest_url);
+    free(pf);
 }
 
 void hls_prefetch_get_stats(const hls_prefetch_t *pf,
                             hls_prefetch_stats_t *out) {
-    (void)pf;
-    if (out) memset(out, 0, sizeof(*out));
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!pf) return;
+    out->bytes_buffered    = pf->ring ? ring_count(pf->ring) : 0;
+    out->bytes_capacity    = pf->ring ? ring_capacity(pf->ring) : 0;
+    out->segments_fetched  = pf->segments_fetched;
+    out->manifest_refreshes= pf->manifest_refreshes;
+    out->manifest_errors   = pf->manifest_errors;
+    out->last_refresh_ms   = pf->last_refresh_ms;
 }
 
 /* ---------------------------------------------------------------------------
