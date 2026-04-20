@@ -2505,9 +2505,26 @@ int main(int argc, char **argv) {
                 unsigned int dec_age = pb->player.decoder_last_read_ms
                                      ? tnow - pb->player.decoder_last_read_ms
                                      : 0;
+                /* Channel name priority:
+                 *   1. If we're on a portal live channel (current_live_idx
+                 *      >= 0), use the portal catalog's name — pb->channel
+                 *      is sticky for NPO and stays at whatever it was
+                 *      before the last wheel-zap, so the catalog entry is
+                 *      what's actually playing.
+                 *   2. Otherwise fall back to pb->channel->display (NPO
+                 *      mode without portal / VOD / episode paths).
+                 *   3. Otherwise "-". */
+                const char *ch_name = "-";
+                if (current_live_idx >= 0 &&
+                    current_live_idx < (int)live_list.count &&
+                    live_list.entries[current_live_idx].name)
+                    ch_name = live_list.entries[current_live_idx].name;
+                else if (pb->channel && pb->channel->display)
+                    ch_name = pb->channel->display;
                 snprintf(debug_buf, sizeof(debug_buf),
-                         "DEBUG  vq=%zu/%zu aq=%zu/%zu  dec_age=%ums  "
+                         "DEBUG  ch=%s  vq=%zu/%zu aq=%zu/%zu  dec_age=%ums  "
                          "dec_done=%d  clk=%.1fs  samples=%lld",
+                         ch_name,
                          pb->player.video_q.count, pb->player.video_q.capacity,
                          pb->player.audio_q.count, pb->player.audio_q.capacity,
                          dec_age, pb->player.decoder_done,
