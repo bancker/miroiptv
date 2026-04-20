@@ -1,5 +1,6 @@
 #include "render.h"
 #include "player.h"
+#include "hls_prefetch.h"
 #include "npo.h"
 #include "sync.h"
 #include "xtream.h"
@@ -2490,15 +2491,33 @@ int main(int argc, char **argv) {
                     ch_name = live_list.entries[current_live_idx].name;
                 else if (pb->channel && pb->channel->display)
                     ch_name = pb->channel->display;
-                snprintf(debug_buf, sizeof(debug_buf),
-                         "DEBUG  ch=%s  vq=%zu/%zu aq=%zu/%zu  dec_age=%ums  "
-                         "dec_done=%d  clk=%.1fs  samples=%lld",
-                         ch_name,
-                         pb->player.video_q.count, pb->player.video_q.capacity,
-                         pb->player.audio_q.count, pb->player.audio_q.capacity,
-                         dec_age, pb->player.decoder_done,
-                         av_clock_ready(&pb->clk) ? av_clock_now(&pb->clk) : 0.0,
-                         (long long)pb->audio.samples_played);
+                if (pb->player.prefetch) {
+                    hls_prefetch_stats_t ps;
+                    hls_prefetch_get_stats(pb->player.prefetch, &ps);
+                    snprintf(debug_buf, sizeof(debug_buf),
+                             "DEBUG  ch=%s  vq=%zu/%zu aq=%zu/%zu  dec_age=%ums  "
+                             "dec_done=%d  clk=%.1fs  buf=%.1fMB/%.1fMB  segs=%zu  "
+                             "manif=%zu/%zu",
+                             ch_name,
+                             pb->player.video_q.count, pb->player.video_q.capacity,
+                             pb->player.audio_q.count, pb->player.audio_q.capacity,
+                             dec_age, pb->player.decoder_done,
+                             av_clock_ready(&pb->clk) ? av_clock_now(&pb->clk) : 0.0,
+                             ps.bytes_buffered / 1048576.0, ps.bytes_capacity / 1048576.0,
+                             ps.segments_fetched,
+                             ps.manifest_refreshes - ps.manifest_errors,
+                             ps.manifest_refreshes);
+                } else {
+                    snprintf(debug_buf, sizeof(debug_buf),
+                             "DEBUG  ch=%s  vq=%zu/%zu aq=%zu/%zu  dec_age=%ums  "
+                             "dec_done=%d  clk=%.1fs  samples=%lld",
+                             ch_name,
+                             pb->player.video_q.count, pb->player.video_q.capacity,
+                             pb->player.audio_q.count, pb->player.audio_q.capacity,
+                             dec_age, pb->player.decoder_done,
+                             av_clock_ready(&pb->clk) ? av_clock_now(&pb->clk) : 0.0,
+                             (long long)pb->audio.samples_played);
+                }
             }
             overlay_render_debug(&ov, r.renderer, debug_buf, ww, wh);
         }

@@ -2,6 +2,7 @@
 #define TV_PLAYER_H
 
 #include "common.h"
+#include "hls_prefetch.h"
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
@@ -22,6 +23,8 @@ typedef struct {
 
     queue_t           video_q;      /* holds video_frame_t* */
     queue_t           audio_q;      /* holds audio_chunk_t* */
+
+    hls_prefetch_t   *prefetch;   /* HLS live prefetcher; NULL for non-HLS */
 
     pthread_t         thread;
     volatile int      stop;

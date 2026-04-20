@@ -64,12 +64,35 @@ int player_open(player_t *p, const char *url) {
      * than hard-failing the decode context. */
     av_dict_set(&opts, "fflags",                     "+discardcorrupt+genpts", 0);
 
-    int rc_open = avformat_open_input(&p->fmt, url, NULL, &opts);
-    av_dict_free(&opts);
-    if (rc_open != 0) {
-        fprintf(stderr, "avformat_open_input failed for %s\n", url);
-        goto fail;
+    int is_live_hls = !getenv("TV_DISABLE_PREFETCH") &&
+                      url && strstr(url, ".m3u8") &&
+                      (strncmp(url, "http://", 7) == 0 ||
+                       strncmp(url, "https://", 8) == 0);
+    if (is_live_hls) {
+        p->prefetch = hls_prefetch_open(url);
+        if (!p->prefetch) {
+            fprintf(stderr, "hls_prefetch_open failed for %s\n", url);
+            av_dict_free(&opts);
+            goto fail;
+        }
+        if (hls_prefetch_attach(p->prefetch, p->fmt) != 0) {
+            fprintf(stderr, "hls_prefetch_attach failed\n");
+            av_dict_free(&opts);
+            goto fail;
+        }
+        if (avformat_open_input(&p->fmt, NULL, NULL, &opts) != 0) {
+            fprintf(stderr, "avformat_open_input (custom IO) failed\n");
+            av_dict_free(&opts);
+            goto fail;
+        }
+    } else {
+        if (avformat_open_input(&p->fmt, url, NULL, &opts) != 0) {
+            fprintf(stderr, "avformat_open_input failed for %s\n", url);
+            av_dict_free(&opts);
+            goto fail;
+        }
     }
+    av_dict_free(&opts);
     if (avformat_find_stream_info(p->fmt, NULL) < 0) {
         fprintf(stderr, "avformat_find_stream_info failed\n");
         goto fail;
@@ -178,6 +201,15 @@ void player_close(player_t *p) {
     if (p->vctx) avcodec_free_context(&p->vctx);
     if (p->actx) avcodec_free_context(&p->actx);
     if (p->sctx) avcodec_free_context(&p->sctx);
+    /* Tear down the prefetcher BEFORE avformat_close_input. The prefetcher
+     * owns the AVIOContext (pb). We null out p->fmt->pb first so libav's
+     * close path doesn't double-free our avio buffer, then we let
+     * hls_prefetch_close() free the avio properly. */
+    if (p->prefetch) {
+        if (p->fmt) p->fmt->pb = NULL;
+        hls_prefetch_close(p->prefetch);
+        p->prefetch = NULL;
+    }
     if (p->fmt)  avformat_close_input(&p->fmt);
     queue_destroy_with(&p->video_q, (void(*)(void*))video_frame_free);
     queue_destroy_with(&p->audio_q, (void(*)(void*))audio_chunk_free);

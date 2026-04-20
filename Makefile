@@ -37,6 +37,12 @@ QUEUE_TEST_BIN = build/test_queue.exe
 XTREAM_TEST_SRC = tests/test_xtream_parse.c src/xtream.c src/npo.c src/queue.c
 XTREAM_TEST_BIN = build/test_xtream_parse.exe
 
+PREFETCH_TEST_SRC = tests/test_hls_prefetch.c src/hls_prefetch.c src/queue.c
+PREFETCH_TEST_BIN = build/test_hls_prefetch.exe
+
+INTEG_TEST_SRC = tests/test_integration_prefetch.c src/hls_prefetch.c src/queue.c
+INTEG_TEST_BIN = build/test_integration_prefetch.exe
+
 .PHONY: all run test clean
 
 all: $(BIN)
@@ -53,11 +59,13 @@ build:
 run: $(BIN)
 	./$(BIN)
 
-test: $(TEST_BIN) $(FAV_TEST_BIN) $(QUEUE_TEST_BIN) $(XTREAM_TEST_BIN)
+test: $(TEST_BIN) $(FAV_TEST_BIN) $(QUEUE_TEST_BIN) $(XTREAM_TEST_BIN) $(PREFETCH_TEST_BIN) $(INTEG_TEST_BIN)
 	./$(TEST_BIN)
 	./$(FAV_TEST_BIN)
 	./$(QUEUE_TEST_BIN)
 	./$(XTREAM_TEST_BIN)
+	./$(PREFETCH_TEST_BIN)
+	./$(INTEG_TEST_BIN)
 
 $(TEST_BIN): $(TEST_SRC) | build
 	$(CC) $(CFLAGS) -Isrc $(TEST_SRC) -o $@ $(LDLIBS)
@@ -70,6 +78,12 @@ $(QUEUE_TEST_BIN): $(QUEUE_TEST_SRC) | build
 
 $(XTREAM_TEST_BIN): $(XTREAM_TEST_SRC) | build
 	$(CC) $(CFLAGS) -Isrc $(XTREAM_TEST_SRC) -o $@ $(LDLIBS)
+
+$(PREFETCH_TEST_BIN): $(PREFETCH_TEST_SRC) | build
+	$(CC) -Wall -Wextra -Wpedantic -std=c11 -Isrc $(PREFETCH_TEST_SRC) -o $@ -pthread -lcurl -lavformat -lavutil -lws2_32
+
+$(INTEG_TEST_BIN): $(INTEG_TEST_SRC) | build
+	$(CC) -Wall -Wextra -Wpedantic -std=c11 -Isrc $(INTEG_TEST_SRC) -o $@ -pthread -lcurl -lavformat -lavutil -lws2_32
 
 clean:
 	rm -rf build
