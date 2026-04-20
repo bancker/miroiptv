@@ -45,28 +45,63 @@ static char *slurp(const char *path, size_t *len_out) {
     return buf;
 }
 
+static int fav_push(favorites_t *fv, int stream_id, int num, const char *name) {
+    /* Dedup: skip duplicates. */
+    for (size_t i = 0; i < fv->count; ++i)
+        if (fv->entries[i].stream_id == stream_id) return 0;
+
+    if (fv->count == fv->cap) {
+        size_t ncap = fv->cap ? fv->cap * 2 : 8;
+        favorite_t *grown = realloc(fv->entries, ncap * sizeof(*grown));
+        if (!grown) return -1;
+        fv->entries = grown;
+        fv->cap     = ncap;
+    }
+    favorite_t *f = &fv->entries[fv->count];
+    f->stream_id = stream_id;
+    f->num       = num;
+    f->name      = name ? strdup(name) : strdup("");
+    f->hidden    = 0;
+    if (!f->name) return -1;
+    ++fv->count;
+    return 1;
+}
+
 int favorites_load_from_path(favorites_t *fv, const char *path) {
     memset(fv, 0, sizeof(*fv));
 
     size_t len = 0;
     char *body = slurp(path, &len);
-    if (!body) return 0;        /* missing file -> empty, no error */
-    if (len == 0) { free(body); return 0; }  /* empty file -> empty */
+    if (!body) return 0;
+    if (len == 0) { free(body); return 0; }
 
     cJSON *root = cJSON_Parse(body);
     free(body);
     if (!root) {
-        /* Malformed — backup + empty. Implemented in Task 5. */
         fprintf(stderr, "favorites: malformed %s — ignoring for now\n", path);
         return 0;
     }
     if (!cJSON_IsArray(root)) { cJSON_Delete(root); return 0; }
 
-    size_t n = cJSON_GetArraySize(root);
-    if (n == 0) { cJSON_Delete(root); return 0; }
+    cJSON *item;
+    cJSON_ArrayForEach(item, root) {
+        cJSON *sid_j  = cJSON_GetObjectItemCaseSensitive(item, "stream_id");
+        cJSON *num_j  = cJSON_GetObjectItemCaseSensitive(item, "num");
+        cJSON *name_j = cJSON_GetObjectItemCaseSensitive(item, "name");
 
-    /* Non-empty array: parsing implemented in Task 4. For now return empty
-     * so the empty-case tests pass. */
+        if (!cJSON_IsNumber(sid_j)) {
+            fprintf(stderr, "favorites: skipping entry without stream_id\n");
+            continue;
+        }
+        int sid = sid_j->valueint;
+        if (sid <= 0) {
+            fprintf(stderr, "favorites: skipping non-positive stream_id %d\n", sid);
+            continue;
+        }
+        int num = cJSON_IsNumber(num_j) ? num_j->valueint : 0;
+        const char *name = cJSON_IsString(name_j) ? name_j->valuestring : "";
+        fav_push(fv, sid, num, name);
+    }
     cJSON_Delete(root);
     return 0;
 }

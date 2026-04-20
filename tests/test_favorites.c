@@ -152,11 +152,64 @@ static void test_path_linux_xdg_fallback(void) {
 }
 #endif
 
+static void test_round_trip_read_valid(void) {
+    favorites_t fv = {0};
+    int rc = favorites_load_from_path(&fv, "tests/fixtures/favorites_valid.json");
+    assert(rc == 0);
+    assert(fv.count == 3);
+
+    /* Expect sort-by-num after reconcile, but Task 4 doesn't reconcile —
+     * order is insertion order from the file. Assert by scan. */
+    int found_npo = 0, found_euro = 0, found_disco = 0;
+    for (size_t i = 0; i < fv.count; ++i) {
+        if (fv.entries[i].stream_id == 1234) {
+            assert(strcmp(fv.entries[i].name, "NPO 1 HD") == 0);
+            assert(fv.entries[i].num == 101);
+            found_npo = 1;
+        } else if (fv.entries[i].stream_id == 5678) {
+            assert(fv.entries[i].num == 201);
+            found_euro = 1;
+        } else if (fv.entries[i].stream_id == 9012) {
+            found_disco = 1;
+        }
+    }
+    assert(found_npo && found_euro && found_disco);
+    favorites_free(&fv);
+    puts("OK test_round_trip_read_valid");
+}
+
+static void test_edge_cases(void) {
+    favorites_t fv = {0};
+    int rc = favorites_load_from_path(&fv, "tests/fixtures/favorites_edge.json");
+    assert(rc == 0);
+    /* Accepted: id=1111 (with unknown field), id=2222 (first occurrence).
+     * Rejected: missing stream_id, stream_id==0, stream_id==-5, duplicate. */
+    assert(fv.count == 2);
+
+    int found_1111 = 0, found_2222 = 0;
+    for (size_t i = 0; i < fv.count; ++i) {
+        if (fv.entries[i].stream_id == 1111) {
+            /* Unicode must round-trip byte-for-byte. */
+            assert(strcmp(fv.entries[i].name, "Unicode \xe2\x98\x85 \xf0\x9f\x8e\xac HD") == 0);
+            found_1111 = 1;
+        }
+        if (fv.entries[i].stream_id == 2222) {
+            assert(strcmp(fv.entries[i].name, "Keep me") == 0);
+            found_2222 = 1;
+        }
+    }
+    assert(found_1111 && found_2222);
+    favorites_free(&fv);
+    puts("OK test_edge_cases");
+}
+
 int main(void) {
     test_path_env_override();
     test_path_defaults_nonnull();
     test_missing_file_is_empty();
     test_empty_file_is_empty();
     test_empty_array_is_empty();
+    test_round_trip_read_valid();
+    test_edge_cases();
     return 0;
 }
