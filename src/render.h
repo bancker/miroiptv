@@ -53,6 +53,19 @@ typedef struct {
      * unset, keeps the previous silence-with-tick behaviour (needed during
      * normal network hiccups where the decoder is still alive). */
     const volatile int *halt_on_miss;
+
+    /* Audio-pipeline latency (seconds). Samples are written to SDL's
+     * buffer, then drained through SDL's callback queue, the OS audio
+     * subsystem, and the hardware — typical ~30-50 ms on Windows.
+     * samples_played counts writes, so the clock leads actually-audible
+     * time by this offset. Seeded at audio_open from (2 * have.samples)
+     * / sample_rate; overridable via env TV_AUDIO_LATENCY_MS.
+     *
+     * Applied by subtracting it from first_pts at clock-seed time —
+     * so the clock returns time-of-currently-audible-sample, not
+     * time-of-currently-written-sample. Video display decisions now
+     * match audio output, eliminating the ~40ms audio lag. */
+    double            pipeline_latency_s;
 } audio_out_t;
 
 int  audio_open(audio_out_t *ao, queue_t *q, int sample_rate);

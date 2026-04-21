@@ -91,9 +91,18 @@ static void audio_callback(void *ud, uint8_t *stream, int len) {
             /* Seed the A/V clock baseline from the FIRST audio pts we play,
              * not the first video frame's pts — in mid-stream opens audio
              * starts well before the first IDR and using video's pts made
-             * the clock race ahead, dropping every subsequent video frame. */
+             * the clock race ahead, dropping every subsequent video frame.
+             *
+             * Shift backward by pipeline_latency_s: SDL buffers samples
+             * ahead of the actual audio device, so the sample we're
+             * writing now is heard ~40ms from now. Without this shift,
+             * clock reads first_pts at wall-time 0 but the corresponding
+             * audio sample is heard at wall-time 40ms — video ends up
+             * 40ms ahead of audio. With the shift, clock reads
+             * (first_pts - 40ms) at wall-time 0 and first_pts at
+             * wall-time 40ms, matching when the audio actually emerges. */
             if (!ao->has_first_pts) {
-                ao->first_pts     = c->pts;
+                ao->first_pts     = c->pts - ao->pipeline_latency_s;
                 ao->has_first_pts = 1;
             }
             ao->cur = c;
@@ -127,6 +136,24 @@ int audio_open(audio_out_t *ao, queue_t *q, int sample_rate) {
         fprintf(stderr, "SDL_OpenAudioDevice: %s\n", SDL_GetError());
         return -1;
     }
+
+    /* Pipeline-latency estimate — used by audio_callback's first_pts
+     * seeding to keep video in sync with what's actually AUDIBLE (not
+     * just what's been written to SDL's buffer). SDL typically runs
+     * 2 callback periods ahead of the device plus a few ms of OS /
+     * driver buffer on top. 2 * have.samples is a good starting point
+     * for Windows WASAPI shared mode (~43ms at 48kHz with have.samples
+     * = 1024). Env TV_AUDIO_LATENCY_MS overrides for tuning. */
+    const char *env_lat = getenv("TV_AUDIO_LATENCY_MS");
+    if (env_lat && *env_lat) {
+        ao->pipeline_latency_s = atof(env_lat) / 1000.0;
+    } else {
+        ao->pipeline_latency_s =
+            (double)(2 * have.samples) / (double)have.freq;
+    }
+    fprintf(stderr, "[audio] pipeline latency: %.1fms (have.samples=%d)\n",
+            ao->pipeline_latency_s * 1000.0, have.samples);
+
     /* Start PAUSED so audio doesn't play the first second-or-so of content
      * before the video decoder has produced its first frame. Main unpauses
      * when video_frames_pushed >= 1 (or after a 3s timeout). This makes
