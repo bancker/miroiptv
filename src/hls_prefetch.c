@@ -594,6 +594,15 @@ static void *prefetch_thread(void *arg) {
     hls_prefetch_t *pf = (hls_prefetch_t *)arg;
     int backoff_ms = 500;
 
+    /* Health diagnostics — help diagnose "worked for ~N seconds then
+     * decoder EOF'd" scenarios. Every 10s we log a status line with
+     * ring depth + refresh counts. On "manifest OK but no new segments
+     * for 3 consecutive cycles" we warn: that means the portal's live
+     * edge is stuck and the ring WILL drain. */
+    unsigned int last_status_log_ms = 0;
+    size_t       prev_segs_fetched  = 0;
+    int          stale_refresh_count = 0;
+
     while (!pf->stop) {
         manifest_t m;
         memset(&m, 0, sizeof(m));
@@ -618,6 +627,7 @@ static void *prefetch_thread(void *arg) {
         int target_duration_ms = m.target_duration_ms;
 
         /* Enqueue any segments not yet seen */
+        size_t segs_before = pf->segments_fetched;
         seg_queue_enqueue(pf->queue, &m);
 
         /* Fetch all pending segments into the ring */
@@ -651,6 +661,40 @@ static void *prefetch_thread(void *arg) {
         }
 
         manifest_free(&m);
+
+        /* Health diagnostics (AFTER manifest_free so m isn't reused) */
+        if (pf->segments_fetched == segs_before) {
+            stale_refresh_count++;
+            if (stale_refresh_count == 3) {
+                fprintf(stderr, "[prefetch] WARN: 3 consecutive manifest "
+                                "refreshes yielded zero new segments — live "
+                                "edge appears stalled; ring will drain\n");
+            }
+        } else {
+            stale_refresh_count = 0;
+        }
+
+        unsigned int now_ms = get_ticks_ms();
+        if (now_ms - last_status_log_ms > 10000) {
+            last_status_log_ms = now_ms;
+            size_t buf_now = pf->ring ? ring_count(pf->ring) : 0;
+            size_t buf_cap = pf->ring ? ring_capacity(pf->ring) : 0;
+            fprintf(stderr, "[prefetch] status: buf=%.1fMB/%.1fMB  segs=%zu  "
+                            "manif=%zu ok / %zu err  stale=%d\n",
+                    buf_now / 1048576.0, buf_cap / 1048576.0,
+                    pf->segments_fetched,
+                    pf->manifest_refreshes - pf->manifest_errors,
+                    pf->manifest_errors,
+                    stale_refresh_count);
+        }
+
+        /* Warn if ring is dangerously low (<2 MB ≈ <2s of video at 10 Mbps). */
+        if (pf->ring && ring_count(pf->ring) < 2 * 1024 * 1024 &&
+            pf->segments_fetched > 2) {
+            fprintf(stderr, "[prefetch] WARN: ring depth %.2fMB — decoder "
+                            "starvation imminent\n",
+                    ring_count(pf->ring) / 1048576.0);
+        }
 
         /* Sleep target_duration / 2, clamped 2000-6000 ms */
         if (!pf->stop) {
