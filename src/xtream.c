@@ -283,17 +283,26 @@ char *xtream_timeshift_url(const xtream_t *x, int archive_stream_id,
 }
 
 char *xtream_stream_url(const xtream_t *x, int stream_id) {
-    /* http://HOST:PORT/live/USER/PASS/ID.ts — raw MPEG-TS via a single long-
-     * lived TCP connection. We previously used .m3u8 (HLS manifest) but this
-     * portal rate-limits playlist refreshes with HTTP 509 every ~30-60s,
-     * causing libav's HLS demuxer to fail the reload and exit. The .ts
-     * endpoint avoids playlist refreshes entirely — one redirect to the
-     * origin, then pure byte stream. Verified: 15.8 MB pulled in 12s, no
-     * stalls, sync byte alignment clean. */
+    /* http://HOST:PORT/live/USER/PASS/ID.m3u8 — HLS manifest. Routed
+     * through hls_prefetch (see player.c's is_live_hls sniff) which
+     * owns manifest refresh + segment fetching on its own thread with
+     * fresh curl handles per request. That avoids the HTTP 509 on
+     * keep-alive refresh that libav's built-in HLS demuxer triggers
+     * against this portal, AND gives us a 15-second pre-roll buffer
+     * that absorbs the portal's ~15-30s connection TTL.
+     *
+     * History:
+     *   1. .m3u8 (original) — hit 509 on libav's keep-alive refresh.
+     *   2. .ts — single long connection instead, avoided 509 but the
+     *      portal then closed the connection every ~15-30s with no
+     *      recovery layer underneath it; watchdog visible as 1-3s
+     *      stutter every drop.
+     *   3. .m3u8 via prefetch (current) — prefetcher handles refreshes
+     *      transparently; drops absorbed by the local ring buffer. */
     size_t cap = strlen(x->host) + strlen(x->user) + strlen(x->pass) + 64;
     char *out = malloc(cap);
     if (!out) return NULL;
-    snprintf(out, cap, "http://%s:%d/live/%s/%s/%d.ts",
+    snprintf(out, cap, "http://%s:%d/live/%s/%s/%d.m3u8",
              x->host, x->port, x->user, x->pass, stream_id);
     return out;
 }
