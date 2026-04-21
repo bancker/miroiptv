@@ -493,14 +493,24 @@ static int fetch_manifest(const char *url, manifest_t *out) {
     CURLcode rc = curl_easy_perform(c);
     long status = 0;
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
-    curl_easy_cleanup(c);
-
-    if (rc != CURLE_OK || status != 200) {
-        free(gb.buf);
-        return -1;
+    /* Effective URL after redirects — critical for segment-URL resolution.
+     * The Xtream portal serves the m3u8 via 302 -> CDN host (e.g. ce.zova.pro);
+     * segment URLs in the manifest are relative ("/hls/<token>/<id>.ts")
+     * and must resolve against the CDN host, not the original portal host.
+     * Using the original URL as base_url gave 403 on every segment fetch. */
+    const char *effective = url;
+    char *redirect_url = NULL;
+    if (curl_easy_getinfo(c, CURLINFO_EFFECTIVE_URL, &redirect_url) == CURLE_OK
+        && redirect_url && *redirect_url) {
+        effective = redirect_url;
     }
 
-    int parse_rc = manifest_parse(gb.buf, gb.len, url, out);
+    int parse_rc = -1;
+    if (rc == CURLE_OK && status == 200) {
+        parse_rc = manifest_parse(gb.buf, gb.len, effective, out);
+    }
+
+    curl_easy_cleanup(c);   /* must outlive our use of redirect_url */
     free(gb.buf);
     return parse_rc;
 }
@@ -706,6 +716,20 @@ hls_prefetch_t *hls_prefetch_open(const char *manifest_url) {
     curl_easy_setopt(preflight, CURLOPT_WRITEDATA, &gb);
     curl_easy_setopt(preflight, CURLOPT_USERAGENT, "Lavf/58.76.100");
     CURLcode crc = curl_easy_perform(preflight);
+    /* Capture effective URL (post-redirect) BEFORE cleanup — segment URLs
+     * in the manifest are relative and must resolve against the CDN host
+     * we were redirected to, not the original portal host. */
+    const char *preflight_effective = manifest_url;
+    char *preflight_redirect = NULL;
+    if (curl_easy_getinfo(preflight, CURLINFO_EFFECTIVE_URL, &preflight_redirect) == CURLE_OK
+        && preflight_redirect && *preflight_redirect) {
+        preflight_effective = preflight_redirect;
+    }
+    /* Parse with the post-redirect URL while the curl handle is still alive
+     * (redirect_url is owned by the handle). */
+    int mrc = (crc == CURLE_OK)
+              ? manifest_parse(gb.buf, gb.len, preflight_effective, &m_preflight)
+              : -1;
     curl_easy_cleanup(preflight);
     if (crc != CURLE_OK) {
         fprintf(stderr, "hls_prefetch: pre-flight fetch failed: %s\n",
@@ -713,7 +737,6 @@ hls_prefetch_t *hls_prefetch_open(const char *manifest_url) {
         free(gb.buf);
         goto preflight_fail;
     }
-    int mrc = manifest_parse(gb.buf, gb.len, manifest_url, &m_preflight);
     free(gb.buf);
     if (mrc != 0) {
         fprintf(stderr, "hls_prefetch: pre-flight manifest parse failed\n");
