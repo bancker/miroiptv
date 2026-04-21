@@ -548,31 +548,30 @@ struct hls_prefetch {
     AVIOContext    *avio;
 };
 
-/* Production curl write callback — pushes bytes into pf->ring. */
-static size_t pf_ring_write_cb(char *ptr, size_t size, size_t nmemb,
-                                void *userdata) {
-    hls_prefetch_t *pf = (hls_prefetch_t *)userdata;
-    size_t total = size * nmemb;
-    if (total == 0) return 0;
-    if (pf->stop) return 0;   /* abort if closing */
-    int written = ring_write(pf->ring, (const unsigned char *)ptr, total);
-    if (written < 0) return 0;
-    return (size_t)written;
-}
-
-/* Fetch one segment URL into pf->ring. Returns 0 on success, -1 on failure. */
+/* Fetch one segment URL into pf->ring. Returns 0 on success, -1 on failure.
+ *
+ * Buffers the entire segment in a scratch grow_buf first, then atomically
+ * splices it into the ring on success. A curl timeout / connection drop
+ * mid-segment produces a partial grow_buf that we discard — it never
+ * reaches the ring. Previously we streamed directly into the ring via a
+ * write callback, which meant one timed-out segment corrupted the stream
+ * (libav's MPEG-TS demuxer wedged on the resulting byte-level discontinuity).
+ *
+ * Memory cost: one segment worth of RAM held during each fetch (~500KB for
+ * a 11s HLS segment at ~4 Mbps). Released immediately after ring_write. */
 static int fetch_segment_into_ring(hls_prefetch_t *pf, const char *url) {
     if (!url || !pf) return -1;
 
     CURL *c = curl_easy_init();
     if (!c) return -1;
 
+    grow_buf_t gb = {0};
     curl_easy_setopt(c, CURLOPT_URL, url);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 15L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, pf_ring_write_cb);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, pf);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, grow_buf_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &gb);
     curl_easy_setopt(c, CURLOPT_USERAGENT, "Lavf/58.76.100");
     curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L);
 
@@ -582,11 +581,23 @@ static int fetch_segment_into_ring(hls_prefetch_t *pf, const char *url) {
     curl_easy_cleanup(c);
 
     if (rc != CURLE_OK || status != 200) {
-        fprintf(stderr, "[prefetch] segment fetch failed: url=%s curl=%d status=%ld\n",
-                url, (int)rc, status);
+        fprintf(stderr, "[prefetch] segment fetch failed: url=%s curl=%d status=%ld "
+                        "(%zu bytes partial — discarded)\n",
+                url, (int)rc, status, gb.len);
+        free(gb.buf);
         return -1;
     }
-    return 0;
+
+    /* Successful complete fetch — atomically splice into the ring.
+     * ring_write blocks until all bytes are accepted (consumer drains
+     * as needed) or stop is set. Returns -1 only if closed mid-write. */
+    if (pf->stop) {
+        free(gb.buf);
+        return -1;
+    }
+    int wrc = ring_write(pf->ring, (const unsigned char *)gb.buf, gb.len);
+    free(gb.buf);
+    return (wrc < 0) ? -1 : 0;
 }
 
 /* The prefetcher worker thread. */
