@@ -1400,6 +1400,35 @@ int main(int argc, char **argv) {
                 }
                 toast_until_ms = SDL_GetTicks() + 3000;
             }
+            else if (k == SDLK_LEFTBRACKET || k == SDLK_RIGHTBRACKET) {
+                /* Runtime A/V-sync tuner. '[' decreases, ']' increases the
+                 * audio-pipeline latency estimate by 5ms per press. The
+                 * clock formula is (first_pts - latency) + samples/rate;
+                 * adjusting latency shifts where video lands relative to
+                 * audio. Increase latency if audio seems BEHIND video
+                 * (lips move before words). Decrease if audio is AHEAD
+                 * (words before lips). Effect is immediate — no restart
+                 * needed. Set env TV_AUDIO_LATENCY_MS=<value> once you
+                 * find the sweet spot to persist it across runs. */
+                double delta_s = (k == SDLK_RIGHTBRACKET) ? 0.005 : -0.005;
+                /* Applying delta to pipeline_latency_s shifts the clock.
+                 * To make the shift immediate in the currently-running
+                 * playback, we also shift first_pts by -delta (since clock
+                 * = first_pts + samples/rate, subtracting from first_pts
+                 * moves the clock backward by the same amount — which
+                 * means "audio has been playing longer than we thought",
+                 * i.e. video should be displayed earlier from this moment
+                 * on). */
+                pb->audio.pipeline_latency_s += delta_s;
+                if (pb->audio.has_first_pts) {
+                    pb->audio.first_pts -= delta_s;
+                }
+                snprintf(toast_text, sizeof(toast_text),
+                         "A/V sync: %+.0f ms offset (latency=%.0fms)",
+                         pb->audio.pipeline_latency_s * 1000.0,
+                         pb->audio.pipeline_latency_s * 1000.0);
+                toast_until_ms = SDL_GetTicks() + 2000;
+            }
             else if (k == SDLK_ASTERISK ||
                      (k == SDLK_8 && (ev.key.keysym.mod & KMOD_SHIFT))) {
                 /* '*' on US keyboards is Shift+8. Some layouts send SDLK_ASTERISK
