@@ -1,7 +1,81 @@
 #include "render.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifdef _WIN32
+#  include <direct.h>
+#  define PATH_SEP '\\'
+#else
+#  include <sys/stat.h>
+#  include <sys/types.h>
+#  define PATH_SEP '/'
+#endif
+
+/* Resolve %APPDATA%\miroiptv\av_latency.ms (or Linux XDG equivalent).
+ * Returns malloc'd string; caller frees. Mirrors favorites_path logic
+ * but kept local to avoid pulling the favorites module into render.c.
+ * NULL if no suitable path can be built. */
+static char *av_latency_persist_path(void) {
+#ifdef _WIN32
+    const char *base = getenv("APPDATA");
+    if (!base || !*base) return NULL;
+    size_t n = strlen(base) + strlen("\\miroiptv\\av_latency.ms") + 1;
+    char *out = malloc(n);
+    if (!out) return NULL;
+    snprintf(out, n, "%s\\miroiptv\\av_latency.ms", base);
+    return out;
+#else
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    char base[512];
+    if (xdg && *xdg) {
+        snprintf(base, sizeof(base), "%s/miroiptv", xdg);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !*home) return NULL;
+        snprintf(base, sizeof(base), "%s/.config/miroiptv", home);
+    }
+    size_t n = strlen(base) + strlen("/av_latency.ms") + 1;
+    char *out = malloc(n);
+    if (!out) return NULL;
+    snprintf(out, n, "%s/av_latency.ms", base);
+    return out;
+#endif
+}
+
+static int av_latency_load_ms(void) {
+    char *path = av_latency_persist_path();
+    if (!path) return -1;
+    FILE *f = fopen(path, "r");
+    free(path);
+    if (!f) return -1;
+    int ms = -1;
+    if (fscanf(f, "%d", &ms) != 1) ms = -1;
+    fclose(f);
+    return ms;
+}
+
+void av_latency_save_ms(int ms) {
+    char *path = av_latency_persist_path();
+    if (!path) return;
+    /* mkdir -p the parent dir (single-level mkdir, parent usually exists) */
+    char *slash = strrchr(path, PATH_SEP);
+    if (slash) {
+        *slash = '\0';
+#ifdef _WIN32
+        _mkdir(path);
+#else
+        mkdir(path, 0755);
+#endif
+        *slash = PATH_SEP;
+    }
+    FILE *f = fopen(path, "w");
+    free(path);
+    if (!f) return;
+    fprintf(f, "%d\n", ms);
+    fclose(f);
+}
 
 int render_init(render_t *r, int w, int h, const char *title) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS) != 0) {
@@ -139,20 +213,32 @@ int audio_open(audio_out_t *ao, queue_t *q, int sample_rate) {
 
     /* Pipeline-latency estimate — used by audio_callback's first_pts
      * seeding to keep video in sync with what's actually AUDIBLE (not
-     * just what's been written to SDL's buffer). SDL typically runs
-     * 2 callback periods ahead of the device plus a few ms of OS /
-     * driver buffer on top. 2 * have.samples is a good starting point
-     * for Windows WASAPI shared mode (~43ms at 48kHz with have.samples
-     * = 1024). Env TV_AUDIO_LATENCY_MS overrides for tuning. */
+     * just what's been written to SDL's buffer). Priority:
+     *   1. env TV_AUDIO_LATENCY_MS (session override, for testing)
+     *   2. persisted value from %APPDATA%\miroiptv\av_latency.ms
+     *      (auto-saved by the '['/']' runtime tuner — so user's tuned
+     *      value sticks across app launches)
+     *   3. 2 * have.samples / have.freq — reasonable SDL+WASAPI default
+     *
+     * Different audio stacks have wildly different latencies: WASAPI
+     * shared ~40ms, exclusive ~10ms, Bluetooth 200-500ms, virtual
+     * audio cables 100-300ms. No way to auto-detect from SDL2, hence
+     * runtime tuning + persistence. */
     const char *env_lat = getenv("TV_AUDIO_LATENCY_MS");
+    int persisted_ms = -1;
+    const char *src = "default";
     if (env_lat && *env_lat) {
         ao->pipeline_latency_s = atof(env_lat) / 1000.0;
+        src = "env";
+    } else if ((persisted_ms = av_latency_load_ms()) > 0) {
+        ao->pipeline_latency_s = persisted_ms / 1000.0;
+        src = "persisted";
     } else {
         ao->pipeline_latency_s =
             (double)(2 * have.samples) / (double)have.freq;
     }
-    fprintf(stderr, "[audio] pipeline latency: %.1fms (have.samples=%d)\n",
-            ao->pipeline_latency_s * 1000.0, have.samples);
+    fprintf(stderr, "[audio] pipeline latency: %.0fms (%s, have.samples=%d)\n",
+            ao->pipeline_latency_s * 1000.0, src, have.samples);
 
     /* Start PAUSED so audio doesn't play the first second-or-so of content
      * before the video decoder has produced its first frame. Main unpauses

@@ -1423,10 +1423,11 @@ int main(int argc, char **argv) {
                 if (pb->audio.has_first_pts) {
                     pb->audio.first_pts -= delta_s;
                 }
+                /* Auto-save so the tuned value survives across runs. */
+                int ms_now = (int)(pb->audio.pipeline_latency_s * 1000.0 + 0.5);
+                av_latency_save_ms(ms_now);
                 snprintf(toast_text, sizeof(toast_text),
-                         "A/V sync: %+.0f ms offset (latency=%.0fms)",
-                         pb->audio.pipeline_latency_s * 1000.0,
-                         pb->audio.pipeline_latency_s * 1000.0);
+                         "A/V sync latency: %d ms  (saved)", ms_now);
                 toast_until_ms = SDL_GetTicks() + 2000;
             }
             else if (k == SDLK_ASTERISK ||

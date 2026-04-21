@@ -71,6 +71,13 @@ typedef struct {
 int  audio_open(audio_out_t *ao, queue_t *q, int sample_rate);
 void audio_close(audio_out_t *ao);
 
+/* Persist the A/V-sync latency tuning to %APPDATA%\miroiptv\av_latency.ms
+ * (Windows) or $XDG_CONFIG_HOME/miroiptv/av_latency.ms (Linux). Called by
+ * main.c's '[' / ']' key handlers so the user's tuned value survives
+ * across app launches. Silent on errors — the tuner still works in-memory
+ * for the current session even if persistence fails. */
+void av_latency_save_ms(int ms);
+
 #include <SDL2/SDL_ttf.h>
 #include "npo.h"
 
