@@ -25,6 +25,11 @@ SRC      = $(wildcard src/*.c)
 OBJ      = $(SRC:src/%.c=build/%.o)
 BIN      = build/miroiptv.exe
 
+# Windows resource: embeds miroiptv.ico into the exe so Explorer /
+# taskbar / Alt-Tab show the app icon even before the window opens.
+# windres ships with MinGW — compiles .rc -> .o that the final link picks up.
+RC_OBJ   = build/miroiptv_res.o
+
 TEST_SRC = tests/test_npo_parse.c src/npo.c src/queue.c
 TEST_BIN = build/test_npo_parse.exe
 
@@ -47,11 +52,17 @@ INTEG_TEST_BIN = build/test_integration_prefetch.exe
 
 all: $(BIN)
 
-$(BIN): $(OBJ) | build
-	$(CC) $(OBJ) -o $@ $(LDLIBS)
+$(BIN): $(OBJ) $(RC_OBJ) | build
+	$(CC) $(OBJ) $(RC_OBJ) -o $@ $(LDLIBS)
 
 build/%.o: src/%.c | build
 	$(CC) $(CFLAGS) -Isrc -c $< -o $@
+
+# Icon resource. Build assets/miroiptv.rc (-> miroiptv_res.o) via windres.
+# The .rc references miroiptv.ico relative to its own directory, so we
+# run windres with --include-dir=assets so the .ico is found.
+$(RC_OBJ): assets/miroiptv.rc assets/miroiptv.ico | build
+	windres --include-dir=assets -i assets/miroiptv.rc -o $@
 
 build:
 	mkdir -p build

@@ -1,0 +1,11 @@
+/* Windows resource script — embeds the app icon into the exe so
+ * Windows Explorer / taskbar / Alt-Tab show it without needing the
+ * BMP file at runtime.
+ *
+ * Numeric id 1 is the convention for "the app's primary icon":
+ * Explorer scans the .exe, finds the lowest-numbered ICON resource,
+ * and uses it as the file icon. SDL2 does NOT use this; it uses the
+ * runtime SDL_SetWindowIcon path instead (see render_init). Both
+ * exist for redundancy: the .ico covers pre-run state (file manager,
+ * shortcuts), the runtime BMP covers the live window. */
+1 ICON "miroiptv.ico"

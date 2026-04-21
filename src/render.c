@@ -87,6 +87,19 @@ int render_init(render_t *r, int w, int h, const char *title) {
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         w, h, SDL_WINDOW_SHOWN | SDL_WINDOW_BORDERLESS);
     if (!r->window) { fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return -1; }
+
+    /* Window icon — shows in taskbar + Alt-Tab + title bar. Loaded at
+     * runtime from assets/miroiptv.bmp (48x48). The exe ALSO has the
+     * icon embedded via a Windows resource (.rc -> windres -> linked
+     * in), which Explorer uses before the process even starts. Belt
+     * and suspenders. Silent if the BMP is missing — the .ico resource
+     * inside the exe covers the important surfaces anyway. */
+    SDL_Surface *icon = SDL_LoadBMP("assets/miroiptv.bmp");
+    if (icon) {
+        SDL_SetWindowIcon(r->window, icon);
+        SDL_FreeSurface(icon);
+    }
+
     r->renderer = SDL_CreateRenderer(r->window, -1,
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!r->renderer) { fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError()); return -1; }
