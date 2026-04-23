@@ -5,3 +5,6 @@ build/
 .vscode/
 .idea/
 .claude/
+
+# Personal launcher with portal credentials — never commit.
+tv.bat
