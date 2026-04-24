@@ -402,19 +402,40 @@ static int switch_subtitle_track(player_t *p, int new_track) {
     return 0;
 }
 
-/* ASS/SSA subtitles use a pipe-delimited "Dialogue" format where the actual
- * spoken text is the last field. Strip the header so the renderer just gets
- * the line the user cares about. Plain text (subrip, mov_text, webvtt) comes
- * through unchanged. Also strips inline ASS override tags like {\an8}. */
+/* ASS/SSA subtitles use a comma-delimited "Dialogue" format where the actual
+ * spoken text is the last (10th) field. Strip the header so the renderer
+ * just gets the line the user cares about. Plain text (subrip, mov_text,
+ * webvtt) comes through unchanged. Also strips inline ASS override tags
+ * like {\an8}.
+ *
+ * Two wire formats to handle:
+ *   pre-ffmpeg-4.0:  "Dialogue: 0,0:00:29.00,0:00:31.00,Default,,0,0,0,,TEXT"
+ *   ffmpeg 4.0+:     "0,0:00:29.00,0:00:31.00,Default,,0,0,0,,TEXT"
+ * The 4.0+ format drops the "Dialogue: " prefix, which is why text like
+ * "29,0,Default,,0,0,0,," was leaking through unparsed before the
+ * digit-prefix detection below. */
 static char *strip_subtitle_markup(const char *in) {
     if (!in) return NULL;
-    /* If it's an ASS Dialogue line, grab everything after the 9th comma. */
     const char *text = in;
+
+    /* Handle both ASS wire formats. Detection: (a) literal "Dialogue:"
+     * prefix, or (b) a numeric first field (the Layer number) followed
+     * by a comma. Plain subrip/webvtt starts with letters/punctuation
+     * so won't false-match the (b) branch. On match, skip past the
+     * 9th comma to reach the Text field. */
+    int looks_like_ass = 0;
     if (strncmp(in, "Dialogue:", 9) == 0) {
+        looks_like_ass = 1;
+    } else {
+        const char *probe = in;
+        while (*probe >= '0' && *probe <= '9') probe++;
+        if (probe != in && *probe == ',') looks_like_ass = 1;
+    }
+    if (looks_like_ass) {
         const char *p = in;
         int commas = 0;
         while (*p && commas < 9) { if (*p++ == ',') commas++; }
-        if (*p) text = p;
+        if (commas == 9) text = p;
     }
     size_t n = strlen(text);
     char *out = malloc(n + 1);
