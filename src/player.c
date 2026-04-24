@@ -418,24 +418,35 @@ static char *strip_subtitle_markup(const char *in) {
     if (!in) return NULL;
     const char *text = in;
 
-    /* Handle both ASS wire formats. Detection: (a) literal "Dialogue:"
-     * prefix, or (b) a numeric first field (the Layer number) followed
-     * by a comma. Plain subrip/webvtt starts with letters/punctuation
-     * so won't false-match the (b) branch. On match, skip past the
-     * 9th comma to reach the Text field. */
-    int looks_like_ass = 0;
+    /* Handle both ASS wire formats, each with a different field count:
+     *
+     *   "Dialogue: 0,0:00:29.00,0:00:31.00,Default,,0,0,0,,TEXT"
+     *       — pre-ffmpeg-4.0 and the raw .ass file format.
+     *       10 fields: Layer,Start,End,Style,Name,ML,MR,MV,Effect,Text.
+     *       9 commas before the text field.
+     *
+     *   "4,0,Default,,0,0,0,,TEXT"
+     *       — ffmpeg 4.0+ via avcodec_decode_subtitle2, produced by
+     *       ff_ass_bprint_text_event. 9 fields: ReadOrder,Layer,Style,
+     *       Name,ML,MR,MV,Effect,Text. Start/End are carried on the
+     *       AVSubtitle struct itself, not in the string.
+     *       8 commas before the text field.
+     *
+     * Plain subrip/webvtt starts with letters/punctuation so the
+     * digit-prefix check won't false-match. */
+    int skip_commas = 0;
     if (strncmp(in, "Dialogue:", 9) == 0) {
-        looks_like_ass = 1;
+        skip_commas = 9;
     } else {
         const char *probe = in;
         while (*probe >= '0' && *probe <= '9') probe++;
-        if (probe != in && *probe == ',') looks_like_ass = 1;
+        if (probe != in && *probe == ',') skip_commas = 8;
     }
-    if (looks_like_ass) {
+    if (skip_commas > 0) {
         const char *p = in;
         int commas = 0;
-        while (*p && commas < 9) { if (*p++ == ',') commas++; }
-        if (commas == 9) text = p;
+        while (*p && commas < skip_commas) { if (*p++ == ',') commas++; }
+        if (commas == skip_commas) text = p;
     }
     size_t n = strlen(text);
     char *out = malloc(n + 1);
