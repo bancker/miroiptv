@@ -1,0 +1,6 @@
+target/
+*.pdb
+vendor/libmpv/libmpv-2.dll
+vendor/libmpv/libmpv.lib
+vendor/libmpv/libmpv-2.def
+vendor/libmpv/.mpv-dev-version
