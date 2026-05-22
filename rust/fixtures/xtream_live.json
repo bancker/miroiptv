@@ -1,0 +1,4 @@
+[
+  {"stream_id": 101, "name": "NPO 1", "category_id": "1", "epg_channel_id": "npo1.nl"},
+  {"stream_id": 102, "name": "NPO 2", "category_id": "1", "epg_channel_id": "npo2.nl"}
+]
