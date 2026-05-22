@@ -1,0 +1,8 @@
+# Rust's self-contained GNU sysroot is missing some Windows system libs
+# (libshlwapi, etc.) that eframe + wgpu need. Point the linker at the
+# system MinGW lib dir so it can find them.
+
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+    "-C", "link-arg=-LC:/Users/brnck/scoop/apps/gcc/current/x86_64-w64-mingw32/lib",
+]

@@ -6,3 +6,6 @@ pub mod search;
 pub mod epg;
 pub mod portal;
 pub mod player;
+pub mod catalog;
+pub mod shortcuts;
+pub mod app;
