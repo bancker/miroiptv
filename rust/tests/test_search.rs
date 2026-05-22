@@ -1,7 +1,11 @@
 use tvplayer::search::{rank, ItemKind, SearchItem};
 
 fn item(name: &str, kind: ItemKind) -> SearchItem {
-    SearchItem { id: 1, name: name.into(), kind }
+    SearchItem {
+        id: 1,
+        name: name.into(),
+        kind,
+    }
 }
 
 #[test]
@@ -21,8 +25,8 @@ fn substring_match_case_insensitive() {
 #[test]
 fn live_ranks_above_movie_above_series_for_same_match_length() {
     let items = vec![
-        item("Nieuws (movie)",  ItemKind::Movie),
-        item("Nieuws (live)",   ItemKind::Live),
+        item("Nieuws (movie)", ItemKind::Movie),
+        item("Nieuws (live)", ItemKind::Live),
         item("Nieuws (series)", ItemKind::Series),
     ];
     let r = rank("nieuws", &items);
@@ -33,7 +37,9 @@ fn live_ranks_above_movie_above_series_for_same_match_length() {
 
 #[test]
 fn capped_at_12() {
-    let items: Vec<SearchItem> = (0..30).map(|i| item(&format!("Foo {}", i), ItemKind::Movie)).collect();
+    let items: Vec<SearchItem> = (0..30)
+        .map(|i| item(&format!("Foo {}", i), ItemKind::Movie))
+        .collect();
     let r = rank("foo", &items);
     assert_eq!(r.len(), 12);
 }

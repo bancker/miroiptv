@@ -22,7 +22,9 @@ unsafe impl Sync for Mpv {}
 impl Mpv {
     pub fn new() -> Result<Self, MpvError> {
         let h = unsafe { sys::mpv_create() };
-        if h.is_null() { return Err(MpvError::NullHandle); }
+        if h.is_null() {
+            return Err(MpvError::NullHandle);
+        }
 
         let me = Self { handle: h };
 
@@ -42,12 +44,16 @@ impl Mpv {
         check(unsafe { sys::mpv_initialize(h) })?;
 
         let lvl = CString::new("info").unwrap();
-        unsafe { sys::mpv_request_log_messages(h, lvl.as_ptr()); }
+        unsafe {
+            sys::mpv_request_log_messages(h, lvl.as_ptr());
+        }
 
         Ok(me)
     }
 
-    pub fn raw(&self) -> *mut sys::mpv_handle { self.handle }
+    pub fn raw(&self) -> *mut sys::mpv_handle {
+        self.handle
+    }
 
     pub fn set_option(&self, name: &str, value: &str) -> Result<(), MpvError> {
         let n = CString::new(name).unwrap();
@@ -65,7 +71,9 @@ impl Mpv {
         let n = CString::new(name).unwrap();
         unsafe {
             let p = sys::mpv_get_property_string(self.handle, n.as_ptr());
-            if p.is_null() { return None; }
+            if p.is_null() {
+                return None;
+            }
             let s = CStr::from_ptr(p).to_string_lossy().into_owned();
             sys::mpv_free(p as *mut c_void);
             Some(s)
@@ -76,9 +84,18 @@ impl Mpv {
         let n = CString::new(name).unwrap();
         let mut out: f64 = 0.0;
         let rc = unsafe {
-            sys::mpv_get_property(self.handle, n.as_ptr(), sys::MPV_FORMAT_DOUBLE, &mut out as *mut _ as *mut c_void)
+            sys::mpv_get_property(
+                self.handle,
+                n.as_ptr(),
+                sys::MPV_FORMAT_DOUBLE,
+                &mut out as *mut _ as *mut c_void,
+            )
         };
-        if rc < 0 { None } else { Some(out) }
+        if rc < 0 {
+            None
+        } else {
+            Some(out)
+        }
     }
 
     pub fn command(&self, args: &[&str]) -> Result<(), MpvError> {
@@ -97,25 +114,37 @@ impl Mpv {
         unsafe { sys::mpv_wait_event(self.handle, timeout_s) }
     }
 
-    pub fn set_wakeup_callback(&self, cb: extern "C" fn(*mut c_void), ud: *mut c_void) {
-        unsafe { sys::mpv_set_wakeup_callback(self.handle, cb, ud); }
+    /// # Safety
+    /// The caller must ensure `ud` outlives the mpv handle, and is safe to
+    /// dereference from any thread (the callback fires from mpv's worker
+    /// threads).
+    pub unsafe fn set_wakeup_callback(&self, cb: extern "C" fn(*mut c_void), ud: *mut c_void) {
+        sys::mpv_set_wakeup_callback(self.handle, cb, ud);
     }
 }
 
 impl Drop for Mpv {
     fn drop(&mut self) {
         if !self.handle.is_null() {
-            unsafe { sys::mpv_terminate_destroy(self.handle); }
+            unsafe {
+                sys::mpv_terminate_destroy(self.handle);
+            }
             self.handle = ptr::null_mut();
         }
     }
 }
 
 pub fn check(rc: i32) -> Result<(), MpvError> {
-    if rc >= 0 { return Ok(()); }
+    if rc >= 0 {
+        return Ok(());
+    }
     let msg = unsafe {
         let p = sys::mpv_error_string(rc);
-        if p.is_null() { "unknown".into() } else { CStr::from_ptr(p).to_string_lossy().into_owned() }
+        if p.is_null() {
+            "unknown".into()
+        } else {
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
     };
     Err(MpvError::Code(rc, msg))
 }

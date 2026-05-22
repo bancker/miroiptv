@@ -13,6 +13,9 @@ fn create_and_destroy() {
 #[ignore]
 fn loadfile_dummy_succeeds() {
     let mpv = Mpv::new().expect("mpv init");
-    let r = mpv.command(&["loadfile", "av://lavfi:smptebars=size=640x360:rate=25:duration=1"]);
+    let r = mpv.command(&[
+        "loadfile",
+        "av://lavfi:smptebars=size=640x360:rate=25:duration=1",
+    ]);
     assert!(r.is_ok(), "loadfile should succeed: {:?}", r);
 }

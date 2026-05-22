@@ -32,8 +32,7 @@ fn main() -> anyhow::Result<()> {
     storage.ensure_config_dir()?;
 
     let portal: Arc<dyn Portal> = if let Some(s) = cli.xtream.as_deref() {
-        let creds =
-            parse_xtream_creds(s).map_err(|e| anyhow::anyhow!("--xtream parse: {}", e))?;
+        let creds = parse_xtream_creds(s).map_err(|e| anyhow::anyhow!("--xtream parse: {}", e))?;
         Arc::new(XtreamPortal::new(creds))
     } else {
         Arc::new(XtreamPortal::new(XtreamCreds {

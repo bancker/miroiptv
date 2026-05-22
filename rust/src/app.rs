@@ -48,7 +48,9 @@ impl TvApp {
     ) -> Self {
         // Whenever a new mpv frame is ready, ask egui to redraw.
         let ctx = cc.egui_ctx.clone();
-        player.frames.set_new_frame_callback(move || ctx.request_repaint());
+        player
+            .frames
+            .set_new_frame_callback(move || ctx.request_repaint());
 
         let favorites = Favorites::load(&storage.favorites_path()).unwrap_or_default();
         catalog.spawn_fetch();
@@ -118,7 +120,9 @@ impl TvApp {
         self.epg_fetch_pending_for = Some(stream_id);
         tokio::spawn(async move {
             match portal.fetch_epg(stream_id).await {
-                Ok(epg) => { *slot.lock() = Some((stream_id, epg)); }
+                Ok(epg) => {
+                    *slot.lock() = Some((stream_id, epg));
+                }
                 Err(e) => tracing::warn!("epg fetch failed for {}: {}", stream_id, e),
             }
         });
@@ -207,34 +211,63 @@ impl TvApp {
         }
 
         let (
-            down, up, left, right, scroll, f_key, e_key, shift, d, n1, n2, n3,
-            f11, esc, n_key, r_key, a_key, s_key, star,
-        ) = ctx.input(|i| (
-            i.key_pressed(Key::ArrowDown),
-            i.key_pressed(Key::ArrowUp),
-            i.key_pressed(Key::ArrowLeft),
-            i.key_pressed(Key::ArrowRight),
-            i.raw_scroll_delta.y,
-            i.key_pressed(Key::F),
-            i.key_pressed(Key::E),
-            i.modifiers.shift,
-            i.key_pressed(Key::D),
-            i.key_pressed(Key::Num1),
-            i.key_pressed(Key::Num2),
-            i.key_pressed(Key::Num3),
-            i.key_pressed(Key::F11),
-            i.key_pressed(Key::Escape),
-            i.key_pressed(Key::N),
-            i.key_pressed(Key::R),
-            i.key_pressed(Key::A),
-            i.key_pressed(Key::S),
-            i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "*")),
-        ));
+            down,
+            up,
+            left,
+            right,
+            scroll,
+            f_key,
+            e_key,
+            shift,
+            d,
+            n1,
+            n2,
+            n3,
+            f11,
+            esc,
+            n_key,
+            r_key,
+            a_key,
+            s_key,
+            star,
+        ) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::ArrowDown),
+                i.key_pressed(Key::ArrowUp),
+                i.key_pressed(Key::ArrowLeft),
+                i.key_pressed(Key::ArrowRight),
+                i.raw_scroll_delta.y,
+                i.key_pressed(Key::F),
+                i.key_pressed(Key::E),
+                i.modifiers.shift,
+                i.key_pressed(Key::D),
+                i.key_pressed(Key::Num1),
+                i.key_pressed(Key::Num2),
+                i.key_pressed(Key::Num3),
+                i.key_pressed(Key::F11),
+                i.key_pressed(Key::Escape),
+                i.key_pressed(Key::N),
+                i.key_pressed(Key::R),
+                i.key_pressed(Key::A),
+                i.key_pressed(Key::S),
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Text(t) if t == "*")),
+            )
+        });
 
-        if down { self.zap_delta(1); }
-        if up { self.zap_delta(-1); }
-        if scroll > 0.5 { self.zap_delta(-1); }
-        if scroll < -0.5 { self.zap_delta(1); }
+        if down {
+            self.zap_delta(1);
+        }
+        if up {
+            self.zap_delta(-1);
+        }
+        if scroll > 0.5 {
+            self.zap_delta(-1);
+        }
+        if scroll < -0.5 {
+            self.zap_delta(1);
+        }
 
         if left {
             let _ = self.player.cmd_tx.send(Cmd::SeekRelative(-30.0));
@@ -247,7 +280,9 @@ impl TvApp {
 
         if f_key && !shift {
             self.show_search = !self.show_search;
-            if self.show_search { self.search_query.clear(); }
+            if self.show_search {
+                self.search_query.clear();
+            }
         }
         if f_key && shift {
             self.show_favs = !self.show_favs;
@@ -261,11 +296,19 @@ impl TvApp {
             }
         }
 
-        if d { self.show_debug = !self.show_debug; }
+        if d {
+            self.show_debug = !self.show_debug;
+        }
 
-        if n1 { self.zap_npo(1); }
-        if n2 { self.zap_npo(2); }
-        if n3 { self.zap_npo(3); }
+        if n1 {
+            self.zap_npo(1);
+        }
+        if n2 {
+            self.zap_npo(2);
+        }
+        if n3 {
+            self.zap_npo(3);
+        }
 
         if n_key {
             if let Some(sid) = shortcuts::news_npo(&self.catalog) {
@@ -304,23 +347,28 @@ impl TvApp {
             self.search_query.clear();
         }
 
-        if star { self.toggle_favorite_current(); }
+        if star {
+            self.toggle_favorite_current();
+        }
     }
 
     fn update_video_texture(&mut self, ctx: &egui::Context) {
         let frame: RgbaFrame = self.player.frames.read();
-        if frame.w == 0 || frame.h == 0 { return; }
-        if frame.version == self.last_frame_version && self.video_tex.is_some() { return; }
+        if frame.w == 0 || frame.h == 0 {
+            return;
+        }
+        if frame.version == self.last_frame_version && self.video_tex.is_some() {
+            return;
+        }
         self.last_frame_version = frame.version;
 
         // mpv emits rgb0: bytes are R, G, B, 0. egui ColorImage wants RGBA.
         // Just force the 4th byte to 255 (opaque).
         let mut rgba = frame.data.clone();
-        for px in rgba.chunks_exact_mut(4) { px[3] = 255; }
-        let img = ColorImage::from_rgba_unmultiplied(
-            [frame.w as usize, frame.h as usize],
-            &rgba,
-        );
+        for px in rgba.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        let img = ColorImage::from_rgba_unmultiplied([frame.w as usize, frame.h as usize], &rgba);
         match self.video_tex.as_mut() {
             Some(t) => t.set(img, TextureOptions::LINEAR),
             None => self.video_tex = Some(ctx.load_texture("video", img, TextureOptions::LINEAR)),
@@ -336,8 +384,12 @@ impl TvApp {
     }
 
     fn paint_toast(&self, ctx: &egui::Context) {
-        let Some((text, t0)) = &self.toast else { return; };
-        if t0.elapsed() > Duration::from_secs(4) { return; }
+        let Some((text, t0)) = &self.toast else {
+            return;
+        };
+        if t0.elapsed() > Duration::from_secs(4) {
+            return;
+        }
         egui::Area::new(egui::Id::new("__toast__"))
             .anchor(egui::Align2::LEFT_BOTTOM, [12.0, -12.0])
             .show(ctx, |ui| {
@@ -350,7 +402,9 @@ impl TvApp {
     }
 
     fn paint_search(&mut self, ctx: &egui::Context) {
-        if !self.show_search { return; }
+        if !self.show_search {
+            return;
+        }
         let mut zap_pick: Option<(i64, String, ItemKind)> = None;
 
         egui::Area::new(egui::Id::new("__search__"))
@@ -375,7 +429,10 @@ impl TvApp {
                                 ItemKind::Movie => "[FILM]",
                                 ItemKind::Series => "[SERIE]",
                             };
-                            if ui.selectable_label(false, format!("{} {}", tag, it.name)).clicked() {
+                            if ui
+                                .selectable_label(false, format!("{} {}", tag, it.name))
+                                .clicked()
+                            {
                                 zap_pick = Some((it.id, it.name.clone(), it.kind));
                             }
                         }
@@ -394,8 +451,12 @@ impl TvApp {
 
     fn handle_search_pick(&mut self, id: i64, name: &str, kind: ItemKind) {
         match kind {
-            ItemKind::Live => { self.zap_by_id(id); }
-            ItemKind::Movie => { self.play_movie(id, name); }
+            ItemKind::Live => {
+                self.zap_by_id(id);
+            }
+            ItemKind::Movie => {
+                self.play_movie(id, name);
+            }
             ItemKind::Series => {
                 self.set_toast(format!("series picker not in v1: {}", name));
             }
@@ -405,7 +466,9 @@ impl TvApp {
     }
 
     fn paint_favs(&mut self, ctx: &egui::Context) {
-        if !self.show_favs { return; }
+        if !self.show_favs {
+            return;
+        }
         let mut zap_id: Option<i64> = None;
         let mut remove_id: Option<i64> = None;
         let entries: Vec<_> = self.favorites.iter().cloned().collect();
@@ -446,8 +509,12 @@ impl TvApp {
     }
 
     fn paint_epg_strip(&self, ctx: &egui::Context) {
-        if !self.show_epg_strip { return; }
-        let Some(epg) = &self.current_epg else { return; };
+        if !self.show_epg_strip {
+            return;
+        }
+        let Some(epg) = &self.current_epg else {
+            return;
+        };
         let now = chrono::Utc::now();
         let mut text = String::new();
         if let Some(cur) = epg.current_at(now) {
@@ -459,9 +526,15 @@ impl TvApp {
             ));
         }
         if let Some(nxt) = epg.next_at(now) {
-            text.push_str(&format!("    ->  {}  {}", nxt.start.format("%H:%M"), nxt.title));
+            text.push_str(&format!(
+                "    ->  {}  {}",
+                nxt.start.format("%H:%M"),
+                nxt.title
+            ));
         }
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
 
         egui::Area::new(egui::Id::new("__epg_strip__"))
             .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -60.0])
@@ -475,8 +548,12 @@ impl TvApp {
     }
 
     fn paint_epg_grid(&self, ctx: &egui::Context) {
-        if !self.show_epg_grid { return; }
-        let Some(epg) = &self.current_epg else { return; };
+        if !self.show_epg_grid {
+            return;
+        }
+        let Some(epg) = &self.current_epg else {
+            return;
+        };
         egui::Area::new(egui::Id::new("__epg_grid__"))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
@@ -486,22 +563,26 @@ impl TvApp {
                         ui.set_width(560.0);
                         ui.heading("EPG");
                         ui.separator();
-                        egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                            for e in epg.entries() {
-                                ui.label(format!(
-                                    "{}-{}  {}",
-                                    e.start.format("%H:%M"),
-                                    e.end.format("%H:%M"),
-                                    e.title
-                                ));
-                            }
-                        });
+                        egui::ScrollArea::vertical()
+                            .max_height(420.0)
+                            .show(ui, |ui| {
+                                for e in epg.entries() {
+                                    ui.label(format!(
+                                        "{}-{}  {}",
+                                        e.start.format("%H:%M"),
+                                        e.end.format("%H:%M"),
+                                        e.title
+                                    ));
+                                }
+                            });
                     });
             });
     }
 
     fn paint_debug_hud(&self, ctx: &egui::Context) {
-        if !self.show_debug { return; }
+        if !self.show_debug {
+            return;
+        }
         egui::Area::new(egui::Id::new("__debug__"))
             .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
             .show(ctx, |ui| {
@@ -514,7 +595,14 @@ impl TvApp {
                             ui.label(format!("channel: {}", n));
                         }
                         ui.label(format!("favs: {}", self.favorites.iter().count()));
-                        ui.label(format!("catalog: {}", if self.catalog.is_loaded() { "loaded" } else { "loading..." }));
+                        ui.label(format!(
+                            "catalog: {}",
+                            if self.catalog.is_loaded() {
+                                "loaded"
+                            } else {
+                                "loading..."
+                            }
+                        ));
                     });
             });
     }
@@ -547,12 +635,12 @@ impl eframe::App for TvApp {
                         ui.label(
                             egui::RichText::new("tvplayer")
                                 .color(Color32::from_white_alpha(80))
-                                .heading()
+                                .heading(),
                         );
                         if !self.catalog.is_loaded() {
                             ui.label(
                                 egui::RichText::new("loading catalog...")
-                                    .color(Color32::from_white_alpha(60))
+                                    .color(Color32::from_white_alpha(60)),
                             );
                         }
                     });

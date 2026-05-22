@@ -5,7 +5,7 @@ fn e(title: &str, start_min: i64, end_min: i64) -> EpgEntry {
     EpgEntry {
         title: title.into(),
         start: Utc.timestamp_opt(start_min * 60, 0).unwrap(),
-        end:   Utc.timestamp_opt(end_min   * 60, 0).unwrap(),
+        end: Utc.timestamp_opt(end_min * 60, 0).unwrap(),
     }
 }
 

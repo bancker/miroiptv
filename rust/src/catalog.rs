@@ -42,21 +42,39 @@ impl CatalogStore {
     }
 
     pub fn live_channels(&self) -> Vec<LiveChannel> {
-        self.inner.read().as_ref().map(|c| c.live.clone()).unwrap_or_default()
+        self.inner
+            .read()
+            .as_ref()
+            .map(|c| c.live.clone())
+            .unwrap_or_default()
     }
 
     pub fn search_items(&self) -> Vec<SearchItem> {
         let g = self.inner.read();
-        let Some(c) = g.as_ref() else { return Vec::new(); };
+        let Some(c) = g.as_ref() else {
+            return Vec::new();
+        };
         let mut v = Vec::with_capacity(c.live.len() + c.movies.len() + c.series.len());
         for x in &c.live {
-            v.push(SearchItem { id: x.stream_id, name: x.name.clone(), kind: ItemKind::Live });
+            v.push(SearchItem {
+                id: x.stream_id,
+                name: x.name.clone(),
+                kind: ItemKind::Live,
+            });
         }
         for x in &c.movies {
-            v.push(SearchItem { id: x.stream_id, name: x.name.clone(), kind: ItemKind::Movie });
+            v.push(SearchItem {
+                id: x.stream_id,
+                name: x.name.clone(),
+                kind: ItemKind::Movie,
+            });
         }
         for x in &c.series {
-            v.push(SearchItem { id: x.series_id, name: x.name.clone(), kind: ItemKind::Series });
+            v.push(SearchItem {
+                id: x.series_id,
+                name: x.name.clone(),
+                kind: ItemKind::Series,
+            });
         }
         v
     }
@@ -66,11 +84,15 @@ impl CatalogStore {
         rank(query, &items).into_iter().cloned().collect()
     }
 
-    pub fn portal(&self) -> &Arc<dyn Portal> { &self.portal }
+    pub fn portal(&self) -> &Arc<dyn Portal> {
+        &self.portal
+    }
 
     /// Look up a movie's container extension by stream_id; default "mkv".
     pub fn movie_extension(&self, stream_id: i64) -> String {
-        self.inner.read().as_ref()
+        self.inner
+            .read()
+            .as_ref()
             .and_then(|c| c.movies.iter().find(|m| m.stream_id == stream_id))
             .and_then(|m| m.container_extension.clone())
             .unwrap_or_else(|| "mkv".to_owned())

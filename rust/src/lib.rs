@@ -1,11 +1,11 @@
 // tvplayer: lightweight IPTV player on libmpv + egui
-pub mod args;
-pub mod storage;
-pub mod favorites;
-pub mod search;
-pub mod epg;
-pub mod portal;
-pub mod player;
-pub mod catalog;
-pub mod shortcuts;
 pub mod app;
+pub mod args;
+pub mod catalog;
+pub mod epg;
+pub mod favorites;
+pub mod player;
+pub mod portal;
+pub mod search;
+pub mod shortcuts;
+pub mod storage;

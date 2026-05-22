@@ -10,7 +10,7 @@ use std::sync::Arc;
 pub struct RgbaFrame {
     pub w: u32,
     pub h: u32,
-    pub data: Vec<u8>,   // length = w*h*4, BGRA0 from mpv
+    pub data: Vec<u8>, // length = w*h*4, BGRA0 from mpv
     pub version: u64,
 }
 
@@ -19,7 +19,11 @@ pub struct FrameBus {
     on_new_frame: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
-impl Default for FrameBus { fn default() -> Self { Self::new() } }
+impl Default for FrameBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FrameBus {
     pub fn new() -> Self {
@@ -40,10 +44,14 @@ impl FrameBus {
     fn write(&self, w: u32, h: u32, data: Vec<u8>) {
         {
             let mut g = self.inner.lock();
-            g.w = w; g.h = h; g.data = data;
+            g.w = w;
+            g.h = h;
+            g.data = data;
             g.version = g.version.wrapping_add(1);
         }
-        if let Some(cb) = self.on_new_frame.lock().as_ref() { cb(); }
+        if let Some(cb) = self.on_new_frame.lock().as_ref() {
+            cb();
+        }
     }
 }
 
@@ -60,7 +68,12 @@ pub struct RenderCtx {
 unsafe impl Send for RenderCtx {}
 
 impl RenderCtx {
-    pub fn new(mpv: &Mpv, frames: Arc<FrameBus>, init_w: u32, init_h: u32) -> Result<Self, MpvError> {
+    pub fn new(
+        mpv: &Mpv,
+        frames: Arc<FrameBus>,
+        init_w: u32,
+        init_h: u32,
+    ) -> Result<Self, MpvError> {
         let api_type = CString::new(sys::MPV_RENDER_API_TYPE_SW).unwrap();
 
         let mut params: [sys::mpv_render_param; 2] = [
@@ -79,7 +92,10 @@ impl RenderCtx {
             sys::mpv_render_context_create(&mut ctx as *mut _, mpv.raw(), params.as_mut_ptr())
         };
         if rc < 0 || ctx.is_null() {
-            return Err(MpvError::Code(rc, "mpv_render_context_create failed".into()));
+            return Err(MpvError::Code(
+                rc,
+                "mpv_render_context_create failed".into(),
+            ));
         }
 
         let buf = vec![0u8; (init_w as usize).max(1) * (init_h as usize).max(1) * 4];
@@ -96,7 +112,9 @@ impl RenderCtx {
     pub fn resize(&mut self, w: u32, h: u32) {
         let w = w.max(1);
         let h = h.max(1);
-        if w == self.width && h == self.height { return; }
+        if w == self.width && h == self.height {
+            return;
+        }
         self.width = w;
         self.height = h;
         self.buf = vec![0u8; (w as usize) * (h as usize) * 4];
@@ -110,11 +128,26 @@ impl RenderCtx {
         let mut stride: usize = (self.width as usize) * 4;
 
         let mut params: [sys::mpv_render_param; 5] = [
-            sys::mpv_render_param { type_: sys::MPV_RENDER_PARAM_SW_SIZE,    data: size_arr.as_mut_ptr() as *mut c_void },
-            sys::mpv_render_param { type_: sys::MPV_RENDER_PARAM_SW_FORMAT,  data: format.as_ptr() as *mut c_void },
-            sys::mpv_render_param { type_: sys::MPV_RENDER_PARAM_SW_STRIDE,  data: &mut stride as *mut _ as *mut c_void },
-            sys::mpv_render_param { type_: sys::MPV_RENDER_PARAM_SW_POINTER, data: self.buf.as_mut_ptr() as *mut c_void },
-            sys::mpv_render_param { type_: sys::MPV_RENDER_PARAM_INVALID,    data: ptr::null_mut() },
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_SW_SIZE,
+                data: size_arr.as_mut_ptr() as *mut c_void,
+            },
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_SW_FORMAT,
+                data: format.as_ptr() as *mut c_void,
+            },
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_SW_STRIDE,
+                data: &mut stride as *mut _ as *mut c_void,
+            },
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_SW_POINTER,
+                data: self.buf.as_mut_ptr() as *mut c_void,
+            },
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_INVALID,
+                data: ptr::null_mut(),
+            },
         ];
         check(unsafe { sys::mpv_render_context_render(self.raw, params.as_mut_ptr()) })?;
         self.frames.write(self.width, self.height, self.buf.clone());
@@ -130,7 +163,9 @@ impl RenderCtx {
 impl Drop for RenderCtx {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            unsafe { sys::mpv_render_context_free(self.raw); }
+            unsafe {
+                sys::mpv_render_context_free(self.raw);
+            }
             self.raw = ptr::null_mut();
         }
     }

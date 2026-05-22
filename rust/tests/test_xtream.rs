@@ -1,6 +1,9 @@
 use tvplayer::args::XtreamCreds;
 use tvplayer::portal::{xtream::XtreamPortal, Portal};
-use wiremock::{matchers::{method, path}, Mock, MockServer, ResponseTemplate};
+use wiremock::{
+    matchers::{method, path},
+    Mock, MockServer, ResponseTemplate,
+};
 
 fn fixtures(name: &str) -> String {
     std::fs::read_to_string(format!("fixtures/{}.json", name)).unwrap()
@@ -29,8 +32,8 @@ async fn mount_action(server: &MockServer, action: &str, body: String) {
 async fn fetch_catalog_combines_all_three_lists() {
     let server = MockServer::start().await;
     mount_action(&server, "get_live_streams", fixtures("xtream_live")).await;
-    mount_action(&server, "get_vod_streams",  fixtures("xtream_vod")).await;
-    mount_action(&server, "get_series",       fixtures("xtream_series")).await;
+    mount_action(&server, "get_vod_streams", fixtures("xtream_vod")).await;
+    mount_action(&server, "get_series", fixtures("xtream_series")).await;
 
     let portal = XtreamPortal::new(creds_for(&server));
     let cat = portal.fetch_catalog().await.unwrap();
@@ -58,8 +61,10 @@ async fn fetch_epg_returns_parsed_entries() {
 #[test]
 fn live_stream_url_shape() {
     let creds = XtreamCreds {
-        username: "u".into(), password: "p".into(),
-        host: "h.example.com".into(), port: 8080,
+        username: "u".into(),
+        password: "p".into(),
+        host: "h.example.com".into(),
+        port: 8080,
     };
     let portal = XtreamPortal::new(creds);
     assert_eq!(
@@ -71,8 +76,10 @@ fn live_stream_url_shape() {
 #[test]
 fn movie_stream_url_uses_extension() {
     let creds = XtreamCreds {
-        username: "u".into(), password: "p".into(),
-        host: "h.example.com".into(), port: 80,
+        username: "u".into(),
+        password: "p".into(),
+        host: "h.example.com".into(),
+        port: 80,
     };
     let portal = XtreamPortal::new(creds);
     assert_eq!(

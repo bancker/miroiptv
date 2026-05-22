@@ -3,12 +3,15 @@ use tvplayer::args::{parse_xtream_creds, XtreamCreds};
 #[test]
 fn parses_xtream_creds_with_port() {
     let c = parse_xtream_creds("user:pass@host.example.com:8080").unwrap();
-    assert_eq!(c, XtreamCreds {
-        username: "user".into(),
-        password: "pass".into(),
-        host: "host.example.com".into(),
-        port: 8080,
-    });
+    assert_eq!(
+        c,
+        XtreamCreds {
+            username: "user".into(),
+            password: "pass".into(),
+            host: "host.example.com".into(),
+            port: 8080,
+        }
+    );
 }
 
 #[test]

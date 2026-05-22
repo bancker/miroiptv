@@ -1,11 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 fn deser_id<'de, D>(d: D) -> Result<i64, D::Error>
-where D: serde::Deserializer<'de> {
+where
+    D: serde::Deserializer<'de>,
+{
     use serde::Deserialize as _;
     let v = serde_json::Value::deserialize(d)?;
     match v {
-        serde_json::Value::Number(n) => n.as_i64().ok_or_else(|| serde::de::Error::custom("not an i64")),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .ok_or_else(|| serde::de::Error::custom("not an i64")),
         serde_json::Value::String(s) => s.parse::<i64>().map_err(serde::de::Error::custom),
         _ => Err(serde::de::Error::custom("expected number or string")),
     }

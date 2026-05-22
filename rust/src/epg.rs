@@ -19,7 +19,9 @@ impl Epg {
         Self { entries }
     }
 
-    pub fn entries(&self) -> &[EpgEntry] { &self.entries }
+    pub fn entries(&self) -> &[EpgEntry] {
+        &self.entries
+    }
 
     pub fn current_at(&self, t: DateTime<Utc>) -> Option<&EpgEntry> {
         self.entries.iter().find(|e| e.start <= t && t < e.end)

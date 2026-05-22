@@ -1,5 +1,9 @@
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
-pub enum ItemKind { Live, Movie, Series }
+pub enum ItemKind {
+    Live,
+    Movie,
+    Series,
+}
 
 #[derive(Debug, Clone)]
 pub struct SearchItem {
@@ -10,9 +14,12 @@ pub struct SearchItem {
 
 pub fn rank<'a>(query: &str, items: &'a [SearchItem]) -> Vec<&'a SearchItem> {
     let q = query.trim().to_lowercase();
-    if q.is_empty() { return Vec::new(); }
+    if q.is_empty() {
+        return Vec::new();
+    }
 
-    let mut hits: Vec<&SearchItem> = items.iter()
+    let mut hits: Vec<&SearchItem> = items
+        .iter()
         .filter(|it| it.name.to_lowercase().contains(&q))
         .collect();
 

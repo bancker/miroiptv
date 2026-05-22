@@ -1,8 +1,8 @@
 pub mod types;
 pub mod xtream;
 
-use thiserror::Error;
 use crate::epg::Epg;
+use thiserror::Error;
 pub use types::*;
 
 #[derive(Debug, Error)]
