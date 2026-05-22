@@ -113,3 +113,34 @@ Requires the [GitHub CLI](https://cli.github.com) (`gh auth login` once).
 
 Personal project, no licence declared. If you want to reuse any of the
 code, open an issue and we'll figure something out.
+
+---
+
+# Rust rewrite (`tvplayer`, active)
+
+A clean rebuild of this player in Rust on libmpv is underway under `rust/`.
+The C app stays on `main` as a fallback while the rewrite is being validated.
+
+- Design: `docs/superpowers/specs/2026-05-22-rust-tvplayer-design.md`
+- Implementation plan: `docs/superpowers/plans/2026-05-22-rust-tvplayer.md`
+- Manual validation checklist: `docs/VALIDATION.md`
+
+## Build the Rust player
+
+```powershell
+.\rust\vendor\fetch-mpv.ps1     # one-time: vendor libmpv-2.dll + headers
+cd rust
+cargo test                       # 26 unit + integration tests
+cargo build --release            # -> rust\target\release\tvplayer.exe
+.\target\release\tvplayer.exe --selftest
+cd ..
+```
+
+## Portable zip
+
+```powershell
+.\build-zip.ps1                  # -> dist\tvplayer-v0.1.0.zip
+.\verify.ps1                     # smoke-test the zip
+```
+
+End-user docs are inside the zip's `README.txt` after extraction.
