@@ -47,6 +47,14 @@ pub struct mpv_event_property {
 }
 
 #[repr(C)]
+pub struct mpv_event_log_message {
+    pub prefix: *const c_char,
+    pub level: *const c_char,
+    pub text: *const c_char,
+    pub log_level: c_int,
+}
+
+#[repr(C)]
 pub struct mpv_event_end_file {
     pub reason: c_int,
     pub error: c_int,

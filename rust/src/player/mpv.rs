@@ -43,7 +43,12 @@ impl Mpv {
 
         check(unsafe { sys::mpv_initialize(h) })?;
 
-        let lvl = CString::new("info").unwrap();
+        // Default to "info" so demux/HW-decode/HLS errors land in our log
+        // file without spamming per-packet trace under normal playback.
+        // Diagnose deeper issues with: set MPV_LOG_LEVEL=v (verbose) or
+        // =debug before launching.
+        let lvl_str = std::env::var("MPV_LOG_LEVEL").unwrap_or_else(|_| "info".to_owned());
+        let lvl = CString::new(lvl_str).unwrap();
         unsafe {
             sys::mpv_request_log_messages(h, lvl.as_ptr());
         }

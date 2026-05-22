@@ -21,7 +21,10 @@ pub unsafe fn from_mpv(evt: *mut sys::mpv_event) -> Option<Event> {
     }
 }
 
-unsafe fn end_file_reason(evt: *mut sys::mpv_event) -> String {
+/// # Safety
+/// Same constraints as [`from_mpv`]. Callers should only pass events whose
+/// `event_id == MPV_EVENT_END_FILE`.
+pub unsafe fn end_file_reason(evt: *mut sys::mpv_event) -> String {
     let data = (*evt).data;
     if data.is_null() {
         return "unknown".into();
@@ -35,6 +38,33 @@ unsafe fn end_file_reason(evt: *mut sys::mpv_event) -> String {
         4 => "redirect".into(),
         n => format!("reason={}", n),
     }
+}
+
+/// Parse an `MPV_EVENT_LOG_MESSAGE` payload into (prefix, level, text).
+///
+/// # Safety
+/// Same constraints as [`from_mpv`]. Callers should only pass events whose
+/// `event_id == MPV_EVENT_LOG_MESSAGE`.
+pub unsafe fn log_message(evt: *mut sys::mpv_event) -> Option<(String, String, String)> {
+    let data = (*evt).data as *const sys::mpv_event_log_message;
+    if data.is_null() {
+        return None;
+    }
+    let cstr_or = |p: *const std::os::raw::c_char| -> String {
+        if p.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    };
+    let prefix = cstr_or((*data).prefix);
+    let level = cstr_or((*data).level);
+    let mut text = cstr_or((*data).text);
+    // mpv log lines include trailing newline; strip for tidier formatting.
+    while text.ends_with('\n') || text.ends_with('\r') {
+        text.pop();
+    }
+    Some((prefix, level, text))
 }
 
 /// # Safety

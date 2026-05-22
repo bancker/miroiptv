@@ -105,18 +105,55 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
 
                 let evt = mpv.wait_event(0.005);
                 let id = unsafe { (*evt).event_id };
-                if id != mpv_sys::MPV_EVENT_NONE {
-                    debug!("mpv event id={}", id);
-                    if let Some(e) = unsafe { events::from_mpv(evt) } {
-                        let _ = evt_tx.send(e);
+                match id {
+                    mpv_sys::MPV_EVENT_NONE => {}
+                    mpv_sys::MPV_EVENT_LOG_MESSAGE => {
+                        if let Some((prefix, level, text)) = unsafe { events::log_message(evt) } {
+                            let line = format!("[mpv:{}] {}", prefix, text);
+                            match level.as_str() {
+                                "fatal" | "error" => error!("{}", line),
+                                "warn" => warn!("{}", line),
+                                "info" | "status" | "v" => info!("{}", line),
+                                _ => debug!("{}", line),
+                            }
+                        }
                     }
-                    if id == mpv_sys::MPV_EVENT_PROPERTY_CHANGE {
+                    mpv_sys::MPV_EVENT_FILE_LOADED => {
+                        info!("mpv: file-loaded");
+                        let _ = evt_tx.send(Event::FileLoaded);
+                    }
+                    mpv_sys::MPV_EVENT_PLAYBACK_RESTART => {
+                        debug!("mpv: playback-restart");
+                        let _ = evt_tx.send(Event::PlaybackStarted);
+                    }
+                    mpv_sys::MPV_EVENT_END_FILE => {
+                        let reason = unsafe { events::end_file_reason(evt) };
+                        warn!("mpv: end-file (reason={})", reason);
+                        let _ = evt_tx.send(Event::EndOfFile { reason });
+                    }
+                    mpv_sys::MPV_EVENT_VIDEO_RECONFIG => {
+                        let w = mpv
+                            .get_property_string("dwidth")
+                            .unwrap_or_else(|| "?".into());
+                        let h = mpv
+                            .get_property_string("dheight")
+                            .unwrap_or_else(|| "?".into());
+                        info!("mpv: video-reconfig {}x{}", w, h);
+                    }
+                    mpv_sys::MPV_EVENT_AUDIO_RECONFIG => {
+                        info!("mpv: audio-reconfig");
+                    }
+                    mpv_sys::MPV_EVENT_PROPERTY_CHANGE => {
                         if let Some((n, v)) = unsafe { events::property_change(evt) } {
                             let _ = evt_tx.send(Event::PropertyChanged { name: n, value: v });
                         }
                     }
-                    if id == mpv_sys::MPV_EVENT_SHUTDOWN {
+                    mpv_sys::MPV_EVENT_SHUTDOWN => {
+                        warn!("mpv: shutdown event - exiting player thread");
                         return;
+                    }
+                    _ => {
+                        debug!("mpv event id={}", id);
                     }
                 }
 

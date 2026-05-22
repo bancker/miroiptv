@@ -148,6 +148,13 @@ impl TvApp {
 
     fn zap_to(&mut self, sid: i64, name: &str, idx: Option<usize>) {
         let url = self.catalog.portal().live_stream_url(sid);
+        tracing::info!(
+            "zap: -> {} (stream_id={}, idx={:?}, prev={:?})",
+            name,
+            sid,
+            idx,
+            self.current_name
+        );
         let _ = self.player.cmd_tx.send(Cmd::LoadUrl(url));
         self.current_idx = idx;
         self.current_name = Some(name.to_owned());

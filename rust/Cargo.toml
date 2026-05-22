@@ -1,6 +1,6 @@
 [package]
 name = "tvplayer"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["miroiptv"]
 license = "MIT"
@@ -24,6 +24,7 @@ serde_json = "1"
 directories = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
 anyhow = "1"
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
