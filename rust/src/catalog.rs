@@ -2,11 +2,21 @@ use crate::portal::{Catalog as PortalCatalog, LiveChannel, Portal};
 use crate::search::{rank, ItemKind, SearchItem};
 use parking_lot::RwLock;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{info, warn};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogStatus {
+    Idle,
+    Fetching(String),  // current step description
+    Loaded,
+    Failed(String),
+}
 
 pub struct CatalogStore {
     inner: Arc<RwLock<Option<PortalCatalog>>>,
     portal: Arc<dyn Portal>,
+    status: Arc<RwLock<CatalogStatus>>,
 }
 
 impl CatalogStore {
@@ -14,27 +24,47 @@ impl CatalogStore {
         Self {
             inner: Arc::new(RwLock::new(None)),
             portal,
+            status: Arc::new(RwLock::new(CatalogStatus::Idle)),
         }
     }
 
     /// Spawn an async fetch on the current tokio runtime. Non-blocking.
+    /// Safe to call repeatedly: subsequent calls trigger a re-fetch.
     pub fn spawn_fetch(self: &Arc<Self>) {
         let inner = self.inner.clone();
         let portal = self.portal.clone();
+        let status = self.status.clone();
+        *status.write() = CatalogStatus::Fetching("connecting...".into());
+
         tokio::spawn(async move {
+            let t0 = Instant::now();
+            *status.write() = CatalogStatus::Fetching("fetching catalog...".into());
+            info!("catalog: starting fetch");
+
             match portal.fetch_catalog().await {
                 Ok(c) => {
+                    let elapsed_ms = t0.elapsed().as_millis();
                     info!(
-                        "catalog loaded: {} live, {} movies, {} series",
+                        "catalog: loaded in {} ms ({} live, {} movies, {} series)",
+                        elapsed_ms,
                         c.live.len(),
                         c.movies.len(),
                         c.series.len()
                     );
                     *inner.write() = Some(c);
+                    *status.write() = CatalogStatus::Loaded;
                 }
-                Err(e) => warn!("catalog fetch failed: {}", e),
+                Err(e) => {
+                    let msg = format!("{}", e);
+                    warn!("catalog: fetch failed after {} ms: {}", t0.elapsed().as_millis(), msg);
+                    *status.write() = CatalogStatus::Failed(msg);
+                }
             }
         });
+    }
+
+    pub fn status(&self) -> CatalogStatus {
+        self.status.read().clone()
     }
 
     pub fn is_loaded(&self) -> bool {

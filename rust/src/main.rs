@@ -2,12 +2,20 @@ use clap::Parser;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tracing_subscriber::EnvFilter;
-use tvplayer::app::TvApp;
+use tvplayer::app::{PortalState, TvApp};
 use tvplayer::args::{parse_xtream_creds, Cli, XtreamCreds};
 use tvplayer::catalog::CatalogStore;
 use tvplayer::player;
 use tvplayer::portal::{xtream::XtreamPortal, Portal};
 use tvplayer::storage::Storage;
+
+fn is_placeholder_creds(creds: &XtreamCreds) -> bool {
+    let host = creds.host.to_lowercase();
+    host == "host.example.com"
+        || host == "example.com"
+        || host.is_empty()
+        || (creds.username == "user" && creds.password == "pass")
+}
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -31,16 +39,43 @@ fn main() -> anyhow::Result<()> {
     let storage = Storage::standard()?;
     storage.ensure_config_dir()?;
 
-    let portal: Arc<dyn Portal> = if let Some(s) = cli.xtream.as_deref() {
-        let creds = parse_xtream_creds(s).map_err(|e| anyhow::anyhow!("--xtream parse: {}", e))?;
-        Arc::new(XtreamPortal::new(creds))
+    // Resolve portal:
+    //   1. --xtream provided AND not placeholder -> real portal
+    //   2. otherwise -> "no portal" sentinel; UI shows configure-portal screen
+    let (portal, portal_state): (Arc<dyn Portal>, PortalState) = if let Some(s) = cli.xtream.as_deref() {
+        match parse_xtream_creds(s) {
+            Ok(creds) if !is_placeholder_creds(&creds) => {
+                tracing::info!("portal: xtream {}@{}:{}", creds.username, creds.host, creds.port);
+                (Arc::new(XtreamPortal::new(creds)), PortalState::Configured)
+            }
+            Ok(creds) => {
+                tracing::warn!("portal: placeholder credentials detected ({:?}@{}:{}). Edit run.bat or pass --xtream user:pass@host:port.", creds.username, creds.host, creds.port);
+                (
+                    Arc::new(XtreamPortal::new(XtreamCreds {
+                        username: "anon".into(),
+                        password: "anon".into(),
+                        host: "127.0.0.1".into(),
+                        port: 1,
+                    })),
+                    PortalState::Placeholder,
+                )
+            }
+            Err(e) => {
+                tracing::error!("portal: --xtream parse failed: {}", e);
+                anyhow::bail!("invalid --xtream credentials: {}", e);
+            }
+        }
     } else {
-        Arc::new(XtreamPortal::new(XtreamCreds {
-            username: "anon".into(),
-            password: "anon".into(),
-            host: "127.0.0.1".into(),
-            port: 1,
-        }))
+        tracing::warn!("portal: no --xtream argument given. Configure run.bat or pass --xtream user:pass@host:port. A bare URL still works.");
+        (
+            Arc::new(XtreamPortal::new(XtreamCreds {
+                username: "anon".into(),
+                password: "anon".into(),
+                host: "127.0.0.1".into(),
+                port: 1,
+            })),
+            PortalState::Missing,
+        )
     };
     let catalog = Arc::new(CatalogStore::new(portal));
 
@@ -60,8 +95,9 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "tvplayer",
         options,
-        Box::new(move |cc| Box::new(TvApp::new(cc, player_handle, catalog, storage))),
+        Box::new(move |cc| Box::new(TvApp::new(cc, player_handle, catalog, storage, portal_state))),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {}", e))?;
     Ok(())
 }
+

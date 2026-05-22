@@ -1,4 +1,4 @@
-use crate::catalog::CatalogStore;
+use crate::catalog::{CatalogStatus, CatalogStore};
 use crate::epg::Epg;
 use crate::favorites::Favorites;
 use crate::player::{Cmd, Event, PlayerHandle, RgbaFrame};
@@ -11,11 +11,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortalState {
+    /// `--xtream user:pass@host:port` was given with non-placeholder values.
+    Configured,
+    /// No `--xtream` argument given at all.
+    Missing,
+    /// `--xtream` was given but with the placeholder template values.
+    Placeholder,
+}
+
 pub struct TvApp {
     player: PlayerHandle,
     catalog: Arc<CatalogStore>,
     favorites: Favorites,
     storage: Storage,
+    portal_state: PortalState,
 
     video_tex: Option<TextureHandle>,
     last_frame_version: u64,
@@ -45,6 +56,7 @@ impl TvApp {
         player: PlayerHandle,
         catalog: Arc<CatalogStore>,
         storage: Storage,
+        portal_state: PortalState,
     ) -> Self {
         // Whenever a new mpv frame is ready, ask egui to redraw.
         let ctx = cc.egui_ctx.clone();
@@ -53,13 +65,19 @@ impl TvApp {
             .set_new_frame_callback(move || ctx.request_repaint());
 
         let favorites = Favorites::load(&storage.favorites_path()).unwrap_or_default();
-        catalog.spawn_fetch();
+        // Only kick off a fetch if we actually have a real portal — otherwise the
+        // request would hang on a placeholder/missing host until the network timeout
+        // and the user would see "loading..." for ~45s before any error appears.
+        if portal_state == PortalState::Configured {
+            catalog.spawn_fetch();
+        }
 
         Self {
             player,
             catalog,
             favorites,
             storage,
+            portal_state,
             video_tex: None,
             last_frame_version: 0,
             current_idx: None,
@@ -230,6 +248,7 @@ impl TvApp {
             a_key,
             s_key,
             star,
+            f5,
         ) = ctx.input(|i| {
             (
                 i.key_pressed(Key::ArrowDown),
@@ -253,6 +272,7 @@ impl TvApp {
                 i.events
                     .iter()
                     .any(|e| matches!(e, egui::Event::Text(t) if t == "*")),
+                i.key_pressed(Key::F5),
             )
         });
 
@@ -349,6 +369,18 @@ impl TvApp {
 
         if star {
             self.toggle_favorite_current();
+        }
+
+        if f5 {
+            match self.portal_state {
+                PortalState::Configured => {
+                    self.catalog.spawn_fetch();
+                    self.set_toast("retrying portal fetch...");
+                }
+                PortalState::Missing | PortalState::Placeholder => {
+                    self.set_toast("no portal configured - edit run.bat");
+                }
+            }
         }
     }
 
@@ -595,16 +627,102 @@ impl TvApp {
                             ui.label(format!("channel: {}", n));
                         }
                         ui.label(format!("favs: {}", self.favorites.iter().count()));
-                        ui.label(format!(
-                            "catalog: {}",
-                            if self.catalog.is_loaded() {
-                                "loaded"
-                            } else {
-                                "loading..."
-                            }
-                        ));
+                        ui.label(format!("catalog: {:?}", self.catalog.status()));
+                        ui.label(format!("portal: {:?}", self.portal_state));
                     });
             });
+    }
+
+    fn paint_empty_state(&self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.25);
+            ui.label(
+                egui::RichText::new("tvplayer")
+                    .color(Color32::from_white_alpha(180))
+                    .size(48.0),
+            );
+            ui.add_space(20.0);
+            match self.portal_state {
+                PortalState::Missing => {
+                    ui.label(
+                        egui::RichText::new("no portal configured")
+                            .color(Color32::from_white_alpha(140))
+                            .size(20.0),
+                    );
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Edit run.bat and set XTREAM_CREDS=user:pass@host:port,\n\
+                             or pass --xtream user:pass@host:port on the command line.",
+                        )
+                        .color(Color32::from_white_alpha(110)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "(A bare URL also works: tvplayer.exe https://example.com/some.m3u8)",
+                        )
+                        .italics()
+                        .color(Color32::from_white_alpha(80)),
+                    );
+                }
+                PortalState::Placeholder => {
+                    ui.label(
+                        egui::RichText::new("placeholder credentials in run.bat")
+                            .color(Color32::from_rgb(255, 200, 80))
+                            .size(20.0),
+                    );
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "The XTREAM_CREDS line in run.bat still has the example values\n\
+                             (user:pass@host.example.com:...). Edit it with your real portal\n\
+                             credentials and start the player again.",
+                        )
+                        .color(Color32::from_white_alpha(140)),
+                    );
+                }
+                PortalState::Configured => match self.catalog.status() {
+                    CatalogStatus::Idle | CatalogStatus::Fetching(_) => {
+                        let msg = if let CatalogStatus::Fetching(s) = self.catalog.status() {
+                            s
+                        } else {
+                            "preparing...".into()
+                        };
+                        ui.label(
+                            egui::RichText::new(msg)
+                                .color(Color32::from_white_alpha(140))
+                                .size(20.0),
+                        );
+                        ui.add_space(8.0);
+                        ui.spinner();
+                    }
+                    CatalogStatus::Loaded => {
+                        ui.label(
+                            egui::RichText::new("catalog loaded - press 1/2/3 for NPO or f to search")
+                                .color(Color32::from_white_alpha(140))
+                                .size(18.0),
+                        );
+                    }
+                    CatalogStatus::Failed(e) => {
+                        ui.label(
+                            egui::RichText::new("portal fetch failed")
+                                .color(Color32::from_rgb(255, 120, 120))
+                                .size(20.0),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(e).color(Color32::from_white_alpha(140)),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("press F5 to retry").italics()
+                                .color(Color32::from_white_alpha(100)),
+                        );
+                    }
+                },
+            }
+        });
     }
 }
 
@@ -630,20 +748,7 @@ impl eframe::App for TvApp {
                     let avail = ui.available_size();
                     ui.add(egui::Image::new(tex).fit_to_exact_size(avail));
                 } else {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(ui.available_height() * 0.4);
-                        ui.label(
-                            egui::RichText::new("tvplayer")
-                                .color(Color32::from_white_alpha(80))
-                                .heading(),
-                        );
-                        if !self.catalog.is_loaded() {
-                            ui.label(
-                                egui::RichText::new("loading catalog...")
-                                    .color(Color32::from_white_alpha(60)),
-                            );
-                        }
-                    });
+                    self.paint_empty_state(ui);
                 }
             });
 

@@ -36,8 +36,13 @@ if (Test-Path (Join-Path $mpvDir 'LICENSE.txt')) {
 
 $runBat = @'
 @echo off
-REM Set your Xtream Codes portal credentials here:
+REM =====================================================================
+REM  !!  EDIT THE LINE BELOW WITH YOUR REAL XTREAM PORTAL CREDENTIALS  !!
+REM  Format: user:pass@host:port
+REM  Without a real portal the app shows a "no portal configured" screen.
+REM =====================================================================
 set XTREAM_CREDS=user:pass@host.example.com:8080
+
 "%~dp0tvplayer.exe" --xtream %XTREAM_CREDS% %*
 '@
 Set-Content -Path (Join-Path $staging 'run.bat') -Value $runBat -Encoding ASCII
