@@ -109,8 +109,9 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                     mpv_sys::MPV_EVENT_NONE => {}
                     mpv_sys::MPV_EVENT_LOG_MESSAGE => {
                         if let Some((prefix, level, text)) = unsafe { events::log_message(evt) } {
+                            let effective = effective_log_level(&prefix, &level, &text);
                             let line = format!("[mpv:{}] {}", prefix, text);
-                            match level.as_str() {
+                            match effective {
                                 "fatal" | "error" => error!("{}", line),
                                 "warn" => warn!("{}", line),
                                 "info" | "status" | "v" => info!("{}", line),
@@ -176,4 +177,74 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
         evt_rx: parking_lot::Mutex::new(evt_rx),
         frames,
     })
+}
+
+/// Downgrade the effective log level for known-benign mpv messages so the
+/// ERROR view stays signal-only. Today's only entry: Xtream-style IPTV
+/// portals close HLS manifest HTTP responses without `Content-Length` or
+/// chunked encoding; ffmpeg flags this as
+/// `http: Error reading HTTP response: End of file`, but mpv's HLS layer
+/// reads the manifest fine and continues playback. Downgrade these to
+/// `debug` (silent unless `RUST_LOG=tvplayer=debug`).
+fn effective_log_level<'a>(prefix: &str, level: &'a str, text: &str) -> &'a str {
+    if level == "error"
+        && prefix == "ffmpeg"
+        && text.contains("Error reading HTTP response: End of file")
+    {
+        return "debug";
+    }
+    level
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_log_level;
+
+    #[test]
+    fn downgrades_benign_http_eof_from_ffmpeg() {
+        assert_eq!(
+            effective_log_level(
+                "ffmpeg",
+                "error",
+                "http: Error reading HTTP response: End of file"
+            ),
+            "debug"
+        );
+    }
+
+    #[test]
+    fn leaves_real_ffmpeg_errors_alone() {
+        assert_eq!(
+            effective_log_level("ffmpeg", "error", "Connection refused"),
+            "error"
+        );
+        assert_eq!(
+            effective_log_level("ffmpeg", "error", "HTTP 404 Not Found"),
+            "error"
+        );
+    }
+
+    #[test]
+    fn does_not_match_other_prefixes() {
+        assert_eq!(
+            effective_log_level(
+                "hls",
+                "error",
+                "http: Error reading HTTP response: End of file"
+            ),
+            "error"
+        );
+    }
+
+    #[test]
+    fn does_not_match_non_error_levels() {
+        assert_eq!(
+            effective_log_level(
+                "ffmpeg",
+                "info",
+                "http: Error reading HTTP response: End of file"
+            ),
+            "info"
+        );
+    }
 }
