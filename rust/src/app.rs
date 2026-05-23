@@ -1,15 +1,65 @@
 use crate::catalog::{CatalogStatus, CatalogStore};
-use crate::epg::Epg;
+use crate::epg::{Epg, EpgEntry};
 use crate::favorites::Favorites;
 use crate::player::{Cmd, Event, PlayerHandle, RgbaFrame};
+use crate::portal::LiveChannel;
 use crate::search::ItemKind;
 use crate::shortcuts;
 use crate::storage::Storage;
 use egui::{Color32, ColorImage, Key, TextureHandle, TextureOptions};
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuidePane {
+    Channels,
+    Programmes,
+}
+
+/// Two-pane EPG guide opened with `g`.
+/// Left pane = filterable channel list (all live + archive channels).
+/// Right pane = programme list of the highlighted channel.
+/// EPG fetched lazily per channel with 200 ms debounce + per-session cache.
+struct GuideState {
+    open: bool,
+    pane: GuidePane,
+    filter: String,
+    /// Indices into `catalog.live_channels()` for entries that match `filter`.
+    /// Rebuilt only when filter changes or catalog reloads.
+    visible: Vec<usize>,
+    visible_filter_snapshot: String,
+    channel_cursor: usize,
+    programme_cursor: usize,
+    /// stream_id -> EPG. Filled by background tokio tasks; UI reads each frame.
+    epg_cache: Arc<Mutex<HashMap<i64, Epg>>>,
+    /// Currently-pending fetch (None means idle). Prevents duplicate requests.
+    epg_pending: Arc<Mutex<Option<i64>>>,
+    /// When did the highlighted channel last change? Used for 200 ms debounce
+    /// so rapid arrow-down scrolling doesn't fire one HTTP fetch per row.
+    cursor_settled_since: Instant,
+    cursor_settled_for: Option<i64>,
+}
+
+impl Default for GuideState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            pane: GuidePane::Channels,
+            filter: String::new(),
+            visible: Vec::new(),
+            visible_filter_snapshot: String::new(),
+            channel_cursor: 0,
+            programme_cursor: 0,
+            epg_cache: Arc::new(Mutex::new(HashMap::new())),
+            epg_pending: Arc::new(Mutex::new(None)),
+            cursor_settled_since: Instant::now(),
+            cursor_settled_for: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortalState {
@@ -48,6 +98,10 @@ pub struct TvApp {
     show_debug: bool,
 
     search_query: String,
+
+    guide: GuideState,
+    /// Tracks borderless+always-on-top toggle (`b` key).
+    borderless: bool,
 }
 
 impl TvApp {
@@ -93,6 +147,8 @@ impl TvApp {
             show_epg_grid: false,
             show_debug: false,
             search_query: String::new(),
+            guide: GuideState::default(),
+            borderless: false,
         }
     }
 
@@ -123,11 +179,32 @@ impl TvApp {
     }
 
     fn drain_epg(&mut self) {
-        let mut s = self.epg_slot.lock();
-        if let Some((sid, epg)) = s.take() {
+        let arrived = self.epg_slot.lock().take();
+        if let Some((sid, epg)) = arrived {
             if Some(sid) == self.epg_fetch_pending_for {
-                self.current_epg = Some(epg);
                 self.epg_fetch_pending_for = None;
+                // Enrich the zap toast with current programme if this EPG
+                // is for the channel we're now playing. We still call
+                // set_toast (4s lifetime) so the user sees the title pop
+                // in shortly after the channel name.
+                if Some(sid) == self.current_stream_id {
+                    if let Some(now_prog) = epg.current_at(chrono::Utc::now()) {
+                        let name = self
+                            .current_name
+                            .clone()
+                            .unwrap_or_else(|| "?".into());
+                        let start = now_prog.start.with_timezone(&chrono::Local);
+                        let end = now_prog.end.with_timezone(&chrono::Local);
+                        self.set_toast(format!(
+                            "[TV] {}  |  {}  ({}-{})",
+                            name,
+                            now_prog.title,
+                            start.format("%H:%M"),
+                            end.format("%H:%M")
+                        ));
+                    }
+                }
+                self.current_epg = Some(epg);
             }
         }
     }
@@ -256,6 +333,8 @@ impl TvApp {
             s_key,
             star,
             f5,
+            g_key,
+            b_key,
         ) = ctx.input(|i| {
             (
                 i.key_pressed(Key::ArrowDown),
@@ -280,6 +359,8 @@ impl TvApp {
                     .iter()
                     .any(|e| matches!(e, egui::Event::Text(t) if t == "*")),
                 i.key_pressed(Key::F5),
+                i.key_pressed(Key::G),
+                i.key_pressed(Key::B),
             )
         });
 
@@ -388,6 +469,31 @@ impl TvApp {
                     self.set_toast("no portal configured - edit run.bat");
                 }
             }
+        }
+
+        if g_key {
+            self.toggle_guide();
+        }
+
+        if b_key {
+            self.toggle_borderless(ctx);
+        }
+    }
+
+    fn toggle_borderless(&mut self, ctx: &egui::Context) {
+        self.borderless = !self.borderless;
+        if self.borderless {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::AlwaysOnTop,
+            ));
+            self.set_toast("borderless + always-on-top  (press b again to restore)");
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::Normal,
+            ));
+            self.set_toast("normal window");
         }
     }
 
@@ -731,6 +837,449 @@ impl TvApp {
             }
         });
     }
+
+    // ------------------------------------------------------------------
+    // Guide (`g` key): two-pane channel + programme browser with catch-up
+    // ------------------------------------------------------------------
+
+    fn toggle_guide(&mut self) {
+        if !self.catalog.is_loaded() {
+            self.set_toast("catalog still loading - press g again in a moment");
+            return;
+        }
+        self.guide.open = !self.guide.open;
+        if self.guide.open {
+            self.guide.pane = GuidePane::Channels;
+            self.guide.filter.clear();
+            self.guide.channel_cursor = 0;
+            self.guide.programme_cursor = 0;
+            self.guide.cursor_settled_since = Instant::now();
+            self.guide.cursor_settled_for = None;
+            // visible list will (re)build on next paint via refresh_visible()
+        }
+    }
+
+    /// Rebuild `guide.visible` when the filter text has changed since the
+    /// last frame. Cheap to call every frame because the snapshot check
+    /// short-circuits when nothing has changed.
+    fn refresh_visible_if_stale(&mut self, channels: &[LiveChannel]) {
+        if self.guide.visible_filter_snapshot == self.guide.filter
+            && self.guide.visible.len() <= channels.len()
+            && !self.guide.visible.is_empty()
+        {
+            return;
+        }
+        let f = self.guide.filter.trim().to_lowercase();
+        self.guide.visible = if f.is_empty() {
+            (0..channels.len()).collect()
+        } else {
+            channels
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.name.to_lowercase().contains(&f))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        self.guide.visible_filter_snapshot = self.guide.filter.clone();
+        if self.guide.channel_cursor >= self.guide.visible.len() {
+            self.guide.channel_cursor = 0;
+        }
+    }
+
+    fn current_guide_channel<'a>(&self, channels: &'a [LiveChannel]) -> Option<&'a LiveChannel> {
+        let idx = *self.guide.visible.get(self.guide.channel_cursor)?;
+        channels.get(idx)
+    }
+
+    /// If cursor has been stable on a channel for >=200ms and we haven't
+    /// fetched its EPG yet (and nothing is currently being fetched), spawn
+    /// the background fetch. Uses fetch_day_epg for archive channels (full
+    /// catch-up history) and fetch_epg for live ones (now + next).
+    fn guide_maybe_fetch_epg(&mut self, channels: &[LiveChannel]) {
+        let Some(channel) = self.current_guide_channel(channels) else { return; };
+        let sid = channel.stream_id;
+        // Track when the cursor moved to this channel.
+        if self.guide.cursor_settled_for != Some(sid) {
+            self.guide.cursor_settled_for = Some(sid);
+            self.guide.cursor_settled_since = Instant::now();
+            self.guide.programme_cursor = 0;
+            return;
+        }
+        if self.guide.cursor_settled_since.elapsed() < Duration::from_millis(200) {
+            return;
+        }
+        if self.guide.epg_cache.lock().contains_key(&sid) {
+            return;
+        }
+        if *self.guide.epg_pending.lock() == Some(sid) {
+            return;
+        }
+        *self.guide.epg_pending.lock() = Some(sid);
+        let cache = self.guide.epg_cache.clone();
+        let pending = self.guide.epg_pending.clone();
+        let portal = self.catalog.portal().clone();
+        let is_archive = channel.tv_archive == 1;
+        tokio::spawn(async move {
+            let r = if is_archive {
+                portal.fetch_day_epg(sid).await
+            } else {
+                portal.fetch_epg(sid).await
+            };
+            match r {
+                Ok(epg) => {
+                    cache.lock().insert(sid, epg);
+                }
+                Err(e) => tracing::warn!("guide: EPG fetch failed for {}: {}", sid, e),
+            }
+            *pending.lock() = None;
+        });
+    }
+
+    fn guide_play_selected_programme(&mut self, channels: &[LiveChannel]) {
+        let Some(channel) = self.current_guide_channel(channels).cloned() else { return; };
+        let maybe_epg = self.guide.epg_cache.lock().get(&channel.stream_id).cloned();
+        let Some(epg) = maybe_epg else {
+            self.set_toast("EPG not loaded yet for this channel");
+            return;
+        };
+        let Some(entry) = epg.entries().get(self.guide.programme_cursor).cloned() else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        if entry.start > now {
+            self.set_toast(format!(
+                "not yet aired: {} ({})",
+                entry.title,
+                entry.start.format("%H:%M")
+            ));
+            return;
+        }
+        // Past or currently-airing. Pick the right URL + stream_id.
+        let (url, tag) = if entry.end <= now {
+            // Past - needs catch-up. Requires archive channel.
+            if channel.tv_archive != 1 {
+                self.set_toast(format!(
+                    "no catch-up for '{}': not an archive channel",
+                    channel.name
+                ));
+                return;
+            }
+            let dur_min =
+                ((entry.end - entry.start).num_minutes() as u32).max(1);
+            (
+                self.catalog
+                    .portal()
+                    .catchup_url(channel.stream_id, entry.start, dur_min),
+                "CATCHUP",
+            )
+        } else {
+            // Currently airing: live URL. If we're on the archive variant,
+            // swap to its live twin by name; otherwise use the channel as-is.
+            let live_sid = if channel.tv_archive == 1 {
+                self.catalog
+                    .live_id_by_name(&channel.name)
+                    .unwrap_or(channel.stream_id)
+            } else {
+                channel.stream_id
+            };
+            (
+                self.catalog.portal().live_stream_url(live_sid),
+                "LIVE",
+            )
+        };
+        tracing::info!(
+            "guide: [{}] {} | {} ({} -> {})",
+            tag,
+            channel.name,
+            entry.title,
+            entry.start.format("%Y-%m-%d %H:%M"),
+            entry.end.format("%H:%M")
+        );
+        let _ = self.player.cmd_tx.send(Cmd::LoadUrl(url));
+        self.current_name = Some(format!("{} - {}", channel.name, entry.title));
+        self.current_stream_id = Some(channel.stream_id);
+        self.current_epg = None;
+        self.set_toast(format!(
+            "[{}] {} | {} @ {}",
+            tag,
+            channel.name,
+            entry.title,
+            entry.start.format("%H:%M")
+        ));
+        self.guide.open = false;
+    }
+
+    /// Tune the highlighted channel live (Enter from Channels pane).
+    fn guide_tune_selected_channel(&mut self, channels: &[LiveChannel]) {
+        let Some(channel) = self.current_guide_channel(channels).cloned() else { return; };
+        // Archive channels don't serve /live/; swap to the live twin if it exists.
+        let (live_sid, name) = if channel.tv_archive == 1 {
+            match self.catalog.live_id_by_name(&channel.name) {
+                Some(id) => (id, channel.name.clone()),
+                None => {
+                    self.set_toast(format!(
+                        "no live variant for archive '{}' - pick a programme on the right",
+                        channel.name
+                    ));
+                    return;
+                }
+            }
+        } else {
+            (channel.stream_id, channel.name.clone())
+        };
+        let live = self.catalog.live_channels();
+        let idx = live.iter().position(|c| c.stream_id == live_sid);
+        self.zap_to(live_sid, &name, idx);
+        self.guide.open = false;
+    }
+
+    fn handle_guide_keys(&mut self, ctx: &egui::Context) {
+        let (esc, up, down, pgup, pgdn, home, end, left, right, tab, enter, backspace, g_key) =
+            ctx.input(|i| {
+                (
+                    i.key_pressed(Key::Escape),
+                    i.key_pressed(Key::ArrowUp),
+                    i.key_pressed(Key::ArrowDown),
+                    i.key_pressed(Key::PageUp),
+                    i.key_pressed(Key::PageDown),
+                    i.key_pressed(Key::Home),
+                    i.key_pressed(Key::End),
+                    i.key_pressed(Key::ArrowLeft),
+                    i.key_pressed(Key::ArrowRight),
+                    i.key_pressed(Key::Tab),
+                    i.key_pressed(Key::Enter),
+                    i.key_pressed(Key::Backspace),
+                    i.key_pressed(Key::G),
+                )
+            });
+        if esc || g_key {
+            self.guide.open = false;
+            return;
+        }
+        // Type chars -> filter (in Channels pane). Doesn't reach the
+        // Programmes pane to avoid wiping filter while inspecting EPG.
+        if self.guide.pane == GuidePane::Channels {
+            let typed: String = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| {
+                        if let egui::Event::Text(t) = e {
+                            Some(t.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            });
+            if !typed.is_empty() {
+                self.guide.filter.push_str(&typed);
+                self.guide.channel_cursor = 0;
+            }
+            if backspace && !self.guide.filter.is_empty() {
+                self.guide.filter.pop();
+                self.guide.channel_cursor = 0;
+            }
+        }
+        let channels = self.catalog.live_channels();
+        self.refresh_visible_if_stale(&channels);
+
+        match self.guide.pane {
+            GuidePane::Channels => {
+                let n = self.guide.visible.len();
+                if n > 0 {
+                    if down { self.guide.channel_cursor = (self.guide.channel_cursor + 1) % n; }
+                    if up   { self.guide.channel_cursor = (self.guide.channel_cursor + n - 1) % n; }
+                    if pgdn { self.guide.channel_cursor = (self.guide.channel_cursor + 10).min(n - 1); }
+                    if pgup { self.guide.channel_cursor = self.guide.channel_cursor.saturating_sub(10); }
+                    if home { self.guide.channel_cursor = 0; }
+                    if end  { self.guide.channel_cursor = n - 1; }
+                }
+                if right || tab {
+                    self.guide.pane = GuidePane::Programmes;
+                }
+                if enter {
+                    self.guide_tune_selected_channel(&channels);
+                }
+            }
+            GuidePane::Programmes => {
+                let n = self
+                    .current_guide_channel(&channels)
+                    .and_then(|c| self.guide.epg_cache.lock().get(&c.stream_id).map(|e| e.entries().len()))
+                    .unwrap_or(0);
+                if n > 0 {
+                    if down { self.guide.programme_cursor = (self.guide.programme_cursor + 1) % n; }
+                    if up   { self.guide.programme_cursor = (self.guide.programme_cursor + n - 1) % n; }
+                    if pgdn { self.guide.programme_cursor = (self.guide.programme_cursor + 10).min(n - 1); }
+                    if pgup { self.guide.programme_cursor = self.guide.programme_cursor.saturating_sub(10); }
+                    if home { self.guide.programme_cursor = 0; }
+                    if end  { self.guide.programme_cursor = n - 1; }
+                }
+                if left {
+                    self.guide.pane = GuidePane::Channels;
+                }
+                if enter {
+                    self.guide_play_selected_programme(&channels);
+                }
+            }
+        }
+    }
+
+    fn paint_guide(&mut self, ctx: &egui::Context) {
+        if !self.guide.open { return; }
+        let channels = self.catalog.live_channels();
+        self.refresh_visible_if_stale(&channels);
+        self.guide_maybe_fetch_epg(&channels);
+
+        let current_channel = self.current_guide_channel(&channels).cloned();
+        let cache = self.guide.epg_cache.lock();
+        let programmes: Vec<EpgEntry> = current_channel
+            .as_ref()
+            .and_then(|c| cache.get(&c.stream_id).map(|e| e.entries().to_vec()))
+            .unwrap_or_default();
+        drop(cache);
+        let now = chrono::Utc::now();
+        let visible = self.guide.visible.clone();
+        let pane = self.guide.pane;
+
+        egui::Window::new("__guide__")
+            .title_bar(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::popup(&ctx.style())
+                    .fill(Color32::from_black_alpha(235))
+                    .inner_margin(10.0),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(1100.0);
+                ui.set_height(620.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("guide").heading().color(Color32::WHITE),
+                    );
+                    ui.label(
+                        egui::RichText::new("  type to filter   |   arrows nav   |   Tab/right -> programmes   |   Enter play   |   Esc/g close")
+                            .color(Color32::from_white_alpha(120))
+                            .italics(),
+                    );
+                });
+                if !self.guide.filter.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("filter: {}_", self.guide.filter))
+                            .color(Color32::from_rgb(220, 220, 80))
+                            .monospace(),
+                    );
+                }
+                ui.separator();
+
+                ui.columns(2, |cols| {
+                    // ---- Channels pane ----
+                    let active = pane == GuidePane::Channels;
+                    cols[0].label(
+                        egui::RichText::new(format!(
+                            "Channels ({} of {}){}",
+                            visible.len(),
+                            channels.len(),
+                            if active { "  <-" } else { "" }
+                        ))
+                        .color(if active {
+                            Color32::WHITE
+                        } else {
+                            Color32::from_white_alpha(140)
+                        }),
+                    );
+                    let cursor = self.guide.channel_cursor;
+                    let row_h = 18.0;
+                    egui::ScrollArea::vertical()
+                        .id_source("guide_channels")
+                        .auto_shrink([false, false])
+                        .show_rows(&mut cols[0], row_h, visible.len(), |ui, range| {
+                            for i in range {
+                                let ch_idx = visible[i];
+                                let ch = &channels[ch_idx];
+                                let is_archive = ch.tv_archive == 1;
+                                let prefix = if is_archive { "[TK] " } else { "     " };
+                                let lbl = format!("{}{}", prefix, ch.name);
+                                let resp = ui.selectable_label(i == cursor, lbl);
+                                if i == cursor {
+                                    resp.scroll_to_me(Some(egui::Align::Center));
+                                }
+                            }
+                        });
+
+                    // ---- Programmes pane ----
+                    let active = pane == GuidePane::Programmes;
+                    let header = match &current_channel {
+                        Some(c) => format!("Programmes - {}", c.name),
+                        None => "Programmes".into(),
+                    };
+                    cols[1].label(
+                        egui::RichText::new(format!(
+                            "{}{}",
+                            header,
+                            if active { "  <-" } else { "" }
+                        ))
+                        .color(if active {
+                            Color32::WHITE
+                        } else {
+                            Color32::from_white_alpha(140)
+                        }),
+                    );
+                    if programmes.is_empty() {
+                        let pending = *self.guide.epg_pending.lock();
+                        let msg = if pending.is_some() {
+                            "loading EPG..."
+                        } else if current_channel.is_none() {
+                            "no channel selected"
+                        } else {
+                            "no EPG entries"
+                        };
+                        cols[1].label(
+                            egui::RichText::new(msg)
+                                .color(Color32::from_white_alpha(120))
+                                .italics(),
+                        );
+                    } else {
+                        let cursor = self.guide.programme_cursor;
+                        let row_h = 20.0;
+                        egui::ScrollArea::vertical()
+                            .id_source("guide_programmes")
+                            .auto_shrink([false, false])
+                            .show_rows(&mut cols[1], row_h, programmes.len(), |ui, range| {
+                                for i in range {
+                                    let e = &programmes[i];
+                                    let marker = if e.start <= now && now < e.end {
+                                        "NU "
+                                    } else if e.end <= now {
+                                        "    "
+                                    } else {
+                                        "-> "
+                                    };
+                                    let local = e.start.with_timezone(&chrono::Local);
+                                    let lbl = format!(
+                                        "{}{}  {}",
+                                        marker,
+                                        local.format("%a %H:%M"),
+                                        e.title
+                                    );
+                                    let color = if e.end <= now {
+                                        Color32::from_white_alpha(120)
+                                    } else if e.start <= now {
+                                        Color32::from_rgb(220, 220, 80)
+                                    } else {
+                                        Color32::WHITE
+                                    };
+                                    let text = egui::RichText::new(lbl).color(color);
+                                    let resp = ui.selectable_label(i == cursor, text);
+                                    if i == cursor && pane == GuidePane::Programmes {
+                                        resp.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                }
+                            });
+                    }
+                });
+            });
+    }
 }
 
 impl Drop for TvApp {
@@ -746,7 +1295,13 @@ impl eframe::App for TvApp {
         self.drain_epg();
         self.forward_window_size(ctx);
         self.update_video_texture(ctx);
-        self.handle_keys(ctx);
+        // Guide owns input while it's open - we don't want `1`/`2`/`3` etc.
+        // firing zaps when the user is typing into the channel filter.
+        if self.guide.open {
+            self.handle_guide_keys(ctx);
+        } else {
+            self.handle_keys(ctx);
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(Color32::BLACK))
@@ -765,6 +1320,7 @@ impl eframe::App for TvApp {
         self.paint_epg_strip(ctx);
         self.paint_epg_grid(ctx);
         self.paint_debug_hud(ctx);
+        self.paint_guide(ctx);
 
         ctx.request_repaint_after(Duration::from_millis(33));
     }

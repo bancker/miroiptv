@@ -40,6 +40,26 @@ impl XtreamPortal {
     fn base(&self) -> String {
         format!("http://{}:{}", self.creds.host, self.creds.port)
     }
+
+    async fn parse_epg(&self, url: &str) -> Result<Epg, PortalError> {
+        let txt = self.client.get(url).send().await?.text().await?;
+        let wrap: EpgWrapper =
+            serde_json::from_str(&txt).map_err(|e| PortalError::Shape(e.to_string()))?;
+        let entries: Vec<EpgEntry> = wrap
+            .epg_listings
+            .into_iter()
+            .filter_map(|r| {
+                let start = as_i64(&r.start_timestamp)?;
+                let end = as_i64(&r.stop_timestamp)?;
+                Some(EpgEntry {
+                    title: b64_decode(&r.title),
+                    start: Utc.timestamp_opt(start, 0).single()?,
+                    end: Utc.timestamp_opt(end, 0).single()?,
+                })
+            })
+            .collect();
+        Ok(Epg::new(entries))
+    }
 }
 
 #[derive(Deserialize)]
@@ -113,23 +133,13 @@ impl Portal for XtreamPortal {
             ("stream_id", &sid),
             ("limit", "100"),
         ]);
-        let txt = self.client.get(url).send().await?.text().await?;
-        let wrap: EpgWrapper =
-            serde_json::from_str(&txt).map_err(|e| PortalError::Shape(e.to_string()))?;
-        let entries: Vec<EpgEntry> = wrap
-            .epg_listings
-            .into_iter()
-            .filter_map(|r| {
-                let start = as_i64(&r.start_timestamp)?;
-                let end = as_i64(&r.stop_timestamp)?;
-                Some(EpgEntry {
-                    title: b64_decode(&r.title),
-                    start: Utc.timestamp_opt(start, 0).single()?,
-                    end: Utc.timestamp_opt(end, 0).single()?,
-                })
-            })
-            .collect();
-        Ok(Epg::new(entries))
+        self.parse_epg(&url).await
+    }
+
+    async fn fetch_day_epg(&self, stream_id: i64) -> Result<Epg, PortalError> {
+        let sid = stream_id.to_string();
+        let url = self.api_url(&[("action", "get_simple_data_table"), ("stream_id", &sid)]);
+        self.parse_epg(&url).await
     }
 
     async fn fetch_series_episodes(&self, series_id: i64) -> Result<Vec<Episode>, PortalError> {
@@ -209,6 +219,30 @@ impl Portal for XtreamPortal {
             self.creds.password,
             episode_id,
             container_ext
+        )
+    }
+
+    fn catchup_url(
+        &self,
+        stream_id: i64,
+        start: chrono::DateTime<chrono::Utc>,
+        duration_min: u32,
+    ) -> String {
+        // Xtream Codes timeshift convention:
+        //   /timeshift/<user>/<pass>/<duration_min>/<YYYY-MM-DD:HH-MM>/<stream_id>.m3u8
+        // The timestamp is in portal-local time. We use OS local time as a
+        // best-effort approximation - works as long as the user runs the
+        // app in the same timezone as the portal.
+        let local = start.with_timezone(&chrono::Local);
+        let ts = local.format("%Y-%m-%d:%H-%M");
+        format!(
+            "{}/timeshift/{}/{}/{}/{}/{}.m3u8",
+            self.base(),
+            self.creds.username,
+            self.creds.password,
+            duration_min,
+            ts,
+            stream_id
         )
     }
 }

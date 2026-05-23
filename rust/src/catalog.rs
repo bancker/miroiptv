@@ -79,6 +79,36 @@ impl CatalogStore {
             .unwrap_or_default()
     }
 
+    /// Archive (catch-up) channels: `tv_archive == 1`. These serve
+    /// `/timeshift/...` and `get_simple_data_table` returns the full
+    /// catch-up history; the matching live channel (`tv_archive == 0`)
+    /// is needed for live URLs.
+    pub fn archive_channels(&self) -> Vec<LiveChannel> {
+        self.inner
+            .read()
+            .as_ref()
+            .map(|c| {
+                c.live
+                    .iter()
+                    .filter(|x| x.tv_archive == 1)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Find the live (non-archive) variant of a channel by exact name match.
+    /// Used by the guide when the user picks an airing-now programme on an
+    /// archive channel - we have to swap to the live id to actually play.
+    pub fn live_id_by_name(&self, name: &str) -> Option<i64> {
+        self.inner.read().as_ref().and_then(|c| {
+            c.live
+                .iter()
+                .find(|x| x.tv_archive != 1 && x.name == name)
+                .map(|x| x.stream_id)
+        })
+    }
+
     pub fn search_items(&self) -> Vec<SearchItem> {
         let g = self.inner.read();
         let Some(c) = g.as_ref() else {
