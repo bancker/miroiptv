@@ -51,6 +51,82 @@ enum TimeMode {
     Primetime,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelMode {
+    /// All channels including tv_archive=1 archive duplicates (prefixed [TK]).
+    All,
+    /// Only tv_archive=0 - the live-only channels.
+    Live,
+    /// Only tv_archive=1 - the catch-up archive channels.
+    Catchup,
+}
+
+/// Pick a recognisable accent color for a channel based on common Dutch
+/// pattern matches. Purely visual - lets the user spot a channel category
+/// at a glance without us shipping logos. Falls back to neutral grey.
+fn channel_accent_color(name: &str) -> Color32 {
+    let n = name.to_uppercase();
+    if n.contains("NPO 1") || n.contains("NPO1") {
+        Color32::from_rgb(245, 130, 32)
+    } else if n.contains("NPO 2") || n.contains("NPO2") {
+        Color32::from_rgb(40, 165, 220)
+    } else if n.contains("NPO 3") || n.contains("NPO3") {
+        Color32::from_rgb(120, 200, 70)
+    } else if n.contains("NPO") {
+        Color32::from_rgb(220, 110, 30)
+    } else if n.contains("RTL 4") || n.contains("RTL4") {
+        Color32::from_rgb(220, 30, 30)
+    } else if n.contains("RTL 5") || n.contains("RTL5") {
+        Color32::from_rgb(180, 50, 50)
+    } else if n.contains("RTL Z") || n.contains("RTLZ") {
+        Color32::from_rgb(160, 30, 30)
+    } else if n.contains("RTL") {
+        Color32::from_rgb(200, 40, 40)
+    } else if n.contains("SBS") {
+        Color32::from_rgb(255, 160, 0)
+    } else if n.contains("NET 5") || n.contains("NET5") {
+        Color32::from_rgb(180, 90, 180)
+    } else if n.contains("VERONICA") {
+        Color32::from_rgb(200, 50, 100)
+    } else if n.contains("SPORT") || n.contains("ESPN") || n.contains("ZIGGO SPORT") || n.contains("FOX SPORTS") {
+        Color32::from_rgb(50, 170, 90)
+    } else if n.contains("DISCOVERY") || n.contains("NATIONAL GEOGRAPHIC") || n.contains("HISTORY") || n.contains("ANIMAL PLANET") {
+        Color32::from_rgb(40, 140, 140)
+    } else if n.contains("FILM") || n.contains("CINEMA") || n.contains("MOVIE") {
+        Color32::from_rgb(140, 70, 200)
+    } else if n.contains("KIDS") || n.contains("DISNEY") || n.contains("NICKELODEON") || n.contains("CARTOON") {
+        Color32::from_rgb(230, 90, 160)
+    } else if n.contains("NIEUWS") || n.contains("NEWS") || n.contains("BNR") || n.contains("NOS") {
+        Color32::from_rgb(70, 130, 220)
+    } else {
+        Color32::from_rgb(110, 110, 120)
+    }
+}
+
+/// Extract a 1-3 character "badge" label from a channel name. For Dutch
+/// patterns we prefer the channel number ("NPO 1" -> "1", "RTL 4" -> "4");
+/// for others we fall back to the first letter.
+fn channel_badge_label(name: &str) -> String {
+    let up = name.to_uppercase();
+    for prefix in ["NPO ", "NPO", "RTL ", "RTL", "SBS ", "SBS", "NET ", "NET"] {
+        if let Some(idx) = up.find(prefix) {
+            let rest = &up[idx + prefix.len()..];
+            let digits: String = rest
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit() && *c != 'Z')
+                .take_while(|c| c.is_ascii_digit() || *c == 'Z')
+                .collect();
+            if !digits.is_empty() {
+                return digits;
+            }
+        }
+    }
+    name.chars()
+        .find(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "?".into())
+}
+
 /// NLZIET-style column EPG guide opened with `g`.
 ///
 /// Layout: top filter/time bar, then N vertical channel columns side-by-side.
@@ -88,6 +164,8 @@ struct GuideState {
     /// When set, force-scroll each visible column to the position that matches
     /// `time_mode` on the next paint. Consumed by paint_guide.
     pending_time_scroll: bool,
+
+    channel_mode: ChannelMode,
 }
 
 impl Default for GuideState {
@@ -106,6 +184,7 @@ impl Default for GuideState {
             visible_set_settled_snapshot: Vec::new(),
             time_mode: TimeMode::NowAndNext,
             pending_time_scroll: true,
+            channel_mode: ChannelMode::All,
         }
     }
 }
@@ -906,24 +985,36 @@ impl TvApp {
         }
     }
 
-    /// Re-derive `visible` (channel indices matching the filter) when the
-    /// filter changes or the catalog reloads. Cheap to call per-frame.
+    /// Re-derive `visible` (channel indices matching the filter + channel
+    /// mode) when EITHER input changes. Snapshot encodes both so we can
+    /// short-circuit per-frame.
     fn refresh_visible_if_stale(&mut self, channels: &[LiveChannel]) {
         let f = self.guide.filter.trim().to_lowercase();
-        if self.guide.visible_filter_snapshot == f && !self.guide.visible.is_empty() {
+        let mode = self.guide.channel_mode;
+        // Encode mode + filter into snapshot string; both must trigger rebuild.
+        let snapshot = match mode {
+            ChannelMode::All => format!("A|{}", f),
+            ChannelMode::Live => format!("L|{}", f),
+            ChannelMode::Catchup => format!("C|{}", f),
+        };
+        if self.guide.visible_filter_snapshot == snapshot && !self.guide.visible.is_empty() {
             return;
         }
-        self.guide.visible = if f.is_empty() {
-            (0..channels.len()).collect()
-        } else {
-            channels
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.name.to_lowercase().contains(&f))
-                .map(|(i, _)| i)
-                .collect()
+        let mode_pass = move |c: &LiveChannel| -> bool {
+            match mode {
+                ChannelMode::All => true,
+                ChannelMode::Live => c.tv_archive == 0,
+                ChannelMode::Catchup => c.tv_archive == 1,
+            }
         };
-        self.guide.visible_filter_snapshot = f;
+        self.guide.visible = channels
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| mode_pass(c))
+            .filter(|(_, c)| f.is_empty() || c.name.to_lowercase().contains(&f))
+            .map(|(i, _)| i)
+            .collect();
+        self.guide.visible_filter_snapshot = snapshot;
         if self.guide.column_offset >= self.guide.visible.len() {
             self.guide.column_offset = 0;
         }
@@ -1124,34 +1215,44 @@ impl TvApp {
     }
 
     fn handle_guide_keys(&mut self, ctx: &egui::Context) {
-        let (esc, g_key, up, down, left, right, pgup, pgdn, home, end, enter, backspace, n_key, p_key) =
-            ctx.input(|i| (
-                i.key_pressed(Key::Escape),
-                i.key_pressed(Key::G),
-                i.key_pressed(Key::ArrowUp),
-                i.key_pressed(Key::ArrowDown),
-                i.key_pressed(Key::ArrowLeft),
-                i.key_pressed(Key::ArrowRight),
-                i.key_pressed(Key::PageUp),
-                i.key_pressed(Key::PageDown),
-                i.key_pressed(Key::Home),
-                i.key_pressed(Key::End),
-                i.key_pressed(Key::Enter),
-                i.key_pressed(Key::Backspace),
-                i.key_pressed(Key::N),
-                i.key_pressed(Key::P),
-            ));
+        let (
+            esc, g_key, up, down, left, right, pgup, pgdn, home, end, enter, backspace,
+            n_key, p_key, a_key, t_key, l_key,
+        ) = ctx.input(|i| (
+            i.key_pressed(Key::Escape),
+            i.key_pressed(Key::G),
+            i.key_pressed(Key::ArrowUp),
+            i.key_pressed(Key::ArrowDown),
+            i.key_pressed(Key::ArrowLeft),
+            i.key_pressed(Key::ArrowRight),
+            i.key_pressed(Key::PageUp),
+            i.key_pressed(Key::PageDown),
+            i.key_pressed(Key::Home),
+            i.key_pressed(Key::End),
+            i.key_pressed(Key::Enter),
+            i.key_pressed(Key::Backspace),
+            i.key_pressed(Key::N),
+            i.key_pressed(Key::P),
+            i.key_pressed(Key::A),
+            i.key_pressed(Key::T),
+            i.key_pressed(Key::L),
+        ));
         if esc || g_key {
             self.guide.open = false;
             return;
         }
-        // Typed chars feed the filter (except 'n'/'p' which are time-mode
-        // hotkeys - we suppress those from the filter input).
+        // Typed chars feed the filter, EXCEPT mode hotkeys (n/p time mode,
+        // a/l/t channel mode) which we reserve. The filter still accepts
+        // any other letter/digit normally.
         let typed: String = ctx.input(|i| {
             i.events
                 .iter()
                 .filter_map(|e| match e {
-                    egui::Event::Text(t) if t != "n" && t != "p" => Some(t.clone()),
+                    egui::Event::Text(t)
+                        if t != "n" && t != "p" && t != "a" && t != "l" && t != "t" =>
+                    {
+                        Some(t.clone())
+                    }
                     _ => None,
                 })
                 .collect()
@@ -1173,6 +1274,18 @@ impl TvApp {
         if p_key && self.guide.time_mode != TimeMode::Primetime {
             self.guide.time_mode = TimeMode::Primetime;
             self.guide.pending_time_scroll = true;
+        }
+        if a_key && self.guide.channel_mode != ChannelMode::All {
+            self.guide.channel_mode = ChannelMode::All;
+            self.guide.column_offset = 0;
+        }
+        if l_key && self.guide.channel_mode != ChannelMode::Live {
+            self.guide.channel_mode = ChannelMode::Live;
+            self.guide.column_offset = 0;
+        }
+        if t_key && self.guide.channel_mode != ChannelMode::Catchup {
+            self.guide.channel_mode = ChannelMode::Catchup;
+            self.guide.column_offset = 0;
         }
 
         let channels = self.catalog.live_channels();
@@ -1250,14 +1363,16 @@ impl TvApp {
 
         let now = chrono::Utc::now();
         let time_mode = self.guide.time_mode;
+        let chan_mode = self.guide.channel_mode;
         let filter_visible = self.guide.filter.clone();
         let selected_col = self.guide.selected_col;
         let column_offset = self.guide.column_offset;
+        let now_playing = self.current_name.clone();
 
-        // Snapshot EPG data + row cursors for the visible columns into
-        // owned data BEFORE rendering. This keeps the egui draw closure
-        // free of borrows on `self` (which would prevent us from updating
-        // row_per_channel on click).
+        // Snapshot the visible column slice into owned data BEFORE we
+        // hand a &mut Ui into the draw closure. Keeps `self` free so the
+        // click-handler post-draw can mutate row_per_channel + dispatch
+        // play actions without fighting the borrow checker.
         struct ColData {
             channel: LiveChannel,
             programmes: Vec<EpgEntry>,
@@ -1282,233 +1397,335 @@ impl TvApp {
                 .collect()
         };
 
-        // Click intent collected during draw, applied after the borrow ends.
-        let mut clicked: Option<(usize, usize)> = None; // (col, row)
+        // Click intents (col, row) collected during draw, applied after.
+        let mut clicked: Option<(usize, usize)> = None;
 
-        egui::Window::new("__guide__")
-            .title_bar(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .frame(
-                egui::Frame::popup(&ctx.style())
-                    .fill(Color32::from_black_alpha(238))
-                    .inner_margin(12.0),
-            )
+        // Full-window dark background. CentralPanel replaces the video
+        // surface entirely while the guide is open - no bleed-through.
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(Color32::from_rgb(14, 14, 18)))
             .show(ctx, |ui| {
-                let avail = ctx.input(|i| i.viewport().inner_rect.map(|r| (r.width(), r.height())))
-                    .unwrap_or((1280.0, 720.0));
-                ui.set_width(avail.0 - 40.0);
-                ui.set_height(avail.1 - 40.0);
-
-                // ---- Top bar ----
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("TV-gids").heading().color(Color32::WHITE));
-                    ui.add_space(16.0);
-
-                    let nn_active = time_mode == TimeMode::NowAndNext;
-                    let pt_active = time_mode == TimeMode::Primetime;
-                    let mode_pill = |ui: &mut egui::Ui, label: &str, active: bool| {
-                        let bg = if active {
-                            Color32::from_rgb(60, 95, 140)
-                        } else {
-                            Color32::from_rgb(40, 40, 45)
-                        };
-                        let fg = if active { Color32::WHITE } else { Color32::from_white_alpha(180) };
-                        egui::Frame::none()
-                            .fill(bg)
-                            .rounding(4.0)
-                            .inner_margin(egui::Margin::symmetric(10.0, 4.0))
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(label).color(fg));
-                            });
-                    };
-                    mode_pill(ui, "Nu & straks (n)", nn_active);
-                    ui.add_space(6.0);
-                    mode_pill(ui, "Primetime (p)", pt_active);
-
-                    ui.add_space(20.0);
-                    ui.label(
-                        egui::RichText::new("type to filter   /   arrows = nav   /   Enter = play   /   Esc/g = close")
-                            .color(Color32::from_white_alpha(110))
-                            .italics(),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "channels {}-{} of {}",
-                                column_offset + 1,
-                                (column_offset + col_data.len()).min(n_visible),
-                                n_visible
-                            ))
-                            .color(Color32::from_white_alpha(140)),
-                        );
-                    });
-                });
-                if !filter_visible.is_empty() {
-                    ui.label(
-                        egui::RichText::new(format!("filter: {}_", filter_visible))
-                            .color(Color32::from_rgb(220, 220, 80))
-                            .monospace(),
-                    );
-                }
-                ui.separator();
-
-                // ---- Column grid ----
-                if col_data.is_empty() {
-                    ui.label(
-                        egui::RichText::new("no channels match filter")
-                            .color(Color32::from_white_alpha(140))
-                            .italics(),
-                    );
-                    return;
-                }
-                ui.columns(col_data.len(), |cols| {
-                    for (vi, cd) in col_data.iter().enumerate() {
-                        let column_ui = &mut cols[vi];
-                        let is_selected_col = vi == selected_col;
-                        let is_archive = cd.channel.tv_archive == 1;
-
-                        // Header
-                        let header_bg = if is_selected_col {
-                            Color32::from_rgb(50, 80, 120)
-                        } else {
-                            Color32::from_rgb(35, 35, 40)
-                        };
-                        egui::Frame::none()
-                            .fill(header_bg)
-                            .rounding(4.0)
-                            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                            .show(column_ui, |ui| {
-                                let badge = if is_archive { "[TK]  " } else { "" };
-                                ui.label(
-                                    egui::RichText::new(format!("{}{}", badge, cd.channel.name))
-                                        .color(Color32::WHITE)
-                                        .strong(),
-                                );
-                            });
-
-                        if cd.programmes.is_empty() {
-                            let msg = if cd.loading {
-                                "loading EPG..."
-                            } else {
-                                "no EPG data"
-                            };
-                            column_ui.add_space(8.0);
-                            column_ui.label(
-                                egui::RichText::new(msg)
-                                    .color(Color32::from_white_alpha(120))
-                                    .italics(),
+                // ---------- Top bar ----------
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::symmetric(16.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("TV-gids")
+                                    .heading()
+                                    .color(Color32::WHITE),
                             );
-                            continue;
-                        }
+                            ui.add_space(20.0);
 
-                        let cursor = cd.row;
-                        let row_h = 38.0;
-                        let mut clicked_in_col: Option<usize> = None;
-                        egui::ScrollArea::vertical()
-                            .id_source(format!("guide_col_{}", vi))
-                            .auto_shrink([false, false])
-                            .show_rows(column_ui, row_h, cd.programmes.len(), |ui, range| {
-                                for i in range {
-                                    let e = &cd.programmes[i];
-                                    let status = programme_status(e, &cd.channel, now);
-                                    let local_start = e.start.with_timezone(&chrono::Local);
-                                    let time_label = local_start.format("%H:%M").to_string();
-                                    let (bg, fg, badge) = match status {
-                                        ProgrammeStatus::Live => (
-                                            Color32::from_rgb(45, 70, 35),
-                                            Color32::WHITE,
-                                            Some(("LIVE", Color32::from_rgb(120, 220, 100))),
-                                        ),
-                                        ProgrammeStatus::Catchup => (
-                                            Color32::from_rgb(28, 28, 32),
-                                            Color32::from_white_alpha(200),
-                                            Some(("Terugkijken", Color32::from_rgb(140, 180, 220))),
-                                        ),
-                                        ProgrammeStatus::Future => (
-                                            Color32::from_rgb(22, 22, 26),
-                                            Color32::WHITE,
-                                            None,
-                                        ),
-                                        ProgrammeStatus::PastUnavailable => (
-                                            Color32::from_rgb(22, 22, 26),
-                                            Color32::from_white_alpha(90),
-                                            None,
-                                        ),
-                                    };
-                                    let row_bg = if i == cursor && is_selected_col {
-                                        Color32::from_rgb(70, 100, 150)
-                                    } else {
-                                        bg
-                                    };
-                                    let frame = egui::Frame::none()
-                                        .fill(row_bg)
-                                        .rounding(3.0)
-                                        .inner_margin(egui::Margin::symmetric(6.0, 4.0))
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new(&time_label)
-                                                        .color(Color32::from_white_alpha(180))
-                                                        .monospace()
-                                                        .size(11.0),
-                                                );
-                                                ui.label(
-                                                    egui::RichText::new(&e.title)
-                                                        .color(fg)
-                                                        .size(12.0),
-                                                );
-                                                if let Some((b_txt, b_col)) = badge {
-                                                    ui.with_layout(
-                                                        egui::Layout::right_to_left(egui::Align::Center),
-                                                        |ui| {
-                                                            ui.label(
-                                                                egui::RichText::new(b_txt)
-                                                                    .color(b_col)
-                                                                    .size(10.0)
-                                                                    .strong(),
-                                                            );
-                                                        },
-                                                    );
-                                                }
-                                            });
-                                            // Live progress bar at the bottom of the row.
-                                            if matches!(status, ProgrammeStatus::Live) {
-                                                let total = (e.end - e.start).num_seconds().max(1) as f32;
-                                                let elapsed = (now - e.start).num_seconds().max(0) as f32;
-                                                let progress = (elapsed / total).clamp(0.0, 1.0);
-                                                let bar_rect = ui.available_rect_before_wrap();
-                                                let (full, _) = ui.allocate_exact_size(
-                                                    egui::vec2(bar_rect.width(), 3.0),
-                                                    egui::Sense::hover(),
-                                                );
-                                                ui.painter().rect_filled(
-                                                    full,
-                                                    1.0,
-                                                    Color32::from_white_alpha(30),
-                                                );
-                                                let mut done = full;
-                                                done.set_width(full.width() * progress);
-                                                ui.painter().rect_filled(
-                                                    done,
-                                                    1.0,
-                                                    Color32::from_rgb(120, 220, 100),
-                                                );
-                                            }
-                                        });
-                                    if frame.response.interact(egui::Sense::click()).clicked() {
-                                        clicked_in_col = Some(i);
-                                    }
-                                    if i == cursor && is_selected_col {
-                                        frame.response.scroll_to_me(Some(egui::Align::Center));
-                                    }
+                            // Time-mode pills
+                            let mode_pill = |ui: &mut egui::Ui, label: &str, active: bool, accent: Color32| {
+                                let bg = if active { accent } else { Color32::from_rgb(32, 32, 38) };
+                                let fg = if active { Color32::WHITE } else { Color32::from_white_alpha(180) };
+                                egui::Frame::none()
+                                    .fill(bg)
+                                    .rounding(14.0)
+                                    .inner_margin(egui::Margin::symmetric(12.0, 5.0))
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new(label).color(fg).size(12.0));
+                                    });
+                            };
+                            mode_pill(ui, "Nu & straks  (n)", time_mode == TimeMode::NowAndNext, Color32::from_rgb(60, 110, 170));
+                            ui.add_space(6.0);
+                            mode_pill(ui, "Primetime  (p)", time_mode == TimeMode::Primetime, Color32::from_rgb(60, 110, 170));
+
+                            ui.add_space(18.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+
+                            // Channel-mode pills
+                            mode_pill(ui, "Alle  (a)", chan_mode == ChannelMode::All, Color32::from_rgb(80, 100, 120));
+                            ui.add_space(4.0);
+                            mode_pill(ui, "Live  (l)", chan_mode == ChannelMode::Live, Color32::from_rgb(70, 130, 70));
+                            ui.add_space(4.0);
+                            mode_pill(ui, "Terugkijken  (t)", chan_mode == ChannelMode::Catchup, Color32::from_rgb(110, 140, 200));
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if n_visible > 0 {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "channels {}-{} of {}",
+                                            column_offset + 1,
+                                            (column_offset + col_data.len()).min(n_visible),
+                                            n_visible
+                                        ))
+                                        .color(Color32::from_white_alpha(150))
+                                        .size(12.0),
+                                    );
+                                }
+                                if let Some(np) = &now_playing {
+                                    ui.add_space(20.0);
+                                    ui.label(
+                                        egui::RichText::new(format!("speelt: {}", np))
+                                            .color(Color32::from_rgb(120, 220, 100))
+                                            .size(12.0)
+                                            .strong(),
+                                    );
                                 }
                             });
-                        if let Some(row) = clicked_in_col {
-                            clicked = Some((vi, row));
+                        });
+
+                        // Filter line (only when active)
+                        if !filter_visible.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format!("filter: {}_", filter_visible))
+                                    .color(Color32::from_rgb(230, 220, 110))
+                                    .monospace()
+                                    .size(13.0),
+                            );
                         }
-                    }
+                    });
+
+                // Thin separator line between top bar and grid
+                let sep_rect = ui.available_rect_before_wrap();
+                ui.painter().hline(
+                    sep_rect.x_range(),
+                    sep_rect.top(),
+                    egui::Stroke::new(1.0, Color32::from_rgb(35, 35, 42)),
+                );
+                ui.add_space(2.0);
+
+                // ---------- Empty-state ----------
+                if col_data.is_empty() {
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new(match chan_mode {
+                                ChannelMode::Catchup => "geen terugkijk-kanalen matchen filter",
+                                ChannelMode::Live => "geen live-kanalen matchen filter",
+                                ChannelMode::All => "geen kanalen matchen filter",
+                            })
+                            .color(Color32::from_white_alpha(140))
+                            .italics()
+                            .size(16.0),
+                        );
+                    });
+                    return;
+                }
+
+                // ---------- Column grid ----------
+                // Leave a bit of room at the bottom for the keybinding hint.
+                let grid_bottom_reserve = 26.0;
+                let grid_rect = ui.available_rect_before_wrap();
+                let grid_height = (grid_rect.height() - grid_bottom_reserve).max(100.0);
+                let _ = ui.allocate_ui_with_layout(
+                    egui::vec2(grid_rect.width(), grid_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.columns(col_data.len(), |cols| {
+                            for (vi, cd) in col_data.iter().enumerate() {
+                                let column_ui = &mut cols[vi];
+                                let is_selected_col = vi == selected_col;
+                                let is_archive = cd.channel.tv_archive == 1;
+                                let accent = channel_accent_color(&cd.channel.name);
+                                let badge_label = channel_badge_label(&cd.channel.name);
+
+                                // ---- Column header (colored top band + badge + name) ----
+                                // 3px coloured accent strip
+                                let strip_rect = column_ui.available_rect_before_wrap();
+                                let (strip, _) = column_ui.allocate_exact_size(
+                                    egui::vec2(strip_rect.width(), 3.0),
+                                    egui::Sense::hover(),
+                                );
+                                column_ui.painter().rect_filled(strip, 0.0, accent);
+
+                                let header_bg = if is_selected_col {
+                                    Color32::from_rgb(40, 55, 80)
+                                } else {
+                                    Color32::from_rgb(24, 24, 30)
+                                };
+                                egui::Frame::none()
+                                    .fill(header_bg)
+                                    .inner_margin(egui::Margin::symmetric(6.0, 5.0))
+                                    .show(column_ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            // Round-ish badge with channel number / initial
+                                            egui::Frame::none()
+                                                .fill(accent)
+                                                .rounding(10.0)
+                                                .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(&badge_label)
+                                                            .color(Color32::WHITE)
+                                                            .strong()
+                                                            .size(11.0),
+                                                    );
+                                                });
+                                            ui.add_space(4.0);
+                                            let suffix = if is_archive { "  TK" } else { "" };
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format!(
+                                                        "{}{}",
+                                                        cd.channel.name, suffix
+                                                    ))
+                                                    .color(Color32::WHITE)
+                                                    .strong()
+                                                    .size(12.0),
+                                                )
+                                                .truncate(true),
+                                            );
+                                        });
+                                    });
+
+                                if cd.programmes.is_empty() {
+                                    column_ui.add_space(8.0);
+                                    let msg = if cd.loading { "EPG laden..." } else { "geen EPG" };
+                                    column_ui.label(
+                                        egui::RichText::new(msg)
+                                            .color(Color32::from_white_alpha(110))
+                                            .italics()
+                                            .size(11.0),
+                                    );
+                                    continue;
+                                }
+
+                                let cursor = cd.row;
+                                let row_h = 22.0;
+                                let mut clicked_in_col: Option<usize> = None;
+                                egui::ScrollArea::vertical()
+                                    .id_source(format!("guide_col_{}_{}", vi, cd.channel.stream_id))
+                                    .auto_shrink([false, false])
+                                    .show_rows(column_ui, row_h, cd.programmes.len(), |ui, range| {
+                                        for i in range {
+                                            let e = &cd.programmes[i];
+                                            let status = programme_status(e, &cd.channel, now);
+                                            let local_start = e.start.with_timezone(&chrono::Local);
+                                            let time_label = local_start.format("%H:%M").to_string();
+
+                                            let (bg, fg, badge) = match status {
+                                                ProgrammeStatus::Live => (
+                                                    Color32::from_rgb(28, 58, 30),
+                                                    Color32::WHITE,
+                                                    Some(("LIVE", Color32::from_rgb(120, 230, 100))),
+                                                ),
+                                                ProgrammeStatus::Catchup => (
+                                                    Color32::from_rgb(18, 18, 22),
+                                                    Color32::from_white_alpha(210),
+                                                    Some(("Terugkijken", Color32::from_rgb(140, 180, 220))),
+                                                ),
+                                                ProgrammeStatus::Future => (
+                                                    Color32::from_rgb(18, 18, 22),
+                                                    Color32::WHITE,
+                                                    None,
+                                                ),
+                                                ProgrammeStatus::PastUnavailable => (
+                                                    Color32::from_rgb(18, 18, 22),
+                                                    Color32::from_white_alpha(95),
+                                                    None,
+                                                ),
+                                            };
+                                            let is_selected = i == cursor && is_selected_col;
+                                            let row_bg = if is_selected {
+                                                // Subtle highlight overlay - blend selection with status colour
+                                                match status {
+                                                    ProgrammeStatus::Live => Color32::from_rgb(36, 75, 50),
+                                                    _ => Color32::from_rgb(40, 55, 80),
+                                                }
+                                            } else {
+                                                bg
+                                            };
+                                            // Selected row gets a 2px accent-color left border drawn
+                                            // by painting a small strip BEFORE the row frame.
+                                            let frame_response = egui::Frame::none()
+                                                .fill(row_bg)
+                                                .inner_margin(egui::Margin {
+                                                    left: if is_selected { 6.0 } else { 4.0 },
+                                                    right: 4.0,
+                                                    top: 1.0,
+                                                    bottom: 1.0,
+                                                })
+                                                .show(ui, |ui| {
+                                                    let row_rect = ui.available_rect_before_wrap();
+                                                    if is_selected {
+                                                        let mut bar = row_rect;
+                                                        bar.set_left(row_rect.left() - 4.0);
+                                                        bar.set_right(row_rect.left() - 2.0);
+                                                        ui.painter().rect_filled(bar, 0.0, accent);
+                                                    }
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(&time_label)
+                                                                .color(Color32::from_white_alpha(180))
+                                                                .monospace()
+                                                                .size(10.0),
+                                                        );
+                                                        ui.add_space(4.0);
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                egui::RichText::new(&e.title)
+                                                                    .color(fg)
+                                                                    .size(11.0),
+                                                            )
+                                                            .truncate(true),
+                                                        );
+                                                        if let Some((b_txt, b_col)) = badge {
+                                                            ui.with_layout(
+                                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                                |ui| {
+                                                                    ui.label(
+                                                                        egui::RichText::new(b_txt)
+                                                                            .color(b_col)
+                                                                            .size(9.0)
+                                                                            .strong(),
+                                                                    );
+                                                                },
+                                                            );
+                                                        }
+                                                    });
+                                                    // 2px progress bar at bottom of LIVE row only.
+                                                    if matches!(status, ProgrammeStatus::Live) {
+                                                        let total = (e.end - e.start).num_seconds().max(1) as f32;
+                                                        let elapsed = (now - e.start).num_seconds().max(0) as f32;
+                                                        let progress = (elapsed / total).clamp(0.0, 1.0);
+                                                        let bar_rect = ui.available_rect_before_wrap();
+                                                        let (full, _) = ui.allocate_exact_size(
+                                                            egui::vec2(bar_rect.width(), 2.0),
+                                                            egui::Sense::hover(),
+                                                        );
+                                                        ui.painter().rect_filled(full, 1.0, Color32::from_white_alpha(35));
+                                                        let mut done = full;
+                                                        done.set_width(full.width() * progress);
+                                                        ui.painter().rect_filled(
+                                                            done,
+                                                            1.0,
+                                                            Color32::from_rgb(120, 230, 100),
+                                                        );
+                                                    }
+                                                })
+                                                .response;
+                                            if frame_response.interact(egui::Sense::click()).clicked() {
+                                                clicked_in_col = Some(i);
+                                            }
+                                            if is_selected {
+                                                frame_response.scroll_to_me(Some(egui::Align::Center));
+                                            }
+                                        }
+                                    });
+                                if let Some(row) = clicked_in_col {
+                                    clicked = Some((vi, row));
+                                }
+                            }
+                        });
+                    },
+                );
+
+                // ---------- Footer hint ----------
+                ui.add_space(4.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "type = filter   /   pijl = nav   /   PgUp/PgDn = sneller   /   Enter = afspelen   /   Esc of g = sluiten",
+                        )
+                        .color(Color32::from_white_alpha(95))
+                        .size(11.0),
+                    );
                 });
             });
 
@@ -1544,24 +1761,33 @@ impl eframe::App for TvApp {
             self.handle_keys(ctx);
         }
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(Color32::BLACK))
-            .show(ctx, |ui| {
-                if let Some(tex) = &self.video_tex {
-                    let avail = ui.available_size();
-                    ui.add(egui::Image::new(tex).fit_to_exact_size(avail));
-                } else {
-                    self.paint_empty_state(ui);
-                }
-            });
-
+        // Guide takes over the full window when open. Skipping the video
+        // texture upload in this branch removes ~5 MB of per-frame memcpy
+        // work while the user is browsing the schedule.
+        if self.guide.open {
+            self.paint_guide(ctx);
+        } else {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(Color32::BLACK))
+                .show(ctx, |ui| {
+                    if let Some(tex) = &self.video_tex {
+                        let avail = ui.available_size();
+                        ui.add(egui::Image::new(tex).fit_to_exact_size(avail));
+                    } else {
+                        self.paint_empty_state(ui);
+                    }
+                });
+            // Overlays only make sense in video mode - inside the guide they
+            // would compete visually with the schedule grid.
+            self.paint_search(ctx);
+            self.paint_favs(ctx);
+            self.paint_epg_strip(ctx);
+            self.paint_epg_grid(ctx);
+            self.paint_debug_hud(ctx);
+        }
+        // Toast remains visible above everything (covers play-action feedback
+        // when the user picks a programme from the guide).
         self.paint_toast(ctx);
-        self.paint_search(ctx);
-        self.paint_favs(ctx);
-        self.paint_epg_strip(ctx);
-        self.paint_epg_grid(ctx);
-        self.paint_debug_hud(ctx);
-        self.paint_guide(ctx);
 
         ctx.request_repaint_after(Duration::from_millis(33));
     }
