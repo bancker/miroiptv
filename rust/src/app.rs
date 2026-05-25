@@ -161,9 +161,10 @@ struct GuideState {
     visible_set_settled_snapshot: Vec<i64>,
 
     time_mode: TimeMode,
-    /// When set, force-scroll each visible column to the position that matches
-    /// `time_mode` on the next paint. Consumed by paint_guide.
-    pending_time_scroll: bool,
+    /// Channels whose vertical scroll has already been centered since the
+    /// last time-mode change / guide open. We only FORCE the scroll offset
+    /// once per centering event so the user can scroll freely afterwards.
+    centered_for: HashSet<i64>,
 
     channel_mode: ChannelMode,
 }
@@ -183,7 +184,7 @@ impl Default for GuideState {
             visible_set_settled_since: Instant::now(),
             visible_set_settled_snapshot: Vec::new(),
             time_mode: TimeMode::NowAndNext,
-            pending_time_scroll: true,
+            centered_for: HashSet::new(),
             channel_mode: ChannelMode::All,
         }
     }
@@ -980,7 +981,9 @@ impl TvApp {
             self.guide.filter.clear();
             self.guide.column_offset = 0;
             self.guide.selected_col = 0;
-            self.guide.pending_time_scroll = true;
+            // Each opened guide starts fresh: re-center every column on
+            // its current programme.
+            self.guide.centered_for.clear();
             // visible list (re)builds on next paint via refresh_visible_if_stale
         }
     }
@@ -1119,26 +1122,27 @@ impl TvApp {
         }
     }
 
-    /// Apply the time-mode scroll for every visible column whose EPG has
-    /// landed in cache. Called once when the guide opens, when the user
-    /// switches mode (n/p), and after each new EPG fetch completes.
-    fn guide_apply_time_scroll(&mut self, channels: &[LiveChannel], num_cols: usize) {
+    /// Update `row_per_channel` for every visible column whose EPG has
+    /// landed in cache, setting it to the row that matches the current
+    /// `time_mode`. This drives both the cursor position and the scroll
+    /// target (paint_guide will center on this row for not-yet-centered
+    /// channels). Re-runs every paint so channels whose EPG arrives late
+    /// still get their cursor positioned correctly.
+    fn guide_sync_target_rows(&mut self, channels: &[LiveChannel], num_cols: usize) {
         let now = chrono::Utc::now();
         let cache = self.guide.epg_cache.lock();
-        let mut any = false;
         for col in 0..num_cols {
             let Some(ch) = self.guide_visible_channel_at(col, channels) else { continue; };
+            // Only set target row if the channel hasn't been centered yet -
+            // once the user has interacted (or we centered once), respect
+            // their scroll position by not overriding the cursor either.
+            if self.guide.centered_for.contains(&ch.stream_id) {
+                continue;
+            }
             if let Some(epg) = cache.get(&ch.stream_id) {
                 let row = Self::guide_target_row(epg, self.guide.time_mode, now);
                 self.guide.row_per_channel.insert(ch.stream_id, row);
-                any = true;
             }
-        }
-        if any {
-            // Drop the request once we've applied to at least one column;
-            // remaining columns get re-applied on the next paint as their
-            // EPGs land.
-            self.guide.pending_time_scroll = false;
         }
     }
 
@@ -1269,11 +1273,12 @@ impl TvApp {
         }
         if n_key && self.guide.time_mode != TimeMode::NowAndNext {
             self.guide.time_mode = TimeMode::NowAndNext;
-            self.guide.pending_time_scroll = true;
+            // New time-mode: re-center every column on the new target.
+            self.guide.centered_for.clear();
         }
         if p_key && self.guide.time_mode != TimeMode::Primetime {
             self.guide.time_mode = TimeMode::Primetime;
-            self.guide.pending_time_scroll = true;
+            self.guide.centered_for.clear();
         }
         if a_key && self.guide.channel_mode != ChannelMode::All {
             self.guide.channel_mode = ChannelMode::All;
@@ -1348,9 +1353,9 @@ impl TvApp {
         self.refresh_visible_if_stale(&channels);
         let num_cols = self.guide_num_visible_cols(ctx);
         self.guide_kick_visible_fetches(&channels, num_cols);
-        if self.guide.pending_time_scroll {
-            self.guide_apply_time_scroll(&channels, num_cols);
-        }
+        // Park each visible column's cursor on the row that matches the
+        // current time-mode (cheap; no-op for already-centered channels).
+        self.guide_sync_target_rows(&channels, num_cols);
 
         let n_visible = self.guide.visible.len();
         let max_offset = n_visible.saturating_sub(num_cols);
@@ -1378,7 +1383,25 @@ impl TvApp {
             programmes: Vec<EpgEntry>,
             row: usize,
             loading: bool,
+            /// If set, ScrollArea is forced to this y-offset this frame so
+            /// the time-target row lands at the vertical center. Cleared
+            /// after one frame (consumer marks centered_for to suppress
+            /// re-forcing).
+            target_center: Option<f32>,
         }
+        // Approximate column viewport height. Used to compute the scroll
+        // offset that puts the target row at the column's vertical centre.
+        // The actual rendered height is slightly different but close enough
+        // for centring; the user's eye doesn't notice 20 px either way.
+        let window_h = ctx
+            .input(|i| i.viewport().inner_rect.map(|r| r.height()))
+            .unwrap_or(720.0);
+        // Top bar (~60) + filter line maybe (~22 when active) + column
+        // header (~30) + footer hint (~26) + paddings.
+        let column_viewport_h = (window_h - 145.0).max(200.0);
+        const ROW_H: f32 = 26.0;
+        let mut to_mark_centered: Vec<i64> = Vec::new();
+
         let col_data: Vec<ColData> = {
             let cache = self.guide.epg_cache.lock();
             let pending = self.guide.epg_pending.lock();
@@ -1392,10 +1415,31 @@ impl TvApp {
                         .unwrap_or_default();
                     let row = *self.guide.row_per_channel.get(&sid).unwrap_or(&0);
                     let loading = pending.contains(&sid);
-                    Some(ColData { channel: ch, programmes, row, loading })
+                    let target_center = if !programmes.is_empty()
+                        && !self.guide.centered_for.contains(&sid)
+                    {
+                        let raw = (row as f32) * ROW_H
+                            - (column_viewport_h - ROW_H) * 0.5;
+                        to_mark_centered.push(sid);
+                        Some(raw.max(0.0))
+                    } else {
+                        None
+                    };
+                    Some(ColData {
+                        channel: ch,
+                        programmes,
+                        row,
+                        loading,
+                        target_center,
+                    })
                 })
                 .collect()
         };
+        // Record that these channels are now centered so future paints
+        // don't keep forcing the scroll offset (user can scroll freely).
+        for sid in to_mark_centered {
+            self.guide.centered_for.insert(sid);
+        }
 
         // Click intents (col, row) collected during draw, applied after.
         let mut clicked: Option<(usize, usize)> = None;
@@ -1587,12 +1631,24 @@ impl TvApp {
                                 }
 
                                 let cursor = cd.row;
-                                let row_h = 22.0;
                                 let mut clicked_in_col: Option<usize> = None;
-                                egui::ScrollArea::vertical()
-                                    .id_source(format!("guide_col_{}_{}", vi, cd.channel.stream_id))
-                                    .auto_shrink([false, false])
-                                    .show_rows(column_ui, row_h, cd.programmes.len(), |ui, range| {
+
+                                // Per-column scroll target: if this channel
+                                // hasn't been centered since the last
+                                // centering event, force the scroll offset so
+                                // the cursor row sits at the vertical middle
+                                // of the column body. cd.target_center is
+                                // populated upstream when needed.
+                                let mut scroll_area = egui::ScrollArea::vertical()
+                                    .id_source(format!(
+                                        "guide_col_{}_{}",
+                                        vi, cd.channel.stream_id
+                                    ))
+                                    .auto_shrink([false, false]);
+                                if let Some(target_off) = cd.target_center {
+                                    scroll_area = scroll_area.vertical_scroll_offset(target_off);
+                                }
+                                scroll_area.show_rows(column_ui, ROW_H, cd.programmes.len(), |ui, range| {
                                         for i in range {
                                             let e = &cd.programmes[i];
                                             let status = programme_status(e, &cd.channel, now);
@@ -1650,18 +1706,33 @@ impl TvApp {
                                                         ui.painter().rect_filled(bar, 0.0, accent);
                                                     }
                                                     ui.horizontal(|ui| {
-                                                        ui.label(
-                                                            egui::RichText::new(&time_label)
-                                                                .color(Color32::from_white_alpha(180))
-                                                                .monospace()
-                                                                .size(10.0),
+                                                        // Time column - fixed
+                                                        // narrow width so titles
+                                                        // get the rest of the
+                                                        // row to themselves.
+                                                        ui.add_sized(
+                                                            egui::vec2(36.0, ROW_H - 4.0),
+                                                            egui::Label::new(
+                                                                egui::RichText::new(&time_label)
+                                                                    .color(Color32::from_white_alpha(190))
+                                                                    .monospace()
+                                                                    .size(11.0),
+                                                            ),
                                                         );
-                                                        ui.add_space(4.0);
-                                                        ui.add(
+                                                        // Reserve space for the
+                                                        // right-side badge so the
+                                                        // title truncates cleanly
+                                                        // without overrunning it.
+                                                        let badge_w = if badge.is_some() { 78.0 } else { 0.0 };
+                                                        let title_w = (ui.available_width()
+                                                            - badge_w - 4.0)
+                                                            .max(40.0);
+                                                        ui.add_sized(
+                                                            egui::vec2(title_w, ROW_H - 4.0),
                                                             egui::Label::new(
                                                                 egui::RichText::new(&e.title)
                                                                     .color(fg)
-                                                                    .size(11.0),
+                                                                    .size(12.0),
                                                             )
                                                             .truncate(true),
                                                         );
@@ -1669,12 +1740,18 @@ impl TvApp {
                                                             ui.with_layout(
                                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                                 |ui| {
-                                                                    ui.label(
-                                                                        egui::RichText::new(b_txt)
-                                                                            .color(b_col)
-                                                                            .size(9.0)
-                                                                            .strong(),
-                                                                    );
+                                                                    egui::Frame::none()
+                                                                        .fill(b_col)
+                                                                        .rounding(8.0)
+                                                                        .inner_margin(egui::Margin::symmetric(6.0, 1.5))
+                                                                        .show(ui, |ui| {
+                                                                            ui.label(
+                                                                                egui::RichText::new(b_txt)
+                                                                                    .color(Color32::from_rgb(20, 20, 20))
+                                                                                    .size(9.5)
+                                                                                    .strong(),
+                                                                            );
+                                                                        });
                                                                 },
                                                             );
                                                         }
