@@ -109,6 +109,21 @@ impl CatalogStore {
         })
     }
 
+    /// Reverse of live_id_by_name. Used by the guide / zap-toast EPG fetch
+    /// path: some Xtream portals (hnlol et al.) only populate EPG against
+    /// the tv_archive=1 stream_ids - the live variants return empty even
+    /// though they share a programme schedule with their archive twin.
+    /// Looking up the twin by exact name match lets us fetch the right
+    /// EPG and still display it under the live channel's column.
+    pub fn archive_id_by_name(&self, name: &str) -> Option<i64> {
+        self.inner.read().as_ref().and_then(|c| {
+            c.live
+                .iter()
+                .find(|x| x.tv_archive == 1 && x.name == name)
+                .map(|x| x.stream_id)
+        })
+    }
+
     pub fn search_items(&self) -> Vec<SearchItem> {
         let g = self.inner.read();
         let Some(c) = g.as_ref() else {

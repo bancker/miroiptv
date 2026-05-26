@@ -374,14 +374,40 @@ impl TvApp {
         let portal = self.catalog.portal().clone();
         let slot = self.epg_slot.clone();
         self.epg_fetch_pending_for = Some(stream_id);
-        tracing::info!("epg fetch starting for sid={}", stream_id);
+
+        // Same archive-twin trick as the guide: portals like hnlol only
+        // populate EPG against tv_archive=1 stream_ids. For zap-toast
+        // enrichment of a live channel we fetch via its archive twin if
+        // one exists, then store the result under the live sid so the
+        // toast lookup in drain_epg finds it.
+        let channels = self.catalog.live_channels();
+        let (name, is_archive) = channels
+            .iter()
+            .find(|c| c.stream_id == stream_id)
+            .map(|c| (c.name.clone(), c.tv_archive == 1))
+            .unwrap_or_else(|| (String::new(), false));
+        let fetch_sid = if !is_archive && !name.is_empty() {
+            self.catalog
+                .archive_id_by_name(&name)
+                .unwrap_or(stream_id)
+        } else {
+            stream_id
+        };
+        let via_twin = fetch_sid != stream_id;
+        tracing::info!(
+            "epg fetch starting for sid={} (fetch via {}{})",
+            stream_id,
+            fetch_sid,
+            if via_twin { " [archive twin]" } else { "" }
+        );
         tokio::spawn(async move {
-            match portal.fetch_epg(stream_id).await {
+            match portal.fetch_epg(fetch_sid).await {
                 Ok(epg) => {
                     tracing::info!(
-                        "epg fetch ok for sid={} ({} entries)",
+                        "epg fetch ok for sid={} ({} entries via {})",
                         stream_id,
-                        epg.entries().len()
+                        epg.entries().len(),
+                        fetch_sid
                     );
                     *slot.lock() = Some((stream_id, epg));
                 }
@@ -1127,18 +1153,33 @@ impl TvApp {
             let (name, is_archive) = ch_meta
                 .unwrap_or_else(|| ("?".to_owned(), false));
             self.guide.epg_pending.lock().insert(sid);
+
+            // hnlol-style portals only populate EPG against tv_archive=1
+            // stream_ids. For a live channel, try the archive twin's
+            // stream_id first; cache the result under the live sid so the
+            // UI shows it in the live column.
+            let fetch_sid = if !is_archive {
+                self.catalog
+                    .archive_id_by_name(&name)
+                    .unwrap_or(sid)
+            } else {
+                sid
+            };
+            let via_twin = fetch_sid != sid;
             tracing::info!(
-                "guide: epg fetch starting for {} (sid={}, archive={})",
+                "guide: epg fetch starting for {} (display sid={}, archive={}, fetch sid={}{})",
                 name,
                 sid,
-                is_archive
+                is_archive,
+                fetch_sid,
+                if via_twin { " [via archive twin]" } else { "" }
             );
             let cache = self.guide.epg_cache.clone();
             let pending = self.guide.epg_pending.clone();
             let failed = self.guide.epg_failed.clone();
             let portal = self.catalog.portal().clone();
             let log_name = name.clone();
-            let _ = is_archive; // kept for diagnostics in the log line above
+            let _ = is_archive; // captured by log line above
             tokio::spawn(async move {
                 // PRIMARY = fetch_day_epg (get_simple_data_table) for ALL
                 // channels. We need PAST entries above the current
@@ -1147,7 +1188,7 @@ impl TvApp {
                 // past entries (get_short_epg only returns now + future)
                 // the LIVE row clamps to the top of the viewport and the
                 // horizontal alignment across columns breaks.
-                let primary = portal.fetch_day_epg(sid).await;
+                let primary = portal.fetch_day_epg(fetch_sid).await;
                 let final_epg = match primary {
                     Ok(epg) if !epg.entries().is_empty() => {
                         let first = epg.entries().first().map(|e| {
@@ -1176,7 +1217,7 @@ impl TvApp {
                             log_name,
                             sid
                         );
-                        match portal.fetch_epg(sid).await {
+                        match portal.fetch_epg(fetch_sid).await {
                             Ok(epg) if !epg.entries().is_empty() => {
                                 tracing::info!(
                                     "guide: fallback short-EPG ok for {} (sid={}, {} entries - no past)",
@@ -1212,7 +1253,7 @@ impl TvApp {
                             sid,
                             e
                         );
-                        match portal.fetch_epg(sid).await {
+                        match portal.fetch_epg(fetch_sid).await {
                             Ok(epg) if !epg.entries().is_empty() => {
                                 tracing::info!(
                                     "guide: rescue short-EPG ok for {} (sid={}, {} entries - no past)",
