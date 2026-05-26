@@ -5,6 +5,58 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
 
+/// Canonical channel-name key for cross-variant matching. Live and
+/// archive twins of the same channel often differ in superficial
+/// formatting only: "NL | NPO 1" vs "NL | NPO1 HD". Normalizing both
+/// sides to "npo1" makes the lookup robust to those variations.
+///
+/// Rules: strip the "NL | " (or similar pipe-separated country) prefix,
+/// strip common quality suffixes (HD/UHD/4K/SD/FHD), drop all
+/// whitespace, lowercase. Returns the canonical key.
+pub fn normalize_channel_name(name: &str) -> String {
+    // Drop country prefix - splits "NL | NPO 1" / "NL|NPO1" / "BE | Een" alike.
+    let after_pipe = name.rsplit('|').next().unwrap_or(name).trim();
+    // Strip trailing quality marker.
+    let mut s = after_pipe;
+    for suffix in [" UHD", " FHD", " HD", " 4K", " SD"] {
+        s = s.trim_end_matches(suffix);
+    }
+    s.trim()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::normalize_channel_name as n;
+
+    #[test]
+    fn live_and_archive_npo_match() {
+        assert_eq!(n("NL | NPO 1"), n("NL | NPO1 HD"));
+        assert_eq!(n("NL | NPO 3"), n("NL | NPO3 HD"));
+        assert_eq!(n("NL | NPO 3"), n("NL | NPO 3 HD"));
+    }
+
+    #[test]
+    fn live_and_archive_rtl_match() {
+        assert_eq!(n("NL | RTL 4"), n("NL | RTL4 HD"));
+        assert_eq!(n("NL | RTL Z"), n("NL | RTLZ HD"));
+    }
+
+    #[test]
+    fn different_channels_dont_match() {
+        assert_ne!(n("NL | NPO 1"), n("NL | NPO 2"));
+        assert_ne!(n("NL | RTL 4"), n("NL | RTL 5"));
+    }
+
+    #[test]
+    fn no_country_prefix_works() {
+        assert_eq!(n("NPO 1"), n("NPO1 HD"));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogStatus {
     Idle,
@@ -44,13 +96,26 @@ impl CatalogStore {
             match portal.fetch_catalog().await {
                 Ok(c) => {
                     let elapsed_ms = t0.elapsed().as_millis();
+                    let archive_count = c.live.iter().filter(|x| x.tv_archive == 1).count();
                     info!(
-                        "catalog: loaded in {} ms ({} live, {} movies, {} series)",
+                        "catalog: loaded in {} ms ({} live total, {} archive, {} movies, {} series)",
                         elapsed_ms,
                         c.live.len(),
+                        archive_count,
                         c.movies.len(),
                         c.series.len()
                     );
+                    // Dump the full archive list so the user can verify
+                    // which stream_id maps to which channel name and
+                    // test EPG URLs directly.
+                    for ch in c.live.iter().filter(|x| x.tv_archive == 1) {
+                        info!(
+                            "  archive: sid={} name=\"{}\" (normalized=\"{}\")",
+                            ch.stream_id,
+                            ch.name,
+                            normalize_channel_name(&ch.name)
+                        );
+                    }
                     *inner.write() = Some(c);
                     *status.write() = CatalogStatus::Loaded;
                 }
@@ -101,10 +166,11 @@ impl CatalogStore {
     /// Used by the guide when the user picks an airing-now programme on an
     /// archive channel - we have to swap to the live id to actually play.
     pub fn live_id_by_name(&self, name: &str) -> Option<i64> {
+        let target = normalize_channel_name(name);
         self.inner.read().as_ref().and_then(|c| {
             c.live
                 .iter()
-                .find(|x| x.tv_archive != 1 && x.name == name)
+                .find(|x| x.tv_archive != 1 && normalize_channel_name(&x.name) == target)
                 .map(|x| x.stream_id)
         })
     }
@@ -113,13 +179,14 @@ impl CatalogStore {
     /// path: some Xtream portals (hnlol et al.) only populate EPG against
     /// the tv_archive=1 stream_ids - the live variants return empty even
     /// though they share a programme schedule with their archive twin.
-    /// Looking up the twin by exact name match lets us fetch the right
-    /// EPG and still display it under the live channel's column.
+    /// Matching is by normalized name so 'NL | NPO 1' (live) and
+    /// 'NL | NPO1 HD' (archive) resolve to the same canonical key.
     pub fn archive_id_by_name(&self, name: &str) -> Option<i64> {
+        let target = normalize_channel_name(name);
         self.inner.read().as_ref().and_then(|c| {
             c.live
                 .iter()
-                .find(|x| x.tv_archive == 1 && x.name == name)
+                .find(|x| x.tv_archive == 1 && normalize_channel_name(&x.name) == target)
                 .map(|x| x.stream_id)
         })
     }
@@ -161,6 +228,25 @@ impl CatalogStore {
 
     pub fn portal(&self) -> &Arc<dyn Portal> {
         &self.portal
+    }
+
+    /// After catalog loads, dump every tv_archive=1 channel with its
+    /// stream_id at INFO so the user can verify which sid maps to which
+    /// channel name and test EPG URLs directly. Cheap: runs once per
+    /// catalog load (~once per session).
+    pub fn log_archive_inventory(&self) {
+        if let Some(c) = self.inner.read().as_ref() {
+            let arch: Vec<_> = c.live.iter().filter(|x| x.tv_archive == 1).collect();
+            tracing::info!("catalog: {} archive channels total", arch.len());
+            for x in &arch {
+                tracing::info!(
+                    "  archive: sid={} name=\"{}\" (normalized=\"{}\")",
+                    x.stream_id,
+                    x.name,
+                    normalize_channel_name(&x.name)
+                );
+            }
+        }
     }
 
     /// Look up a movie's container extension by stream_id; default "mkv".
