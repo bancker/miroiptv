@@ -1138,81 +1138,100 @@ impl TvApp {
             let failed = self.guide.epg_failed.clone();
             let portal = self.catalog.portal().clone();
             let log_name = name.clone();
+            let _ = is_archive; // kept for diagnostics in the log line above
             tokio::spawn(async move {
-                // Primary endpoint: fetch_day_epg for archive, fetch_epg
-                // (get_short_epg) for live channels.
-                let primary = if is_archive {
-                    portal.fetch_day_epg(sid).await
-                } else {
-                    portal.fetch_epg(sid).await
-                };
+                // PRIMARY = fetch_day_epg (get_simple_data_table) for ALL
+                // channels. We need PAST entries above the current
+                // programme so each column can scroll the LIVE row to the
+                // same vertical middle as every other column - without
+                // past entries (get_short_epg only returns now + future)
+                // the LIVE row clamps to the top of the viewport and the
+                // horizontal alignment across columns breaks.
+                let primary = portal.fetch_day_epg(sid).await;
                 let final_epg = match primary {
                     Ok(epg) if !epg.entries().is_empty() => {
+                        let first = epg.entries().first().map(|e| {
+                            e.start.with_timezone(&chrono::Local).format("%H:%M").to_string()
+                        });
+                        let last = epg.entries().last().map(|e| {
+                            e.end.with_timezone(&chrono::Local).format("%H:%M").to_string()
+                        });
                         tracing::info!(
-                            "guide: epg ok for {} (sid={}, {} entries via primary)",
+                            "guide: epg ok for {} (sid={}, {} entries, {}..{})",
                             log_name,
                             sid,
-                            epg.entries().len()
+                            epg.entries().len(),
+                            first.as_deref().unwrap_or("?"),
+                            last.as_deref().unwrap_or("?")
                         );
                         Some(epg)
                     }
                     Ok(empty_epg) => {
-                        // Primary returned 0 entries. Some Xtream portals
-                        // only expose EPG via get_simple_data_table even
-                        // for live channels - retry with that endpoint
-                        // before giving up.
-                        if !is_archive {
-                            tracing::info!(
-                                "guide: primary epg empty for {} (sid={}); retrying via fetch_day_epg",
-                                log_name,
-                                sid
-                            );
-                            match portal.fetch_day_epg(sid).await {
-                                Ok(epg) if !epg.entries().is_empty() => {
-                                    tracing::info!(
-                                        "guide: fallback ok for {} (sid={}, {} entries)",
-                                        log_name,
-                                        sid,
-                                        epg.entries().len()
-                                    );
-                                    Some(epg)
-                                }
-                                Ok(_) => {
-                                    tracing::info!(
-                                        "guide: portal has no EPG for {} (sid={}) - empty on both endpoints",
-                                        log_name,
-                                        sid
-                                    );
-                                    Some(empty_epg)
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "guide: fallback fetch_day_epg failed for {} (sid={}): {}",
-                                        log_name,
-                                        sid,
-                                        e
-                                    );
-                                    Some(empty_epg)
-                                }
+                        // Day endpoint returned empty. Fall back to the
+                        // short endpoint - some portals only expose data
+                        // there. Result has no past entries so the LIVE
+                        // row won't centre, but it's better than nothing.
+                        tracing::info!(
+                            "guide: day-EPG empty for {} (sid={}); retrying via fetch_epg",
+                            log_name,
+                            sid
+                        );
+                        match portal.fetch_epg(sid).await {
+                            Ok(epg) if !epg.entries().is_empty() => {
+                                tracing::info!(
+                                    "guide: fallback short-EPG ok for {} (sid={}, {} entries - no past)",
+                                    log_name,
+                                    sid,
+                                    epg.entries().len()
+                                );
+                                Some(epg)
                             }
-                        } else {
-                            tracing::info!(
-                                "guide: archive endpoint returned 0 entries for {} (sid={})",
-                                log_name,
-                                sid
-                            );
-                            Some(empty_epg)
+                            Ok(_) => {
+                                tracing::info!(
+                                    "guide: portal has no EPG for {} (sid={}) - empty on both endpoints",
+                                    log_name,
+                                    sid
+                                );
+                                Some(empty_epg)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "guide: fallback fetch_epg failed for {} (sid={}): {}",
+                                    log_name,
+                                    sid,
+                                    e
+                                );
+                                Some(empty_epg)
+                            }
                         }
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "guide: epg fetch failed for {} (sid={}): {}",
+                            "guide: day-EPG failed for {} (sid={}): {} - trying short endpoint",
                             log_name,
                             sid,
                             e
                         );
-                        failed.lock().insert(sid);
-                        None
+                        match portal.fetch_epg(sid).await {
+                            Ok(epg) if !epg.entries().is_empty() => {
+                                tracing::info!(
+                                    "guide: rescue short-EPG ok for {} (sid={}, {} entries - no past)",
+                                    log_name,
+                                    sid,
+                                    epg.entries().len()
+                                );
+                                Some(epg)
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    "guide: both endpoints failed for {} (sid={})",
+                                    log_name,
+                                    sid
+                                );
+                                failed.lock().insert(sid);
+                                None
+                            }
+                        }
                     }
                 };
                 if let Some(epg) = final_epg {
