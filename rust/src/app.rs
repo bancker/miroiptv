@@ -165,6 +165,11 @@ struct GuideState {
     /// last time-mode change / guide open. We only FORCE the scroll offset
     /// once per centering event so the user can scroll freely afterwards.
     centered_for: HashSet<i64>,
+    /// Stream IDs whose last EPG fetch returned an error or returned with
+    /// zero entries after our fallback attempt. UI shows a distinct
+    /// 'EPG mislukt' message instead of the ambiguous 'geen EPG' that
+    /// could mean either failure or successful-but-empty.
+    epg_failed: Arc<Mutex<HashSet<i64>>>,
 
     channel_mode: ChannelMode,
 }
@@ -185,6 +190,7 @@ impl Default for GuideState {
             visible_set_settled_snapshot: Vec::new(),
             time_mode: TimeMode::NowAndNext,
             centered_for: HashSet::new(),
+            epg_failed: Arc::new(Mutex::new(HashSet::new())),
             channel_mode: ChannelMode::All,
         }
     }
@@ -1095,32 +1101,122 @@ impl TvApp {
         }
         let cache_g = self.guide.epg_cache.lock();
         let pend_g = self.guide.epg_pending.lock();
+        let failed_g = self.guide.epg_failed.lock();
+        // Skip channels that are cached, pending, OR have already failed -
+        // no point hammering the portal with a request that just errored.
         let to_fetch: Vec<i64> = self
             .guide
             .visible_set_settled_snapshot
             .iter()
             .copied()
-            .filter(|sid| !cache_g.contains_key(sid) && !pend_g.contains(sid))
+            .filter(|sid| {
+                !cache_g.contains_key(sid)
+                    && !pend_g.contains(sid)
+                    && !failed_g.contains(sid)
+            })
             .collect();
+        drop(failed_g);
         drop(pend_g);
         drop(cache_g);
         for sid in to_fetch {
-            let is_archive = channels
+            // Resolve channel name for clearer logs.
+            let ch_meta = channels
                 .iter()
-                .any(|c| c.stream_id == sid && c.tv_archive == 1);
+                .find(|c| c.stream_id == sid)
+                .map(|c| (c.name.clone(), c.tv_archive == 1));
+            let (name, is_archive) = ch_meta
+                .unwrap_or_else(|| ("?".to_owned(), false));
             self.guide.epg_pending.lock().insert(sid);
+            tracing::info!(
+                "guide: epg fetch starting for {} (sid={}, archive={})",
+                name,
+                sid,
+                is_archive
+            );
             let cache = self.guide.epg_cache.clone();
             let pending = self.guide.epg_pending.clone();
+            let failed = self.guide.epg_failed.clone();
             let portal = self.catalog.portal().clone();
+            let log_name = name.clone();
             tokio::spawn(async move {
-                let r = if is_archive {
+                // Primary endpoint: fetch_day_epg for archive, fetch_epg
+                // (get_short_epg) for live channels.
+                let primary = if is_archive {
                     portal.fetch_day_epg(sid).await
                 } else {
                     portal.fetch_epg(sid).await
                 };
-                match r {
-                    Ok(epg) => { cache.lock().insert(sid, epg); }
-                    Err(e) => tracing::warn!("guide: EPG fetch failed for {}: {}", sid, e),
+                let final_epg = match primary {
+                    Ok(epg) if !epg.entries().is_empty() => {
+                        tracing::info!(
+                            "guide: epg ok for {} (sid={}, {} entries via primary)",
+                            log_name,
+                            sid,
+                            epg.entries().len()
+                        );
+                        Some(epg)
+                    }
+                    Ok(empty_epg) => {
+                        // Primary returned 0 entries. Some Xtream portals
+                        // only expose EPG via get_simple_data_table even
+                        // for live channels - retry with that endpoint
+                        // before giving up.
+                        if !is_archive {
+                            tracing::info!(
+                                "guide: primary epg empty for {} (sid={}); retrying via fetch_day_epg",
+                                log_name,
+                                sid
+                            );
+                            match portal.fetch_day_epg(sid).await {
+                                Ok(epg) if !epg.entries().is_empty() => {
+                                    tracing::info!(
+                                        "guide: fallback ok for {} (sid={}, {} entries)",
+                                        log_name,
+                                        sid,
+                                        epg.entries().len()
+                                    );
+                                    Some(epg)
+                                }
+                                Ok(_) => {
+                                    tracing::info!(
+                                        "guide: portal has no EPG for {} (sid={}) - empty on both endpoints",
+                                        log_name,
+                                        sid
+                                    );
+                                    Some(empty_epg)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "guide: fallback fetch_day_epg failed for {} (sid={}): {}",
+                                        log_name,
+                                        sid,
+                                        e
+                                    );
+                                    Some(empty_epg)
+                                }
+                            }
+                        } else {
+                            tracing::info!(
+                                "guide: archive endpoint returned 0 entries for {} (sid={})",
+                                log_name,
+                                sid
+                            );
+                            Some(empty_epg)
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "guide: epg fetch failed for {} (sid={}): {}",
+                            log_name,
+                            sid,
+                            e
+                        );
+                        failed.lock().insert(sid);
+                        None
+                    }
+                };
+                if let Some(epg) = final_epg {
+                    cache.lock().insert(sid, epg);
                 }
                 pending.lock().remove(&sid);
             });
@@ -1415,6 +1511,10 @@ impl TvApp {
             programmes: Vec<EpgEntry>,
             row: usize,
             loading: bool,
+            /// True when the last fetch attempt errored (HTTP / parse).
+            /// Distinct from `loading=false && programmes empty` which
+            /// means the portal genuinely returned no EPG data.
+            failed: bool,
             /// If set, ScrollArea is forced to this y-offset this frame so
             /// the time-target row lands at the vertical center. Cleared
             /// after one frame (consumer marks centered_for to suppress
@@ -1437,6 +1537,7 @@ impl TvApp {
         let col_data: Vec<ColData> = {
             let cache = self.guide.epg_cache.lock();
             let pending = self.guide.epg_pending.lock();
+            let failed = self.guide.epg_failed.lock();
             (0..num_cols)
                 .filter_map(|col| {
                     let ch = self.guide_visible_channel_at(col, &channels)?.clone();
@@ -1447,6 +1548,7 @@ impl TvApp {
                         .unwrap_or_default();
                     let row = *self.guide.row_per_channel.get(&sid).unwrap_or(&0);
                     let loading = pending.contains(&sid);
+                    let did_fail = failed.contains(&sid);
                     let target_center = if !programmes.is_empty()
                         && !self.guide.centered_for.contains(&sid)
                     {
@@ -1462,6 +1564,7 @@ impl TvApp {
                         programmes,
                         row,
                         loading,
+                        failed: did_fail,
                         target_center,
                     })
                 })
@@ -1652,10 +1755,22 @@ impl TvApp {
 
                                 if cd.programmes.is_empty() {
                                     column_ui.add_space(8.0);
-                                    let msg = if cd.loading { "EPG laden..." } else { "geen EPG" };
+                                    let (msg, col_) = if cd.loading {
+                                        ("EPG laden...", Color32::from_white_alpha(120))
+                                    } else if cd.failed {
+                                        (
+                                            "EPG ophalen mislukt",
+                                            Color32::from_rgb(220, 130, 110),
+                                        )
+                                    } else {
+                                        (
+                                            "portal heeft geen EPG voor dit kanaal",
+                                            Color32::from_white_alpha(95),
+                                        )
+                                    };
                                     column_ui.label(
                                         egui::RichText::new(msg)
-                                            .color(Color32::from_white_alpha(110))
+                                            .color(col_)
                                             .italics()
                                             .size(11.0),
                                     );
