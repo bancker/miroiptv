@@ -43,10 +43,43 @@ impl XtreamPortal {
 
     async fn parse_epg(&self, url: &str) -> Result<Epg, PortalError> {
         let txt = self.client.get(url).send().await?.text().await?;
-        let wrap: EpgWrapper =
-            serde_json::from_str(&txt).map_err(|e| PortalError::Shape(e.to_string()))?;
-        let entries: Vec<EpgEntry> = wrap
-            .epg_listings
+        let bytes = txt.len();
+
+        // Portals are inconsistent. We try the four shapes we've seen in
+        // the wild before giving up - silently mapping an unknown shape to
+        // "0 entries" is what made every channel show 'no EPG' in
+        // guide-leeg.jpg / nok.jpg. Each attempt is fail-fast (serde
+        // shape mismatch returns Err on the first wrong key).
+        let listings: Vec<EpgRaw> = if let Ok(w) =
+            serde_json::from_str::<EpgWrapper>(&txt)
+        {
+            w.epg_listings
+        } else if let Ok(arr) = serde_json::from_str::<Vec<EpgRaw>>(&txt) {
+            arr
+        } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+            // Last-resort: pluck any array we recognise from a top-level
+            // object under one of the keys portals use.
+            v.as_object()
+                .and_then(|o| {
+                    ["epg_listings", "epg", "data", "listings", "items"]
+                        .iter()
+                        .find_map(|k| o.get(*k))
+                })
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|x| serde_json::from_value::<EpgRaw>(x).ok())
+                .collect()
+        } else {
+            return Err(PortalError::Shape(format!(
+                "EPG body not parseable as JSON ({} bytes)",
+                bytes
+            )));
+        };
+
+        let raw_count = listings.len();
+        let entries: Vec<EpgEntry> = listings
             .into_iter()
             .filter_map(|r| {
                 let start = as_i64(&r.start_timestamp)?;
@@ -58,6 +91,19 @@ impl XtreamPortal {
                 })
             })
             .collect();
+
+        // Empty result is the diagnostic-worthy state. Log a 300-char
+        // sample of what the portal actually returned so we can adapt
+        // the parser if the shape is new.
+        if entries.is_empty() {
+            let sample: String = txt.chars().take(300).collect();
+            tracing::info!(
+                "EPG empty after parse: {} bytes, {} raw listings, sample: {:?}",
+                bytes,
+                raw_count,
+                sample
+            );
+        }
         Ok(Epg::new(entries))
     }
 }
@@ -70,11 +116,23 @@ struct EpgWrapper {
 
 #[derive(Deserialize)]
 struct EpgRaw {
-    #[serde(default)]
+    // Programme name. Most portals use "title"; some use "name" or
+    // "programme" (XMLTV-style). Accept all.
+    #[serde(default, alias = "name", alias = "programme")]
     title: String,
-    #[serde(default)]
+    // Start time as Unix epoch seconds (number or numeric string).
+    // Field name varies: start_timestamp (standard) / start / start_time.
+    #[serde(default, alias = "start", alias = "start_time")]
     start_timestamp: serde_json::Value,
-    #[serde(default)]
+    // End time. Field name varies: stop_timestamp (standard) / end /
+    // stop / end_time / end_timestamp.
+    #[serde(
+        default,
+        alias = "end",
+        alias = "stop",
+        alias = "end_time",
+        alias = "end_timestamp"
+    )]
     stop_timestamp: serde_json::Value,
 }
 
