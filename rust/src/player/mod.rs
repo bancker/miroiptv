@@ -180,16 +180,37 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
 }
 
 /// Downgrade the effective log level for known-benign mpv messages so the
-/// ERROR view stays signal-only. Today's only entry: Xtream-style IPTV
-/// portals close HLS manifest HTTP responses without `Content-Length` or
-/// chunked encoding; ffmpeg flags this as
-/// `http: Error reading HTTP response: End of file`, but mpv's HLS layer
-/// reads the manifest fine and continues playback. Downgrade these to
-/// `debug` (silent unless `RUST_LOG=tvplayer=debug`).
+/// ERROR view stays signal-only.
+///
+/// Entries today (all share the pattern "ffmpeg emits scary text but mpv's
+/// upper layer handles it without disruption"):
+///
+/// 1. HLS manifest HTTP-EOF: Xtream-style portals close the HLS playlist
+///    response without `Content-Length` / chunked encoding -> ffmpeg flags
+///    "Error reading HTTP response: End of file" but mpv reads the bytes
+///    fine and continues playback.
+///
+/// 2. H.264 startup PPS/SPS misses: when joining a live HLS stream
+///    mid-segment the demuxer sees B/P frames that reference
+///    Picture/Sequence Parameter Sets it hasn't seen yet (those are
+///    codec config blobs that only appear at I-frames). Until the first
+///    keyframe arrives (~0.5s after zap) we get a flood of
+///    "non-existing PPS 0", "non-existing SPS 0", "no frame!". Decoding
+///    then starts cleanly. The flood was making the log unreadable on
+///    every channel switch.
 fn effective_log_level<'a>(prefix: &str, level: &'a str, text: &str) -> &'a str {
-    if level == "error"
-        && prefix == "ffmpeg"
-        && text.contains("Error reading HTTP response: End of file")
+    if level != "error" {
+        return level;
+    }
+    if prefix == "ffmpeg" && text.contains("Error reading HTTP response: End of file") {
+        return "debug";
+    }
+    let from_ffmpeg = prefix == "ffmpeg" || prefix.starts_with("ffmpeg/");
+    if from_ffmpeg
+        && (text.contains("non-existing PPS")
+            || text.contains("non-existing SPS")
+            || text == "h264: no frame!"
+            || text.ends_with(" no frame!"))
     {
         return "debug";
     }
@@ -245,6 +266,39 @@ mod tests {
                 "http: Error reading HTTP response: End of file"
             ),
             "info"
+        );
+    }
+
+    #[test]
+    fn downgrades_h264_startup_pps_sps_noise() {
+        assert_eq!(
+            effective_log_level("ffmpeg", "error", "NULL: non-existing PPS 0 referenced"),
+            "debug"
+        );
+        assert_eq!(
+            effective_log_level(
+                "ffmpeg/video",
+                "error",
+                "h264: non-existing SPS 0 referenced in buffering period"
+            ),
+            "debug"
+        );
+        assert_eq!(
+            effective_log_level("ffmpeg/video", "error", "h264: no frame!"),
+            "debug"
+        );
+    }
+
+    #[test]
+    fn leaves_real_h264_errors_alone() {
+        // Different text about h264 - keep as error.
+        assert_eq!(
+            effective_log_level("ffmpeg/video", "error", "h264: decode_slice_header error"),
+            "error"
+        );
+        assert_eq!(
+            effective_log_level("ffmpeg", "error", "Invalid data found when processing input"),
+            "error"
         );
     }
 }

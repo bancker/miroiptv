@@ -310,30 +310,56 @@ impl TvApp {
     fn drain_epg(&mut self) {
         let arrived = self.epg_slot.lock().take();
         if let Some((sid, epg)) = arrived {
-            if Some(sid) == self.epg_fetch_pending_for {
+            // Gate on current_stream_id (single source of truth) instead of
+            // the racy epg_fetch_pending_for. After rapid A->B->C zaps the
+            // earlier fetches still arrive; if they don't match the channel
+            // we're now watching, discard. If C's fetch is still in flight
+            // by the time A's lands, A is correctly dropped.
+            if Some(sid) == self.current_stream_id {
                 self.epg_fetch_pending_for = None;
-                // Enrich the zap toast with current programme if this EPG
-                // is for the channel we're now playing. We still call
-                // set_toast (4s lifetime) so the user sees the title pop
-                // in shortly after the channel name.
-                if Some(sid) == self.current_stream_id {
-                    if let Some(now_prog) = epg.current_at(chrono::Utc::now()) {
-                        let name = self
-                            .current_name
-                            .clone()
-                            .unwrap_or_else(|| "?".into());
-                        let start = now_prog.start.with_timezone(&chrono::Local);
-                        let end = now_prog.end.with_timezone(&chrono::Local);
-                        self.set_toast(format!(
-                            "[TV] {}  |  {}  ({}-{})",
-                            name,
-                            now_prog.title,
-                            start.format("%H:%M"),
-                            end.format("%H:%M")
-                        ));
-                    }
+                let now = chrono::Utc::now();
+                let entries = epg.entries().len();
+                if let Some(now_prog) = epg.current_at(now) {
+                    let name = self
+                        .current_name
+                        .clone()
+                        .unwrap_or_else(|| "?".into());
+                    let start = now_prog.start.with_timezone(&chrono::Local);
+                    let end = now_prog.end.with_timezone(&chrono::Local);
+                    tracing::info!(
+                        "epg landed for sid={} ({} entries) -> enrich toast: {} | {} ({}-{})",
+                        sid,
+                        entries,
+                        name,
+                        now_prog.title,
+                        start.format("%H:%M"),
+                        end.format("%H:%M")
+                    );
+                    // Reset the 4s toast timer so user sees the enriched
+                    // title even if the bare-channel toast had already
+                    // ticked away.
+                    self.set_toast(format!(
+                        "[TV] {}  |  {}  ({}-{})",
+                        name,
+                        now_prog.title,
+                        start.format("%H:%M"),
+                        end.format("%H:%M")
+                    ));
+                } else {
+                    tracing::info!(
+                        "epg landed for sid={} ({} entries) - no current programme at {}",
+                        sid,
+                        entries,
+                        now.with_timezone(&chrono::Local).format("%H:%M:%S")
+                    );
                 }
                 self.current_epg = Some(epg);
+            } else {
+                tracing::debug!(
+                    "epg arrived for sid={} (now on {:?}) - discarded",
+                    sid,
+                    self.current_stream_id
+                );
             }
         }
     }
@@ -342,12 +368,18 @@ impl TvApp {
         let portal = self.catalog.portal().clone();
         let slot = self.epg_slot.clone();
         self.epg_fetch_pending_for = Some(stream_id);
+        tracing::info!("epg fetch starting for sid={}", stream_id);
         tokio::spawn(async move {
             match portal.fetch_epg(stream_id).await {
                 Ok(epg) => {
+                    tracing::info!(
+                        "epg fetch ok for sid={} ({} entries)",
+                        stream_id,
+                        epg.entries().len()
+                    );
                     *slot.lock() = Some((stream_id, epg));
                 }
-                Err(e) => tracing::warn!("epg fetch failed for {}: {}", stream_id, e),
+                Err(e) => tracing::warn!("epg fetch failed for sid={}: {}", stream_id, e),
             }
         });
     }
