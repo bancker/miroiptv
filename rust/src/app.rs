@@ -235,8 +235,10 @@ pub struct TvApp {
     search_query: String,
 
     guide: GuideState,
-    /// Tracks borderless+always-on-top toggle (`b` key).
+    /// Tracks borderless+always-on-top toggle (`t` key).
     borderless: bool,
+    /// `?` toggles a centered help overlay listing every hotkey.
+    show_help: bool,
 }
 
 impl TvApp {
@@ -284,6 +286,7 @@ impl TvApp {
             search_query: String::new(),
             guide: GuideState::default(),
             borderless: false,
+            show_help: false,
         }
     }
 
@@ -527,7 +530,8 @@ impl TvApp {
             star,
             f5,
             g_key,
-            b_key,
+            t_key,
+            qmark,
         ) = ctx.input(|i| {
             (
                 i.key_pressed(Key::ArrowDown),
@@ -553,9 +557,25 @@ impl TvApp {
                     .any(|e| matches!(e, egui::Event::Text(t) if t == "*")),
                 i.key_pressed(Key::F5),
                 i.key_pressed(Key::G),
-                i.key_pressed(Key::B),
+                i.key_pressed(Key::T),
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Text(t) if t == "?")),
             )
         });
+
+        // Help overlay swallows other input - the user is reading the
+        // keymap, not zapping. Only `?` and Esc should be live.
+        if self.show_help {
+            if qmark || esc {
+                self.show_help = false;
+            }
+            return;
+        }
+        if qmark {
+            self.show_help = true;
+            return;
+        }
 
         if down {
             self.zap_delta(1);
@@ -668,7 +688,7 @@ impl TvApp {
             self.toggle_guide();
         }
 
-        if b_key {
+        if t_key {
             self.toggle_borderless(ctx);
         }
     }
@@ -680,7 +700,7 @@ impl TvApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                 egui::WindowLevel::AlwaysOnTop,
             ));
-            self.set_toast("borderless + always-on-top  (press b again to restore)");
+            self.set_toast("borderless + always-on-top  (press t again to restore)");
         } else {
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
@@ -913,6 +933,106 @@ impl TvApp {
                                     ));
                                 }
                             });
+                    });
+            });
+    }
+
+    fn paint_help(&self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+        // ROWS: (key, action). Categorised via leading-space prefix on
+        // section headers so the layout stays compact and one column.
+        const SECTIONS: &[(&str, &[(&str, &str)])] = &[
+            (
+                "Viewer (when guide is closed)",
+                &[
+                    ("Up / Down  -  Mouse wheel", "previous / next channel"),
+                    ("1 / 2 / 3", "NPO 1 / 2 / 3"),
+                    ("n", "news shortcut (NPO)"),
+                    ("r", "news shortcut (RTL)"),
+                    ("f", "cross-catalog search (live + films + series)"),
+                    ("Shift+F", "favorites panel"),
+                    ("*", "toggle current channel as favorite"),
+                    ("e", "EPG strip overlay (now + next)"),
+                    ("Shift+E", "EPG grid"),
+                    ("a / s", "cycle audio / subtitle track"),
+                    ("Left / Right", "VOD seek -30s / +30s"),
+                    ("F11", "fullscreen"),
+                    ("F5", "retry portal fetch"),
+                    ("d", "debug HUD"),
+                    ("g", "open guide"),
+                    ("t", "borderless + always-on-top  (toggle)"),
+                    ("?", "this help"),
+                    ("Esc", "close overlays"),
+                ],
+            ),
+            (
+                "Guide (when guide is open)",
+                &[
+                    ("type letters", "filter channels"),
+                    ("Backspace", "remove from filter"),
+                    ("Up / Down", "programme cursor in selected column"),
+                    ("Left / Right", "switch column"),
+                    ("PgUp / PgDn", "10 rows jump"),
+                    ("Home / End", "first / last programme"),
+                    ("n / p", "Nu & straks  /  Primetime time-mode"),
+                    ("a / l / t", "Alle  /  Live  /  Terugkijken channel-mode"),
+                    ("Enter", "play selected programme (live / catch-up)"),
+                    ("Esc or g", "close guide"),
+                ],
+            ),
+        ];
+        egui::Area::new(egui::Id::new("__help__"))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Frame::popup(&ctx.style())
+                    .fill(Color32::from_rgb(20, 20, 26))
+                    .inner_margin(egui::Margin::symmetric(16.0, 14.0))
+                    .show(ui, |ui| {
+                        ui.set_max_width(720.0);
+                        ui.label(
+                            egui::RichText::new("tvplayer  -  hotkeys")
+                                .color(Color32::WHITE)
+                                .heading(),
+                        );
+                        ui.add_space(8.0);
+                        for (section, rows) in SECTIONS {
+                            ui.label(
+                                egui::RichText::new(*section)
+                                    .color(Color32::from_rgb(120, 180, 240))
+                                    .strong()
+                                    .size(13.0),
+                            );
+                            ui.add_space(4.0);
+                            egui::Grid::new(format!("__help_grid_{}", section))
+                                .num_columns(2)
+                                .spacing([24.0, 4.0])
+                                .show(ui, |ui| {
+                                    for (key, action) in *rows {
+                                        ui.label(
+                                            egui::RichText::new(*key)
+                                                .monospace()
+                                                .color(Color32::from_rgb(230, 220, 110))
+                                                .size(12.0),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(*action)
+                                                .color(Color32::from_white_alpha(220))
+                                                .size(12.0),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                            ui.add_space(10.0);
+                        }
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("press ? or Esc to close")
+                                .italics()
+                                .color(Color32::from_white_alpha(140))
+                                .size(11.0),
+                        );
                     });
             });
     }
@@ -1409,7 +1529,7 @@ impl TvApp {
     fn handle_guide_keys(&mut self, ctx: &egui::Context) {
         let (
             esc, g_key, up, down, left, right, pgup, pgdn, home, end, enter, backspace,
-            n_key, p_key, a_key, t_key, l_key,
+            n_key, p_key, a_key, t_key, l_key, qmark,
         ) = ctx.input(|i| (
             i.key_pressed(Key::Escape),
             i.key_pressed(Key::G),
@@ -1428,7 +1548,21 @@ impl TvApp {
             i.key_pressed(Key::A),
             i.key_pressed(Key::T),
             i.key_pressed(Key::L),
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Text(t) if t == "?")),
         ));
+        // Help overlay takes priority over guide input.
+        if self.show_help {
+            if qmark || esc {
+                self.show_help = false;
+            }
+            return;
+        }
+        if qmark {
+            self.show_help = true;
+            return;
+        }
         if esc || g_key {
             self.guide.open = false;
             return;
@@ -1441,7 +1575,12 @@ impl TvApp {
                 .iter()
                 .filter_map(|e| match e {
                     egui::Event::Text(t)
-                        if t != "n" && t != "p" && t != "a" && t != "l" && t != "t" =>
+                        if t != "n"
+                            && t != "p"
+                            && t != "a"
+                            && t != "l"
+                            && t != "t"
+                            && t != "?" =>
                     {
                         Some(t.clone())
                     }
@@ -2072,6 +2211,10 @@ impl eframe::App for TvApp {
         // Toast remains visible above everything (covers play-action feedback
         // when the user picks a programme from the guide).
         self.paint_toast(ctx);
+        // Help overlay paints last so it sits on top of everything,
+        // including the guide. Whether the guide is open is irrelevant
+        // for `?` - the help is a global overlay.
+        self.paint_help(ctx);
 
         ctx.request_repaint_after(Duration::from_millis(33));
     }
