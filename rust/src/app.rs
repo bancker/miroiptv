@@ -1,8 +1,10 @@
+use crate::args::parse_xtream_creds;
 use crate::catalog::{CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::Favorites;
 use crate::player::{Cmd, Event, PlayerHandle, RgbaFrame};
-use crate::portal::LiveChannel;
+use crate::presets::Presets;
+use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};
 use crate::search::ItemKind;
 use crate::shortcuts;
 use crate::storage::Storage;
@@ -12,6 +14,25 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
+
+/// Persisted "what was playing" so startup can resume it. `live` flags whether
+/// the stall watchdog should arm on resume (live channels yes, VOD/catch-up no).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct LastWatched {
+    url: String,
+    live: bool,
+}
+
+impl LastWatched {
+    fn load(path: &std::path::Path) -> Option<Self> {
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    }
+    fn save(&self, path: &std::path::Path) {
+        if let Ok(s) = serde_json::to_string(self) {
+            let _ = std::fs::write(path, s);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProgrammeStatus {
@@ -239,6 +260,31 @@ pub struct TvApp {
     borderless: bool,
     /// `?` toggles a centered help overlay listing every hotkey.
     show_help: bool,
+
+    // ---- silent-stall watchdog: recover frozen streams by reloading ----
+    /// URL of the stream currently loaded, so the watchdog can reload it.
+    current_url: Option<String>,
+    /// Last FrameBus.version we observed, and when it last advanced.
+    last_progress_version: u64,
+    last_progress_at: Instant,
+    /// When we last auto-reloaded, to rate-limit recovery attempts.
+    last_recovery_at: Option<Instant>,
+    /// Armed only for live channels (VOD/catch-up can legitimately end).
+    stall_watchdog_armed: bool,
+
+    // ---- car-radio number presets on digit keys 0-9 ----
+    presets: Presets,
+    /// Per-digit press-start time, for long-press(save) vs tap(recall).
+    /// None = key currently up.
+    digit_down_since: [Option<Instant>; 10],
+    /// True once a held digit fired its save, so its release won't also recall.
+    digit_long_fired: [bool; 10],
+
+    // ---- first-run portal setup prompt (writes tvplayer.ini) ----
+    cfg_host: String,
+    cfg_user: String,
+    cfg_pass: String,
+    cfg_error: Option<String>,
 }
 
 impl TvApp {
@@ -248,6 +294,7 @@ impl TvApp {
         catalog: Arc<CatalogStore>,
         storage: Storage,
         portal_state: PortalState,
+        initial_url: Option<String>,
     ) -> Self {
         // Whenever a new mpv frame is ready, ask egui to redraw.
         let ctx = cc.egui_ctx.clone();
@@ -256,6 +303,7 @@ impl TvApp {
             .set_new_frame_callback(move || ctx.request_repaint());
 
         let favorites = Favorites::load(&storage.favorites_path()).unwrap_or_default();
+        let presets = Presets::load(&storage.presets_path()).unwrap_or_default();
         // Only kick off a fetch if we actually have a real portal — otherwise the
         // request would hang on a placeholder/missing host until the network timeout
         // and the user would see "loading..." for ~45s before any error appears.
@@ -263,7 +311,7 @@ impl TvApp {
             catalog.spawn_fetch();
         }
 
-        Self {
+        let mut app = Self {
             player,
             catalog,
             favorites,
@@ -287,11 +335,89 @@ impl TvApp {
             guide: GuideState::default(),
             borderless: false,
             show_help: false,
+            current_url: None,
+            last_progress_version: 0,
+            last_progress_at: Instant::now(),
+            last_recovery_at: None,
+            stall_watchdog_armed: false,
+            presets,
+            digit_down_since: [None; 10],
+            digit_long_fired: [false; 10],
+            cfg_host: String::new(),
+            cfg_user: String::new(),
+            cfg_pass: String::new(),
+            cfg_error: None,
+        };
+        // Initial stream: an explicit --url / bare URL wins; otherwise resume
+        // whatever we were watching last session (persisted by load_url).
+        if let Some(url) = initial_url {
+            app.load_url(url, false);
+        } else if let Some(lw) = LastWatched::load(&app.storage.last_watched_path()) {
+            tracing::info!("resuming last watched ({})", lw.url);
+            app.set_toast("laatste zender hervatten...");
+            app.load_url(lw.url, lw.live);
         }
+        app
     }
 
     fn set_toast(&mut self, s: impl Into<String>) {
         self.toast = Some((s.into(), Instant::now()));
+    }
+
+    /// Send a stream to the player and remember it as `current_url`. `watchdog`
+    /// arms the silent-stall auto-reload (live channels only; VOD/catch-up pass
+    /// false so a finished file isn't reloaded on a loop). Centralises the
+    /// LoadUrl send so current_url and the watchdog timer stay consistent.
+    fn load_url(&mut self, url: String, watchdog: bool) {
+        let _ = self.player.cmd_tx.send(Cmd::LoadUrl(url.clone()));
+        // Remember as last-watched so the next launch resumes it.
+        LastWatched {
+            url: url.clone(),
+            live: watchdog,
+        }
+        .save(&self.storage.last_watched_path());
+        self.current_url = Some(url);
+        self.stall_watchdog_armed = watchdog;
+        // Fresh stream: give it a full window to start before judging it stalled.
+        self.last_progress_at = Instant::now();
+    }
+
+    /// Recover a SILENT video stall: frames stop advancing while a live stream
+    /// should be playing and mpv emitted no end-file/error. We reload the
+    /// current URL - the automatic version of the user's "zap up then back
+    /// down" fix. Runs every update() (~30 Hz, even with no frames) so it fires
+    /// while the picture is frozen. Uses FrameBus::version() to avoid cloning
+    /// the pixel buffer.
+    fn check_stall(&mut self) {
+        if !self.stall_watchdog_armed {
+            return;
+        }
+        let Some(url) = self.current_url.clone() else {
+            return;
+        };
+        let v = self.player.frames.version();
+        if v != self.last_progress_version {
+            self.last_progress_version = v;
+            self.last_progress_at = Instant::now();
+            return;
+        }
+        const STALL: Duration = Duration::from_secs(10);
+        const COOLDOWN: Duration = Duration::from_secs(15);
+        if self.last_progress_at.elapsed() < STALL {
+            return;
+        }
+        if let Some(t) = self.last_recovery_at {
+            if t.elapsed() < COOLDOWN {
+                return;
+            }
+        }
+        tracing::warn!(
+            "video stalled ~{}s with no end-file/error - auto-reloading stream",
+            self.last_progress_at.elapsed().as_secs()
+        );
+        self.set_toast("herverbinden...");
+        self.load_url(url, true);
+        self.last_recovery_at = Some(Instant::now());
     }
 
     fn drain_events(&mut self) {
@@ -306,7 +432,28 @@ impl TvApp {
             match evt {
                 Event::FileLoaded => {}
                 Event::PlaybackStarted => {}
-                Event::EndOfFile { reason } => self.set_toast(format!("ended: {}", reason)),
+                Event::EndOfFile { reason } => {
+                    // mpv fires end-file on EVERY channel switch: loadfile stops
+                    // the previous stream with reason=stop. Surfacing that as a
+                    // toast overwrote the "[TV] <channel>" zap toast (single slot)
+                    // and the EPG-enriched line, leaving the user staring at
+                    // "ended: <reason>" with no idea what they tuned to.
+                    // quit/redirect/eof are equally internal - only a genuine
+                    // playback error deserves to interrupt the channel toast.
+                    //
+                    // eof/error mean the stream won't resume on its own: disarm
+                    // the silent-stall watchdog so it doesn't reload a finished
+                    // file on a loop. A plain stop (channel switch) leaves the
+                    // watchdog armed for the stream we just loaded.
+                    if reason == "eof" || reason == "error" {
+                        self.stall_watchdog_armed = false;
+                    }
+                    if reason == "error" {
+                        self.set_toast("stream error - zap up/down to retry");
+                    } else {
+                        tracing::debug!("mpv end-file ({}) - toast suppressed", reason);
+                    }
+                }
                 Event::Error { msg } => {
                     warn!("player error: {}", msg);
                     self.set_toast(format!("error: {}", msg));
@@ -378,44 +525,78 @@ impl TvApp {
         let slot = self.epg_slot.clone();
         self.epg_fetch_pending_for = Some(stream_id);
 
-        // Same archive-twin trick as the guide: portals like hnlol only
-        // populate EPG against tv_archive=1 stream_ids. For zap-toast
-        // enrichment of a live channel we fetch via its archive twin if
-        // one exists, then store the result under the live sid so the
-        // toast lookup in drain_epg finds it.
+        // EPG location is portal-dependent. MOST portals populate EPG on the
+        // live stream_id; a few (e.g. hnlol) only populate the tv_archive=1
+        // "twin" with the same name. v0.2.0 fetched the live sid directly; the
+        // archive-twin redirect added for hnlol then broke normal portals
+        // whose twins return empty. So: try the live sid first and fall back
+        // to the twin only when the live fetch comes back empty - correct for
+        // both portal styles. The result is always stored under the live sid
+        // so drain_epg's current_stream_id match still works.
         let channels = self.catalog.live_channels();
         let (name, is_archive) = channels
             .iter()
             .find(|c| c.stream_id == stream_id)
             .map(|c| (c.name.clone(), c.tv_archive == 1))
             .unwrap_or_else(|| (String::new(), false));
-        let fetch_sid = if !is_archive && !name.is_empty() {
+        let twin_sid = if !is_archive && !name.is_empty() {
             self.catalog
                 .archive_id_by_name(&name)
-                .unwrap_or(stream_id)
+                .filter(|&t| t != stream_id)
         } else {
-            stream_id
+            None
         };
-        let via_twin = fetch_sid != stream_id;
         tracing::info!(
-            "epg fetch starting for sid={} (fetch via {}{})",
+            "epg fetch starting for sid={} (twin fallback={:?})",
             stream_id,
-            fetch_sid,
-            if via_twin { " [archive twin]" } else { "" }
+            twin_sid
         );
         tokio::spawn(async move {
-            match portal.fetch_epg(fetch_sid).await {
-                Ok(epg) => {
-                    tracing::info!(
-                        "epg fetch ok for sid={} ({} entries via {})",
-                        stream_id,
-                        epg.entries().len(),
-                        fetch_sid
-                    );
-                    *slot.lock() = Some((stream_id, epg));
+            // Primary: the live sid itself (what v0.2.0 did, works for normal portals).
+            let mut epg = match portal.fetch_epg(stream_id).await {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("epg direct fetch failed for sid={}: {}", stream_id, e);
+                    Epg::new(Vec::new())
                 }
-                Err(e) => tracing::warn!("epg fetch failed for sid={}: {}", stream_id, e),
+            };
+            // Fallback: archive twin, only when the live sid returned nothing.
+            if epg.entries().is_empty() {
+                if let Some(twin) = twin_sid {
+                    tracing::info!(
+                        "epg empty on live sid={}, retrying via archive twin {}",
+                        stream_id,
+                        twin
+                    );
+                    match portal.fetch_epg(twin).await {
+                        Ok(e) if !e.entries().is_empty() => {
+                            tracing::info!(
+                                "epg twin ok for sid={} ({} entries via {})",
+                                stream_id,
+                                e.entries().len(),
+                                twin
+                            );
+                            epg = e;
+                        }
+                        Ok(_) => {
+                            tracing::info!("epg twin {} also empty for sid={}", twin, stream_id)
+                        }
+                        Err(e) => tracing::warn!(
+                            "epg twin fetch failed for sid={} (twin {}): {}",
+                            stream_id,
+                            twin,
+                            e
+                        ),
+                    }
+                }
+            } else {
+                tracing::info!(
+                    "epg direct ok for sid={} ({} entries)",
+                    stream_id,
+                    epg.entries().len()
+                );
             }
+            *slot.lock() = Some((stream_id, epg));
         });
     }
 
@@ -428,7 +609,7 @@ impl TvApp {
             idx,
             self.current_name
         );
-        let _ = self.player.cmd_tx.send(Cmd::LoadUrl(url));
+        self.load_url(url, true);
         self.current_idx = idx;
         self.current_name = Some(name.to_owned());
         self.current_stream_id = Some(sid);
@@ -463,18 +644,10 @@ impl TvApp {
         }
     }
 
-    fn zap_npo(&mut self, n: u8) {
-        if let Some(sid) = shortcuts::npo_shortcut_id(&self.catalog, n) {
-            self.zap_by_id(sid);
-        } else {
-            self.set_toast(format!("NPO {} not in catalog", n));
-        }
-    }
-
     fn play_movie(&mut self, sid: i64, name: &str) {
         let ext = self.catalog.movie_extension(sid);
         let url = self.catalog.portal().movie_stream_url(sid, &ext);
-        let _ = self.player.cmd_tx.send(Cmd::LoadUrl(url));
+        self.load_url(url, false);
         self.current_name = Some(name.to_owned());
         self.current_idx = None;
         self.current_stream_id = None;
@@ -498,6 +671,174 @@ impl TvApp {
         }
     }
 
+    /// Car-radio number presets on digit keys 0-9: hold a digit
+    /// (>= LONG_PRESS) to store the current channel in that slot, tap it to
+    /// recall the stored channel. Called from handle_keys (viewer only - in
+    /// the guide, digits feed the channel filter instead).
+    fn handle_number_presets(&mut self, ctx: &egui::Context) {
+        const DIGIT_KEYS: [Key; 10] = [
+            Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4,
+            Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9,
+        ];
+        const LONG_PRESS: Duration = Duration::from_millis(550);
+        for (d, key) in DIGIT_KEYS.iter().enumerate() {
+            let (pressed, down, released) = ctx.input(|i| {
+                (i.key_pressed(*key), i.key_down(*key), i.key_released(*key))
+            });
+            // Start timing on the first press; ignore OS key-repeat presses so
+            // a held key keeps its original down-time.
+            if pressed && self.digit_down_since[d].is_none() {
+                self.digit_down_since[d] = Some(Instant::now());
+                self.digit_long_fired[d] = false;
+            }
+            // Long-press: fire the save once we cross the threshold while held.
+            if down && !self.digit_long_fired[d] {
+                if let Some(t0) = self.digit_down_since[d] {
+                    if t0.elapsed() >= LONG_PRESS {
+                        self.digit_long_fired[d] = true;
+                        self.save_preset(d as u8);
+                    }
+                }
+            }
+            if released {
+                // Tap (released before the long-press fired) -> recall.
+                if self.digit_down_since[d].is_some() && !self.digit_long_fired[d] {
+                    self.recall_preset(d as u8);
+                }
+                self.digit_down_since[d] = None;
+                self.digit_long_fired[d] = false;
+            }
+        }
+    }
+
+    fn save_preset(&mut self, digit: u8) {
+        let Some(sid) = self.current_stream_id else {
+            self.set_toast(format!("preset {} - geen live zender actief", digit));
+            return;
+        };
+        let name = self.current_name.clone().unwrap_or_default();
+        self.presets.set(digit, sid, &name);
+        let _ = self.presets.save(&self.storage.presets_path());
+        self.set_toast(format!("preset {} opgeslagen: {}", digit, name));
+    }
+
+    fn recall_preset(&mut self, digit: u8) {
+        let target = self.presets.get(digit).map(|p| p.stream_id);
+        match target {
+            Some(sid) => self.zap_by_id(sid),
+            None => self.set_toast(format!(
+                "preset {} is leeg - houd {} ingedrukt om op te slaan",
+                digit, digit
+            )),
+        }
+    }
+
+    /// First-run portal setup: shown when no credentials are configured.
+    /// Collects host/user/pass, writes tvplayer.ini and connects live.
+    fn paint_portal_prompt(&mut self, ctx: &egui::Context) {
+        let mut submit: Option<String> = None;
+        egui::Area::new(egui::Id::new("__portal_prompt__"))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Frame::popup(&ctx.style())
+                    .fill(Color32::from_rgb(22, 22, 28))
+                    .inner_margin(egui::Margin::symmetric(20.0, 18.0))
+                    .show(ui, |ui| {
+                        ui.set_width(430.0);
+                        ui.label(
+                            egui::RichText::new("Portal instellen")
+                                .heading()
+                                .color(Color32::WHITE),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Vul je Xtream-gegevens in. Ze worden opgeslagen in tvplayer.ini naast de app.",
+                            )
+                            .color(Color32::from_white_alpha(150))
+                            .size(12.0),
+                        );
+                        ui.add_space(12.0);
+                        egui::Grid::new("__portal_grid__")
+                            .num_columns(2)
+                            .spacing([10.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label("Server (host:poort)");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.cfg_host)
+                                        .hint_text("m.hnlol.com:8080")
+                                        .desired_width(250.0),
+                                );
+                                ui.end_row();
+                                ui.label("Gebruiker");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.cfg_user)
+                                        .hint_text("naam")
+                                        .desired_width(250.0),
+                                );
+                                ui.end_row();
+                                ui.label("Wachtwoord");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.cfg_pass)
+                                        .password(true)
+                                        .desired_width(250.0),
+                                );
+                                ui.end_row();
+                            });
+                        if let Some(err) = &self.cfg_error {
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(err)
+                                    .color(Color32::from_rgb(240, 130, 110))
+                                    .size(12.0),
+                            );
+                        }
+                        ui.add_space(12.0);
+                        let ready = !self.cfg_host.trim().is_empty()
+                            && !self.cfg_user.trim().is_empty()
+                            && !self.cfg_pass.is_empty();
+                        let clicked = ui
+                            .add_enabled(ready, egui::Button::new("Verbinden en opslaan"))
+                            .clicked();
+                        let entered = ready && ctx.input(|i| i.key_pressed(Key::Enter));
+                        if clicked || entered {
+                            submit = Some(format!(
+                                "{}:{}@{}",
+                                self.cfg_user.trim(),
+                                self.cfg_pass,
+                                self.cfg_host.trim()
+                            ));
+                        }
+                    });
+            });
+        if let Some(s) = submit {
+            self.apply_creds_string(&s);
+        }
+    }
+
+    /// Validate prompt creds, persist to tvplayer.ini, then rebuild the catalog
+    /// live and start fetching - no restart needed.
+    fn apply_creds_string(&mut self, creds_str: &str) {
+        let creds = match parse_xtream_creds(creds_str) {
+            Ok(c) => c,
+            Err(e) => {
+                self.cfg_error = Some(format!("ongeldige gegevens: {}", e));
+                return;
+            }
+        };
+        let path = crate::args::ini_path();
+        if let Err(e) = std::fs::write(&path, creds_str) {
+            self.cfg_error = Some(format!("kon {} niet schrijven: {}", path.display(), e));
+            return;
+        }
+        tracing::info!("portal creds saved to {} - connecting", path.display());
+        let portal: Arc<dyn Portal> = Arc::new(XtreamPortal::new(creds));
+        self.catalog = Arc::new(CatalogStore::new(portal));
+        self.catalog.spawn_fetch();
+        self.portal_state = PortalState::Configured;
+        self.cfg_error = None;
+        self.set_toast("verbinden met portal...");
+    }
+
     fn handle_keys(&mut self, ctx: &egui::Context) {
         // Search box owns input when open; only handle escape/enter externally.
         if self.show_search {
@@ -518,9 +859,6 @@ impl TvApp {
             e_key,
             shift,
             d,
-            n1,
-            n2,
-            n3,
             f11,
             esc,
             n_key,
@@ -543,9 +881,6 @@ impl TvApp {
                 i.key_pressed(Key::E),
                 i.modifiers.shift,
                 i.key_pressed(Key::D),
-                i.key_pressed(Key::Num1),
-                i.key_pressed(Key::Num2),
-                i.key_pressed(Key::Num3),
                 i.key_pressed(Key::F11),
                 i.key_pressed(Key::Escape),
                 i.key_pressed(Key::N),
@@ -621,15 +956,8 @@ impl TvApp {
             self.show_debug = !self.show_debug;
         }
 
-        if n1 {
-            self.zap_npo(1);
-        }
-        if n2 {
-            self.zap_npo(2);
-        }
-        if n3 {
-            self.zap_npo(3);
-        }
+        // Digit keys 0-9 are car-radio presets: tap = recall, hold = store.
+        self.handle_number_presets(ctx);
 
         if n_key {
             if let Some(sid) = shortcuts::news_npo(&self.catalog) {
@@ -948,7 +1276,8 @@ impl TvApp {
                 "Viewer (when guide is closed)",
                 &[
                     ("Up / Down  -  Mouse wheel", "previous / next channel"),
-                    ("1 / 2 / 3", "NPO 1 / 2 / 3"),
+                    ("0-9  (tap)", "recall channel preset"),
+                    ("0-9  (hold)", "store current channel as preset"),
                     ("n", "news shortcut (NPO)"),
                     ("r", "news shortcut (RTL)"),
                     ("f", "cross-catalog search (live + films + series)"),
@@ -1125,7 +1454,7 @@ impl TvApp {
                     }
                     CatalogStatus::Loaded => {
                         ui.label(
-                            egui::RichText::new("catalog loaded - press 1/2/3 for NPO or f to search")
+                            egui::RichText::new("catalog loaded - f = search, g = guide, 0-9 = presets")
                                 .color(Color32::from_white_alpha(140))
                                 .size(18.0),
                         );
@@ -1512,7 +1841,7 @@ impl TvApp {
             entry.start.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"),
             entry.end.with_timezone(&chrono::Local).format("%H:%M")
         );
-        let _ = self.player.cmd_tx.send(Cmd::LoadUrl(url));
+        self.load_url(url, false);
         self.current_name = Some(format!("{} - {}", channel.name, entry.title));
         self.current_stream_id = Some(channel.stream_id);
         self.current_epg = None;
@@ -2174,6 +2503,7 @@ impl eframe::App for TvApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.drain_epg();
+        self.check_stall();
         self.forward_window_size(ctx);
         self.update_video_texture(ctx);
         // Guide owns input while it's open - we don't want `1`/`2`/`3` etc.
@@ -2189,6 +2519,16 @@ impl eframe::App for TvApp {
         // work while the user is browsing the schedule.
         if self.guide.open {
             self.paint_guide(ctx);
+        } else if matches!(
+            self.portal_state,
+            PortalState::Missing | PortalState::Placeholder
+        ) {
+            // First-run: no credentials yet - show the portal setup prompt
+            // over a dark background instead of the video surface.
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(Color32::from_rgb(14, 14, 18)))
+                .show(ctx, |_ui| {});
+            self.paint_portal_prompt(ctx);
         } else {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(Color32::BLACK))

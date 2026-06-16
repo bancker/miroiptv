@@ -3,11 +3,19 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use tvplayer::app::{PortalState, TvApp};
-use tvplayer::args::{parse_xtream_creds, Cli, XtreamCreds};
+use tvplayer::args::{ini_path, parse_xtream_creds, read_ini_creds, Cli, XtreamCreds};
 use tvplayer::catalog::CatalogStore;
 use tvplayer::player;
 use tvplayer::portal::{xtream::XtreamPortal, Portal};
 use tvplayer::storage::Storage;
+
+// Detach from the console window so `--no-console` end-user launches don't
+// get a separate debug console. kernel32; only declared on Windows.
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn FreeConsole() -> std::os::raw::c_int;
+}
 
 fn is_placeholder_creds(creds: &XtreamCreds) -> bool {
     let host = creds.host.to_lowercase();
@@ -90,6 +98,14 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Console-subsystem binary: developers get a live log console by default.
+    // End-user launches pass --no-console to suppress it (file logging under
+    // %APPDATA%\tvplayer\log\ is unaffected).
+    #[cfg(windows)]
+    if cli.no_console {
+        unsafe { FreeConsole() };
+    }
+
     let storage = Storage::standard()?;
     storage.ensure_config_dir()?;
     let log_dir = init_logging(&storage);
@@ -105,8 +121,15 @@ fn main() -> anyhow::Result<()> {
     // Resolve portal:
     //   1. --xtream provided AND not placeholder -> real portal
     //   2. otherwise -> "no portal" sentinel; UI shows configure-portal screen
+    // Credentials come from --xtream (explicit) or, failing that, tvplayer.ini
+    // in the app folder. If neither exists the app shows a first-run prompt
+    // that writes tvplayer.ini.
+    let creds_str = cli
+        .xtream
+        .clone()
+        .or_else(|| read_ini_creds(&ini_path()));
     let (portal, portal_state): (Arc<dyn Portal>, PortalState) = if let Some(s) =
-        cli.xtream.as_deref()
+        creds_str.as_deref()
     {
         match parse_xtream_creds(s) {
             Ok(creds) if !is_placeholder_creds(&creds) => {
@@ -136,7 +159,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
     } else {
-        tracing::warn!("portal: no --xtream argument given. Configure run.bat or pass --xtream user:pass@host:port. A bare URL still works.");
+        tracing::warn!("portal: no credentials (--xtream or tvplayer.ini). Showing first-run setup prompt.");
         (
             Arc::new(XtreamPortal::new(XtreamCreds {
                 username: "anon".into(),
@@ -150,10 +173,6 @@ fn main() -> anyhow::Result<()> {
     let catalog = Arc::new(CatalogStore::new(portal));
 
     let player_handle = player::spawn(1280, 720)?;
-
-    if let Some(u) = cli.url.clone() {
-        let _ = player_handle.cmd_tx.send(player::Cmd::LoadUrl(u));
-    }
 
     let mut options = eframe::NativeOptions::default();
     options.viewport = options
@@ -172,6 +191,7 @@ fn main() -> anyhow::Result<()> {
                 catalog,
                 storage,
                 portal_state,
+                cli.url,
             ))
         }),
     );

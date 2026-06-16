@@ -6,6 +6,7 @@ pub mod epg;
 pub mod favorites;
 pub mod player;
 pub mod portal;
+pub mod presets;
 pub mod search;
 pub mod shortcuts;
 pub mod storage;

@@ -41,6 +41,13 @@ impl FrameBus {
         self.inner.lock().clone()
     }
 
+    /// Cheap read of just the frame version counter, without cloning the
+    /// ~3.6 MB pixel buffer. The stall watchdog polls this every frame, so
+    /// it must not pay the full `read()` clone.
+    pub fn version(&self) -> u64 {
+        self.inner.lock().version
+    }
+
     fn write(&self, w: u32, h: u32, data: Vec<u8>) {
         {
             let mut g = self.inner.lock();

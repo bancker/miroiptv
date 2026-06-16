@@ -14,6 +14,11 @@ pub struct Cli {
     /// Run smoke selftest and exit
     #[arg(long, hide = true)]
     pub selftest: bool,
+
+    /// Detach the Windows debug console at startup (for end-user launches).
+    /// Logs still go to the file under %APPDATA%\tvplayer\log\.
+    #[arg(long = "no-console")]
+    pub no_console: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -32,6 +37,34 @@ pub enum CredsError {
     NoUserPass,
     #[error("invalid port number")]
     BadPort,
+}
+
+/// Path to `tvplayer.ini` next to the executable (falls back to CWD if the
+/// exe path can't be resolved). This is the app's "root folder" config file.
+pub fn ini_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("tvplayer.ini")
+}
+
+/// Read a creds string (`user:pass@host:port`) from tvplayer.ini, if present.
+/// Accepts a bare line or a `key=value` form (any key); `#`/`;` lines are
+/// comments. Returns the first line that looks like credentials (contains `@`).
+pub fn read_ini_creds(path: &std::path::Path) -> Option<String> {
+    let txt = std::fs::read_to_string(path).ok()?;
+    for line in txt.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let val = line.split_once('=').map(|(_, v)| v.trim()).unwrap_or(line);
+        if val.contains('@') {
+            return Some(val.to_string());
+        }
+    }
+    None
 }
 
 pub fn parse_xtream_creds(s: &str) -> Result<XtreamCreds, CredsError> {

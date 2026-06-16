@@ -30,6 +30,12 @@ impl Storage {
     pub fn favorites_path(&self) -> PathBuf {
         self.root.join("favorites.json")
     }
+    pub fn presets_path(&self) -> PathBuf {
+        self.root.join("presets.json")
+    }
+    pub fn last_watched_path(&self) -> PathBuf {
+        self.root.join("last_watched.json")
+    }
     pub fn config_path(&self) -> PathBuf {
         self.root.join("config.json")
     }

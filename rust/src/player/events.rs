@@ -30,12 +30,24 @@ pub unsafe fn end_file_reason(evt: *mut sys::mpv_event) -> String {
         return "unknown".into();
     }
     let ef = data as *const sys::mpv_event_end_file;
-    match (*ef).reason {
+    reason_label((*ef).reason)
+}
+
+/// Label for an `mpv_end_file_reason` enum value.
+///
+/// The values are NOT contiguous - mpv's public enum skips 1:
+/// `EOF=0, STOP=2, QUIT=3, ERROR=4, REDIRECT=5` (mpv/client.h:1465).
+/// The previous mapping assumed `0..=4` were contiguous, so STOP(2) -
+/// the reason mpv reports for the previous stream on EVERY channel
+/// switch (loadfile stops it) - was mislabelled "quit". That is the
+/// "ended: quit" the user kept seeing.
+fn reason_label(code: std::os::raw::c_int) -> String {
+    match code {
         0 => "eof".into(),
-        1 => "stop".into(),
-        2 => "quit".into(),
-        3 => "error".into(),
-        4 => "redirect".into(),
+        2 => "stop".into(),
+        3 => "quit".into(),
+        4 => "error".into(),
+        5 => "redirect".into(),
         n => format!("reason={}", n),
     }
 }
@@ -86,4 +98,34 @@ pub unsafe fn property_change(evt: *mut sys::mpv_event) -> Option<(String, Strin
         String::new()
     };
     Some((name, val))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reason_label;
+
+    // Values mirror mpv/client.h's mpv_end_file_reason enum, which is NOT
+    // contiguous (1 is unused): EOF=0, STOP=2, QUIT=3, ERROR=4, REDIRECT=5.
+    #[test]
+    fn maps_each_mpv_reason_to_its_label() {
+        assert_eq!(reason_label(0), "eof");
+        assert_eq!(reason_label(2), "stop");
+        assert_eq!(reason_label(3), "quit");
+        assert_eq!(reason_label(4), "error");
+        assert_eq!(reason_label(5), "redirect");
+    }
+
+    #[test]
+    fn stop_is_not_mislabelled_quit() {
+        // Regression guard for the off-by-one that made every channel switch
+        // (mpv reports STOP=2 for the previous stream) surface as "ended: quit".
+        assert_eq!(reason_label(2), "stop");
+        assert_ne!(reason_label(2), "quit");
+    }
+
+    #[test]
+    fn unknown_code_is_explicit_not_silently_dropped() {
+        assert_eq!(reason_label(1), "reason=1"); // unused slot in mpv's enum
+        assert_eq!(reason_label(7), "reason=7");
+    }
 }
