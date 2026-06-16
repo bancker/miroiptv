@@ -182,10 +182,10 @@ struct GuideState {
     visible_set_settled_snapshot: Vec<i64>,
 
     time_mode: TimeMode,
-    /// Channels whose vertical scroll has already been centered since the
-    /// last time-mode change / guide open. We only FORCE the scroll offset
-    /// once per centering event so the user can scroll freely afterwards.
-    centered_for: HashSet<i64>,
+    /// While true, every visible column's current-programme row is forced to
+    /// the vertical centre each frame (the "now line"). Set on open / time-mode
+    /// change / left-right pan; cleared when the user browses with up/down.
+    auto_center: bool,
     /// Stream IDs whose last EPG fetch returned an error or returned with
     /// zero entries after our fallback attempt. UI shows a distinct
     /// 'EPG mislukt' message instead of the ambiguous 'geen EPG' that
@@ -210,7 +210,7 @@ impl Default for GuideState {
             visible_set_settled_since: Instant::now(),
             visible_set_settled_snapshot: Vec::new(),
             time_mode: TimeMode::NowAndNext,
-            centered_for: HashSet::new(),
+            auto_center: true,
             epg_failed: Arc::new(Mutex::new(HashSet::new())),
             channel_mode: ChannelMode::All,
         }
@@ -1508,7 +1508,7 @@ impl TvApp {
             self.guide.selected_col = 0;
             // Each opened guide starts fresh: re-center every column on
             // its current programme.
-            self.guide.centered_for.clear();
+            self.guide.auto_center = true;
             // visible list (re)builds on next paint via refresh_visible_if_stale
         }
     }
@@ -1778,16 +1778,17 @@ impl TvApp {
     /// channels). Re-runs every paint so channels whose EPG arrives late
     /// still get their cursor positioned correctly.
     fn guide_sync_target_rows(&mut self, channels: &[LiveChannel], num_cols: usize) {
+        // While auto-centring, park every visible column's cursor on its
+        // current programme every frame, so the now-line follows time and
+        // newly-revealed columns line up. Once the user browses with up/down
+        // we stop overriding their cursor.
+        if !self.guide.auto_center {
+            return;
+        }
         let now = chrono::Utc::now();
         let cache = self.guide.epg_cache.lock();
         for col in 0..num_cols {
             let Some(ch) = self.guide_visible_channel_at(col, channels) else { continue; };
-            // Only set target row if the channel hasn't been centered yet -
-            // once the user has interacted (or we centered once), respect
-            // their scroll position by not overriding the cursor either.
-            if self.guide.centered_for.contains(&ch.stream_id) {
-                continue;
-            }
             if let Some(epg) = cache.get(&ch.stream_id) {
                 let row = Self::guide_target_row(epg, self.guide.time_mode, now);
                 self.guide.row_per_channel.insert(ch.stream_id, row);
@@ -1942,11 +1943,11 @@ impl TvApp {
         if n_key && self.guide.time_mode != TimeMode::NowAndNext {
             self.guide.time_mode = TimeMode::NowAndNext;
             // New time-mode: re-center every column on the new target.
-            self.guide.centered_for.clear();
+            self.guide.auto_center = true;
         }
         if p_key && self.guide.time_mode != TimeMode::Primetime {
             self.guide.time_mode = TimeMode::Primetime;
-            self.guide.centered_for.clear();
+            self.guide.auto_center = true;
         }
         if a_key && self.guide.channel_mode != ChannelMode::All {
             self.guide.channel_mode = ChannelMode::All;
@@ -1965,6 +1966,16 @@ impl TvApp {
         self.refresh_visible_if_stale(&channels);
         let num_cols = self.guide_num_visible_cols(ctx);
         let n_visible = self.guide.visible.len();
+
+        // Up/down browse programmes - release auto-centring so the user's
+        // cursor is respected. Left/right pan channels - keep centring so the
+        // now-line stays put as columns scroll in.
+        if up || down || pgup || pgdn || home || end {
+            self.guide.auto_center = false;
+        }
+        if left || right {
+            self.guide.auto_center = true;
+        }
 
         // Programme cursor (up/down/pgup/pgdn/home/end) acts on the
         // selected column.
@@ -2055,24 +2066,8 @@ impl TvApp {
             /// Distinct from `loading=false && programmes empty` which
             /// means the portal genuinely returned no EPG data.
             failed: bool,
-            /// If set, ScrollArea is forced to this y-offset this frame so
-            /// the time-target row lands at the vertical center. Cleared
-            /// after one frame (consumer marks centered_for to suppress
-            /// re-forcing).
-            target_center: Option<f32>,
         }
-        // Approximate column viewport height. Used to compute the scroll
-        // offset that puts the target row at the column's vertical centre.
-        // The actual rendered height is slightly different but close enough
-        // for centring; the user's eye doesn't notice 20 px either way.
-        let window_h = ctx
-            .input(|i| i.viewport().inner_rect.map(|r| r.height()))
-            .unwrap_or(720.0);
-        // Top bar (~60) + filter line maybe (~22 when active) + column
-        // header (~30) + footer hint (~26) + paddings.
-        let column_viewport_h = (window_h - 145.0).max(200.0);
         const ROW_H: f32 = 26.0;
-        let mut to_mark_centered: Vec<i64> = Vec::new();
 
         let col_data: Vec<ColData> = {
             let cache = self.guide.epg_cache.lock();
@@ -2089,33 +2084,16 @@ impl TvApp {
                     let row = *self.guide.row_per_channel.get(&sid).unwrap_or(&0);
                     let loading = pending.contains(&sid);
                     let did_fail = failed.contains(&sid);
-                    let target_center = if !programmes.is_empty()
-                        && !self.guide.centered_for.contains(&sid)
-                    {
-                        let raw = (row as f32) * ROW_H
-                            - (column_viewport_h - ROW_H) * 0.5;
-                        to_mark_centered.push(sid);
-                        Some(raw.max(0.0))
-                    } else {
-                        None
-                    };
                     Some(ColData {
                         channel: ch,
                         programmes,
                         row,
                         loading,
                         failed: did_fail,
-                        target_center,
                     })
                 })
                 .collect()
         };
-        // Record that these channels are now centered so future paints
-        // don't keep forcing the scroll offset (user can scroll freely).
-        for sid in to_mark_centered {
-            self.guide.centered_for.insert(sid);
-        }
-
         // Click intents (col, row) collected during draw, applied after.
         let mut clicked: Option<(usize, usize)> = None;
 
@@ -2320,24 +2298,31 @@ impl TvApp {
                                 let cursor = cd.row;
                                 let mut clicked_in_col: Option<usize> = None;
 
-                                // Per-column scroll target: if this channel
-                                // hasn't been centered since the last
-                                // centering event, force the scroll offset so
-                                // the cursor row sits at the vertical middle
-                                // of the column body. cd.target_center is
-                                // populated upstream when needed.
-                                let mut scroll_area = egui::ScrollArea::vertical()
-                                    .id_source(format!(
-                                        "guide_col_{}_{}",
-                                        vi, cd.channel.stream_id
-                                    ))
-                                    .auto_shrink([false, false]);
-                                if let Some(target_off) = cd.target_center {
-                                    scroll_area = scroll_area.vertical_scroll_offset(target_off);
-                                }
-                                scroll_area.show_rows(column_ui, ROW_H, cd.programmes.len(), |ui, range| {
-                                        for i in range {
-                                            let e = &cd.programmes[i];
+                                // egui's ScrollArea offset is unreliable on a
+                                // virtualised list, so we DON'T scroll. Instead
+                                // we render only the window of programmes that
+                                // fills the viewport and use a top spacer to pin
+                                // the focus row (current programme, or the cursor
+                                // while browsing) to the vertical centre. Every
+                                // column does the same -> all the green LIVE rows
+                                // line up on one centre line, and the content
+                                // never exceeds the viewport so nothing scrolls.
+                                let view_h = column_ui.available_height().max(ROW_H);
+                                let rows_fit = ((view_h / ROW_H) as usize).max(1);
+                                let half = rows_fit / 2;
+                                let n = cd.programmes.len();
+                                let focus = cd.row.min(n.saturating_sub(1));
+                                let start = focus.saturating_sub(half);
+                                let above = focus - start;
+                                let pad_top = (half - above) as f32 * ROW_H;
+                                let end = (focus + (rows_fit - half)).min(n);
+                                egui::ScrollArea::vertical()
+                                    .id_source(format!("guide_col_{}", cd.channel.stream_id))
+                                    .auto_shrink([false, false])
+                                    .show(column_ui, |ui| {
+                                        ui.add_space(pad_top);
+                                        for p in start..end {
+                                            let e = &cd.programmes[p];
                                             let status = programme_status(e, &cd.channel, now);
                                             let local_start = e.start.with_timezone(&chrono::Local);
                                             let time_label = local_start.format("%H:%M").to_string();
@@ -2364,7 +2349,7 @@ impl TvApp {
                                                     None,
                                                 ),
                                             };
-                                            let is_selected = i == cursor && is_selected_col;
+                                            let is_selected = p == cursor && is_selected_col;
                                             let row_bg = if is_selected {
                                                 // Subtle highlight overlay - blend selection with status colour
                                                 match status {
@@ -2465,10 +2450,7 @@ impl TvApp {
                                                 })
                                                 .response;
                                             if frame_response.interact(egui::Sense::click()).clicked() {
-                                                clicked_in_col = Some(i);
-                                            }
-                                            if is_selected {
-                                                frame_response.scroll_to_me(Some(egui::Align::Center));
+                                                clicked_in_col = Some(p);
                                             }
                                         }
                                     });
