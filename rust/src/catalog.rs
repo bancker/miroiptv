@@ -1,6 +1,7 @@
 use crate::portal::{Catalog as PortalCatalog, LiveChannel, Portal};
 use crate::search::{rank, ItemKind, SearchItem};
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -54,6 +55,117 @@ mod normalize_tests {
     #[test]
     fn no_country_prefix_works() {
         assert_eq!(n("NPO 1"), n("NPO1 HD"));
+    }
+}
+
+/// Quality tier of a channel name's marker; higher = better. A plain
+/// unmarked feed ranks ABOVE an explicit SD one (unmarked is usually the
+/// main HD-ish stream). Only used to pick between variants of the SAME
+/// channel, so loose substring matching is safe here.
+fn quality_rank(name: &str) -> u8 {
+    let up = name.to_uppercase();
+    if up.contains("UHD") || up.contains("4K") || up.contains("2160") || up.contains("ULTRA HD") {
+        4
+    } else if up.contains("FHD") || up.contains("1080") || up.contains("FULL HD") {
+        3
+    } else if up.contains("HD") || up.contains("720") {
+        2
+    } else if up.contains("SD") {
+        0
+    } else {
+        1
+    }
+}
+
+/// Score for choosing a channel's zap representative: a live entry always
+/// beats its archive (catch-up) twin, then higher quality wins.
+fn variant_score(ch: &LiveChannel) -> u16 {
+    let live = if ch.tv_archive == 0 { 1u16 } else { 0 };
+    live * 10 + quality_rank(&ch.name) as u16
+}
+
+/// Collapse a live-channel list to ONE entry per distinct channel (keyed by
+/// [`normalize_channel_name`]), keeping the highest-scoring variant so the
+/// user doesn't zap through NPO1 HD / UHD / FHD / catch-up duplicates. Order
+/// follows each channel's first appearance in the portal list.
+pub fn dedupe_zap(channels: &[LiveChannel]) -> Vec<LiveChannel> {
+    let mut order: Vec<String> = Vec::new();
+    let mut best: HashMap<String, LiveChannel> = HashMap::new();
+    for ch in channels {
+        let key = normalize_channel_name(&ch.name);
+        if key.is_empty() {
+            continue;
+        }
+        match best.get(&key) {
+            None => {
+                order.push(key.clone());
+                best.insert(key, ch.clone());
+            }
+            Some(cur) if variant_score(ch) > variant_score(cur) => {
+                best.insert(key, ch.clone());
+            }
+            Some(_) => {}
+        }
+    }
+    order.into_iter().filter_map(|k| best.remove(&k)).collect()
+}
+
+#[cfg(test)]
+mod zap_tests {
+    use super::*;
+
+    fn ch(stream_id: i64, name: &str, tv_archive: i32) -> LiveChannel {
+        LiveChannel {
+            stream_id,
+            name: name.into(),
+            category_id: None,
+            epg_channel_id: None,
+            tv_archive,
+            tv_archive_duration: 0,
+        }
+    }
+
+    #[test]
+    fn keeps_highest_quality_per_channel() {
+        let list = vec![
+            ch(1, "NL | NPO 1 HD", 0),
+            ch(2, "NL | NPO 1 UHD", 0),
+            ch(3, "NL | NPO 1 FHD", 0),
+            ch(4, "NL | NPO 2 HD", 0),
+        ];
+        let z = dedupe_zap(&list);
+        assert_eq!(z.len(), 2, "NPO 1 collapses to one, NPO 2 separate");
+        let npo1 = z
+            .iter()
+            .find(|c| normalize_channel_name(&c.name) == "npo1")
+            .unwrap();
+        assert_eq!(npo1.stream_id, 2, "UHD variant wins");
+    }
+
+    #[test]
+    fn prefers_live_over_archive_twin() {
+        let list = vec![ch(10, "NL | NPO 1 HD", 1), ch(11, "NL | NPO 1 HD", 0)];
+        let z = dedupe_zap(&list);
+        assert_eq!(z.len(), 1);
+        assert_eq!(z[0].stream_id, 11);
+        assert_eq!(z[0].tv_archive, 0);
+    }
+
+    #[test]
+    fn preserves_first_appearance_order() {
+        let list = vec![ch(1, "RTL 4", 0), ch(2, "NPO 1", 0), ch(3, "RTL 4 HD", 0)];
+        let z = dedupe_zap(&list);
+        assert_eq!(z.len(), 2);
+        assert_eq!(normalize_channel_name(&z[0].name), "rtl4");
+        assert_eq!(normalize_channel_name(&z[1].name), "npo1");
+    }
+
+    #[test]
+    fn unmarked_beats_explicit_sd() {
+        let list = vec![ch(1, "Foo SD", 0), ch(2, "Foo", 0)];
+        let z = dedupe_zap(&list);
+        assert_eq!(z.len(), 1);
+        assert_eq!(z[0].stream_id, 2);
     }
 }
 
@@ -141,6 +253,16 @@ impl CatalogStore {
             .read()
             .as_ref()
             .map(|c| c.live.clone())
+            .unwrap_or_default()
+    }
+
+    /// Deduplicated channel list for up/down zapping: one entry per distinct
+    /// channel, highest-quality live variant. See [`dedupe_zap`].
+    pub fn zap_channels(&self) -> Vec<LiveChannel> {
+        self.inner
+            .read()
+            .as_ref()
+            .map(|c| dedupe_zap(&c.live))
             .unwrap_or_default()
     }
 

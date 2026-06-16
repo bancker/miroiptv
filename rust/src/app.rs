@@ -1,5 +1,5 @@
 use crate::args::parse_xtream_creds;
-use crate::catalog::{CatalogStatus, CatalogStore};
+use crate::catalog::{normalize_channel_name, CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::Favorites;
 use crate::player::{Cmd, Event, PlayerHandle, RgbaFrame};
@@ -619,8 +619,10 @@ impl TvApp {
     }
 
     fn zap_delta(&mut self, delta: i32) {
-        let live = self.catalog.live_channels();
-        if live.is_empty() {
+        // Zap over the deduped list so up/down skips HD/UHD/FHD/catch-up
+        // duplicates of the same channel (one best-quality entry each).
+        let zap = self.catalog.zap_channels();
+        if zap.is_empty() {
             if !self.catalog.is_loaded() {
                 self.set_toast("catalog loading...");
             } else {
@@ -628,8 +630,8 @@ impl TvApp {
             }
             return;
         }
-        if let Some(i) = shortcuts::next_live_idx(self.current_idx, live.len(), delta) {
-            let ch = &live[i];
+        if let Some(i) = shortcuts::next_live_idx(self.current_idx, zap.len(), delta) {
+            let ch = &zap[i];
             let sid = ch.stream_id;
             let name = ch.name.clone();
             self.zap_to(sid, &name, Some(i));
@@ -638,10 +640,20 @@ impl TvApp {
 
     fn zap_by_id(&mut self, sid: i64) {
         let live = self.catalog.live_channels();
-        if let Some((i, ch)) = live.iter().enumerate().find(|(_, c)| c.stream_id == sid) {
-            let name = ch.name.clone();
-            self.zap_to(sid, &name, Some(i));
-        }
+        let Some(ch) = live.iter().find(|c| c.stream_id == sid) else {
+            return;
+        };
+        let name = ch.name.clone();
+        // Park the up/down cursor on this channel's entry in the deduped zap
+        // list (matched by normalized name) so subsequent zapping continues
+        // from the right place; play the exact sid requested.
+        let key = normalize_channel_name(&name);
+        let idx = self
+            .catalog
+            .zap_channels()
+            .iter()
+            .position(|c| normalize_channel_name(&c.name) == key);
+        self.zap_to(sid, &name, idx);
     }
 
     fn play_movie(&mut self, sid: i64, name: &str) {
