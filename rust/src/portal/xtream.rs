@@ -1,7 +1,7 @@
 use super::{types::*, Portal, PortalError};
 use crate::args::XtreamCreds;
 use crate::epg::{Epg, EpgEntry};
-use chrono::{TimeZone, Utc};
+use chrono::{Local, NaiveDateTime, TimeZone, Utc};
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -43,68 +43,7 @@ impl XtreamPortal {
 
     async fn parse_epg(&self, url: &str) -> Result<Epg, PortalError> {
         let txt = self.client.get(url).send().await?.text().await?;
-        let bytes = txt.len();
-
-        // Portals are inconsistent. We try the four shapes we've seen in
-        // the wild before giving up - silently mapping an unknown shape to
-        // "0 entries" is what made every channel show 'no EPG' in
-        // guide-leeg.jpg / nok.jpg. Each attempt is fail-fast (serde
-        // shape mismatch returns Err on the first wrong key).
-        let listings: Vec<EpgRaw> = if let Ok(w) =
-            serde_json::from_str::<EpgWrapper>(&txt)
-        {
-            w.epg_listings
-        } else if let Ok(arr) = serde_json::from_str::<Vec<EpgRaw>>(&txt) {
-            arr
-        } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-            // Last-resort: pluck any array we recognise from a top-level
-            // object under one of the keys portals use.
-            v.as_object()
-                .and_then(|o| {
-                    ["epg_listings", "epg", "data", "listings", "items"]
-                        .iter()
-                        .find_map(|k| o.get(*k))
-                })
-                .and_then(|x| x.as_array())
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|x| serde_json::from_value::<EpgRaw>(x).ok())
-                .collect()
-        } else {
-            return Err(PortalError::Shape(format!(
-                "EPG body not parseable as JSON ({} bytes)",
-                bytes
-            )));
-        };
-
-        let raw_count = listings.len();
-        let entries: Vec<EpgEntry> = listings
-            .into_iter()
-            .filter_map(|r| {
-                let start = as_i64(&r.start_timestamp)?;
-                let end = as_i64(&r.stop_timestamp)?;
-                Some(EpgEntry {
-                    title: b64_decode(&r.title),
-                    start: Utc.timestamp_opt(start, 0).single()?,
-                    end: Utc.timestamp_opt(end, 0).single()?,
-                })
-            })
-            .collect();
-
-        // Empty result is the diagnostic-worthy state. Log a 300-char
-        // sample of what the portal actually returned so we can adapt
-        // the parser if the shape is new.
-        if entries.is_empty() {
-            let sample: String = txt.chars().take(300).collect();
-            tracing::info!(
-                "EPG empty after parse: {} bytes, {} raw listings, sample: {:?}",
-                bytes,
-                raw_count,
-                sample
-            );
-        }
-        Ok(Epg::new(entries))
+        Ok(parse_epg_body(&txt))
     }
 }
 
@@ -120,20 +59,22 @@ struct EpgRaw {
     // "programme" (XMLTV-style). Accept all.
     #[serde(default, alias = "name", alias = "programme")]
     title: String,
-    // Start time as Unix epoch seconds (number or numeric string).
-    // Field name varies: start_timestamp (standard) / start / start_time.
-    #[serde(default, alias = "start", alias = "start_time")]
+    // Xtream standard: Unix epoch seconds (number or numeric string).
+    #[serde(default)]
     start_timestamp: serde_json::Value,
-    // End time. Field name varies: stop_timestamp (standard) / end /
-    // stop / end_time / end_timestamp.
-    #[serde(
-        default,
-        alias = "end",
-        alias = "stop",
-        alias = "end_time",
-        alias = "end_timestamp"
-    )]
+    #[serde(default)]
     stop_timestamp: serde_json::Value,
+    // Formatted local datetimes ("YYYY-MM-DD HH:MM:SS"). Kept as DISTINCT
+    // fields, NOT serde aliases of *_timestamp: many portals send BOTH
+    // `start` and `start_timestamp`, and an alias makes serde raise a
+    // duplicate-field error that silently zeroes every listing (the v0.3.x
+    // "geen EPG" regression). Used only as a fallback when no epoch is given.
+    #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
+    end: Option<String>,
+    #[serde(default)]
+    stop: Option<String>,
 }
 
 fn as_i64(v: &serde_json::Value) -> Option<i64> {
@@ -151,6 +92,116 @@ fn b64_decode(s: &str) -> String {
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
         .unwrap_or_else(|| s.to_owned())
+}
+
+/// Resolve a programme timestamp: prefer the explicit Unix epoch, else fall
+/// back to a "YYYY-MM-DD HH:MM:SS" local datetime string.
+fn epoch_or_dt(ts: &serde_json::Value, dt: Option<&str>) -> Option<chrono::DateTime<Utc>> {
+    if let Some(epoch) = as_i64(ts) {
+        if epoch > 0 {
+            return Utc.timestamp_opt(epoch, 0).single();
+        }
+    }
+    let naive = NaiveDateTime::parse_from_str(dt?.trim(), "%Y-%m-%d %H:%M:%S").ok()?;
+    Local
+        .from_local_datetime(&naive)
+        .single()
+        .map(|l| l.with_timezone(&Utc))
+}
+
+/// Parse an Xtream EPG body into an `Epg`. Tolerant of the shapes seen in the
+/// wild (wrapped `{epg_listings:[...]}`, bare array, or a top-level object
+/// under a known key). Pure + sync so it's unit-testable without HTTP.
+fn parse_epg_body(txt: &str) -> Epg {
+    let bytes = txt.len();
+    let listings: Vec<EpgRaw> = if let Ok(w) = serde_json::from_str::<EpgWrapper>(txt) {
+        w.epg_listings
+    } else if let Ok(arr) = serde_json::from_str::<Vec<EpgRaw>>(txt) {
+        arr
+    } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(txt) {
+        v.as_object()
+            .and_then(|o| {
+                ["epg_listings", "epg", "data", "listings", "items"]
+                    .iter()
+                    .find_map(|k| o.get(*k))
+            })
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|x| serde_json::from_value::<EpgRaw>(x).ok())
+            .collect()
+    } else {
+        tracing::warn!("EPG body not parseable as JSON ({} bytes)", bytes);
+        return Epg::new(Vec::new());
+    };
+
+    let raw_count = listings.len();
+    let entries: Vec<EpgEntry> = listings
+        .into_iter()
+        .filter_map(|r| {
+            Some(EpgEntry {
+                title: b64_decode(&r.title),
+                start: epoch_or_dt(&r.start_timestamp, r.start.as_deref())?,
+                end: epoch_or_dt(&r.stop_timestamp, r.end.as_deref().or(r.stop.as_deref()))?,
+            })
+        })
+        .collect();
+
+    if entries.is_empty() {
+        let sample: String = txt.chars().take(300).collect();
+        tracing::info!(
+            "EPG empty after parse: {} bytes, {} raw listings, sample: {:?}",
+            bytes,
+            raw_count,
+            sample
+        );
+    }
+    Epg::new(entries)
+}
+
+#[cfg(test)]
+mod epg_tests {
+    use super::parse_epg_body;
+
+    #[test]
+    fn parses_listing_with_both_start_and_start_timestamp() {
+        // The user's portal shape: each listing carries BOTH the datetime
+        // `start`/`end` AND the epoch `start_timestamp`/`stop_timestamp`. The
+        // old serde-alias version tripped a duplicate-field error -> 0 entries.
+        let body = r#"{"epg_listings":[
+            {"id":"1","title":"QmVsb3cgRGVjayBEb3duIFVuZGVy","lang":"",
+             "start":"2026-06-16 18:10:00","end":"2026-06-16 19:05:00",
+             "start_timestamp":"1781021400","stop_timestamp":"1781024700"}
+        ]}"#;
+        let epg = parse_epg_body(body);
+        assert_eq!(epg.entries().len(), 1, "must parse despite dual fields");
+        assert_eq!(epg.entries()[0].title, "Below Deck Down Under");
+    }
+
+    #[test]
+    fn parses_epoch_only() {
+        let body = r#"{"epg_listings":[{"title":"VGVzdA==","start_timestamp":1781021400,"stop_timestamp":1781024700}]}"#;
+        assert_eq!(parse_epg_body(body).entries().len(), 1);
+    }
+
+    #[test]
+    fn parses_datetime_only_fallback() {
+        let body = r#"{"epg_listings":[{"title":"VGVzdA==","start":"2026-06-16 18:10:00","end":"2026-06-16 19:05:00"}]}"#;
+        assert_eq!(parse_epg_body(body).entries().len(), 1);
+    }
+
+    #[test]
+    fn empty_listings_is_no_entries() {
+        assert_eq!(parse_epg_body(r#"{"epg_listings":[]}"#).entries().len(), 0);
+    }
+
+    #[test]
+    fn bare_array_shape_parses() {
+        let body =
+            r#"[{"title":"VGVzdA==","start_timestamp":"1781021400","stop_timestamp":"1781024700"}]"#;
+        assert_eq!(parse_epg_body(body).entries().len(), 1);
+    }
 }
 
 #[async_trait::async_trait]
