@@ -13,5 +13,6 @@ tv.bat
 rust/target/
 rust/vendor/libmpv/libmpv-2.dll
 rust/vendor/libmpv/libmpv.lib
-dist/tvplayer-*
+# Whole portable-build output dir (tvplayer-* and old miroiptv-* bundles).
+dist/
 
