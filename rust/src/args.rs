@@ -15,10 +15,10 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub selftest: bool,
 
-    /// Detach the Windows debug console at startup (for end-user launches).
-    /// Logs still go to the file under %APPDATA%\tvplayer\log\.
-    #[arg(long = "no-console")]
-    pub no_console: bool,
+    /// Show a live debug console window (off by default). Logs always also go
+    /// to the file under %APPDATA%\tvplayer\log\.
+    #[arg(long)]
+    pub console: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]

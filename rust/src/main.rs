@@ -1,3 +1,7 @@
+// No console window by default - clean for end users. Pass --console for a
+// live debug console; logs always also go to the file under %APPDATA%.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use clap::Parser;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -9,12 +13,55 @@ use tvplayer::player;
 use tvplayer::portal::{xtream::XtreamPortal, Portal};
 use tvplayer::storage::Storage;
 
-// Detach from the console window so `--no-console` end-user launches don't
-// get a separate debug console. kernel32; only declared on Windows.
+/// Optional debug console (opt-in via --console). Without it the binary is a
+/// windowed app with no console at all. Logs always also go to the file.
 #[cfg(windows)]
-#[link(name = "kernel32")]
-extern "system" {
-    fn FreeConsole() -> std::os::raw::c_int;
+mod win_console {
+    use std::os::raw::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AllocConsole() -> i32;
+        fn SetStdHandle(which: u32, handle: *mut c_void) -> i32;
+        fn CreateFileA(
+            name: *const u8,
+            access: u32,
+            share: u32,
+            sec: *mut c_void,
+            disposition: u32,
+            flags: u32,
+            template: *mut c_void,
+        ) -> *mut c_void;
+    }
+
+    /// Allocate a console and point stdout/stderr at it so tracing's stderr
+    /// layer becomes visible. Call before init_logging.
+    pub fn alloc() {
+        const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // (DWORD)-11
+        const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4; // (DWORD)-12
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const OPEN_EXISTING: u32 = 3;
+        unsafe {
+            if AllocConsole() == 0 {
+                return; // already attached to a console
+            }
+            let h = CreateFileA(
+                b"CONOUT$\0".as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            if !h.is_null() && h as isize != -1 {
+                SetStdHandle(STD_OUTPUT_HANDLE, h);
+                SetStdHandle(STD_ERROR_HANDLE, h);
+            }
+        }
+    }
 }
 
 fn is_placeholder_creds(creds: &XtreamCreds) -> bool {
@@ -98,12 +145,11 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Console-subsystem binary: developers get a live log console by default.
-    // End-user launches pass --no-console to suppress it (file logging under
-    // %APPDATA%\tvplayer\log\ is unaffected).
+    // Windowed binary: no console by default. --console opens one with live
+    // logs (the file log under %APPDATA%\tvplayer\log\ is always written).
     #[cfg(windows)]
-    if cli.no_console {
-        unsafe { FreeConsole() };
+    if cli.console {
+        win_console::alloc();
     }
 
     let storage = Storage::standard()?;
@@ -179,7 +225,7 @@ fn main() -> anyhow::Result<()> {
         .viewport
         .with_inner_size([1280.0, 720.0])
         .with_min_inner_size([640.0, 360.0])
-        .with_title("tvplayer");
+        .with_title(format!("tvplayer v{}", env!("CARGO_PKG_VERSION")));
 
     let result = eframe::run_native(
         "tvplayer",

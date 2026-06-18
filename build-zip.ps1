@@ -73,6 +73,7 @@ KEYS
   Shift+F                            favorites list
   *                                  toggle favorite for current channel
   a / s                              cycle audio / subtitle track
+  + / -                              higher / lower quality (live)
   left / right arrow                 seek -30s / +30s (VOD)
   F11                                fullscreen
   d                                  debug HUD

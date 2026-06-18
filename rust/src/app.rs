@@ -1,7 +1,8 @@
 use crate::args::parse_xtream_creds;
-use crate::catalog::{normalize_channel_name, CatalogStatus, CatalogStore};
+use crate::catalog::{normalize_channel_name, quality_label, quality_rank, CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::Favorites;
+use crate::playback_health::PlaybackHealth;
 use crate::player::{Cmd, Event, PlayerHandle, RgbaFrame};
 use crate::presets::Presets;
 use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};
@@ -227,6 +228,37 @@ pub enum PortalState {
     Placeholder,
 }
 
+/// One pickable past news broadcast.
+#[derive(Clone)]
+struct NewsItem {
+    sid: i64, // archive catch-up stream_id, or the live stream_id when `live`
+    title: String,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+    tag: String, // NOS / RTL / CNN / BBC / VRT / ZLD
+    offset: i64, // catch-up start offset (secs); RTL skips ads
+    live: bool,  // 24h news channel with no catch-up - play it live
+}
+
+/// A news source for the `n` picker: which catch-up channel, and which
+/// programmes on it count as "news".
+struct NewsSrc {
+    /// Normalized channel-name key (matched exact first, then substring).
+    chan: &'static str,
+    /// Lowercase title substring required; "" = any programme (news channel).
+    title: &'static str,
+    /// Title substrings to drop (regional/sport/kids variants).
+    excl: &'static [&'static str],
+    tag: &'static str,
+    offset: i64,
+}
+
+/// Modal "latest news" chooser opened with `n` (RTL + NOS combined).
+struct NewsPicker {
+    items: Vec<NewsItem>,
+    selected: usize,
+}
+
 pub struct TvApp {
     player: PlayerHandle,
     catalog: Arc<CatalogStore>,
@@ -244,8 +276,12 @@ pub struct TvApp {
     current_epg: Option<Epg>,
     epg_slot: Arc<Mutex<Option<(i64, Epg)>>>,
     epg_fetch_pending_for: Option<i64>,
+    /// Combined NOS/RTL news list built async for the `n` picker.
+    news_picker_slot: Arc<Mutex<Option<Vec<NewsItem>>>>,
+    /// Open `n` news chooser (modal overlay), if any.
+    news_picker: Option<NewsPicker>,
 
-    toast: Option<(String, Instant)>,
+    toast: Option<(String, Instant, Duration)>,
 
     show_favs: bool,
     show_search: bool,
@@ -271,6 +307,13 @@ pub struct TvApp {
     last_recovery_at: Option<Instant>,
     /// Armed only for live channels (VOD/catch-up can legitimately end).
     stall_watchdog_armed: bool,
+
+    // ---- freeze detection: surfaces cache-underrun stalls (paused-for-cache) ----
+    /// Per-stream freeze tracker (reset on load; counts only post-first-frame
+    /// freezes). Fed by the player's paused-for-cache observation, read by the
+    /// debug HUD. Independent of the stall watchdog above: that one *recovers*
+    /// (auto-reload after ~10s), this one *measures and shows*.
+    health: PlaybackHealth,
 
     // ---- car-radio number presets on digit keys 0-9 ----
     presets: Presets,
@@ -324,6 +367,8 @@ impl TvApp {
             current_stream_id: None,
             current_epg: None,
             epg_slot: Arc::new(Mutex::new(None)),
+            news_picker_slot: Arc::new(Mutex::new(None)),
+            news_picker: None,
             epg_fetch_pending_for: None,
             toast: None,
             show_favs: false,
@@ -340,6 +385,7 @@ impl TvApp {
             last_progress_at: Instant::now(),
             last_recovery_at: None,
             stall_watchdog_armed: false,
+            health: PlaybackHealth::new(),
             presets,
             digit_down_since: [None; 10],
             digit_long_fired: [false; 10],
@@ -352,16 +398,27 @@ impl TvApp {
         // whatever we were watching last session (persisted by load_url).
         if let Some(url) = initial_url {
             app.load_url(url, false);
-        } else if let Some(lw) = LastWatched::load(&app.storage.last_watched_path()) {
-            tracing::info!("resuming last watched ({})", lw.url);
-            app.set_toast("laatste zender hervatten...");
-            app.load_url(lw.url, lw.live);
+        } else if app.portal_state == PortalState::Configured {
+            // Only resume when a portal is actually configured. Without creds
+            // (e.g. tvplayer.ini deleted) drop to the setup prompt instead of
+            // silently replaying the last URL (whose credentials are baked in).
+            if let Some(lw) = LastWatched::load(&app.storage.last_watched_path()) {
+                tracing::info!("resuming last watched ({})", lw.url);
+                app.set_toast("laatste zender hervatten...");
+                app.load_url(lw.url, lw.live);
+            }
         }
         app
     }
 
     fn set_toast(&mut self, s: impl Into<String>) {
-        self.toast = Some((s.into(), Instant::now()));
+        self.toast = Some((s.into(), Instant::now(), Duration::from_secs(4)));
+    }
+
+    /// Toast that lingers for a custom number of seconds. Used by the n/r news
+    /// shortcuts so the "what we're watching" label stays up ~30s.
+    fn set_toast_for(&mut self, s: impl Into<String>, secs: u64) {
+        self.toast = Some((s.into(), Instant::now(), Duration::from_secs(secs)));
     }
 
     /// Send a stream to the player and remember it as `current_url`. `watchdog`
@@ -380,6 +437,9 @@ impl TvApp {
         self.stall_watchdog_armed = watchdog;
         // Fresh stream: give it a full window to start before judging it stalled.
         self.last_progress_at = Instant::now();
+        // Reset per-stream freeze counters; counting re-arms on the first frame
+        // (PlaybackStarted) so startup/zap buffering isn't tallied as a freeze.
+        self.health.reset();
     }
 
     /// Recover a SILENT video stall: frames stop advancing while a live stream
@@ -431,7 +491,11 @@ impl TvApp {
         for evt in buf {
             match evt {
                 Event::FileLoaded => {}
-                Event::PlaybackStarted => {}
+                Event::PlaybackStarted => {
+                    // First frame shown — arm freeze counting. Buffering before
+                    // this point (startup/zap) is shown live but not tallied.
+                    self.health.mark_started();
+                }
                 Event::EndOfFile { reason } => {
                     // mpv fires end-file on EVERY channel switch: loadfile stops
                     // the previous stream with reason=stop. Surfacing that as a
@@ -458,7 +522,35 @@ impl TvApp {
                     warn!("player error: {}", msg);
                     self.set_toast(format!("error: {}", msg));
                 }
-                Event::PropertyChanged { .. } => {}
+                Event::PropertyChanged { name, value } => {
+                    if name == "paused-for-cache" {
+                        let on = value == "yes";
+                        let was = self.health.is_buffering();
+                        let prev_count = self.health.freeze_count();
+                        let now = Instant::now();
+                        self.health.on_buffering_changed(now, on);
+                        if on && !was {
+                            // elapsed() is Some only for a *counted* freeze;
+                            // startup/zap buffering yields None.
+                            if self.health.elapsed(now).is_some() {
+                                tracing::info!("playback froze (cache underrun)");
+                            } else {
+                                tracing::debug!("startup/zap buffering");
+                            }
+                        } else if !on && was {
+                            if self.health.freeze_count() > prev_count {
+                                tracing::info!(
+                                    "playback resumed after {:.1}s - freeze #{}, total {:.1}s",
+                                    self.health.last_freeze().unwrap_or_default().as_secs_f64(),
+                                    self.health.freeze_count(),
+                                    self.health.total_frozen().as_secs_f64(),
+                                );
+                            } else {
+                                tracing::debug!("startup/zap buffering ended");
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -656,6 +748,43 @@ impl TvApp {
         self.zap_to(sid, &name, idx);
     }
 
+    /// Switch the current live channel to a higher (`dir = 1`) or lower
+    /// (`dir = -1`) quality variant of the SAME channel. Stops with a toast at
+    /// the ends, or when there's no other variant. Keeps `current_idx` so up/
+    /// down zapping stays parked on this channel. Runs only on a +/- keypress.
+    fn quality_step(&mut self, dir: i32) {
+        let Some(sid) = self.current_stream_id else {
+            self.set_toast("kwaliteit: geen live kanaal");
+            return;
+        };
+        let nav = self.catalog.quality_nav(sid);
+        if nav.ladder.len() <= 1 {
+            self.set_toast("kwaliteit: geen andere variant");
+            return;
+        }
+        let Some(pos) = nav.pos else {
+            self.set_toast("kwaliteit: huidige variant onbekend");
+            return;
+        };
+        let new = pos as i32 + dir;
+        if new < 0 {
+            self.set_toast("kwaliteit: al op laagste");
+            return;
+        }
+        if new as usize >= nav.ladder.len() {
+            self.set_toast("kwaliteit: al op hoogste");
+            return;
+        }
+        let target = &nav.ladder[new as usize];
+        let (tsid, tname) = (target.stream_id, target.name.clone());
+        let rank = quality_rank(&tname);
+        self.zap_to(tsid, &tname, self.current_idx);
+        // Override zap_to's "[TV] name" toast with explicit quality feedback:
+        // the channel is unchanged, the user wants to see the new tier.
+        let dirn = if dir > 0 { "hoger" } else { "lager" };
+        self.set_toast(format!("kwaliteit {}: {}", dirn, quality_label(rank)));
+    }
+
     fn play_movie(&mut self, sid: i64, name: &str) {
         let ext = self.catalog.movie_extension(sid);
         let url = self.catalog.portal().movie_stream_url(sid, &ext);
@@ -665,6 +794,316 @@ impl TvApp {
         self.current_stream_id = None;
         self.current_epg = None;
         self.set_toast(format!("[FILM] {}", name));
+    }
+
+    /// Find and play the most recent NOS Journaal (npo=true) or RTL Nieuws
+    /// (npo=false) via catch-up. Resolves the news channel's archive
+    /// (tv_archive=1) twin - where both the EPG and the timeshift live -
+    /// fetches its day-EPG async, and hands the result to drain_news.
+    /// Open the `n` news chooser: fetch NOS Journaal (NPO 1+2) and RTL Nieuws
+    /// (RTL 4) catch-up EPG concurrently, build one newest-first list (max 5),
+    /// then pop the modal picker. Fully async - the current channel keeps
+    /// playing and the toast is just a projection.
+    fn open_news_picker(&mut self) {
+        const JOURNAAL_EXCL: &[&str] = &["sport", "jeugd", "regio", "makkelijke taal", "gebaren"];
+        const SOURCES: &[NewsSrc] = &[
+            NewsSrc { chan: "npo1", title: "journaal", excl: JOURNAAL_EXCL, tag: "NOS", offset: 0 },
+            NewsSrc { chan: "npo2", title: "journaal", excl: JOURNAAL_EXCL, tag: "NOS", offset: 0 },
+            NewsSrc { chan: "rtl4", title: "rtl nieuws", excl: &[], tag: "RTL", offset: 30 },
+            NewsSrc { chan: "cnn", title: "", excl: &[], tag: "CNN", offset: 0 },
+            NewsSrc { chan: "bbcnews", title: "", excl: &[], tag: "BBC", offset: 0 },
+            NewsSrc { chan: "vrt1", title: "journaal", excl: &[], tag: "VRT", offset: 0 },
+            NewsSrc { chan: "omroepzeeland", title: "nieuws", excl: &[], tag: "ZLD", offset: 0 },
+        ];
+
+        // Resolve each source to its catch-up (tv_archive=1) channel - that's
+        // where both the EPG and the timeshift live. Exact normalized match
+        // first, then substring (handles "CNN" vs "CNN International").
+        let live = self.catalog.live_channels();
+        let mut sources: Vec<(i64, bool, &'static NewsSrc)> = Vec::new();
+        for src in SOURCES {
+            // Prefer the catch-up (tv_archive=1) twin. If there's none - e.g.
+            // CNN / BBC, 24h news with no catch-up - fall back to the LIVE
+            // channel and play it live.
+            let pick = |archive: bool| {
+                live.iter()
+                    .find(|c| {
+                        (c.tv_archive == 1) == archive
+                            && normalize_channel_name(&c.name) == src.chan
+                    })
+                    .or_else(|| {
+                        live.iter().find(|c| {
+                            (c.tv_archive == 1) == archive
+                                && normalize_channel_name(&c.name).contains(src.chan)
+                        })
+                    })
+                    .map(|c| c.stream_id)
+            };
+            let resolved = pick(true)
+                .map(|sid| (sid, true))
+                .or_else(|| pick(false).map(|sid| (sid, false)));
+            match resolved {
+                Some((sid, _)) if sources.iter().any(|(s, _, _)| *s == sid) => {}
+                Some((sid, is_archive)) => sources.push((sid, is_archive, src)),
+                None => tracing::info!("news source {} ({}) not in catalog", src.tag, src.chan),
+            }
+        }
+        if sources.is_empty() {
+            self.set_toast("geen nieuws-kanalen gevonden");
+            return;
+        }
+        self.set_toast("nieuws ophalen...");
+        let portal = self.catalog.portal().clone();
+        let slot = self.news_picker_slot.clone();
+        tokio::spawn(async move {
+            let now = chrono::Utc::now();
+            let handles: Vec<_> = sources
+                .into_iter()
+                .map(|(sid, is_archive, src)| {
+                    let p = portal.clone();
+                    (
+                        sid,
+                        is_archive,
+                        src,
+                        tokio::spawn(async move { p.fetch_day_epg(sid).await.ok() }),
+                    )
+                })
+                .collect();
+            let mut items: Vec<NewsItem> = Vec::new();
+            for (sid, is_archive, src, h) in handles {
+                let epg = h.await.ok().flatten();
+                if !is_archive {
+                    // 24h news channel (CNN/BBC): no catch-up - one live item,
+                    // titled with whatever it's showing now if EPG is available.
+                    let title = epg
+                        .as_ref()
+                        .and_then(|e| e.current_at(now))
+                        .map(|e| e.title.clone())
+                        .unwrap_or_else(|| "Live".to_string());
+                    items.push(NewsItem {
+                        sid,
+                        title,
+                        start: now,
+                        end: now,
+                        tag: src.tag.to_string(),
+                        offset: 0,
+                        live: true,
+                    });
+                    continue;
+                }
+                if let Some(epg) = epg {
+                    // Per source: matching past entries, newest first, capped at
+                    // 3 so a 24h news channel can't flood the combined list.
+                    let mut found: Vec<NewsItem> = epg
+                        .entries()
+                        .iter()
+                        .filter(|e| e.start <= now)
+                        .filter(|e| {
+                            let t = e.title.to_lowercase();
+                            (src.title.is_empty() || t.contains(src.title))
+                                && !src.excl.iter().any(|x| t.contains(x))
+                        })
+                        .map(|e| NewsItem {
+                            sid,
+                            title: e.title.clone(),
+                            start: e.start,
+                            end: e.end,
+                            tag: src.tag.to_string(),
+                            offset: src.offset,
+                            live: false,
+                        })
+                        .collect();
+                    found.sort_by(|a, b| b.start.cmp(&a.start));
+                    found.truncate(3);
+                    items.extend(found);
+                }
+            }
+            items.sort_by(|a, b| b.start.cmp(&a.start)); // newest first across sources
+            items.truncate(10);
+            tracing::info!(
+                "news picker {} items: {:?}",
+                items.len(),
+                items
+                    .iter()
+                    .map(|i| format!(
+                        "{} {}@{}",
+                        i.tag,
+                        i.title,
+                        i.start.with_timezone(&chrono::Local).format("%H:%M")
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            *slot.lock() = Some(items);
+        });
+    }
+
+    /// When the async news list lands, pop the picker (newest pre-selected).
+    fn drain_news_picker(&mut self) {
+        if let Some(items) = self.news_picker_slot.lock().take() {
+            self.news_picker = Some(NewsPicker { items, selected: 0 });
+        }
+    }
+
+    /// Arrow keys / Enter / Esc for the open news picker.
+    fn handle_news_picker_keys(&mut self, ctx: &egui::Context) {
+        let (up, down, enter, esc) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::ArrowUp),
+                i.key_pressed(Key::ArrowDown),
+                i.key_pressed(Key::Enter),
+                i.key_pressed(Key::Escape),
+            )
+        });
+        if esc {
+            self.news_picker = None;
+            return;
+        }
+        let chosen = {
+            let Some(p) = self.news_picker.as_mut() else {
+                return;
+            };
+            if up {
+                p.selected = p.selected.saturating_sub(1);
+            }
+            if down && !p.items.is_empty() {
+                p.selected = (p.selected + 1).min(p.items.len() - 1);
+            }
+            if enter {
+                p.items.get(p.selected).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(item) = chosen {
+            self.news_picker = None;
+            self.play_news_item(&item);
+        }
+    }
+
+    /// Play a chosen news bulletin via catch-up (RTL skips 30s of ads).
+    fn play_news_item(&mut self, item: &NewsItem) {
+        if item.live {
+            // 24h news channel (CNN/BBC): no catch-up, just play it live.
+            let url = self.catalog.portal().live_stream_url(item.sid);
+            self.load_url(url, true);
+            self.current_name = Some(format!("{} - {}", item.tag, item.title));
+            self.current_idx = None;
+            self.current_stream_id = Some(item.sid);
+            self.current_epg = None;
+            self.set_toast_for(format!("[{}] {}", item.tag, item.title), 30);
+            return;
+        }
+        let off = item.offset;
+        let start = item.start + chrono::Duration::seconds(off);
+        let dur = ((item.end - start).num_minutes() as u32).max(1);
+        let url = self.catalog.portal().catchup_url(item.sid, start, dur);
+        let label = format!(
+            "[TERUG] {}  {}",
+            item.title,
+            item.start.with_timezone(&chrono::Local).format("%H:%M")
+        );
+        tracing::info!("news pick -> {}", label);
+        self.load_url(url, false);
+        self.current_name = Some(label.clone());
+        self.current_idx = None;
+        self.current_stream_id = None;
+        self.current_epg = None;
+        self.set_toast_for(label, 30);
+    }
+
+    fn paint_news_picker(&self, ctx: &egui::Context) {
+        let Some(picker) = &self.news_picker else {
+            return;
+        };
+        egui::Area::new(egui::Id::new("__news_picker__"))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Frame::popup(&ctx.style())
+                    .fill(Color32::from_rgb(20, 20, 26))
+                    .inner_margin(egui::Margin::symmetric(18.0, 16.0))
+                    .show(ui, |ui| {
+                        ui.set_width(540.0);
+                        ui.label(
+                            egui::RichText::new("Laatste nieuws")
+                                .heading()
+                                .color(Color32::WHITE),
+                        );
+                        ui.add_space(10.0);
+                        if picker.items.is_empty() {
+                            ui.label(
+                                egui::RichText::new("geen recente uitzendingen gevonden")
+                                    .italics()
+                                    .color(Color32::from_white_alpha(150)),
+                            );
+                        }
+                        for (i, item) in picker.items.iter().enumerate() {
+                            let selected = i == picker.selected;
+                            let time = item
+                                .start
+                                .with_timezone(&chrono::Local)
+                                .format("%H:%M")
+                                .to_string();
+                            let tag = item.tag.as_str();
+                            let tag_col = match tag {
+                                "RTL" => Color32::from_rgb(225, 80, 80),
+                                "NOS" => Color32::from_rgb(245, 150, 40),
+                                "CNN" => Color32::from_rgb(200, 50, 50),
+                                "BBC" => Color32::from_rgb(190, 30, 40),
+                                "VRT" => Color32::from_rgb(80, 160, 220),
+                                "ZLD" => Color32::from_rgb(90, 180, 90),
+                                _ => Color32::from_rgb(120, 120, 130),
+                            };
+                            let bg = if selected {
+                                Color32::from_rgb(42, 58, 84)
+                            } else {
+                                Color32::from_rgb(26, 26, 32)
+                            };
+                            egui::Frame::none()
+                                .fill(bg)
+                                .rounding(6.0)
+                                .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&time)
+                                                .monospace()
+                                                .size(17.0)
+                                                .color(Color32::from_white_alpha(190)),
+                                        );
+                                        ui.add_space(8.0);
+                                        egui::Frame::none()
+                                            .fill(tag_col)
+                                            .rounding(4.0)
+                                            .inner_margin(egui::Margin::symmetric(5.0, 1.0))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(tag)
+                                                        .size(11.0)
+                                                        .strong()
+                                                        .color(Color32::from_rgb(20, 20, 20)),
+                                                );
+                                            });
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new(&item.title)
+                                                .size(17.0)
+                                                .strong()
+                                                .color(Color32::WHITE),
+                                        );
+                                    });
+                                });
+                            ui.add_space(4.0);
+                        }
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "pijltjes = kiezen   /   Enter = afspelen   /   Esc = sluiten",
+                            )
+                            .size(12.0)
+                            .color(Color32::from_white_alpha(130)),
+                        );
+                    });
+            });
     }
 
     fn toggle_favorite_current(&mut self) {
@@ -861,6 +1300,12 @@ impl TvApp {
             return;
         }
 
+        // News picker is modal: arrows / Enter / Esc only.
+        if self.news_picker.is_some() {
+            self.handle_news_picker_keys(ctx);
+            return;
+        }
+
         let (
             down,
             up,
@@ -874,7 +1319,6 @@ impl TvApp {
             f11,
             esc,
             n_key,
-            r_key,
             a_key,
             s_key,
             star,
@@ -882,6 +1326,8 @@ impl TvApp {
             g_key,
             t_key,
             qmark,
+            plus,
+            minus,
         ) = ctx.input(|i| {
             (
                 i.key_pressed(Key::ArrowDown),
@@ -896,7 +1342,6 @@ impl TvApp {
                 i.key_pressed(Key::F11),
                 i.key_pressed(Key::Escape),
                 i.key_pressed(Key::N),
-                i.key_pressed(Key::R),
                 i.key_pressed(Key::A),
                 i.key_pressed(Key::S),
                 i.events
@@ -908,6 +1353,12 @@ impl TvApp {
                 i.events
                     .iter()
                     .any(|e| matches!(e, egui::Event::Text(t) if t == "?")),
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Text(t) if t == "+")),
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Text(t) if t == "-")),
             )
         });
 
@@ -946,6 +1397,15 @@ impl TvApp {
             self.set_toast(">> +30s");
         }
 
+        // + / - : step to a higher / lower quality variant of the current
+        // channel (live only). Read as text events like * and ? above.
+        if plus {
+            self.quality_step(1);
+        }
+        if minus {
+            self.quality_step(-1);
+        }
+
         if f_key && !shift {
             self.show_search = !self.show_search;
             if self.show_search {
@@ -972,18 +1432,7 @@ impl TvApp {
         self.handle_number_presets(ctx);
 
         if n_key {
-            if let Some(sid) = shortcuts::news_npo(&self.catalog) {
-                self.zap_by_id(sid);
-            } else {
-                self.set_toast("no NPO channel in catalog");
-            }
-        }
-        if r_key {
-            if let Some(sid) = shortcuts::news_rtl(&self.catalog) {
-                self.zap_by_id(sid);
-            } else {
-                self.set_toast("no RTL channel in catalog");
-            }
+            self.open_news_picker();
         }
 
         if a_key {
@@ -1082,10 +1531,10 @@ impl TvApp {
     }
 
     fn paint_toast(&self, ctx: &egui::Context) {
-        let Some((text, t0)) = &self.toast else {
+        let Some((text, t0, dur)) = &self.toast else {
             return;
         };
-        if t0.elapsed() > Duration::from_secs(4) {
+        if t0.elapsed() > *dur {
             return;
         }
         egui::Area::new(egui::Id::new("__toast__"))
@@ -1290,14 +1739,14 @@ impl TvApp {
                     ("Up / Down  -  Mouse wheel", "previous / next channel"),
                     ("0-9  (tap)", "recall channel preset"),
                     ("0-9  (hold)", "store current channel as preset"),
-                    ("n", "news shortcut (NPO)"),
-                    ("r", "news shortcut (RTL)"),
+                    ("n", "nieuws kiezen: NOS / RTL / CNN / BBC / VRT / ZLD"),
                     ("f", "cross-catalog search (live + films + series)"),
                     ("Shift+F", "favorites panel"),
                     ("*", "toggle current channel as favorite"),
                     ("e", "EPG strip overlay (now + next)"),
                     ("Shift+E", "EPG grid"),
                     ("a / s", "cycle audio / subtitle track"),
+                    ("+ / -", "hogere / lagere kwaliteit (live)"),
                     ("Left / Right", "VOD seek -30s / +30s"),
                     ("F11", "fullscreen"),
                     ("F5", "retry portal fetch"),
@@ -1333,9 +1782,12 @@ impl TvApp {
                     .show(ui, |ui| {
                         ui.set_max_width(720.0);
                         ui.label(
-                            egui::RichText::new("tvplayer  -  hotkeys")
-                                .color(Color32::WHITE)
-                                .heading(),
+                            egui::RichText::new(format!(
+                                "tvplayer v{}  -  hotkeys",
+                                env!("CARGO_PKG_VERSION")
+                            ))
+                            .color(Color32::WHITE)
+                            .heading(),
                         );
                         ui.add_space(8.0);
                         for (section, rows) in SECTIONS {
@@ -1369,7 +1821,7 @@ impl TvApp {
                         }
                         ui.separator();
                         ui.label(
-                            egui::RichText::new("press ? or Esc to close")
+                            egui::RichText::new("(c) 2026 Bart    -    press ? or Esc to close")
                                 .italics()
                                 .color(Color32::from_white_alpha(140))
                                 .size(11.0),
@@ -1390,6 +1842,39 @@ impl TvApp {
                     .show(ui, |ui| {
                         let frame = self.player.frames.read();
                         ui.label(format!("frame v{} {}x{}", frame.version, frame.w, frame.h));
+                        // playback health: freeze detection (paused-for-cache).
+                        // Colour-coded instead of glyphs — egui's default fonts
+                        // don't reliably ship emoji.
+                        let now = Instant::now();
+                        let (txt, col) = if self.health.is_buffering() {
+                            match self.health.elapsed(now) {
+                                Some(d) => (
+                                    format!("playback: BUFFERING  {:.1}s", d.as_secs_f64()),
+                                    Color32::from_rgb(255, 170, 60),
+                                ),
+                                None => (
+                                    "playback: buffering (startup)".to_string(),
+                                    Color32::from_rgb(210, 210, 130),
+                                ),
+                            }
+                        } else {
+                            (
+                                "playback: live".to_string(),
+                                Color32::from_rgb(120, 220, 120),
+                            )
+                        };
+                        ui.label(egui::RichText::new(txt).color(col));
+                        let last = self
+                            .health
+                            .last_freeze()
+                            .map(|d| format!("{:.1}s", d.as_secs_f64()))
+                            .unwrap_or_else(|| "-".to_string());
+                        ui.label(format!(
+                            "freezes: {}   total {:.1}s   last {}",
+                            self.health.freeze_count(),
+                            self.health.total_frozen().as_secs_f64(),
+                            last,
+                        ));
                         if let Some(n) = &self.current_name {
                             ui.label(format!("channel: {}", n));
                         }
@@ -1551,7 +2036,7 @@ impl TvApp {
 
     /// How many columns fit at the current window width. Adaptive.
     fn guide_num_visible_cols(&self, ctx: &egui::Context) -> usize {
-        const COL_PX: f32 = 200.0;
+        const COL_PX: f32 = 230.0;
         let w = ctx
             .input(|i| i.viewport().inner_rect.map(|r| r.width()))
             .unwrap_or(1280.0);
@@ -2067,7 +2552,6 @@ impl TvApp {
             /// means the portal genuinely returned no EPG data.
             failed: bool,
         }
-        const ROW_H: f32 = 26.0;
 
         let col_data: Vec<ColData> = {
             let cache = self.guide.epg_cache.lock();
@@ -2307,15 +2791,22 @@ impl TvApp {
                                 // column does the same -> all the green LIVE rows
                                 // line up on one centre line, and the content
                                 // never exceeds the viewport so nothing scrolls.
-                                let view_h = column_ui.available_height().max(ROW_H);
-                                let rows_fit = ((view_h / ROW_H) as usize).max(1);
-                                let half = rows_fit / 2;
+                                // Fixed window: 3 past + current + 4 upcoming,
+                                // sized so those 8 rows fill the column height.
+                                // A top spacer keeps the current programme at the
+                                // same height in every column (the now-line).
+                                const ABOVE: usize = 3;
+                                const BELOW: usize = 4;
+                                let view_h = column_ui.available_height().max(80.0);
+                                let row_h = view_h / (ABOVE + BELOW + 1) as f32;
+                                let title_sz = (row_h * 0.26).clamp(15.0, 22.0);
+                                let time_sz = (row_h * 0.22).clamp(13.0, 18.0);
                                 let n = cd.programmes.len();
                                 let focus = cd.row.min(n.saturating_sub(1));
-                                let start = focus.saturating_sub(half);
+                                let start = focus.saturating_sub(ABOVE);
                                 let above = focus - start;
-                                let pad_top = (half - above) as f32 * ROW_H;
-                                let end = (focus + (rows_fit - half)).min(n);
+                                let pad_top = (ABOVE - above) as f32 * row_h;
+                                let end = (focus + BELOW + 1).min(n);
                                 egui::ScrollArea::vertical()
                                     .id_source(format!("guide_col_{}", cd.channel.stream_id))
                                     .auto_shrink([false, false])
@@ -2336,7 +2827,7 @@ impl TvApp {
                                                 ProgrammeStatus::Catchup => (
                                                     Color32::from_rgb(18, 18, 22),
                                                     Color32::from_white_alpha(210),
-                                                    Some(("Terugkijken", Color32::from_rgb(140, 180, 220))),
+                                                    Some(("TK", Color32::from_rgb(140, 180, 220))),
                                                 ),
                                                 ProgrammeStatus::Future => (
                                                     Color32::from_rgb(18, 18, 22),
@@ -2383,30 +2874,44 @@ impl TvApp {
                                                         // get the rest of the
                                                         // row to themselves.
                                                         ui.add_sized(
-                                                            egui::vec2(36.0, ROW_H - 4.0),
+                                                            egui::vec2(52.0, row_h - 6.0),
                                                             egui::Label::new(
                                                                 egui::RichText::new(&time_label)
-                                                                    .color(Color32::from_white_alpha(190))
+                                                                    .color(Color32::from_white_alpha(165))
                                                                     .monospace()
-                                                                    .size(11.0),
+                                                                    .size(time_sz),
                                                             ),
                                                         );
                                                         // Reserve space for the
                                                         // right-side badge so the
                                                         // title truncates cleanly
                                                         // without overrunning it.
-                                                        let badge_w = if badge.is_some() { 78.0 } else { 0.0 };
+                                                        let badge_w = if badge.is_some() { 52.0 } else { 0.0 };
                                                         let title_w = (ui.available_width()
                                                             - badge_w - 4.0)
                                                             .max(40.0);
-                                                        ui.add_sized(
-                                                            egui::vec2(title_w, ROW_H - 4.0),
-                                                            egui::Label::new(
-                                                                egui::RichText::new(&e.title)
-                                                                    .color(fg)
-                                                                    .size(12.0),
-                                                            )
-                                                            .truncate(true),
+                                                        ui.allocate_ui_with_layout(
+                                                            egui::vec2(title_w, row_h - 6.0),
+                                                            egui::Layout::left_to_right(
+                                                                egui::Align::Center,
+                                                            ),
+                                                            |ui| {
+                                                                // Clip so a long
+                                                                // wrapped title
+                                                                // never bleeds
+                                                                // into the next
+                                                                // row.
+                                                                ui.set_clip_rect(ui.max_rect());
+                                                                ui.add(
+                                                                    egui::Label::new(
+                                                                        egui::RichText::new(&e.title)
+                                                                            .color(fg)
+                                                                            .size(title_sz)
+                                                                            .strong(),
+                                                                    )
+                                                                    .wrap(true),
+                                                                );
+                                                            },
                                                         );
                                                         if let Some((b_txt, b_col)) = badge {
                                                             ui.with_layout(
@@ -2449,6 +2954,15 @@ impl TvApp {
                                                     }
                                                 })
                                                 .response;
+                                            // Thin divider under each row (NLZIET-style).
+                                            ui.painter().hline(
+                                                frame_response.rect.x_range(),
+                                                frame_response.rect.bottom(),
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    Color32::from_white_alpha(18),
+                                                ),
+                                            );
                                             if frame_response.interact(egui::Sense::click()).clicked() {
                                                 clicked_in_col = Some(p);
                                             }
@@ -2494,9 +3008,17 @@ impl Drop for TvApp {
 }
 
 impl eframe::App for TvApp {
+    // Don't persist egui memory across runs - otherwise a stale focus (e.g. the
+    // search box that was open at exit) gets restored on startup. Search must
+    // only appear on `f`.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.drain_epg();
+        self.drain_news_picker();
         self.check_stall();
         self.forward_window_size(ctx);
         self.update_video_texture(ctx);
@@ -2537,6 +3059,7 @@ impl eframe::App for TvApp {
             // Overlays only make sense in video mode - inside the guide they
             // would compete visually with the schedule grid.
             self.paint_search(ctx);
+            self.paint_news_picker(ctx);
             self.paint_favs(ctx);
             self.paint_epg_strip(ctx);
             self.paint_epg_grid(ctx);

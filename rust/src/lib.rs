@@ -4,6 +4,7 @@ pub mod args;
 pub mod catalog;
 pub mod epg;
 pub mod favorites;
+pub mod playback_health;
 pub mod player;
 pub mod portal;
 pub mod presets;

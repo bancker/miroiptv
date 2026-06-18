@@ -67,6 +67,15 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                     }
                 };
 
+            // Observe paused-for-cache as a STRING so the existing
+            // property_change parser yields "yes"/"no" (it only handles
+            // MPV_FORMAT_STRING). This is the freeze signal: mpv flips it to
+            // "yes" when the picture stalls on a cache underrun and back to
+            // "no" when playback resumes.
+            if let Err(e) = mpv.observe_property("paused-for-cache", mpv_sys::MPV_FORMAT_STRING, 1) {
+                warn!("observe paused-for-cache failed: {}", e);
+            }
+
             info!("mpv player thread started");
 
             loop {
