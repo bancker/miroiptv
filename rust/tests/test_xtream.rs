@@ -94,6 +94,27 @@ fn live_stream_url_shape() {
 }
 
 #[test]
+fn live_stream_id_reads_back_a_live_url() {
+    // Last-watched keeps only the URL; resume needs to know the channel.
+    let portal = XtreamPortal::new(XtreamCreds {
+        username: "u".into(),
+        password: "p".into(),
+        host: "h.example.com".into(),
+        port: 8080,
+    });
+    let url = portal.live_stream_url(726347);
+    assert_eq!(portal.live_stream_id(&url), Some(726347));
+    assert_eq!(
+        portal.live_stream_id("http://h.example.com:8080/movie/u/p/5001.mkv"),
+        None
+    );
+    assert_eq!(
+        portal.live_stream_id("http://h.example.com:8080/timeshift/u/p/35/2026-10-10:19-20/9.m3u8"),
+        None
+    );
+}
+
+#[test]
 fn movie_stream_url_uses_extension() {
     let creds = XtreamCreds {
         username: "u".into(),

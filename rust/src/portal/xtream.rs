@@ -309,6 +309,12 @@ impl Portal for XtreamPortal {
         )
     }
 
+    fn live_stream_id(&self, url: &str) -> Option<i64> {
+        let path = url.split('?').next()?;
+        let (_, rest) = path.split_once("/live/")?;
+        rest.rsplit('/').next()?.split('.').next()?.parse().ok()
+    }
+
     fn movie_stream_url(&self, stream_id: i64, container_ext: &str) -> String {
         format!(
             "{}/movie/{}/{}/{}.{}",

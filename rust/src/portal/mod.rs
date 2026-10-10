@@ -27,6 +27,9 @@ pub trait Portal: Send + Sync {
     async fn fetch_day_epg(&self, stream_id: i64) -> Result<Epg, PortalError>;
     async fn fetch_series_episodes(&self, series_id: i64) -> Result<Vec<Episode>, PortalError>;
     fn live_stream_url(&self, stream_id: i64) -> String;
+    /// The stream id of a URL from [`Portal::live_stream_url`]; `None` for
+    /// anything else (catch-up, VOD).
+    fn live_stream_id(&self, url: &str) -> Option<i64>;
     fn movie_stream_url(&self, stream_id: i64, container_ext: &str) -> String;
     fn series_stream_url(&self, episode_id: &str, container_ext: &str) -> String;
     /// Catch-up / timeshift URL for an already-broadcast programme.

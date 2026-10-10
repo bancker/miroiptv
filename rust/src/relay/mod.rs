@@ -16,7 +16,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use playlist::{Playlist, Segment};
 use reqwest::Url;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -56,8 +56,7 @@ pub struct RelayConfig {
     /// How long a prefetch waits for the player to connect before stopping.
     pub prefetch_ttl: Duration,
     /// How long starting a session keeps trying while the portal answers
-    /// "busy": 407 for ~10-13 s after catch-up (the old session still counts),
-    /// 503 when flipping channels gets rate limited.
+    /// "busy" (503 when flipping channels gets rate limited).
     pub busy_wait: Duration,
 }
 
@@ -91,6 +90,8 @@ struct Inner {
     cfg: RelayConfig,
     client: reqwest::Client,
     routes: Mutex<Routes>,
+    /// Upstreams the portal refused to this account (HTTP 407).
+    refused: Mutex<HashSet<String>>,
 }
 
 /// Local stream ids <-> upstream playlist URLs (one entry per distinct
@@ -140,14 +141,23 @@ enum VodState {
     Ready(Bytes),
     /// Not a finished playlist: the player gets it from the portal itself.
     Growing,
+    Refused,
+    Failed,
+}
+
+/// How a session's start went: the player gets 200, 403 or 502.
+enum Start {
+    Playing,
+    /// The portal won't give this account the stream (HTTP 407).
+    Refused,
     Failed,
 }
 
 /// The upstream half of a session: fetching runs in `task` and queues its
-/// output in `rx`; `ready` reports whether a first playlist came in.
+/// output in `rx`; `ready` reports how the start went.
 struct Upstream {
     started: Instant,
-    ready: oneshot::Receiver<bool>,
+    ready: oneshot::Receiver<Start>,
     rx: mpsc::Receiver<Bytes>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -157,12 +167,16 @@ fn spawn_upstream(inner: Arc<Inner>, portal: String) -> Upstream {
     let (ready_tx, ready) = oneshot::channel();
     let task = tokio::spawn(async move {
         match first_playlist(&inner, &portal, inner.cfg.idle_timeout).await {
-            Some(first) => {
-                let _ = ready_tx.send(true);
+            Ok(first) => {
+                let _ = ready_tx.send(Start::Playing);
                 fetch_loop(inner, portal, first.url, first.playlist, tx).await;
             }
-            None => {
-                let _ = ready_tx.send(false);
+            Err(Refused::Denied) => {
+                inner.refused.lock().insert(portal);
+                let _ = ready_tx.send(Start::Refused);
+            }
+            Err(_) => {
+                let _ = ready_tx.send(Start::Failed);
             }
         }
     });
@@ -192,6 +206,7 @@ impl Relay {
             cfg,
             client,
             routes: Mutex::new(Routes::default()),
+            refused: Mutex::new(HashSet::new()),
         });
         tokio::spawn(accept_loop(listener, inner.clone()));
         Ok(Self { inner })
@@ -231,6 +246,12 @@ impl Relay {
         format!("http://127.0.0.1:{}/live/{id}.ts", self.inner.port)
     }
 
+    /// Whether the portal refused `upstream` to this account (HTTP 407): the
+    /// app then plays another variant of the channel.
+    pub fn refused(&self, upstream: &str) -> bool {
+        self.inner.refused.lock().contains(upstream)
+    }
+
     /// Local URL for mpv that plays the catch-up / VOD playlist at `upstream`
     /// from one portal request instead of two. Segments still come straight
     /// from the portal's servers, so seeking works as before.
@@ -241,7 +262,7 @@ impl Relay {
         let task = tokio::spawn(async move {
             let t0 = Instant::now();
             let state = match first_playlist(&inner, &portal, inner.cfg.vod_timeout).await {
-                Some(f) if f.playlist.ended => {
+                Ok(f) if f.playlist.ended => {
                     info!(
                         "relay: catch-up playlist in {} ms ({} segments)",
                         t0.elapsed().as_millis(),
@@ -249,8 +270,12 @@ impl Relay {
                     );
                     VodState::Ready(playlist::absolutize(&f.text, &f.url).into())
                 }
-                Some(_) => VodState::Growing,
-                None => VodState::Failed,
+                Ok(_) => VodState::Growing,
+                Err(Refused::Denied) => {
+                    inner.refused.lock().insert(portal);
+                    VodState::Refused
+                }
+                Err(_) => VodState::Failed,
             };
             let _ = tx.send(state);
         });
@@ -354,12 +379,18 @@ async fn serve_vod(mut conn: TcpStream, found: Option<(watch::Receiver<VodState>
              Connection: close\r\n\r\n"
         )
         .into_bytes(),
-        VodState::Fetching | VodState::Failed => {
-            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-        }
+        VodState::Refused => FORBIDDEN.to_vec(),
+        VodState::Fetching | VodState::Failed => BAD_GATEWAY.to_vec(),
     };
     let _ = conn.write_all(&reply).await;
 }
+
+/// The portal refused the stream to this account.
+const FORBIDDEN: &[u8] =
+    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+/// No usable playlist from the portal.
+const BAD_GATEWAY: &[u8] =
+    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 /// Path of a `GET` request; headers (mpv's Range, Icy-MetaData...) are ignored.
 async fn read_request_path(conn: &mut TcpStream) -> Option<String> {
@@ -388,20 +419,26 @@ async fn read_request_path(conn: &mut TcpStream) -> Option<String> {
 /// whatever the upstream produces until the player hangs up (zap, quit) or
 /// the upstream gives up.
 async fn session(mut up: Upstream, mut conn: TcpStream) {
-    let ready = tokio::select! {
-        ready = &mut up.ready => matches!(ready, Ok(true)),
+    let start = tokio::select! {
+        start = &mut up.ready => start.unwrap_or(Start::Failed),
         _ = hung_up(&mut conn) => {
             up.task.abort(); // zapped on while the portal was still answering
             return;
         }
     };
-    if !ready {
-        warn!("relay: no playlist from the portal - refusing the stream");
-        let _ = conn
-            .write_all(
-                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
-            .await;
+    let refusal = match start {
+        Start::Playing => None,
+        Start::Refused => {
+            warn!("relay: the portal refuses this stream to the account");
+            Some(FORBIDDEN)
+        }
+        Start::Failed => {
+            warn!("relay: no playlist from the portal - refusing the stream");
+            Some(BAD_GATEWAY)
+        }
+    };
+    if let Some(reply) = refusal {
+        let _ = conn.write_all(reply).await;
         up.task.abort();
         return;
     }
@@ -509,9 +546,14 @@ async fn fetch_loop(
 
 /// The session's first playlist, via the portal (which redirects to an edge
 /// server). Retried like any refusal, and for up to `busy_wait` while the
-/// portal says it is busy - a channel that is really gone still fails fast.
-async fn first_playlist(inner: &Inner, portal: &str, timeout: Duration) -> Option<Fetched> {
-    let url = Url::parse(portal).ok()?;
+/// portal says it is busy - a channel that is really gone still fails fast,
+/// and one refused to the account (407) is not asked for again.
+async fn first_playlist(
+    inner: &Inner,
+    portal: &str,
+    timeout: Duration,
+) -> Result<Fetched, Refused> {
+    let url = Url::parse(portal).map_err(|_| Refused::Failed)?;
     let cfg = &inner.cfg;
     let t0 = Instant::now();
     let mut retries = cfg.retry_delays.iter();
@@ -527,8 +569,9 @@ async fn first_playlist(inner: &Inner, portal: &str, timeout: Duration) -> Optio
                         refusals
                     );
                 }
-                return Some(found);
+                return Ok(found);
             }
+            Err(Refused::Denied) => return Err(Refused::Denied),
             Err(refused) => {
                 refusals += 1;
                 pause = match retries.next() {
@@ -538,7 +581,7 @@ async fn first_playlist(inner: &Inner, portal: &str, timeout: Duration) -> Optio
                     {
                         pause
                     }
-                    None => return None,
+                    None => return Err(refused),
                 };
             }
         }
@@ -577,9 +620,11 @@ async fn reload(inner: &Inner, portal: &str, edge: &mut Url) -> Option<Playlist>
 
 /// Why a playlist request brought no playlist.
 enum Refused {
-    /// 407 (the previous session still counts), 503 / 429 (rate limited),
-    /// 509 (session taken over): the portal is there, just not for us yet.
+    /// 503 / 429 (rate limited), 509 (session taken over): the portal is
+    /// there, just not for us yet.
     Busy,
+    /// 407: this stream is not for this account (RTL 4 UHD, every time).
+    Denied,
     /// Anything else: not found, timed out, not a playlist...
     Failed,
 }
@@ -613,7 +658,8 @@ async fn get_playlist(inner: &Inner, url: Url, timeout: Duration) -> Result<Fetc
     if !resp.status().is_success() {
         warn!("relay: playlist request -> HTTP {}", status);
         return Err(match status {
-            407 | 429 | 503 | 509 => Refused::Busy,
+            407 => Refused::Denied,
+            429 | 503 | 509 => Refused::Busy,
             _ => Refused::Failed,
         });
     }

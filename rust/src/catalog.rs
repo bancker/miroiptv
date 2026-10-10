@@ -246,6 +246,21 @@ fn zap_preference(rank: u8) -> u8 {
     }
 }
 
+/// What to play when the portal refuses variant `sid` of a channel: another
+/// variant from its `ladder` ([`quality_ladder`]) in zap order (FHD first, see
+/// [`zap_preference`]), skipping those `refused` says were turned down too.
+pub fn fallback_variant(
+    ladder: &[LiveChannel],
+    sid: i64,
+    refused: impl Fn(&LiveChannel) -> bool,
+) -> Option<LiveChannel> {
+    ladder
+        .iter()
+        .filter(|c| c.stream_id != sid && !refused(c))
+        .max_by_key(|c| zap_preference(quality_rank(&c.name)))
+        .cloned()
+}
+
 /// Collapse a live-channel list to ONE entry per distinct channel (keyed by
 /// [`normalize_channel_name`]), keeping the highest-scoring variant so the
 /// user doesn't zap through NPO1 HD / UHD / FHD / catch-up duplicates. Order
@@ -303,6 +318,32 @@ mod zap_tests {
             .find(|c| normalize_channel_name(&c.name) == "npo1")
             .unwrap();
         assert_eq!(npo1.stream_id, 3, "FHD variant wins");
+    }
+
+    fn rtl4_ladder() -> Vec<LiveChannel> {
+        vec![
+            ch(1, "NL | RTL 4 HD", 0),
+            ch(2, "NL | RTL 4 FHD", 0),
+            ch(3, "NL | RTL 4 UHD", 0),
+        ]
+    }
+
+    #[test]
+    fn a_refused_uhd_variant_falls_back_to_fhd() {
+        let alt = fallback_variant(&rtl4_ladder(), 3, |_| false);
+        assert_eq!(alt.map(|c| c.stream_id), Some(2));
+    }
+
+    #[test]
+    fn fallback_skips_variants_that_were_refused_too() {
+        let alt = fallback_variant(&rtl4_ladder(), 3, |c| c.stream_id == 2);
+        assert_eq!(alt.map(|c| c.stream_id), Some(1));
+    }
+
+    #[test]
+    fn no_fallback_for_a_channel_without_other_variants() {
+        let ladder = vec![ch(3, "NL | RTL 4 UHD", 0)];
+        assert!(fallback_variant(&ladder, 3, |_| false).is_none());
     }
 
     #[test]

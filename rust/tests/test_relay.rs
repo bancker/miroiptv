@@ -365,8 +365,33 @@ async fn a_player_that_leaves_before_the_stream_starts_stops_the_session() {
 }
 
 fn busy() -> ResponseTemplate {
-    // What the portal answers live requests for a while after catch-up.
-    ResponseTemplate::new(407)
+    // What the portal answers when flipping channels gets rate limited.
+    ResponseTemplate::new(503)
+}
+
+#[tokio::test]
+async fn a_stream_the_portal_refuses_fails_fast_and_is_remembered() {
+    // RTL 4 UHD: this account gets 407 for it, every time, at once.
+    let server = MockServer::start().await;
+    portal(&server, vec![ResponseTemplate::new(407)]).await;
+    let upstream = format!("{}/live/u/p/1.m3u8", server.uri());
+
+    let relay = Relay::start(RelayConfig {
+        busy_wait: Duration::from_secs(5),
+        ..fast()
+    })
+    .unwrap();
+    assert!(!relay.refused(&upstream));
+    let local = relay.local_url(&upstream);
+    let t0 = std::time::Instant::now();
+    assert!(status(&local).await.starts_with("HTTP/1.1 403"));
+    assert!(
+        t0.elapsed() < Duration::from_millis(500),
+        "took {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(hits(&server, "/live/u/p/1.m3u8").await, 1, "asked again");
+    assert!(relay.refused(&upstream), "the app needs to know");
 }
 
 #[tokio::test]

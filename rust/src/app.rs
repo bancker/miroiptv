@@ -1,5 +1,5 @@
 use crate::args::parse_xtream_creds;
-use crate::catalog::{normalize_channel_name, quality_label, quality_rank, CatalogStatus, CatalogStore};
+use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, quality_rank, CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::Favorites;
 use crate::playback_health::{PlaybackHealth, ReloadBudget};
@@ -555,6 +555,21 @@ impl TvApp {
                             tracing::warn!("live stream keeps ending - auto-reload budget spent");
                         }
                     }
+                    // The portal refused this variant to the account: play
+                    // another one of the channel rather than an error.
+                    if reason == "error" && live {
+                        let sid = self
+                            .current_url
+                            .as_deref()
+                            .and_then(|u| self.catalog.portal().live_stream_id(u));
+                        if let Some(sid) = sid.filter(|s| self.is_refused(*s)) {
+                            if !self.play_fallback_for(sid, self.current_idx) {
+                                self.stall_watchdog_armed = false;
+                                self.set_toast("zender niet beschikbaar voor dit abonnement");
+                            }
+                            continue;
+                        }
+                    }
                     // eof/error mean the stream won't resume on its own: disarm
                     // the silent-stall watchdog so it doesn't reload a finished
                     // file on a loop. A plain stop (channel switch) leaves the
@@ -743,6 +758,11 @@ impl TvApp {
     }
 
     fn zap_to(&mut self, sid: i64, name: &str, idx: Option<usize>) {
+        // Refused to this account earlier this session: straight to the
+        // channel's next best variant instead of failing again.
+        if self.is_refused(sid) && self.play_fallback_for(sid, idx) {
+            return;
+        }
         let url = self.catalog.portal().live_stream_url(sid);
         tracing::info!(
             "zap: -> {} (stream_id={}, idx={:?}, prev={:?})",
@@ -758,6 +778,32 @@ impl TvApp {
         self.current_epg = None;
         self.set_toast(format!("[TV] {}", name));
         self.kick_epg_fetch(sid);
+    }
+
+    /// Whether the portal refused live stream `sid` to this account this
+    /// session (the relay saw its 407 - RTL 4 UHD, every time).
+    fn is_refused(&self, sid: i64) -> bool {
+        self.relay
+            .as_ref()
+            .is_some_and(|r| r.refused(&self.catalog.portal().live_stream_url(sid)))
+    }
+
+    /// Play the channel's best variant the portal does not refuse instead of
+    /// refused `sid` (RTL 4 UHD -> RTL 4 FHD). False when it has none.
+    fn play_fallback_for(&mut self, sid: i64, idx: Option<usize>) -> bool {
+        let nav = self.catalog.quality_nav(sid);
+        let refused = nav
+            .pos
+            .and_then(|p| nav.ladder.get(p))
+            .map_or("(?)", |c| quality_label(quality_rank(&c.name)));
+        let Some(alt) = fallback_variant(&nav.ladder, sid, |c| self.is_refused(c.stream_id))
+        else {
+            return false;
+        };
+        tracing::info!("zap: stream {} refused by the portal - playing {}", sid, alt.name);
+        self.zap_to(alt.stream_id, &alt.name, idx);
+        self.set_toast(format!("[TV] {} ({} niet beschikbaar)", alt.name, refused));
+        true
     }
 
     /// Up/down zapping. A lone press zaps at once; while the user flips
