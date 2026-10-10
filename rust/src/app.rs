@@ -2,7 +2,7 @@ use crate::args::parse_xtream_creds;
 use crate::catalog::{normalize_channel_name, quality_label, quality_rank, CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::Favorites;
-use crate::playback_health::PlaybackHealth;
+use crate::playback_health::{PlaybackHealth, ReloadBudget};
 use crate::player::{Cmd, Event, PlayerHandle, RgbaFrame};
 use crate::presets::Presets;
 use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};
@@ -307,6 +307,8 @@ pub struct TvApp {
     last_recovery_at: Option<Instant>,
     /// Armed only for live channels (VOD/catch-up can legitimately end).
     stall_watchdog_armed: bool,
+    /// Caps the auto-reloads after a live stream ends unexpectedly (eof).
+    reload_budget: ReloadBudget,
 
     // ---- freeze detection: surfaces cache-underrun stalls (paused-for-cache) ----
     /// Per-stream freeze tracker (reset on load; counts only post-first-frame
@@ -385,6 +387,7 @@ impl TvApp {
             last_progress_at: Instant::now(),
             last_recovery_at: None,
             stall_watchdog_armed: false,
+            reload_budget: ReloadBudget::new(3, Duration::from_secs(60)),
             health: PlaybackHealth::new(),
             presets,
             digit_down_since: [None; 10],
@@ -505,6 +508,24 @@ impl TvApp {
                     // quit/redirect/eof are equally internal - only a genuine
                     // playback error deserves to interrupt the channel toast.
                     //
+                    // A live stream never ends on its own: eof there means the
+                    // portal refused a playlist refresh (HTTP 509) and libav
+                    // gave up. Reload via the portal URL (fresh redirect)
+                    // instead of leaving a frozen picture; the budget stops a
+                    // channel that is really down from reloading on a loop.
+                    let live = self.stall_watchdog_armed;
+                    if reason == "eof" && live {
+                        if let Some(url) = self.current_url.clone() {
+                            if self.reload_budget.try_spend(Instant::now()) {
+                                tracing::warn!("live stream ended (eof) - auto-reloading");
+                                self.set_toast("herverbinden...");
+                                self.load_url(url, true);
+                                self.last_recovery_at = Some(Instant::now());
+                                continue;
+                            }
+                            tracing::warn!("live stream keeps ending - auto-reload budget spent");
+                        }
+                    }
                     // eof/error mean the stream won't resume on its own: disarm
                     // the silent-stall watchdog so it doesn't reload a finished
                     // file on a loop. A plain stop (channel switch) leaves the
@@ -512,7 +533,7 @@ impl TvApp {
                     if reason == "eof" || reason == "error" {
                         self.stall_watchdog_armed = false;
                     }
-                    if reason == "error" {
+                    if reason == "error" || (reason == "eof" && live) {
                         self.set_toast("stream error - zap up/down to retry");
                     } else {
                         tracing::debug!("mpv end-file ({}) - toast suppressed", reason);

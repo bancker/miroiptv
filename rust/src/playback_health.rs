@@ -6,7 +6,9 @@
 //! reads the counters. Counters are per stream — call [`PlaybackHealth::reset`]
 //! when a new stream lands. Startup/zap buffering (before the first frame) is
 //! shown live but not counted; counting arms on [`PlaybackHealth::mark_started`].
+//! [`ReloadBudget`] caps the automatic reloads after a live stream dies.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Default)]
@@ -84,9 +86,71 @@ impl PlaybackHealth {
     }
 }
 
+/// Caps automatic reloads of a live stream that ended unexpectedly. A live
+/// stream never ends on its own (an eof means the portal refused a playlist
+/// refresh and libav gave up), so the app reloads it, but a channel that is
+/// really down would then reload forever: at most `max` per sliding `window`.
+#[derive(Debug)]
+pub struct ReloadBudget {
+    max: usize,
+    window: Duration,
+    recent: VecDeque<Instant>,
+}
+
+impl ReloadBudget {
+    pub fn new(max: usize, window: Duration) -> Self {
+        Self {
+            max,
+            window,
+            recent: VecDeque::with_capacity(max),
+        }
+    }
+
+    /// Spend one reload at `now` if the budget allows it. A refused attempt
+    /// costs nothing.
+    pub fn try_spend(&mut self, now: Instant) -> bool {
+        while self
+            .recent
+            .front()
+            .is_some_and(|&t| now.saturating_duration_since(t) >= self.window)
+        {
+            self.recent.pop_front();
+        }
+        if self.recent.len() >= self.max {
+            return false;
+        }
+        self.recent.push_back(now);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_budget_gives_up_after_max_reloads_per_window() {
+        // A channel that is really down must not reload on a loop.
+        let t0 = Instant::now();
+        let mut b = ReloadBudget::new(3, Duration::from_secs(60));
+        assert!(b.try_spend(t0));
+        assert!(b.try_spend(t0 + Duration::from_secs(13)));
+        assert!(b.try_spend(t0 + Duration::from_secs(26)));
+        assert!(!b.try_spend(t0 + Duration::from_secs(39)));
+    }
+
+    #[test]
+    fn reload_budget_refills_as_old_reloads_leave_the_window() {
+        // One bad minute must not switch auto-recovery off for the session;
+        // a refused attempt must not use up a slot either.
+        let t0 = Instant::now();
+        let mut b = ReloadBudget::new(3, Duration::from_secs(60));
+        for s in [0, 13, 26] {
+            assert!(b.try_spend(t0 + Duration::from_secs(s)));
+        }
+        assert!(!b.try_spend(t0 + Duration::from_secs(39)));
+        assert!(b.try_spend(t0 + Duration::from_secs(61)));
+    }
 
     /// A stream past the startup-buffering window (first frame seen).
     fn started() -> PlaybackHealth {
