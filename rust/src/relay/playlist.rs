@@ -1,5 +1,7 @@
 //! HLS media-playlist parsing for the relay. Pure: no I/O.
 
+use reqwest::Url;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Segment {
     pub seq: u64,
@@ -49,6 +51,37 @@ pub fn parse(text: &str) -> Option<Playlist> {
         segments,
         ended,
     })
+}
+
+/// The playlist text with every URI made absolute against `base` (where it
+/// was fetched from), so it can be served from somewhere else.
+pub fn absolutize(text: &str, base: &Url) -> String {
+    let resolve = |uri: &str| {
+        base.join(uri)
+            .map(String::from)
+            .unwrap_or_else(|_| uri.to_string())
+    };
+    let mut out = String::with_capacity(text.len() * 2);
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if !line.starts_with('#') {
+            out += &resolve(line);
+        } else if let Some(at) = line.find("URI=\"") {
+            // A tag pointing at a file: a key, an init segment, a variant.
+            let (head, rest) = line.split_at(at + 5);
+            match rest.find('"') {
+                Some(end) => {
+                    out += head;
+                    out += &resolve(&rest[..end]);
+                    out += &rest[end..];
+                }
+                None => out += line,
+            }
+        } else {
+            out += line;
+        }
+        out.push('\n');
+    }
+    out
 }
 
 impl Playlist {
@@ -126,6 +159,28 @@ mod tests {
             Some(4703),
             "short playlist: from the first"
         );
+    }
+
+    #[test]
+    fn absolutize_resolves_segment_uris_against_the_playlist_url() {
+        let text = "#EXTM3U\n#EXT-X-TARGETDURATION:60\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+            #EXTINF:60.0,\n/ts/aa/0.ts?token=t1\n\
+            #EXTINF:60.0,\r\nhttp://edge.example/ts/aa/1.ts?token=t1\n#EXT-X-ENDLIST\n";
+        let base = Url::parse("http://portal.example:8080/timeshift/x.m3u8?token=t0").unwrap();
+        let out = absolutize(text, &base);
+        assert!(out.contains("\nhttp://portal.example:8080/ts/aa/0.ts?token=t1\n"));
+        assert!(out.contains("\nhttp://edge.example/ts/aa/1.ts?token=t1\n"));
+        assert!(out.contains("\n#EXT-X-PLAYLIST-TYPE:VOD\n"), "tags kept");
+        assert!(out.ends_with("\n#EXT-X-ENDLIST\n"));
+    }
+
+    #[test]
+    fn absolutize_resolves_uri_attributes_too() {
+        let text = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x1\n#EXTINF:6,\ns.ts\n";
+        let base = Url::parse("http://portal.example/a/b.m3u8").unwrap();
+        let out = absolutize(text, &base);
+        assert!(out.contains("URI=\"http://portal.example/a/key.bin\",IV=0x1\n"));
+        assert!(out.contains("\nhttp://portal.example/a/s.ts\n"));
     }
 
     #[test]

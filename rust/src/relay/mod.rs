@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 
 /// Chunks queued between fetching and the player: ~64 MB at reqwest's usual
@@ -49,6 +49,12 @@ pub struct RelayConfig {
     pub give_up_after: Duration,
     /// A request or download that stalls this long counts as failed.
     pub idle_timeout: Duration,
+    /// How long a prefetch waits for the player to connect before stopping.
+    pub prefetch_ttl: Duration,
+    /// How long starting a session keeps trying while the portal answers
+    /// "busy": 407 for ~10-13 s after catch-up (the old session still counts),
+    /// 503 when flipping channels gets rate limited.
+    pub busy_wait: Duration,
 }
 
 impl Default for RelayConfig {
@@ -63,6 +69,8 @@ impl Default for RelayConfig {
             ],
             give_up_after: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(10),
+            prefetch_ttl: Duration::from_secs(10),
+            busy_wait: Duration::from_secs(20),
         }
     }
 }
@@ -80,12 +88,85 @@ struct Inner {
     routes: Mutex<Routes>,
 }
 
-/// Local stream ids <-> upstream playlist URLs. Grows by one entry per
-/// distinct channel watched, so it stays tiny.
+/// Local stream ids <-> upstream playlist URLs (one entry per distinct
+/// channel watched, so tiny), plus the prefetch waiting for its player and
+/// the catch-up playlist being served.
 #[derive(Default)]
 struct Routes {
     ids: HashMap<String, u64>,
     urls: HashMap<u64, String>,
+    pending: HashMap<u64, Upstream>,
+    vod: Option<Vod>,
+}
+
+impl Routes {
+    fn id_for(&mut self, upstream: &str) -> u64 {
+        let next = self.ids.len() as u64;
+        let id = *self.ids.entry(upstream.to_string()).or_insert(next);
+        self.urls.insert(id, upstream.to_string());
+        id
+    }
+
+    /// A new load: stop fetching for the ones before it that no player is
+    /// playing yet - each holds the account's only portal session.
+    fn supersede(&mut self) {
+        for (_, old) in self.pending.drain() {
+            old.task.abort();
+        }
+        if let Some(old) = self.vod.take() {
+            old.task.abort();
+        }
+    }
+}
+
+/// A finished playlist (catch-up, VOD) fetched once and served from memory:
+/// mpv opens a URL twice, and each open at the portal generates the playlist
+/// anew (~2.5 s, far longer when the portal is busy).
+struct Vod {
+    id: u64,
+    state: watch::Receiver<VodState>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+enum VodState {
+    Fetching,
+    /// The finished playlist, its URIs made absolute.
+    Ready(Bytes),
+    /// Not a finished playlist: the player gets it from the portal itself.
+    Growing,
+    Failed,
+}
+
+/// The upstream half of a session: fetching runs in `task` and queues its
+/// output in `rx`; `ready` reports whether a first playlist came in.
+struct Upstream {
+    started: Instant,
+    ready: oneshot::Receiver<bool>,
+    rx: mpsc::Receiver<Bytes>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+fn spawn_upstream(inner: Arc<Inner>, portal: String) -> Upstream {
+    let (tx, rx) = mpsc::channel::<Bytes>(CHANNEL_CHUNKS);
+    let (ready_tx, ready) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        match first_playlist(&inner, &portal).await {
+            Some(first) => {
+                let _ = ready_tx.send(true);
+                fetch_loop(inner, portal, first.url, first.playlist, tx).await;
+            }
+            None => {
+                let _ = ready_tx.send(false);
+            }
+        }
+    });
+    Upstream {
+        started: Instant::now(),
+        ready,
+        rx,
+        task,
+    }
 }
 
 impl Relay {
@@ -112,12 +193,70 @@ impl Relay {
     }
 
     /// Local URL for mpv that plays the live HLS playlist at `upstream`.
+    /// Fetching starts right away, while mpv is still tearing down the
+    /// previous stream, so the portal round trips overlap that work instead
+    /// of following it. A newer load supersedes a prefetch nobody claimed,
+    /// and an unclaimed one stops after `prefetch_ttl`.
     pub fn local_url(&self, upstream: &str) -> String {
-        let mut routes = self.inner.routes.lock();
-        let next = routes.ids.len() as u64;
-        let id = *routes.ids.entry(upstream.to_string()).or_insert(next);
-        routes.urls.insert(id, upstream.to_string());
+        let up = spawn_upstream(self.inner.clone(), upstream.to_string());
+        let started = up.started;
+        let id = {
+            let mut routes = self.inner.routes.lock();
+            let id = routes.id_for(upstream);
+            routes.supersede();
+            routes.pending.insert(id, up);
+            id
+        };
+        let weak = Arc::downgrade(&self.inner);
+        let ttl = self.inner.cfg.prefetch_ttl;
+        tokio::spawn(async move {
+            tokio::time::sleep(ttl).await;
+            let Some(inner) = weak.upgrade() else { return };
+            let mut routes = inner.routes.lock();
+            if routes
+                .pending
+                .get(&id)
+                .is_some_and(|p| p.started == started)
+            {
+                if let Some(stale) = routes.pending.remove(&id) {
+                    stale.task.abort();
+                }
+            }
+        });
         format!("http://127.0.0.1:{}/live/{id}.ts", self.inner.port)
+    }
+
+    /// Local URL for mpv that plays the catch-up / VOD playlist at `upstream`
+    /// from one portal request instead of two. Segments still come straight
+    /// from the portal's servers, so seeking works as before.
+    pub fn vod_url(&self, upstream: &str) -> String {
+        let (tx, state) = watch::channel(VodState::Fetching);
+        let inner = self.inner.clone();
+        let portal = upstream.to_string();
+        let task = tokio::spawn(async move {
+            let t0 = Instant::now();
+            let state = match first_playlist(&inner, &portal).await {
+                Some(f) if f.playlist.ended => {
+                    info!(
+                        "relay: catch-up playlist in {} ms ({} segments)",
+                        t0.elapsed().as_millis(),
+                        f.playlist.segments.len()
+                    );
+                    VodState::Ready(playlist::absolutize(&f.text, &f.url).into())
+                }
+                Some(_) => VodState::Growing,
+                None => VodState::Failed,
+            };
+            let _ = tx.send(state);
+        });
+        let id = {
+            let mut routes = self.inner.routes.lock();
+            let id = routes.id_for(upstream);
+            routes.supersede();
+            routes.vod = Some(Vod { id, state, task });
+            id
+        };
+        format!("http://127.0.0.1:{}/vod/{id}.m3u8", self.inner.port)
     }
 }
 
@@ -139,13 +278,38 @@ async fn serve(mut conn: TcpStream, inner: Arc<Inner>) {
     let Some(path) = read_request_path(&mut conn).await else {
         return;
     };
-    let upstream = path
+    let vod_id = path
+        .strip_prefix("/vod/")
+        .and_then(|p| p.strip_suffix(".m3u8"))
+        .and_then(|id| id.parse::<u64>().ok());
+    if let Some(id) = vod_id {
+        let found = {
+            let routes = inner.routes.lock();
+            routes.vod.as_ref().filter(|v| v.id == id).map(|v| {
+                (
+                    v.state.clone(),
+                    routes.urls.get(&id).cloned().unwrap_or_default(),
+                )
+            })
+        };
+        return serve_vod(conn, found).await;
+    }
+    let id = path
         .strip_prefix("/live/")
         .and_then(|p| p.strip_suffix(".ts"))
-        .and_then(|id| id.parse::<u64>().ok())
-        .and_then(|id| inner.routes.lock().urls.get(&id).cloned());
+        .and_then(|id| id.parse::<u64>().ok());
+    let (upstream, prefetched) = match id {
+        Some(id) => {
+            let mut routes = inner.routes.lock();
+            (routes.urls.get(&id).cloned(), routes.pending.remove(&id))
+        }
+        None => (None, None),
+    };
     match upstream {
-        Some(upstream) => session(&inner, &upstream, conn).await,
+        Some(upstream) => {
+            let up = prefetched.unwrap_or_else(|| spawn_upstream(inner.clone(), upstream));
+            session(up, conn).await
+        }
         None => {
             let _ = conn
                 .write_all(
@@ -154,6 +318,42 @@ async fn serve(mut conn: TcpStream, inner: Arc<Inner>) {
                 .await;
         }
     }
+}
+
+/// Answer one of mpv's opens of a catch-up playlist, once it is fetched.
+async fn serve_vod(mut conn: TcpStream, found: Option<(watch::Receiver<VodState>, String)>) {
+    let (state, upstream) = match found {
+        Some((mut rx, upstream)) => {
+            let state = rx
+                .wait_for(|s| !matches!(s, VodState::Fetching))
+                .await
+                .map(|s| s.clone())
+                .unwrap_or(VodState::Failed); // superseded while fetching
+            (state, upstream)
+        }
+        None => (VodState::Failed, String::new()),
+    };
+    let reply = match state {
+        VodState::Ready(body) => [
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n\
+                 Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+            &body,
+        ]
+        .concat(),
+        VodState::Growing => format!(
+            "HTTP/1.1 302 Found\r\nLocation: {upstream}\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .into_bytes(),
+        VodState::Fetching | VodState::Failed => {
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        }
+    };
+    let _ = conn.write_all(&reply).await;
 }
 
 /// Path of a `GET` request; headers (mpv's Range, Icy-MetaData...) are ignored.
@@ -180,39 +380,58 @@ async fn read_request_path(conn: &mut TcpStream) -> Option<String> {
 }
 
 /// One player connection: answer 200 once a first playlist is in, then copy
-/// whatever the fetcher produces until the player hangs up (zap, quit) or the
-/// fetcher gives up.
-async fn session(inner: &Arc<Inner>, portal: &str, mut conn: TcpStream) {
-    let t0 = Instant::now();
-    let Some((edge, pl)) = first_playlist(inner, portal).await else {
+/// whatever the upstream produces until the player hangs up (zap, quit) or
+/// the upstream gives up.
+async fn session(mut up: Upstream, mut conn: TcpStream) {
+    let ready = tokio::select! {
+        ready = &mut up.ready => matches!(ready, Ok(true)),
+        _ = hung_up(&mut conn) => {
+            up.task.abort(); // zapped on while the portal was still answering
+            return;
+        }
+    };
+    if !ready {
         warn!("relay: no playlist from the portal - refusing the stream");
         let _ = conn
             .write_all(
                 b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             )
             .await;
+        up.task.abort();
         return;
-    };
+    }
     let ok = b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
-    if conn.write_all(ok).await.is_err() {
-        return;
-    }
-    let (tx, mut rx) = mpsc::channel::<Bytes>(CHANNEL_CHUNKS);
-    let fetcher = tokio::spawn(fetch_loop(inner.clone(), portal.to_string(), edge, pl, tx));
-    let mut first = true;
-    while let Some(chunk) = rx.recv().await {
-        if first {
-            info!(
-                "relay: first bytes to the player after {} ms",
-                t0.elapsed().as_millis()
-            );
-            first = false;
+    if conn.write_all(ok).await.is_ok() {
+        let (mut from_player, mut to_player) = conn.split();
+        let mut first = true;
+        loop {
+            // Waiting for the next chunk can take a segment's length; the
+            // portal must not be polled for a player that already left.
+            let chunk = tokio::select! {
+                chunk = up.rx.recv() => chunk,
+                _ = hung_up(&mut from_player) => None,
+            };
+            let Some(chunk) = chunk else { break };
+            if first {
+                info!(
+                    "relay: first bytes to the player {} ms after the load",
+                    up.started.elapsed().as_millis()
+                );
+                first = false;
+            }
+            if to_player.write_all(&chunk).await.is_err() {
+                break; // player hung up
+            }
         }
-        if conn.write_all(&chunk).await.is_err() {
-            break; // player hung up
-        }
     }
-    fetcher.abort();
+    up.task.abort();
+}
+
+/// Resolves once the player closes the connection: mpv sends nothing after
+/// its request, so anything but more data means it is gone.
+async fn hung_up(from_player: &mut (impl AsyncReadExt + Unpin)) {
+    let mut scratch = [0u8; 64];
+    while matches!(from_player.read(&mut scratch).await, Ok(n) if n > 0) {}
 }
 
 /// Keep fetching new segments in sequence order, refreshing the playlist in
@@ -284,66 +503,115 @@ async fn fetch_loop(
 }
 
 /// The session's first playlist, via the portal (which redirects to an edge
-/// server), retried like any refusal.
-async fn first_playlist(inner: &Inner, portal: &str) -> Option<(Url, Playlist)> {
+/// server). Retried like any refusal, and for up to `busy_wait` while the
+/// portal says it is busy - a channel that is really gone still fails fast.
+async fn first_playlist(inner: &Inner, portal: &str) -> Option<Fetched> {
     let url = Url::parse(portal).ok()?;
-    if let Some(found) = get_playlist(inner, url.clone()).await {
-        return Some(found);
-    }
-    for delay in &inner.cfg.retry_delays {
-        tokio::time::sleep(*delay).await;
-        if let Some(found) = get_playlist(inner, url.clone()).await {
-            return Some(found);
+    let cfg = &inner.cfg;
+    let t0 = Instant::now();
+    let mut retries = cfg.retry_delays.iter();
+    let mut pause = cfg.poll_min;
+    let mut refusals = 0;
+    loop {
+        match get_playlist(inner, url.clone()).await {
+            Ok(found) => {
+                if refusals > 0 {
+                    info!(
+                        "relay: portal let the session in after {} ms ({} refusals)",
+                        t0.elapsed().as_millis(),
+                        refusals
+                    );
+                }
+                return Some(found);
+            }
+            Err(refused) => {
+                refusals += 1;
+                pause = match retries.next() {
+                    Some(delay) => *delay,
+                    None if matches!(refused, Refused::Busy)
+                        && t0.elapsed() + pause < cfg.busy_wait =>
+                    {
+                        pause
+                    }
+                    None => return None,
+                };
+            }
         }
+        tokio::time::sleep(pause).await;
     }
-    None
 }
 
 /// Refresh on the edge URL we were redirected to; when refused, retry it,
 /// then take a fresh token from the portal.
 async fn reload(inner: &Inner, portal: &str, edge: &mut Url) -> Option<Playlist> {
     let t0 = Instant::now();
-    if let Some((_, pl)) = get_playlist(inner, edge.clone()).await {
-        return Some(pl);
+    if let Ok(f) = get_playlist(inner, edge.clone()).await {
+        return Some(f.playlist);
     }
     for delay in &inner.cfg.retry_delays {
         tokio::time::sleep(*delay).await;
-        if let Some((_, pl)) = get_playlist(inner, edge.clone()).await {
+        if let Ok(f) = get_playlist(inner, edge.clone()).await {
             info!(
                 "relay: playlist refresh recovered on retry after {} ms",
                 t0.elapsed().as_millis()
             );
-            return Some(pl);
+            return Some(f.playlist);
         }
     }
-    let (fresh, pl) = get_playlist(inner, Url::parse(portal).ok()?).await?;
+    let fresh = get_playlist(inner, Url::parse(portal).ok()?).await.ok()?;
     info!(
         "relay: playlist refresh recovered with a fresh token after {} ms",
         t0.elapsed().as_millis()
     );
-    *edge = fresh;
-    Some(pl)
+    *edge = fresh.url;
+    Some(fresh.playlist)
 }
 
-/// GET a playlist, following redirects. Returns the final URL (segment URIs
-/// are relative to it) with the parsed playlist. URLs are never logged: the
-/// portal's carry the credentials.
-async fn get_playlist(inner: &Inner, url: Url) -> Option<(Url, Playlist)> {
+/// Why a playlist request brought no playlist.
+enum Refused {
+    /// 407 (the previous session still counts), 503 / 429 (rate limited),
+    /// 509 (session taken over): the portal is there, just not for us yet.
+    Busy,
+    /// Anything else: not found, timed out, not a playlist...
+    Failed,
+}
+
+/// A playlist as fetched: where it ended up after redirects (its URIs are
+/// relative to that), its text, and what parsing found in it.
+struct Fetched {
+    url: Url,
+    text: String,
+    playlist: Playlist,
+}
+
+/// GET a playlist, following redirects. URLs are never logged: the portal's
+/// carry the credentials.
+async fn get_playlist(inner: &Inner, url: Url) -> Result<Fetched, Refused> {
     let timeout = inner.cfg.idle_timeout;
-    let resp = tokio::time::timeout(timeout, inner.client.get(url).send())
-        .await
-        .ok()?
-        .ok()?;
+    let resp = match tokio::time::timeout(timeout, inner.client.get(url).send()).await {
+        Ok(Ok(resp)) => resp,
+        _ => return Err(Refused::Failed),
+    };
+    let status = resp.status().as_u16();
     if !resp.status().is_success() {
-        warn!("relay: playlist request -> HTTP {}", resp.status().as_u16());
-        return None;
+        warn!("relay: playlist request -> HTTP {}", status);
+        return Err(match status {
+            407 | 429 | 503 | 509 => Refused::Busy,
+            _ => Refused::Failed,
+        });
     }
-    let final_url = resp.url().clone();
-    let text = tokio::time::timeout(timeout, resp.text())
-        .await
-        .ok()?
-        .ok()?;
-    Some((final_url, playlist::parse(&text)?))
+    let url = resp.url().clone();
+    match tokio::time::timeout(timeout, resp.text()).await {
+        Ok(Ok(text)) => match playlist::parse(&text) {
+            Some(playlist) => Ok(Fetched {
+                url,
+                text,
+                playlist,
+            }),
+            None => Err(Refused::Failed),
+        },
+        _ => Err(Refused::Failed),
+    }
 }
 
 enum Sent {

@@ -21,3 +21,4 @@ pub mod relay;
 pub mod search;
 pub mod shortcuts;
 pub mod storage;
+pub mod zap;

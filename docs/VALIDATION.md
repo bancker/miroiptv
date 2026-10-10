@@ -18,6 +18,8 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] Mouse wheel up/down: cycles channels
 - [ ] Arrow up/down: cycles channels
 - [ ] Each zap shows a toast with channel name immediately
+- [ ] Hold arrow down ~2 s → names flip in the toast, the picture stays on the old channel; on release it tunes once to the channel shown (log: one `zap: ->` for the first press, one for the release, no `HTTP 503`)
+- [ ] Tap arrow down 3× quickly → tunes once, to the third channel
 
 ## News
 - [ ] `n` → tunes to an NPO channel
@@ -41,6 +43,11 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] Click the favorite → tunes to it
 - [ ] Press `*` again on that channel → toast "removed"
 - [ ] Restart app → favorites persist (still in Shift+F list)
+
+## Catch-up
+- [ ] `g` → pick a finished programme on an archive channel → picture within ~4 s (log: `relay: catch-up playlist in <n> ms`, loadfile `http://127.0.0.1:<port>/vod/<n>.m3u8`)
+- [ ] Left/right arrow seek ±30 s within it
+- [ ] Then zap back to live → live plays, no error toast (a `HTTP 407` in the log may only delay it)
 
 ## Subtitles / audio
 - [ ] On a VOD with multiple audio tracks, press `a` → cycles

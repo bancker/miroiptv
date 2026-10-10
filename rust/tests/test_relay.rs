@@ -88,7 +88,20 @@ fn fast() -> RelayConfig {
         retry_delays: vec![Duration::from_millis(20), Duration::from_millis(20)],
         give_up_after: Duration::from_millis(500),
         idle_timeout: Duration::from_secs(2),
+        prefetch_ttl: Duration::from_secs(5),
+        busy_wait: Duration::from_secs(1),
     }
+}
+
+/// Requests the mock server saw for `path` so far.
+async fn hits(server: &MockServer, path: &str) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == path)
+        .count()
 }
 
 /// Play the relay's local URL like mpv does and collect the body until `want`
@@ -127,6 +140,56 @@ async fn play(local: &str, want: usize) -> (String, bool) {
     let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
     assert!(head.starts_with("HTTP/1.1 200"), "relay answered: {head}");
     (body.to_string(), closed)
+}
+
+/// A whole (non-streaming) answer from the relay: head and body.
+async fn fetch(local: &str) -> (String, String) {
+    let rest = local.trim_start_matches("http://");
+    let (host, path) = rest.split_at(rest.find('/').unwrap());
+    let mut conn = tokio::net::TcpStream::connect(host).await.unwrap();
+    conn.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), conn.read_to_end(&mut raw))
+        .await
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    (format!("{head}\r\n"), body.to_string())
+}
+
+/// Status line the relay answers the player with.
+async fn status(local: &str) -> String {
+    let rest = local.trim_start_matches("http://");
+    let (host, path) = rest.split_at(rest.find('/').unwrap());
+    let mut conn = tokio::net::TcpStream::connect(host).await.unwrap();
+    conn.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(10), conn.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    String::from_utf8_lossy(&buf[..n])
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Request the relay's local URL like mpv does, then close the connection
+/// after `after` without waiting for an answer: a zap away.
+async fn hang_up_after(local: &str, after: Duration) {
+    let rest = local.trim_start_matches("http://");
+    let (host, path) = rest.split_at(rest.find('/').unwrap());
+    let mut conn = tokio::net::TcpStream::connect(host).await.unwrap();
+    conn.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    tokio::time::sleep(after).await;
 }
 
 #[tokio::test]
@@ -187,6 +250,278 @@ async fn takes_a_fresh_token_from_the_portal_when_the_edge_one_dies() {
     let local = relay.local_url(&format!("{}/live/u/p/1.m3u8", server.uri()));
     let (body, _) = play(&local, "S14;S15;S16;S17;".len()).await;
     assert_eq!(body, "S14;S15;S16;S17;");
+}
+
+#[tokio::test]
+async fn starts_fetching_before_the_player_connects() {
+    // While mpv still tears down the previous stream, the portal round trips
+    // should already be running instead of starting once it connects.
+    let server = MockServer::start().await;
+    portal(&server, vec![redirect(&server, "/edge/a/1")]).await;
+    edge(&server, "/edge/a/1", vec![playlist(10, 6), playlist(11, 6)]).await;
+
+    let relay = Relay::start(fast()).unwrap();
+    let local = relay.local_url(&format!("{}/live/u/p/1.m3u8", server.uri()));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        hits(&server, "/live/u/p/1.m3u8").await,
+        1,
+        "portal not asked yet"
+    );
+    let (body, _) = play(&local, "S14;S15;S16;".len()).await;
+    assert_eq!(body, "S14;S15;S16;");
+}
+
+#[tokio::test]
+async fn a_newer_load_cancels_an_unclaimed_prefetch() {
+    // Fast zapping must not leave sessions running on the portal.
+    let server = MockServer::start().await;
+    portal(&server, vec![redirect(&server, "/edge/a/1")]).await;
+    Mock::given(method("GET"))
+        .and(path("/live/u/p/2.m3u8"))
+        .respond_with(script(vec![redirect(&server, "/edge/b/2")]))
+        .mount(&server)
+        .await;
+    edge(&server, "/edge/a/1", vec![playlist(10, 6)]).await;
+    edge(&server, "/edge/b/2", vec![playlist(20, 6), playlist(21, 6)]).await;
+
+    let relay = Relay::start(fast()).unwrap();
+    relay.local_url(&format!("{}/live/u/p/1.m3u8", server.uri()));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let local_b = relay.local_url(&format!("{}/live/u/p/2.m3u8", server.uri()));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        hits(&server, "/edge/a/1").await <= 1,
+        "superseded prefetch kept polling"
+    );
+    // B kept prefetching meanwhile (its playlist moved on to 26 once), so the
+    // player gets that whole cushion at once, in order.
+    let (body, _) = play(&local_b, "S24;S25;S26;".len()).await;
+    assert_eq!(body, "S24;S25;S26;");
+}
+
+#[tokio::test]
+async fn an_unclaimed_prefetch_stops_by_itself() {
+    let server = MockServer::start().await;
+    portal(&server, vec![redirect(&server, "/edge/a/1")]).await;
+    edge(&server, "/edge/a/1", vec![playlist(10, 6)]).await;
+
+    let relay = Relay::start(RelayConfig {
+        prefetch_ttl: Duration::from_millis(200),
+        ..fast()
+    })
+    .unwrap();
+    relay.local_url(&format!("{}/live/u/p/1.m3u8", server.uri()));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        hits(&server, "/edge/a/1").await <= 1,
+        "nobody connected, yet it kept polling"
+    );
+}
+
+#[tokio::test]
+async fn stops_polling_as_soon_as_the_player_hangs_up() {
+    // The portal keeps one session per account and the newest wins: a session
+    // that outlives its player would fight the one being watched.
+    let server = MockServer::start().await;
+    portal(&server, vec![redirect(&server, "/edge/a/1")]).await;
+    edge(&server, "/edge/a/1", vec![playlist(10, 6)]).await;
+
+    let relay = Relay::start(fast()).unwrap();
+    let local = relay.local_url(&format!("{}/live/u/p/1.m3u8", server.uri()));
+    let (body, _) = play(&local, "S14;S15;".len()).await; // connection dropped here
+    assert_eq!(body, "S14;S15;");
+    let after_hangup = hits(&server, "/edge/a/1").await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        hits(&server, "/edge/a/1").await,
+        after_hangup,
+        "kept polling after the player left"
+    );
+}
+
+#[tokio::test]
+async fn a_player_that_leaves_before_the_stream_starts_stops_the_session() {
+    // Flipping channels: mpv drops the connection while the portal is still
+    // slow to answer. Nobody wants that stream any more.
+    let server = MockServer::start().await;
+    portal(
+        &server,
+        vec![redirect(&server, "/edge/a/1").set_delay(Duration::from_millis(400))],
+    )
+    .await;
+    edge(&server, "/edge/a/1", vec![playlist(10, 6)]).await;
+
+    let relay = Relay::start(fast()).unwrap();
+    let local = relay.local_url(&format!("{}/live/u/p/1.m3u8", server.uri()));
+    hang_up_after(&local, Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        hits(&server, "/edge/a/1").await,
+        0,
+        "started a stream for a player that left"
+    );
+}
+
+fn busy() -> ResponseTemplate {
+    // What the portal answers live requests for a while after catch-up.
+    ResponseTemplate::new(407)
+}
+
+#[tokio::test]
+async fn waits_until_the_portal_lets_a_new_session_in() {
+    let server = MockServer::start().await;
+    portal(
+        &server,
+        vec![
+            busy(),
+            busy(),
+            busy(),
+            busy(),
+            busy(),
+            redirect(&server, "/edge/a/1"),
+        ],
+    )
+    .await;
+    edge(&server, "/edge/a/1", vec![playlist(10, 6)]).await;
+
+    let relay = Relay::start(fast()).unwrap();
+    let local = relay.local_url(&format!("{}/live/u/p/1.m3u8", server.uri()));
+    let (body, _) = play(&local, "S14;S15;".len()).await;
+    assert_eq!(body, "S14;S15;");
+}
+
+#[tokio::test]
+async fn a_channel_that_is_gone_fails_fast() {
+    let server = MockServer::start().await;
+    portal(&server, vec![ResponseTemplate::new(404)]).await;
+
+    let relay = Relay::start(RelayConfig {
+        busy_wait: Duration::from_secs(5),
+        ..fast()
+    })
+    .unwrap();
+    let local = relay.local_url(&format!("{}/live/u/p/1.m3u8", server.uri()));
+    let t0 = std::time::Instant::now();
+    assert!(status(&local).await.starts_with("HTTP/1.1 502"));
+    assert!(
+        t0.elapsed() < Duration::from_secs(1),
+        "took {:?}",
+        t0.elapsed()
+    );
+}
+
+const CATCHUP: &str = "/timeshift/u/p/35/2026-10-10:19-20/9.m3u8";
+
+/// A finished (catch-up) playlist with relative segment URIs.
+fn vod_playlist() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_string(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:60\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+         #EXTINF:60.0,\n/ts/a/0.ts?token=t\n#EXTINF:60.0,\n/ts/a/1.ts?token=t\n\
+         #EXT-X-ENDLIST\n",
+    )
+}
+
+async fn catch_up(server: &MockServer, delay: Duration) {
+    Mock::given(method("GET"))
+        .and(path(CATCHUP))
+        .respond_with(redirect(server, "/ts/a/index.m3u8").set_delay(delay))
+        .mount(server)
+        .await;
+    edge(server, "/ts/a/index.m3u8", vec![vod_playlist()]).await;
+}
+
+#[tokio::test]
+async fn serves_a_catch_up_playlist_to_both_of_mpvs_opens_from_one_portal_request() {
+    // mpv opens a URL twice (stream layer, then the HLS demuxer): straight
+    // from the portal that is two playlist generations of ~2.5 s each.
+    let server = MockServer::start().await;
+    catch_up(&server, Duration::ZERO).await;
+
+    let relay = Relay::start(fast()).unwrap();
+    let local = relay.vod_url(&format!("{}{CATCHUP}", server.uri()));
+    let (head, first) = fetch(&local).await;
+    let (_, second) = fetch(&local).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        first.contains(&format!("\n{}/ts/a/0.ts?token=t\n", server.uri())),
+        "{first}"
+    );
+    assert_eq!(first, second);
+    assert_eq!(hits(&server, "/ts/a/index.m3u8").await, 1);
+}
+
+#[tokio::test]
+async fn hands_a_still_growing_playlist_to_the_player_as_is() {
+    // Only a finished playlist can be served from a copy.
+    let server = MockServer::start().await;
+    portal(&server, vec![redirect(&server, "/edge/a/1")]).await;
+    edge(&server, "/edge/a/1", vec![playlist(10, 6)]).await;
+    let upstream = format!("{}/live/u/p/1.m3u8", server.uri());
+
+    let relay = Relay::start(fast()).unwrap();
+    let (head, _) = fetch(&relay.vod_url(&upstream)).await;
+    assert!(head.starts_with("HTTP/1.1 302"), "{head}");
+    assert!(
+        head.contains(&format!("\r\nLocation: {upstream}\r\n")),
+        "{head}"
+    );
+}
+
+#[tokio::test]
+async fn a_catch_up_the_portal_cannot_give_answers_502() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(CATCHUP))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let relay = Relay::start(fast()).unwrap();
+    let local = relay.vod_url(&format!("{}{CATCHUP}", server.uri()));
+    assert!(status(&local).await.starts_with("HTTP/1.1 502"));
+}
+
+#[tokio::test]
+async fn a_newer_load_cancels_a_catch_up_still_being_fetched() {
+    let server = MockServer::start().await;
+    catch_up(&server, Duration::from_millis(400)).await;
+    portal(&server, vec![redirect(&server, "/edge/a/1")]).await;
+    edge(&server, "/edge/a/1", vec![playlist(10, 6)]).await;
+
+    let relay = Relay::start(fast()).unwrap();
+    relay.vod_url(&format!("{}{CATCHUP}", server.uri()));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    relay.local_url(&format!("{}/live/u/p/1.m3u8", server.uri()));
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(
+        hits(&server, "/ts/a/index.m3u8").await,
+        0,
+        "kept fetching a catch-up nobody wants"
+    );
+}
+
+#[tokio::test]
+async fn a_catch_up_load_cancels_an_unclaimed_live_prefetch() {
+    let server = MockServer::start().await;
+    catch_up(&server, Duration::ZERO).await;
+    portal(
+        &server,
+        vec![redirect(&server, "/edge/a/1").set_delay(Duration::from_millis(400))],
+    )
+    .await;
+    edge(&server, "/edge/a/1", vec![playlist(10, 6)]).await;
+
+    let relay = Relay::start(fast()).unwrap();
+    relay.local_url(&format!("{}/live/u/p/1.m3u8", server.uri()));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    relay.vod_url(&format!("{}{CATCHUP}", server.uri()));
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(
+        hits(&server, "/edge/a/1").await,
+        0,
+        "kept prefetching a channel nobody wants"
+    );
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@ use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};
 use crate::search::ItemKind;
 use crate::shortcuts;
 use crate::storage::Storage;
+use crate::zap::ZapPacer;
 use egui::{Color32, ColorImage, Key, TextureHandle, TextureOptions};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -313,6 +314,9 @@ pub struct TvApp {
     /// Local HLS relay for live streams; `None` if it could not start, then
     /// mpv plays the portal directly.
     relay: Option<Relay>,
+    /// Paces up/down zapping: quick presses or a held arrow key only move the
+    /// target (sid, name, zap index); the channel the user stops on loads.
+    zap_pacer: ZapPacer<(i64, String, usize)>,
 
     // ---- freeze detection: surfaces cache-underrun stalls (paused-for-cache) ----
     /// Per-stream freeze tracker (reset on load; counts only post-first-frame
@@ -394,6 +398,8 @@ impl TvApp {
             stall_watchdog_armed: false,
             reload_budget: ReloadBudget::new(3, Duration::from_secs(60)),
             relay,
+            // Deliberate taps come >= ~0.5 s apart, flipping taps faster.
+            zap_pacer: ZapPacer::new(Duration::from_millis(350)),
             health: PlaybackHealth::new(),
             presets,
             digit_down_since: [None; 10],
@@ -435,12 +441,18 @@ impl TvApp {
     /// false so a finished file isn't reloaded on a loop). Centralises the
     /// LoadUrl send so current_url and the watchdog timer stay consistent.
     fn load_url(&mut self, url: String, watchdog: bool) {
+        // Whatever loads now supersedes a zap still waiting for the user to
+        // stop flipping.
+        self.zap_pacer.cancel();
         // Live goes through the local relay: one continuous stream for mpv
         // that rides out portal refusals instead of dying on them. The portal
         // URL stays the current/last-watched one (the relay port changes
-        // between runs).
-        let play = match (&self.relay, watchdog) {
-            (Some(relay), true) => relay.local_url(&url),
+        // between runs). Catch-up (and HLS VOD) comes from one portal request
+        // there instead of mpv's two, each a playlist generation of seconds.
+        let hls = url.split('?').next().is_some_and(|p| p.ends_with(".m3u8"));
+        let play = match &self.relay {
+            Some(relay) if watchdog => relay.local_url(&url),
+            Some(relay) if hls => relay.vod_url(&url),
             _ => url.clone(),
         };
         let _ = self.player.cmd_tx.send(Cmd::LoadUrl(play));
@@ -466,8 +478,8 @@ impl TvApp {
     /// while the picture is frozen. Uses FrameBus::version() to avoid cloning
     /// the pixel buffer.
     fn check_stall(&mut self) {
-        if !self.stall_watchdog_armed {
-            return;
+        if !self.stall_watchdog_armed || self.zap_pacer.waiting().is_some() {
+            return; // nothing to watch, or the user is zapping away anyway
         }
         let Some(url) = self.current_url.clone() else {
             return;
@@ -528,6 +540,9 @@ impl TvApp {
                     // instead of leaving a frozen picture; the budget stops a
                     // channel that is really down from reloading on a loop.
                     let live = self.stall_watchdog_armed;
+                    if reason == "eof" && live && self.zap_pacer.waiting().is_some() {
+                        continue; // the user is zapping away anyway
+                    }
                     if reason == "eof" && live {
                         if let Some(url) = self.current_url.clone() {
                             if self.reload_budget.try_spend(Instant::now()) {
@@ -745,7 +760,10 @@ impl TvApp {
         self.kick_epg_fetch(sid);
     }
 
-    fn zap_delta(&mut self, delta: i32) {
+    /// Up/down zapping. A lone press zaps at once; while the user flips
+    /// (quick presses, a held key) only the channel names show and the one
+    /// they stop on loads - a portal session per keypress gets throttled.
+    fn zap_delta(&mut self, delta: i32, repeat: bool) {
         // Zap over the deduped list so up/down skips HD/UHD/FHD/catch-up
         // duplicates of the same channel (one best-quality entry each).
         let zap = self.catalog.zap_channels();
@@ -757,11 +775,14 @@ impl TvApp {
             }
             return;
         }
-        if let Some(i) = shortcuts::next_live_idx(self.current_idx, zap.len(), delta) {
-            let ch = &zap[i];
-            let sid = ch.stream_id;
-            let name = ch.name.clone();
-            self.zap_to(sid, &name, Some(i));
+        let from = self.zap_pacer.waiting().map(|t| t.2).or(self.current_idx);
+        if let Some(i) = shortcuts::next_live_idx(from, zap.len(), delta) {
+            let name = zap[i].name.clone();
+            let target = (zap[i].stream_id, name.clone(), i);
+            match self.zap_pacer.press(Instant::now(), target, repeat) {
+                Some((sid, name, i)) => self.zap_to(sid, &name, Some(i)),
+                None => self.set_toast(format!("[TV] {}", name)),
+            }
         }
     }
 
@@ -1344,6 +1365,7 @@ impl TvApp {
         let (
             down,
             up,
+            arrow_repeat,
             left,
             right,
             scroll,
@@ -1367,6 +1389,17 @@ impl TvApp {
             (
                 i.key_pressed(Key::ArrowDown),
                 i.key_pressed(Key::ArrowUp),
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key {
+                            key: Key::ArrowDown | Key::ArrowUp,
+                            pressed: true,
+                            repeat: true,
+                            ..
+                        }
+                    )
+                }),
                 i.key_pressed(Key::ArrowLeft),
                 i.key_pressed(Key::ArrowRight),
                 i.raw_scroll_delta.y,
@@ -1411,16 +1444,16 @@ impl TvApp {
         }
 
         if down {
-            self.zap_delta(1);
+            self.zap_delta(1, arrow_repeat);
         }
         if up {
-            self.zap_delta(-1);
+            self.zap_delta(-1, arrow_repeat);
         }
         if scroll > 0.5 {
-            self.zap_delta(-1);
+            self.zap_delta(-1, false);
         }
         if scroll < -0.5 {
-            self.zap_delta(1);
+            self.zap_delta(1, false);
         }
 
         if left {
@@ -3055,6 +3088,10 @@ impl eframe::App for TvApp {
         self.drain_events();
         self.drain_epg();
         self.drain_news_picker();
+        // The channel the user stopped flipping on.
+        if let Some((sid, name, idx)) = self.zap_pacer.due(Instant::now()) {
+            self.zap_to(sid, &name, Some(idx));
+        }
         self.check_stall();
         self.forward_window_size(ctx);
         self.update_video_texture(ctx);
