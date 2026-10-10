@@ -230,10 +230,20 @@ mod quality_tests {
 }
 
 /// Score for choosing a channel's zap representative: a live entry always
-/// beats its archive (catch-up) twin, then higher quality wins.
+/// beats its archive (catch-up) twin, then the preferred quality wins.
 fn variant_score(ch: &LiveChannel) -> u16 {
     let live = if ch.tv_archive == 0 { 1u16 } else { 0 };
-    live * 10 + quality_rank(&ch.name) as u16
+    live * 10 + zap_preference(quality_rank(&ch.name)) as u16
+}
+
+/// Zap preference of a quality tier: FHD first. This portal's "UHD" feeds are
+/// the same 1080p picture at up to ~70% more bitrate, so they only add
+/// bandwidth and freeze risk; UHD stays one `+` away on the quality ladder.
+fn zap_preference(rank: u8) -> u8 {
+    match rank {
+        3 => 5,
+        r => r,
+    }
 }
 
 /// Collapse a live-channel list to ONE entry per distinct channel (keyed by
@@ -278,7 +288,8 @@ mod zap_tests {
     }
 
     #[test]
-    fn keeps_highest_quality_per_channel() {
+    fn zaps_to_fhd_over_uhd() {
+        // This portal's "UHD" is the same 1080p picture at more bitrate.
         let list = vec![
             ch(1, "NL | NPO 1 HD", 0),
             ch(2, "NL | NPO 1 UHD", 0),
@@ -291,7 +302,15 @@ mod zap_tests {
             .iter()
             .find(|c| normalize_channel_name(&c.name) == "npo1")
             .unwrap();
-        assert_eq!(npo1.stream_id, 2, "UHD variant wins");
+        assert_eq!(npo1.stream_id, 3, "FHD variant wins");
+    }
+
+    #[test]
+    fn uhd_still_beats_hd_without_an_fhd_variant() {
+        let list = vec![ch(1, "NL | RTL 7 HD", 0), ch(2, "NL | RTL 7 UHD", 0)];
+        let z = dedupe_zap(&list);
+        assert_eq!(z.len(), 1);
+        assert_eq!(z[0].stream_id, 2);
     }
 
     #[test]
