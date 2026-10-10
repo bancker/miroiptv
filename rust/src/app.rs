@@ -7,7 +7,7 @@ use crate::relay::Relay;
 use crate::player::{Cmd, Event, PlayerHandle, RgbaFrame};
 use crate::presets::Presets;
 use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};
-use crate::search::ItemKind;
+use crate::search::{self, ItemKind, SearchItem};
 use crate::shortcuts;
 use crate::storage::Storage;
 use crate::zap::ZapPacer;
@@ -292,6 +292,13 @@ pub struct TvApp {
     show_debug: bool,
 
     search_query: String,
+    /// Results for the query (and catalog state) in `search_hits_for`:
+    /// searching clones every channel, film and series name, so it runs when
+    /// the query changes rather than every frame.
+    search_hits: Vec<SearchItem>,
+    search_hits_for: Option<(String, bool)>,
+    /// Highlighted result (arrow keys); Enter plays it.
+    search_sel: usize,
 
     guide: GuideState,
     /// Tracks borderless+always-on-top toggle (`t` key).
@@ -388,6 +395,9 @@ impl TvApp {
             show_epg_grid: false,
             show_debug: false,
             search_query: String::new(),
+            search_hits: Vec::new(),
+            search_hits_for: None,
+            search_sel: 0,
             guide: GuideState::default(),
             borderless: false,
             show_help: false,
@@ -1688,6 +1698,15 @@ impl TvApp {
                     .fill(Color32::from_black_alpha(220))
                     .show(ui, |ui| {
                         ui.set_width(560.0);
+                        // Arrows pick a result. Taken before the text box sees
+                        // them: it would jump its cursor to the start / end,
+                        // and what is typed next would land there.
+                        let (down, up) = ui.input_mut(|i| {
+                            (
+                                i.count_and_consume_key(egui::Modifiers::NONE, Key::ArrowDown),
+                                i.count_and_consume_key(egui::Modifiers::NONE, Key::ArrowUp),
+                            )
+                        });
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut self.search_query)
                                 .hint_text("search live / movie / series...")
@@ -1695,24 +1714,35 @@ impl TvApp {
                         );
                         resp.request_focus();
 
-                        let hits = self.catalog.search(&self.search_query);
+                        let key = (self.search_query.clone(), self.catalog.is_loaded());
+                        if self.search_hits_for.as_ref() != Some(&key) {
+                            self.search_hits = self.catalog.search(&self.search_query);
+                            self.search_hits_for = Some(key);
+                            self.search_sel = 0;
+                        }
+                        let shown = self.search_hits.len().min(12);
+                        self.search_sel =
+                            search::step(self.search_sel, shown, down as i32 - up as i32);
                         ui.separator();
-                        for it in hits.iter().take(12) {
+                        for (i, it) in self.search_hits.iter().take(12).enumerate() {
                             let tag = match it.kind {
                                 ItemKind::Live => "[LIVE]",
                                 ItemKind::Movie => "[FILM]",
                                 ItemKind::Series => "[SERIE]",
                             };
                             if ui
-                                .selectable_label(false, format!("{} {}", tag, it.name))
+                                .selectable_label(
+                                    i == self.search_sel,
+                                    format!("{} {}", tag, it.name),
+                                )
                                 .clicked()
                             {
                                 zap_pick = Some((it.id, it.name.clone(), it.kind));
                             }
                         }
                         if ctx.input(|i| i.key_pressed(Key::Enter)) {
-                            if let Some(first) = hits.first() {
-                                zap_pick = Some((first.id, first.name.clone(), first.kind));
+                            if let Some(it) = self.search_hits.get(self.search_sel) {
+                                zap_pick = Some((it.id, it.name.clone(), it.kind));
                             }
                         }
                     });

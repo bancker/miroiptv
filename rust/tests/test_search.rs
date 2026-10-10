@@ -1,4 +1,4 @@
-use bongo_player::search::{rank, ItemKind, SearchItem};
+use bongo_player::search::{rank, step, ItemKind, SearchItem};
 
 fn item(name: &str, kind: ItemKind) -> SearchItem {
     SearchItem {
@@ -48,4 +48,14 @@ fn capped_at_12() {
 fn whitespace_query_returns_empty() {
     let items = vec![item("X", ItemKind::Live)];
     assert!(rank("   ", &items).is_empty());
+}
+
+#[test]
+fn arrows_move_the_highlight_within_the_results() {
+    assert_eq!(step(0, 5, 1), 1);
+    assert_eq!(step(3, 5, -1), 2);
+    assert_eq!(step(4, 5, 1), 4, "stays on the last result");
+    assert_eq!(step(0, 5, -1), 0, "stays on the first result");
+    assert_eq!(step(0, 0, 1), 0, "no results");
+    assert_eq!(step(7, 3, 0), 2, "results shrank while typing");
 }

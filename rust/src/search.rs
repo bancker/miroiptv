@@ -35,6 +35,13 @@ pub fn rank<'a>(query: &str, items: &'a [SearchItem]) -> Vec<&'a SearchItem> {
     hits
 }
 
+/// Move the highlighted result `delta` rows (arrow keys), staying within the
+/// `len` results shown.
+pub fn step(sel: usize, len: usize, delta: i32) -> usize {
+    let last = len.saturating_sub(1) as i64;
+    (sel as i64 + delta as i64).clamp(0, last) as usize
+}
+
 fn kind_rank(k: ItemKind) -> u8 {
     match k {
         ItemKind::Live => 0,

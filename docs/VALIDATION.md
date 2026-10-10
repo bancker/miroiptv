@@ -29,6 +29,8 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] Press `f` → search box appears top-center
 - [ ] Type "matrix" → at least one [FILM] result
 - [ ] Press Enter on a [LIVE] result → tunes to that channel
+- [ ] Arrow down / up → moves the highlighted result; Enter plays the highlighted one (film or channel)
+- [ ] After the arrows, keep typing → the letters land at the end of the query
 - [ ] Esc dismisses search
 
 ## EPG
