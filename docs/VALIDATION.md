@@ -61,6 +61,8 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] On a movie (search "matrix" → enter), play
 - [ ] Left arrow → seeks -30s
 - [ ] Right arrow → seeks +30s
+- [ ] Space → pauses (toast "|| pauze"); space again → plays on. Same for catch-up
+- [ ] Paused, zap to a live channel → it plays (not paused); space on live → toast only, keeps playing
 
 ## Window
 - [ ] F11 → fullscreen toggles

@@ -309,6 +309,10 @@ pub struct TvApp {
     // ---- silent-stall watchdog: recover frozen streams by reloading ----
     /// URL of the stream currently loaded, so the watchdog can reload it.
     current_url: Option<String>,
+    /// Whether that stream is live TV (else a film, series or catch-up).
+    current_live: bool,
+    /// Paused with the space bar (films, series and catch-up only).
+    paused: bool,
     /// Last FrameBus.version we observed, and when it last advanced.
     last_progress_version: u64,
     last_progress_at: Instant,
@@ -402,6 +406,8 @@ impl TvApp {
             borderless: false,
             show_help: false,
             current_url: None,
+            current_live: false,
+            paused: false,
             last_progress_version: 0,
             last_progress_at: Instant::now(),
             last_recovery_at: None,
@@ -456,6 +462,12 @@ impl TvApp {
         // Whatever loads now supersedes a zap still waiting for the user to
         // stop flipping.
         self.zap_pacer.cancel();
+        // mpv keeps `pause` across files: a new stream must not start paused.
+        if self.paused {
+            self.paused = false;
+            let _ = self.player.cmd_tx.send(Cmd::Pause(false));
+        }
+        self.current_live = watchdog;
         // Live goes through the local relay: one continuous stream for mpv
         // that rides out portal refusals instead of dying on them. The portal
         // URL stays the current/last-watched one (the relay port changes
@@ -789,6 +801,24 @@ impl TvApp {
         self.current_epg = None;
         self.set_toast(format!("[TV] {}", name));
         self.kick_epg_fetch(sid);
+    }
+
+    /// Space bar: pause / resume a film, series or catch-up. Live TV keeps
+    /// playing: paused, its relay stream would fall behind the live window.
+    fn toggle_pause(&mut self) {
+        if self.current_live {
+            self.set_toast("pauze: alleen bij films, series en terugkijken");
+            return;
+        }
+        self.paused = !self.paused;
+        let _ = self.player.cmd_tx.send(Cmd::Pause(self.paused));
+        tracing::info!("pause: {} (space)", if self.paused { "on" } else { "off" });
+        if self.paused {
+            // Stays up while paused; any other toast or a new stream replaces it.
+            self.set_toast_for("|| pauze  -  spatie om verder te kijken", 24 * 3600);
+        } else {
+            self.set_toast("> verder");
+        }
     }
 
     /// Where the playing channel sits in `zap`, also when it was resumed at
@@ -1435,6 +1465,7 @@ impl TvApp {
             down,
             up,
             arrow_repeat,
+            space,
             left,
             right,
             scroll,
@@ -1469,6 +1500,7 @@ impl TvApp {
                         }
                     )
                 }),
+                i.key_pressed(Key::Space),
                 i.key_pressed(Key::ArrowLeft),
                 i.key_pressed(Key::ArrowRight),
                 i.raw_scroll_delta.y,
@@ -1523,6 +1555,10 @@ impl TvApp {
         }
         if scroll < -0.5 {
             self.zap_delta(1, false);
+        }
+
+        if space {
+            self.toggle_pause();
         }
 
         if left {
@@ -1905,6 +1941,7 @@ impl TvApp {
                     ("a / s", "cycle audio / subtitle track"),
                     ("+ / -", "hogere / lagere kwaliteit (live)"),
                     ("Left / Right", "VOD seek -30s / +30s"),
+                    ("Space", "pauze / verder (film, serie, terugkijken)"),
                     ("F11", "fullscreen"),
                     ("F5", "retry portal fetch"),
                     ("d", "debug HUD"),
