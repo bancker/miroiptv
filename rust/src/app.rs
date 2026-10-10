@@ -3,6 +3,7 @@ use crate::catalog::{normalize_channel_name, quality_label, quality_rank, Catalo
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::Favorites;
 use crate::playback_health::{PlaybackHealth, ReloadBudget};
+use crate::relay::Relay;
 use crate::player::{Cmd, Event, PlayerHandle, RgbaFrame};
 use crate::presets::Presets;
 use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};
@@ -309,6 +310,9 @@ pub struct TvApp {
     stall_watchdog_armed: bool,
     /// Caps the auto-reloads after a live stream ends unexpectedly (eof).
     reload_budget: ReloadBudget,
+    /// Local HLS relay for live streams; `None` if it could not start, then
+    /// mpv plays the portal directly.
+    relay: Option<Relay>,
 
     // ---- freeze detection: surfaces cache-underrun stalls (paused-for-cache) ----
     /// Per-stream freeze tracker (reset on load; counts only post-first-frame
@@ -340,6 +344,7 @@ impl TvApp {
         storage: Storage,
         portal_state: PortalState,
         initial_url: Option<String>,
+        relay: Option<Relay>,
     ) -> Self {
         // Whenever a new mpv frame is ready, ask egui to redraw.
         let ctx = cc.egui_ctx.clone();
@@ -388,6 +393,7 @@ impl TvApp {
             last_recovery_at: None,
             stall_watchdog_armed: false,
             reload_budget: ReloadBudget::new(3, Duration::from_secs(60)),
+            relay,
             health: PlaybackHealth::new(),
             presets,
             digit_down_since: [None; 10],
@@ -429,7 +435,15 @@ impl TvApp {
     /// false so a finished file isn't reloaded on a loop). Centralises the
     /// LoadUrl send so current_url and the watchdog timer stay consistent.
     fn load_url(&mut self, url: String, watchdog: bool) {
-        let _ = self.player.cmd_tx.send(Cmd::LoadUrl(url.clone()));
+        // Live goes through the local relay: one continuous stream for mpv
+        // that rides out portal refusals instead of dying on them. The portal
+        // URL stays the current/last-watched one (the relay port changes
+        // between runs).
+        let play = match (&self.relay, watchdog) {
+            (Some(relay), true) => relay.local_url(&url),
+            _ => url.clone(),
+        };
+        let _ = self.player.cmd_tx.send(Cmd::LoadUrl(play));
         // Remember as last-watched so the next launch resumes it.
         LastWatched {
             url: url.clone(),

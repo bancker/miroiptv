@@ -8,6 +8,7 @@ use bongo_player::catalog::CatalogStore;
 use bongo_player::legacy;
 use bongo_player::player;
 use bongo_player::portal::{xtream::XtreamPortal, Portal};
+use bongo_player::relay::{Relay, RelayConfig};
 use bongo_player::storage::Storage;
 use bongo_player::{APP_ID, APP_NAME};
 use clap::Parser;
@@ -244,6 +245,16 @@ fn main() -> anyhow::Result<()> {
     };
     let catalog = Arc::new(CatalogStore::new(portal));
 
+    // Local relay for live HLS (see relay/mod.rs). Loopback only; if it can't
+    // bind, live plays straight from the portal as before.
+    let relay = match Relay::start(RelayConfig::default()) {
+        Ok(relay) => Some(relay),
+        Err(e) => {
+            tracing::warn!("relay: could not start ({}) - live plays directly", e);
+            None
+        }
+    };
+
     let player_handle = player::spawn(1280, 720)?;
 
     let mut options = eframe::NativeOptions::default();
@@ -264,6 +275,7 @@ fn main() -> anyhow::Result<()> {
                 storage,
                 portal_state,
                 cli.url,
+                relay,
             ))
         }),
     );

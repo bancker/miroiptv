@@ -17,6 +17,7 @@ pub mod playback_health;
 pub mod player;
 pub mod portal;
 pub mod presets;
+pub mod relay;
 pub mod search;
 pub mod shortcuts;
 pub mod storage;

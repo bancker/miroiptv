@@ -59,6 +59,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 ## Sustained playback
 - [ ] Leave a live stream running for 30 minutes
 - [ ] No audio crackle, no AV drift, no buffer-exhausted toasts
+- [ ] No freeze and no "herverbinden" toast; the log shows live loads as `loadfile http://127.0.0.1:<port>/live/<n>.ts` and at most `relay: ... recovered` lines
 - [ ] CPU stays < 10% (Task Manager check)
 - [ ] Memory steady (no growth over 100 MB after 30 min)
 
