@@ -4,10 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Two codebases in one repo
 
-This repo holds **two implementations of the same IPTV player**, both living on `main`:
+This repo holds **two implementations of the same IPTV player**, both living on `main`, each in its own self-contained project folder (own sources, build scripts, `.gitignore` and build output — nothing builds into the repo root):
 
 - **`rust/` — `tvplayer` (ACTIVE).** A clean rebuild on **libmpv + egui/eframe (wgpu) + tokio**. This is where new work happens.
-- **`src/` — `miroiptv` (FALLBACK).** The original plain-C player on **SDL2 + libav + libcurl**. Kept working as a fallback while the Rust rewrite is validated. Touch it only when explicitly working on the C app.
+- **`c/` — `miroiptv` (FALLBACK).** The original plain-C player on **SDL2 + libav + libcurl**. Kept working as a fallback while the Rust rewrite is validated. Touch it only when explicitly working on the C app.
+
+Shared design docs stay at the repo root in `docs/`.
 
 When a request is ambiguous, assume it targets the **Rust `tvplayer`** app.
 
@@ -15,11 +17,10 @@ When a request is ambiguous, assume it targets the **Rust `tvplayer`** app.
 
 ## Commands
 
-### Rust `tvplayer` (primary — run from `rust/` unless noted)
+### Rust `tvplayer` (primary — run from `rust/`)
 
 ```powershell
-.\rust\vendor\fetch-mpv.ps1          # one-time: vendor libmpv-2.dll + headers (run from repo root)
-cd rust
+.\vendor\fetch-mpv.ps1               # one-time: vendor libmpv-2.dll + headers
 cargo test                           # unit + integration tests (see rust/tests/)
 cargo test --test test_epg           # a single integration-test file
 cargo test <substring>               # a single test by name substring
@@ -29,27 +30,28 @@ cargo clippy --all-targets           # lint
 cargo fmt                            # format
 ```
 
-Package a portable zip (from repo root):
+Package a portable zip (also from `rust/`; output stays in `rust\dist\`):
 
 ```powershell
-.\build-zip.ps1                      # -> dist\tvplayer-vX.Y.Z.zip
+.\build-zip.ps1                      # -> rust\dist\tvplayer-vX.Y.Z.zip
 .\verify.ps1                         # smoke-test the built zip
 ```
 
-### C `miroiptv` (fallback — Windows + MSYS2/MinGW64)
+### C `miroiptv` (fallback — Windows + MSYS2/MinGW64, run from `c/`)
 
 ```bash
-./mk                 # incremental build -> build/miroiptv.exe (wraps make in the MinGW64 env)
+./mk                 # incremental build -> c/build/miroiptv.exe (wraps make in the MinGW64 env)
+./mk test            # build + run the C unit tests
 ./mk clean && ./mk   # fresh rebuild
-./build-dist.sh      # build + package the portable zip
+./build-dist.sh      # build + package the portable zip (-> c/miroiptv-<ver>.zip)
 ./build-dist.sh --release   # build + `gh release create` (version derived from git tag)
 ```
 
-`./mk` / `mk.cmd` exist because the codec DLLs only resolve inside MSYS2's MinGW64 shell.
+`./mk` / `mk.cmd` exist because the codec DLLs only resolve inside MSYS2's MinGW64 shell. The C exe loads `assets/` **relative to the working directory**, so it must run from `c/`; `mk.cmd` and `build-dist.cmd` cd to their own folder, so they work from any directory.
 
 ### Running
 
-Both apps take a portal on the command line: `--xtream user:pass@host:port`, or a bare stream URL for ad-hoc playback. `tv.bat` is a personal launcher holding real credentials and is **git-ignored** — never commit it or hardcode credentials.
+Both apps take a portal on the command line: `--xtream user:pass@host:port`, or a bare stream URL for ad-hoc playback. `tv.bat` (repo root) is a personal launcher for the C app (via `c\mk.cmd`) holding real credentials and is **git-ignored** — never commit it or hardcode credentials.
 
 ## Rust architecture (the big picture)
 
@@ -75,7 +77,7 @@ The module tree is declared in `rust/src/lib.rs`. The non-obvious structure:
 
 ## C architecture (fallback, brief)
 
-Decoder runs on its own pthread pushing into bounded queues (16 video / 32 audio); the main thread consumes at VSYNC. A/V clock is **audio-master** — the SDL audio callback seeds `first_pts` and drives video pacing. Zap is async (`zap_prep_worker`) so the UI never blocks on HTTP/probe. See `src/main.c` (event loop), `src/player.c` (demux/decode), `src/render.c` (SDL/overlays/audio), and README.md "How it works" for the full picture.
+Decoder runs on its own pthread pushing into bounded queues (16 video / 32 audio); the main thread consumes at VSYNC. A/V clock is **audio-master** — the SDL audio callback seeds `first_pts` and drives video pacing. Zap is async (`zap_prep_worker`) so the UI never blocks on HTTP/probe. See `c/src/main.c` (event loop), `c/src/player.c` (demux/decode), `c/src/render.c` (SDL/overlays/audio), and `c/README.md` "How it works" for the full picture.
 
 ## Design docs & validation
 

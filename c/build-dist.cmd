@@ -18,6 +18,14 @@ REM   build-dist.cmd --release   build AND upload to GitHub Releases
 REM                              (requires `gh auth login` beforehand)
 setlocal
 
+REM Work from this script's own folder (the C project root), wherever the
+REM repo lives, so git describe, the zip check and the gh upload resolve
+REM here. setlocal restores the caller's directory on exit. HERE is the
+REM same folder with forward slashes, which MSYS2 bash accepts as-is.
+cd /d "%~dp0"
+set "HERE=%~dp0"
+set "HERE=%HERE:\=/%"
+
 set "MSYS_BASH=C:\Users\brnck\scoop\apps\msys2\current\usr\bin\bash.exe"
 if not exist "%MSYS_BASH%" (
     echo [dist] MSYS2 bash not found at %MSYS_BASH% 1>&2
@@ -34,7 +42,7 @@ echo [dist] version=%TV_VERSION% repo=%TV_REPO%
 REM One bash -lc call. cmd expands %TV_VERSION% / %TV_REPO% before
 REM handing the string off, so the bash command receives literal values.
 REM Exports happen INSIDE bash so build-dist.sh sees them via env.
-"%MSYS_BASH%" -lc "export TV_VERSION=%TV_VERSION% TV_REPO=%TV_REPO% MSYSTEM=MINGW64; source /etc/profile; cd '/c/Dropbox/Sources/tv' && ./build-dist.sh"
+"%MSYS_BASH%" -lc "export TV_VERSION=%TV_VERSION% TV_REPO=%TV_REPO% MSYSTEM=MINGW64; source /etc/profile; cd '%HERE%' && ./build-dist.sh"
 if errorlevel 1 (
     echo [dist] build failed ^(exit %errorlevel%^) - not uploading
     exit /b 1

@@ -1,9 +1,9 @@
 # Build release exe + bundle libmpv-2.dll + assets into a portable zip.
+# Lives in the rust/ project folder; all output stays inside it (dist\).
 $ErrorActionPreference = 'Stop'
 
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$rustDir = Join-Path $root 'rust'
-$distDir = Join-Path $root 'dist'
+$rustDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$distDir = Join-Path $rustDir 'dist'
 
 if (-not (Test-Path (Join-Path $rustDir 'vendor\libmpv\libmpv-2.dll'))) {
     Write-Host 'libmpv not vendored - running fetch-mpv.ps1'

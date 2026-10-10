@@ -1,9 +1,9 @@
 # tvplayer manual validation checklist
 
-Run after `build-zip.ps1` + `verify.ps1` pass. Use a known-good Xtream portal.
+Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream portal.
 
 ## Setup
-- [ ] Extract `dist\tvplayer-v*.zip` to a fresh folder
+- [ ] Extract `rust\dist\tvplayer-v*.zip` to a fresh folder
 - [ ] Edit `run.bat`: set `XTREAM_CREDS=user:pass@host:port`
 - [ ] Double-click `run.bat`
 

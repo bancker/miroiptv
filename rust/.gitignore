@@ -1,4 +1,6 @@
 target/
+# Portable-build output of build-zip.ps1 (tvplayer-v* staging dirs + zips).
+dist/
 *.pdb
 vendor/libmpv/libmpv-2.dll
 vendor/libmpv/libmpv.lib

@@ -1,7 +1,3 @@
-build/
-*.o
-*.exe
-*.pdb
 .vscode/
 .idea/
 .claude/
@@ -9,10 +5,4 @@ build/
 # Personal launcher with portal credentials — never commit.
 tv.bat
 
-# Rust rewrite build artifacts
-rust/target/
-rust/vendor/libmpv/libmpv-2.dll
-rust/vendor/libmpv/libmpv.lib
-# Whole portable-build output dir (tvplayer-* and old miroiptv-* bundles).
-dist/
-
+# Build output is ignored per project: see c/.gitignore and rust/.gitignore.

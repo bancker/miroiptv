@@ -1,0 +1,8 @@
+# C miroiptv build output: make -> build/, build-dist.sh -> dist/ staging
+# plus the portable miroiptv-<version>.zip next to this file.
+build/
+dist/
+miroiptv-*.zip
+*.o
+*.exe
+*.pdb
