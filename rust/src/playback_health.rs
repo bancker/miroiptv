@@ -84,6 +84,18 @@ impl PlaybackHealth {
     pub fn last_freeze(&self) -> Option<Duration> {
         self.last_freeze
     }
+
+    /// How long the stream may go without a new frame before the stall
+    /// watchdog reloads it. Before its first frame the relay may still be
+    /// waiting out a busy portal (its `busy_wait`); reloading then only
+    /// starts that over.
+    pub fn stall_limit(&self) -> Duration {
+        if self.started {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(25)
+        }
+    }
 }
 
 /// Caps automatic reloads of a live stream that ended unexpectedly. A live
@@ -157,6 +169,15 @@ mod tests {
         let mut h = PlaybackHealth::new();
         h.mark_started();
         h
+    }
+
+    #[test]
+    fn a_stream_still_starting_outlasts_the_relays_busy_wait() {
+        // Reloading while the relay waits out a busy portal only starts that
+        // over - with a "herverbinden" toast every 15 s.
+        let busy_wait = crate::relay::RelayConfig::default().busy_wait;
+        assert!(PlaybackHealth::new().stall_limit() > busy_wait);
+        assert_eq!(started().stall_limit(), Duration::from_secs(10));
     }
 
     #[test]

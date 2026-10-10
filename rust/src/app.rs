@@ -490,9 +490,8 @@ impl TvApp {
             self.last_progress_at = Instant::now();
             return;
         }
-        const STALL: Duration = Duration::from_secs(10);
         const COOLDOWN: Duration = Duration::from_secs(15);
-        if self.last_progress_at.elapsed() < STALL {
+        if self.last_progress_at.elapsed() < self.health.stall_limit() {
             return;
         }
         if let Some(t) = self.last_recovery_at {
