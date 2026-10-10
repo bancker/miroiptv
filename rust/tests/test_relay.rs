@@ -88,6 +88,7 @@ fn fast() -> RelayConfig {
         retry_delays: vec![Duration::from_millis(20), Duration::from_millis(20)],
         give_up_after: Duration::from_millis(500),
         idle_timeout: Duration::from_secs(2),
+        vod_timeout: Duration::from_secs(10),
         prefetch_ttl: Duration::from_secs(5),
         busy_wait: Duration::from_secs(1),
     }
@@ -449,6 +450,34 @@ async fn serves_a_catch_up_playlist_to_both_of_mpvs_opens_from_one_portal_reques
     );
     assert_eq!(first, second);
     assert_eq!(hits(&server, "/ts/a/index.m3u8").await, 1);
+}
+
+#[tokio::test]
+async fn waits_for_a_slow_catch_up_playlist_instead_of_asking_again() {
+    // Generating an older programme's playlist took the portal over 10 s;
+    // each new request starts the generation over.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(CATCHUP))
+        .respond_with(redirect(&server, "/ts/a/index.m3u8"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/ts/a/index.m3u8"))
+        .respond_with(vod_playlist().set_delay(Duration::from_millis(2500)))
+        .mount(&server)
+        .await;
+
+    let relay = Relay::start(fast()).unwrap(); // idle_timeout 2 s
+    let local = relay.vod_url(&format!("{}{CATCHUP}", server.uri()));
+    let (head, body) = fetch(&local).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(body.contains("#EXT-X-ENDLIST"), "{body}");
+    assert_eq!(
+        hits(&server, "/ts/a/index.m3u8").await,
+        1,
+        "generation restarted"
+    );
 }
 
 #[tokio::test]

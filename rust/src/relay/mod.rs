@@ -49,6 +49,10 @@ pub struct RelayConfig {
     pub give_up_after: Duration,
     /// A request or download that stalls this long counts as failed.
     pub idle_timeout: Duration,
+    /// How long a catch-up / VOD playlist may take to arrive: the portal
+    /// generates it per request (over 10 s for older programmes) and asking
+    /// again starts that over. mpv's own network timeout.
+    pub vod_timeout: Duration,
     /// How long a prefetch waits for the player to connect before stopping.
     pub prefetch_ttl: Duration,
     /// How long starting a session keeps trying while the portal answers
@@ -69,6 +73,7 @@ impl Default for RelayConfig {
             ],
             give_up_after: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(10),
+            vod_timeout: Duration::from_secs(60),
             prefetch_ttl: Duration::from_secs(10),
             busy_wait: Duration::from_secs(20),
         }
@@ -151,7 +156,7 @@ fn spawn_upstream(inner: Arc<Inner>, portal: String) -> Upstream {
     let (tx, rx) = mpsc::channel::<Bytes>(CHANNEL_CHUNKS);
     let (ready_tx, ready) = oneshot::channel();
     let task = tokio::spawn(async move {
-        match first_playlist(&inner, &portal).await {
+        match first_playlist(&inner, &portal, inner.cfg.idle_timeout).await {
             Some(first) => {
                 let _ = ready_tx.send(true);
                 fetch_loop(inner, portal, first.url, first.playlist, tx).await;
@@ -235,7 +240,7 @@ impl Relay {
         let portal = upstream.to_string();
         let task = tokio::spawn(async move {
             let t0 = Instant::now();
-            let state = match first_playlist(&inner, &portal).await {
+            let state = match first_playlist(&inner, &portal, inner.cfg.vod_timeout).await {
                 Some(f) if f.playlist.ended => {
                     info!(
                         "relay: catch-up playlist in {} ms ({} segments)",
@@ -505,7 +510,7 @@ async fn fetch_loop(
 /// The session's first playlist, via the portal (which redirects to an edge
 /// server). Retried like any refusal, and for up to `busy_wait` while the
 /// portal says it is busy - a channel that is really gone still fails fast.
-async fn first_playlist(inner: &Inner, portal: &str) -> Option<Fetched> {
+async fn first_playlist(inner: &Inner, portal: &str, timeout: Duration) -> Option<Fetched> {
     let url = Url::parse(portal).ok()?;
     let cfg = &inner.cfg;
     let t0 = Instant::now();
@@ -513,7 +518,7 @@ async fn first_playlist(inner: &Inner, portal: &str) -> Option<Fetched> {
     let mut pause = cfg.poll_min;
     let mut refusals = 0;
     loop {
-        match get_playlist(inner, url.clone()).await {
+        match get_playlist(inner, url.clone(), timeout).await {
             Ok(found) => {
                 if refusals > 0 {
                     info!(
@@ -545,12 +550,13 @@ async fn first_playlist(inner: &Inner, portal: &str) -> Option<Fetched> {
 /// then take a fresh token from the portal.
 async fn reload(inner: &Inner, portal: &str, edge: &mut Url) -> Option<Playlist> {
     let t0 = Instant::now();
-    if let Ok(f) = get_playlist(inner, edge.clone()).await {
+    let timeout = inner.cfg.idle_timeout;
+    if let Ok(f) = get_playlist(inner, edge.clone(), timeout).await {
         return Some(f.playlist);
     }
     for delay in &inner.cfg.retry_delays {
         tokio::time::sleep(*delay).await;
-        if let Ok(f) = get_playlist(inner, edge.clone()).await {
+        if let Ok(f) = get_playlist(inner, edge.clone(), timeout).await {
             info!(
                 "relay: playlist refresh recovered on retry after {} ms",
                 t0.elapsed().as_millis()
@@ -558,7 +564,9 @@ async fn reload(inner: &Inner, portal: &str, edge: &mut Url) -> Option<Playlist>
             return Some(f.playlist);
         }
     }
-    let fresh = get_playlist(inner, Url::parse(portal).ok()?).await.ok()?;
+    let fresh = get_playlist(inner, Url::parse(portal).ok()?, timeout)
+        .await
+        .ok()?;
     info!(
         "relay: playlist refresh recovered with a fresh token after {} ms",
         t0.elapsed().as_millis()
@@ -584,13 +592,22 @@ struct Fetched {
     playlist: Playlist,
 }
 
-/// GET a playlist, following redirects. URLs are never logged: the portal's
-/// carry the credentials.
-async fn get_playlist(inner: &Inner, url: Url) -> Result<Fetched, Refused> {
-    let timeout = inner.cfg.idle_timeout;
+/// GET a playlist, following redirects, within `timeout`. URLs are never
+/// logged: the portal's carry the credentials.
+async fn get_playlist(inner: &Inner, url: Url, timeout: Duration) -> Result<Fetched, Refused> {
     let resp = match tokio::time::timeout(timeout, inner.client.get(url).send()).await {
         Ok(Ok(resp)) => resp,
-        _ => return Err(Refused::Failed),
+        Ok(Err(e)) => {
+            warn!("relay: playlist request failed: {}", e.without_url());
+            return Err(Refused::Failed);
+        }
+        Err(_) => {
+            warn!(
+                "relay: playlist request timed out after {} s",
+                timeout.as_secs()
+            );
+            return Err(Refused::Failed);
+        }
     };
     let status = resp.status().as_u16();
     if !resp.status().is_success() {
@@ -608,9 +625,15 @@ async fn get_playlist(inner: &Inner, url: Url) -> Result<Fetched, Refused> {
                 text,
                 playlist,
             }),
-            None => Err(Refused::Failed),
+            None => {
+                warn!("relay: playlist response is not a playlist");
+                Err(Refused::Failed)
+            }
         },
-        _ => Err(Refused::Failed),
+        _ => {
+            warn!("relay: playlist download broke off");
+            Err(Refused::Failed)
+        }
     }
 }
 
