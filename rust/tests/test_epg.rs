@@ -1,5 +1,5 @@
+use bongo_player::epg::{Epg, EpgEntry};
 use chrono::{TimeZone, Utc};
-use tvplayer::epg::{Epg, EpgEntry};
 
 fn e(title: &str, start_min: i64, end_min: i64) -> EpgEntry {
     EpgEntry {

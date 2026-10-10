@@ -2,7 +2,12 @@ use clap::Parser;
 use thiserror::Error;
 
 #[derive(Parser, Debug)]
-#[command(name = "tvplayer", version, about = "Lightweight IPTV player")]
+#[command(
+    name = "BongoPlayer",
+    display_name = "Bongo Player",
+    version,
+    about = "Lightweight IPTV player"
+)]
 pub struct Cli {
     /// Xtream Codes portal: user:pass@host[:port]
     #[arg(long)]
@@ -16,7 +21,7 @@ pub struct Cli {
     pub selftest: bool,
 
     /// Show a live debug console window (off by default). Logs always also go
-    /// to the file under %APPDATA%\tvplayer\log\.
+    /// to the file under %APPDATA%\BongoPlayer\config\log\.
     #[arg(long)]
     pub console: bool,
 }
@@ -39,17 +44,17 @@ pub enum CredsError {
     BadPort,
 }
 
-/// Path to `tvplayer.ini` next to the executable (falls back to CWD if the
+/// Path to `BongoPlayer.ini` next to the executable (falls back to CWD if the
 /// exe path can't be resolved). This is the app's "root folder" config file.
 pub fn ini_path() -> std::path::PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("tvplayer.ini")
+        .join(format!("{}.ini", crate::APP_ID))
 }
 
-/// Read a creds string (`user:pass@host:port`) from tvplayer.ini, if present.
+/// Read a creds string (`user:pass@host:port`) from the ini, if present.
 /// Accepts a bare line or a `key=value` form (any key); `#`/`;` lines are
 /// comments. Returns the first line that looks like credentials (contains `@`).
 pub fn read_ini_creds(path: &std::path::Path) -> Option<String> {

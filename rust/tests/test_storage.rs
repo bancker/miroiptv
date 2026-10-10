@@ -1,4 +1,4 @@
-use tvplayer::storage::Storage;
+use bongo_player::storage::Storage;
 
 #[test]
 fn config_dir_exists_after_ensure() {

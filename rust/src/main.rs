@@ -2,16 +2,18 @@
 // live debug console; logs always also go to the file under %APPDATA%.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+use bongo_player::app::{PortalState, TvApp};
+use bongo_player::args::{ini_path, parse_xtream_creds, read_ini_creds, Cli, XtreamCreds};
+use bongo_player::catalog::CatalogStore;
+use bongo_player::legacy;
+use bongo_player::player;
+use bongo_player::portal::{xtream::XtreamPortal, Portal};
+use bongo_player::storage::Storage;
+use bongo_player::{APP_ID, APP_NAME};
 use clap::Parser;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use tvplayer::app::{PortalState, TvApp};
-use tvplayer::args::{ini_path, parse_xtream_creds, read_ini_creds, Cli, XtreamCreds};
-use tvplayer::catalog::CatalogStore;
-use tvplayer::player;
-use tvplayer::portal::{xtream::XtreamPortal, Portal};
-use tvplayer::storage::Storage;
 
 /// Optional debug console (opt-in via --console). Without it the binary is a
 /// windowed app with no console at all. Logs always also go to the file.
@@ -72,18 +74,26 @@ fn is_placeholder_creds(creds: &XtreamCreds) -> bool {
         || (creds.username == "user" && creds.password == "pass")
 }
 
-/// Initialize tracing: stderr + rolling daily file under %APPDATA%\tvplayer\log\.
-/// Returns the log directory path so callers can show it in the UI / panic hook.
+/// Initialize tracing: stderr + rolling daily file under
+/// %APPDATA%\BongoPlayer\config\log\. Returns the log directory path so callers
+/// can show it in the UI / panic hook.
 fn init_logging(storage: &Storage) -> std::path::PathBuf {
     let log_dir = storage.config_dir().join("log");
     std::fs::create_dir_all(&log_dir).ok();
 
     // Sync rolling appender: writes are line-flushed so a panic-abort still
     // leaves the last few seconds of context on disk.
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "tvplayer.log");
+    let file_appender = tracing_appender::rolling::daily(&log_dir, format!("{APP_ID}.log"));
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("tvplayer=debug,reqwest=warn,hyper=warn"));
+    // Targets are crate names (lib + this bin). Derived via module_path!() so a
+    // rename can't silently mute the app's own logs.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(format!(
+            "{}=debug,{}=debug,reqwest=warn,hyper=warn",
+            bongo_player::LOG_TARGET,
+            module_path!()
+        ))
+    });
 
     let stderr_layer = fmt::layer()
         .with_target(false)
@@ -146,20 +156,37 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Windowed binary: no console by default. --console opens one with live
-    // logs (the file log under %APPDATA%\tvplayer\log\ is always written).
+    // logs (the file log under %APPDATA%\BongoPlayer\config\log\ is always
+    // written).
     #[cfg(windows)]
     if cli.console {
         win_console::alloc();
     }
 
     let storage = Storage::standard()?;
+    // First start after the tvplayer -> Bongo Player rename: carry over the old
+    // data and ini. Must run before ensure_config_dir (an existing config dir
+    // means "already migrated"); results are logged once logging is up.
+    let migrated_config = legacy::legacy_config_dir()
+        .map(|old| legacy::migrate_config_dir(&old, storage.config_dir()));
+    let migrated_ini = legacy::migrate_file(&legacy::legacy_ini_path(), &ini_path());
     storage.ensure_config_dir()?;
     let log_dir = init_logging(&storage);
     install_panic_hook(log_dir.clone());
 
-    tracing::info!("tvplayer v{} starting", env!("CARGO_PKG_VERSION"));
+    tracing::info!("{} v{} starting", APP_NAME, env!("CARGO_PKG_VERSION"));
     tracing::info!("config dir: {}", storage.config_dir().display());
     tracing::info!("log dir:    {}", log_dir.display());
+    match migrated_config {
+        Some(Ok(n)) if n > 0 => tracing::info!("migrated {} files from the tvplayer config dir", n),
+        Some(Err(e)) => tracing::warn!("could not migrate the tvplayer config dir: {}", e),
+        _ => {}
+    }
+    match migrated_ini {
+        Ok(true) => tracing::info!("renamed tvplayer.ini to {}", ini_path().display()),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("could not rename tvplayer.ini: {}", e),
+    }
 
     let rt = Runtime::new()?;
     let _rt_guard = rt.enter();
@@ -167,13 +194,10 @@ fn main() -> anyhow::Result<()> {
     // Resolve portal:
     //   1. --xtream provided AND not placeholder -> real portal
     //   2. otherwise -> "no portal" sentinel; UI shows configure-portal screen
-    // Credentials come from --xtream (explicit) or, failing that, tvplayer.ini
+    // Credentials come from --xtream (explicit) or, failing that, BongoPlayer.ini
     // in the app folder. If neither exists the app shows a first-run prompt
-    // that writes tvplayer.ini.
-    let creds_str = cli
-        .xtream
-        .clone()
-        .or_else(|| read_ini_creds(&ini_path()));
+    // that writes BongoPlayer.ini.
+    let creds_str = cli.xtream.clone().or_else(|| read_ini_creds(&ini_path()));
     let (portal, portal_state): (Arc<dyn Portal>, PortalState) = if let Some(s) =
         creds_str.as_deref()
     {
@@ -205,7 +229,9 @@ fn main() -> anyhow::Result<()> {
             }
         }
     } else {
-        tracing::warn!("portal: no credentials (--xtream or tvplayer.ini). Showing first-run setup prompt.");
+        tracing::warn!(
+            "portal: no credentials (--xtream or {APP_ID}.ini). Showing first-run setup prompt."
+        );
         (
             Arc::new(XtreamPortal::new(XtreamCreds {
                 username: "anon".into(),
@@ -225,10 +251,10 @@ fn main() -> anyhow::Result<()> {
         .viewport
         .with_inner_size([1280.0, 720.0])
         .with_min_inner_size([640.0, 360.0])
-        .with_title(format!("tvplayer v{}", env!("CARGO_PKG_VERSION")));
+        .with_title(format!("{} v{}", APP_NAME, env!("CARGO_PKG_VERSION")));
 
     let result = eframe::run_native(
-        "tvplayer",
+        APP_NAME,
         options,
         Box::new(move |cc| {
             Box::new(TvApp::new(
@@ -245,6 +271,6 @@ fn main() -> anyhow::Result<()> {
         tracing::error!("eframe exited with error: {}", e);
         return Err(anyhow::anyhow!("eframe: {}", e));
     }
-    tracing::info!("tvplayer exited cleanly");
+    tracing::info!("{} exited cleanly", APP_NAME);
     Ok(())
 }

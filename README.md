@@ -1,4 +1,4 @@
-# miroiptv / tvplayer
+# miroiptv / Bongo Player
 
 A small, fast IPTV player for Windows, tuned for Xtream Codes portals
 (Dutch NPO/RTL shortcuts baked in). One portable exe plus its DLLs, no
@@ -10,7 +10,7 @@ build output:
 
 | Folder | App | Stack | Status |
 |---|---|---|---|
-| [`rust/`](rust/) | `tvplayer` | Rust · libmpv · egui/eframe (wgpu) · tokio | active |
+| [`rust/`](rust/) | Bongo Player | Rust · libmpv · egui/eframe (wgpu) · tokio | active |
 | [`c/`](c/) | `miroiptv` | C · SDL2 · libav · libcurl | fallback |
 
 See each folder's README for build instructions. Design docs and plans

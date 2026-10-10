@@ -1,4 +1,4 @@
-use tvplayer::favorites::Favorites;
+use bongo_player::favorites::Favorites;
 
 #[test]
 fn toggle_adds_then_removes() {

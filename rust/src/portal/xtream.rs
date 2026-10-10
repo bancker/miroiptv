@@ -13,7 +13,7 @@ pub struct XtreamPortal {
 impl XtreamPortal {
     pub fn new(creds: XtreamCreds) -> Self {
         let client = reqwest::Client::builder()
-            .user_agent("tvplayer/0.1")
+            .user_agent(format!("{}/{}", crate::APP_ID, env!("CARGO_PKG_VERSION")))
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .expect("build reqwest client");

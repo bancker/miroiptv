@@ -5,9 +5,9 @@ pub struct Storage {
 }
 
 impl Storage {
-    /// Standard location: %APPDATA%\tvplayer\ on Windows.
+    /// Standard location: %APPDATA%\BongoPlayer\config\ on Windows.
     pub fn standard() -> anyhow::Result<Self> {
-        let proj = directories::ProjectDirs::from("", "", "tvplayer")
+        let proj = directories::ProjectDirs::from("", "", crate::APP_ID)
             .ok_or_else(|| anyhow::anyhow!("no project dir"))?;
         Ok(Self {
             root: proj.config_dir().to_path_buf(),

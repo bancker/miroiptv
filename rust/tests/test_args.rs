@@ -1,4 +1,4 @@
-use tvplayer::args::{parse_xtream_creds, XtreamCreds};
+use bongo_player::args::{parse_xtream_creds, XtreamCreds};
 
 #[test]
 fn parses_xtream_creds_with_port() {

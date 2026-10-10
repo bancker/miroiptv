@@ -1,5 +1,5 @@
-use tvplayer::args::XtreamCreds;
-use tvplayer::portal::{xtream::XtreamPortal, Portal};
+use bongo_player::args::XtreamCreds;
+use bongo_player::portal::{xtream::XtreamPortal, Portal};
 use wiremock::{
     matchers::{method, path},
     Mock, MockServer, ResponseTemplate,
@@ -56,6 +56,26 @@ async fn fetch_epg_returns_parsed_entries() {
     assert_eq!(epg.entries().len(), 2);
     assert_eq!(epg.entries()[0].title, "Nieuws");
     assert_eq!(epg.entries()[1].title, "Sport");
+}
+
+#[tokio::test]
+async fn portal_requests_identify_as_bongo_player() {
+    let server = MockServer::start().await;
+    let ua = format!("BongoPlayer/{}", env!("CARGO_PKG_VERSION"));
+    Mock::given(method("GET"))
+        .and(path("/player_api.php"))
+        .and(wiremock::matchers::header("user-agent", ua.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixtures("xtream_epg")))
+        .mount(&server)
+        .await;
+
+    let portal = XtreamPortal::new(creds_for(&server));
+    let epg = portal.fetch_epg(101).await.unwrap();
+    assert_eq!(
+        epg.entries().len(),
+        2,
+        "portal saw a User-Agent other than {ua}"
+    );
 }
 
 #[test]

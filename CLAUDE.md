@@ -6,26 +6,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repo holds **two implementations of the same IPTV player**, both living on `main`, each in its own self-contained project folder (own sources, build scripts, `.gitignore` and build output — nothing builds into the repo root):
 
-- **`rust/` — `tvplayer` (ACTIVE).** A clean rebuild on **libmpv + egui/eframe (wgpu) + tokio**. This is where new work happens.
+- **`rust/` — Bongo Player (ACTIVE; formerly `tvplayer`).** A clean rebuild on **libmpv + egui/eframe (wgpu) + tokio**. This is where new work happens.
 - **`c/` — `miroiptv` (FALLBACK).** The original plain-C player on **SDL2 + libav + libcurl**. Kept working as a fallback while the Rust rewrite is validated. Touch it only when explicitly working on the C app.
 
 Shared design docs stay at the repo root in `docs/`.
 
-When a request is ambiguous, assume it targets the **Rust `tvplayer`** app.
+When a request is ambiguous, assume it targets the **Rust Bongo Player** app.
 
 **Performance is the top constraint.** The whole point of this player is "small, fast, featherlight" — instant zap (~300 ms), one portable exe + DLLs, no installer. The C app was abandoned partly because it grew slow. No change should regress startup time, zap latency, or memory footprint.
 
 ## Commands
 
-### Rust `tvplayer` (primary — run from `rust/`)
+### Rust Bongo Player (primary — run from `rust/`)
 
 ```powershell
 .\vendor\fetch-mpv.ps1               # one-time: vendor libmpv-2.dll + headers
 cargo test                           # unit + integration tests (see rust/tests/)
 cargo test --test test_epg           # a single integration-test file
 cargo test <substring>               # a single test by name substring
-cargo build --release                # -> rust\target\release\tvplayer.exe
-.\target\release\tvplayer.exe --selftest   # headless self-check, no portal needed
+cargo build --release                # -> rust\target\release\BongoPlayer.exe
+.\target\release\BongoPlayer.exe --selftest   # headless self-check, no portal needed
 cargo clippy --all-targets           # lint
 cargo fmt                            # format
 ```
@@ -33,7 +33,7 @@ cargo fmt                            # format
 Package a portable zip (also from `rust/`; output stays in `rust\dist\`):
 
 ```powershell
-.\build-zip.ps1                      # -> rust\dist\tvplayer-vX.Y.Z.zip
+.\build-zip.ps1                      # -> rust\dist\BongoPlayer-vX.Y.Z.zip
 .\verify.ps1                         # smoke-test the built zip
 ```
 
@@ -70,8 +70,9 @@ The module tree is declared in `rust/src/lib.rs`. The non-obvious structure:
 - **`favorites.rs` / `storage.rs` / `presets.rs`** handle persistence (favorites, last-watched-for-resume) under the platform config dir.
 - **`shortcuts.rs`** maps keys to actions; Dutch NPO/RTL channel shortcuts are baked in.
 
-### Two gotchas worth knowing
+### Gotchas worth knowing
 
+- **Names come from `lib.rs`.** `APP_NAME` ("Bongo Player") is what users see; `APP_ID` ("BongoPlayer") names the exe, `BongoPlayer.ini`, `%APPDATA%\BongoPlayer\config\`, the log file and the portal User-Agent. Crate names differ again (`bongo_player` lib, `BongoPlayer` bin), so the default log filter is built from `module_path!()` — never hardcode crate names there, or the app's logs go silent. `legacy.rs` migrates the pre-rename `tvplayer` data (`%APPDATA%\tvplayer\config`, `tvplayer.ini`) once on first start; keep it until no tvplayer installs remain.
 - **Benign mpv log noise is downgraded on purpose.** `player/mod.rs::effective_log_level()` demotes specific ffmpeg "error" lines to debug: HLS HTTP-EOF (Xtream portals close the playlist response without Content-Length) and the H.264 PPS/SPS/"no frame!" flood on every zap (B/P frames before the first keyframe). These are *not* real errors — don't "fix" them by removing the filter, or the log becomes unreadable on every channel switch.
 - **Release profile is `panic = "abort"`** (plus thin LTO, `strip`, `codegen-units = 1`). No unwinding — a panic kills the process. Keep that in mind for anything relying on catching panics.
 

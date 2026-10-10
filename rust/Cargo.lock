@@ -293,6 +293,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "bongo-player"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "clap",
+ "directories",
+ "eframe",
+ "egui",
+ "egui_extras",
+ "embed-resource",
+ "insta",
+ "once_cell",
+ "parking_lot",
+ "proptest",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "url",
+ "urlencoding",
+ "wiremock",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3435,38 +3467,6 @@ name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
-
-[[package]]
-name = "tvplayer"
-version = "0.3.11"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "chrono",
- "clap",
- "directories",
- "eframe",
- "egui",
- "egui_extras",
- "embed-resource",
- "insta",
- "once_cell",
- "parking_lot",
- "proptest",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "url",
- "urlencoding",
- "wiremock",
-]
 
 [[package]]
 name = "type-map"

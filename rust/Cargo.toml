@@ -1,16 +1,17 @@
 [package]
-name = "tvplayer"
-version = "0.3.11"
+name = "bongo-player"
+version = "0.4.0"
 edition = "2021"
 authors = ["miroiptv"]
 license = "MIT"
 
 [lib]
-name = "tvplayer"
+name = "bongo_player"
 path = "src/lib.rs"
 
+# Bin name = exe name: BongoPlayer.exe.
 [[bin]]
-name = "tvplayer"
+name = "BongoPlayer"
 path = "src/main.rs"
 
 [dependencies]

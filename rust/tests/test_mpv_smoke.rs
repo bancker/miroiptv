@@ -1,4 +1,4 @@
-use tvplayer::player::Mpv;
+use bongo_player::player::Mpv;
 
 #[test]
 #[ignore]

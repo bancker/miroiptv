@@ -1,6 +1,6 @@
+use bongo_player::player::{FrameBus, Mpv, RenderCtx};
 use std::sync::Arc;
 use std::time::Duration;
-use tvplayer::player::{FrameBus, Mpv, RenderCtx};
 
 #[test]
 #[ignore]
@@ -21,7 +21,7 @@ fn render_frames_from_test_pattern() {
     while std::time::Instant::now() < deadline && frames_rendered < 5 && !saw_end {
         let evt = mpv.wait_event(0.05);
         let id = unsafe { (*evt).event_id };
-        if id == tvplayer::player::mpv_sys::MPV_EVENT_END_FILE {
+        if id == bongo_player::player::mpv_sys::MPV_EVENT_END_FILE {
             saw_end = true;
         }
         if rctx.has_new_frame() {

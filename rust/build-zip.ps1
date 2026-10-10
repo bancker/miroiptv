@@ -20,14 +20,14 @@ try {
 $verLine = Select-String -Path (Join-Path $rustDir 'Cargo.toml') -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
 if (-not $verLine) { throw "could not parse version from Cargo.toml" }
 $ver = $verLine.Matches.Groups[1].Value
-$stagingName = "tvplayer-v$ver"
+$stagingName = "BongoPlayer-v$ver"
 $staging = Join-Path $distDir $stagingName
 
 if (-not (Test-Path $distDir)) { New-Item -ItemType Directory -Path $distDir -Force | Out-Null }
 if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
 New-Item -ItemType Directory -Path $staging -Force | Out-Null
 
-Copy-Item (Join-Path $rustDir 'target\release\tvplayer.exe') $staging
+Copy-Item (Join-Path $rustDir 'target\release\BongoPlayer.exe') $staging
 Copy-Item (Join-Path $rustDir 'vendor\libmpv\libmpv-2.dll') $staging
 $mpvDir = Join-Path $rustDir 'vendor\libmpv'
 if (Test-Path (Join-Path $mpvDir 'LICENSE.txt')) {
@@ -43,12 +43,12 @@ REM  Without a real portal the app shows a "no portal configured" screen.
 REM =====================================================================
 set XTREAM_CREDS=user:pass@host.example.com:8080
 
-"%~dp0tvplayer.exe" --xtream %XTREAM_CREDS% %*
+"%~dp0BongoPlayer.exe" --xtream %XTREAM_CREDS% %*
 '@
 Set-Content -Path (Join-Path $staging 'run.bat') -Value $runBat -Encoding ASCII
 
 $readme = @"
-tvplayer v$ver - portable
+Bongo Player v$ver - portable
 
 USAGE
 -----
@@ -57,9 +57,16 @@ USAGE
 2. Double-click run.bat
 
 OR from the command line:
-  tvplayer.exe --xtream user:pass@host:port
-  tvplayer.exe https://example.com/some.m3u8      (bare URL, no portal)
-  tvplayer.exe --selftest                          (smoke check)
+  BongoPlayer.exe --xtream user:pass@host:port
+  BongoPlayer.exe https://example.com/some.m3u8      (bare URL, no portal)
+  BongoPlayer.exe --selftest                          (smoke check)
+
+UPGRADING FROM TVPLAYER
+-----------------------
+Favorites, resume points and presets move over automatically on the
+first start. Your portal login (tvplayer.ini) moves too if you unzip
+into your old tvplayer folder; otherwise copy tvplayer.ini next to
+BongoPlayer.exe.
 
 KEYS
 ----
@@ -81,7 +88,7 @@ KEYS
 
 LICENSE
 -------
-tvplayer code: MIT
+Bongo Player code: MIT
 libmpv-2.dll : LGPL-2.1 (see libmpv-LICENSE.txt if bundled)
 
 mpv source:    https://github.com/mpv-player/mpv

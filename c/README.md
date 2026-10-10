@@ -6,7 +6,7 @@ Tuned for Xtream Codes portals — Dutch NPO/RTL shortcuts baked in, but
 any portal works.
 
 This is the original C implementation, kept as a fallback. The active
-Rust rewrite (`tvplayer`) lives in [`../rust/`](../rust/).
+Rust rewrite (Bongo Player) lives in [`../rust/`](../rust/).
 
 ## Features
 

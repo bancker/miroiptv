@@ -1,9 +1,9 @@
-# tvplayer manual validation checklist
+# Bongo Player manual validation checklist
 
 Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream portal.
 
 ## Setup
-- [ ] Extract `rust\dist\tvplayer-v*.zip` to a fresh folder
+- [ ] Extract `rust\dist\BongoPlayer-v*.zip` to a fresh folder
 - [ ] Edit `run.bat`: set `XTREAM_CREDS=user:pass@host:port`
 - [ ] Double-click `run.bat`
 
@@ -61,6 +61,11 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] No audio crackle, no AV drift, no buffer-exhausted toasts
 - [ ] CPU stays < 10% (Task Manager check)
 - [ ] Memory steady (no growth over 100 MB after 30 min)
+
+## Upgrade from tvplayer
+- [ ] With old data in `%APPDATA%\tvplayer\config` and no `%APPDATA%\BongoPlayer`: first start → Shift+F shows the old favorites, resume/presets work
+- [ ] `tvplayer.ini` next to `BongoPlayer.exe` → renamed to `BongoPlayer.ini`, portal connects without the setup prompt
+- [ ] Log (`%APPDATA%\BongoPlayer\config\log\BongoPlayer.log.*`) says "migrated N files from the tvplayer config dir"
 
 ## Crash safety
 - [ ] Bad Xtream cred (`--xtream nope:bad@127.0.0.1:1`) → boots to black window with error toasts, NOT a crash

@@ -323,7 +323,7 @@ pub struct TvApp {
     /// True once a held digit fired its save, so its release won't also recall.
     digit_long_fired: [bool; 10],
 
-    // ---- first-run portal setup prompt (writes tvplayer.ini) ----
+    // ---- first-run portal setup prompt (writes BongoPlayer.ini) ----
     cfg_host: String,
     cfg_user: String,
     cfg_pass: String,
@@ -400,7 +400,7 @@ impl TvApp {
             app.load_url(url, false);
         } else if app.portal_state == PortalState::Configured {
             // Only resume when a portal is actually configured. Without creds
-            // (e.g. tvplayer.ini deleted) drop to the setup prompt instead of
+            // (e.g. BongoPlayer.ini deleted) drop to the setup prompt instead of
             // silently replaying the last URL (whose credentials are baked in).
             if let Some(lw) = LastWatched::load(&app.storage.last_watched_path()) {
                 tracing::info!("resuming last watched ({})", lw.url);
@@ -1185,7 +1185,7 @@ impl TvApp {
     }
 
     /// First-run portal setup: shown when no credentials are configured.
-    /// Collects host/user/pass, writes tvplayer.ini and connects live.
+    /// Collects host/user/pass, writes BongoPlayer.ini and connects live.
     fn paint_portal_prompt(&mut self, ctx: &egui::Context) {
         let mut submit: Option<String> = None;
         egui::Area::new(egui::Id::new("__portal_prompt__"))
@@ -1203,7 +1203,7 @@ impl TvApp {
                         );
                         ui.label(
                             egui::RichText::new(
-                                "Vul je Xtream-gegevens in. Ze worden opgeslagen in tvplayer.ini naast de app.",
+                                "Vul je Xtream-gegevens in. Ze worden opgeslagen in BongoPlayer.ini naast de app.",
                             )
                             .color(Color32::from_white_alpha(150))
                             .size(12.0),
@@ -1266,7 +1266,7 @@ impl TvApp {
         }
     }
 
-    /// Validate prompt creds, persist to tvplayer.ini, then rebuild the catalog
+    /// Validate prompt creds, persist to BongoPlayer.ini, then rebuild the catalog
     /// live and start fetching - no restart needed.
     fn apply_creds_string(&mut self, creds_str: &str) {
         let creds = match parse_xtream_creds(creds_str) {
@@ -1783,7 +1783,8 @@ impl TvApp {
                         ui.set_max_width(720.0);
                         ui.label(
                             egui::RichText::new(format!(
-                                "tvplayer v{}  -  hotkeys",
+                                "{} v{}  -  hotkeys",
+                                crate::APP_NAME,
                                 env!("CARGO_PKG_VERSION")
                             ))
                             .color(Color32::WHITE)
@@ -1889,7 +1890,7 @@ impl TvApp {
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() * 0.25);
             ui.label(
-                egui::RichText::new("tvplayer")
+                egui::RichText::new(crate::APP_NAME)
                     .color(Color32::from_white_alpha(180))
                     .size(48.0),
             );
@@ -1912,7 +1913,7 @@ impl TvApp {
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(
-                            "(A bare URL also works: tvplayer.exe https://example.com/some.m3u8)",
+                            "(A bare URL also works: BongoPlayer.exe https://example.com/some.m3u8)",
                         )
                         .italics()
                         .color(Color32::from_white_alpha(80)),

@@ -1,4 +1,4 @@
-use tvplayer::search::{rank, ItemKind, SearchItem};
+use bongo_player::search::{rank, ItemKind, SearchItem};
 
 fn item(name: &str, kind: ItemKind) -> SearchItem {
     SearchItem {
