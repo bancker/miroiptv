@@ -32,10 +32,30 @@ impl Mpv {
         me.set_option("audio-display", "no")?;
         me.set_option("cache-secs", "10")?;
         me.set_option("hwdec", "auto-safe")?;
+        // Don't decode a frame ahead or wait for the first frame to be fully
+        // rendered before starting: zap -> picture went 1.10 -> 0.82 s on
+        // average. Frame dropping then trusts the stream's fps, which live TV
+        // reports correctly.
+        me.set_option("video-latency-hacks", "yes")?;
         me.set_option("vo", "libmpv")?;
         me.set_option("input-default-bindings", "no")?;
         me.set_option("input-vo-keyboard", "no")?;
         me.set_option("osc", "no")?;
+        // mpv's other built-in Lua scripts: each a VM on its own thread
+        // (~2.5 MB together) the app never uses, and ytdl_hook would launch
+        // yt-dlp on a portal URL that failed to open - one more portal session,
+        // seconds later. Best effort: an mpv without one of them is fine too.
+        for script in [
+            "ytdl",
+            "load-stats-overlay",
+            "load-console",
+            "load-auto-profiles",
+            "load-select",
+            "load-positioning",
+            "load-commands",
+        ] {
+            let _ = me.set_option(script, "no");
+        }
         me.set_option("sid", "auto")?;
         me.set_option("sub-auto", "fuzzy")?;
         // Reduce stdout chatter; we route via mpv's log msg event.
