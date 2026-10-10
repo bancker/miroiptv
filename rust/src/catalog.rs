@@ -246,6 +246,18 @@ fn zap_preference(rank: u8) -> u8 {
     }
 }
 
+/// Where the channel of `variant` sits in a zap list ([`dedupe_zap`]): its own
+/// entry, or the variant that stands for the channel there.
+pub fn zap_position(zap: &[LiveChannel], variant: &LiveChannel) -> Option<usize> {
+    zap.iter()
+        .position(|c| c.stream_id == variant.stream_id)
+        .or_else(|| {
+            let key = normalize_channel_name(&variant.name);
+            zap.iter()
+                .position(|c| normalize_channel_name(&c.name) == key)
+        })
+}
+
 /// What to play when the portal refuses variant `sid` of a channel: another
 /// variant from its `ladder` ([`quality_ladder`]) in zap order (FHD first, see
 /// [`zap_preference`]), skipping those `refused` says were turned down too.
@@ -338,6 +350,20 @@ mod zap_tests {
     fn fallback_skips_variants_that_were_refused_too() {
         let alt = fallback_variant(&rtl4_ladder(), 3, |c| c.stream_id == 2);
         assert_eq!(alt.map(|c| c.stream_id), Some(1));
+    }
+
+    #[test]
+    fn zap_position_finds_the_channel_of_any_variant() {
+        // Resumed on NPO 1 HD, while the zap list has NPO 1 FHD: arrow up
+        // must go to the neighbour, not to the end of a 10,000-channel list.
+        let zap = dedupe_zap(&[
+            ch(1, "NL | NPO 1 HD", 0),
+            ch(3, "NL | NPO 1 FHD", 0),
+            ch(4, "NL | NPO 2 HD", 0),
+        ]);
+        assert_eq!(zap_position(&zap, &ch(1, "NL | NPO 1 HD", 0)), Some(0));
+        assert_eq!(zap_position(&zap, &ch(4, "NL | NPO 2 HD", 0)), Some(1));
+        assert_eq!(zap_position(&zap, &ch(9, "NL | RTL 4", 0)), None);
     }
 
     #[test]

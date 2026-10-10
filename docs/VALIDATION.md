@@ -49,6 +49,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] Left/right arrow seek ±30 s within it
 - [ ] Then zap back to live → live plays, no error toast
 - [ ] A stream the portal refuses (RTL 4 UHD, `HTTP 407`) → the channel's FHD plays within ~1 s with toast "[TV] … (UHD niet beschikbaar)"; a preset on it goes straight to FHD from then on
+- [ ] Restart (resumes the last channel) → arrow up/down goes to its neighbour, not to the end of the list
 
 ## Subtitles / audio
 - [ ] On a VOD with multiple audio tracks, press `a` → cycles

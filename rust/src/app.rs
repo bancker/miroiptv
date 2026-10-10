@@ -1,5 +1,5 @@
 use crate::args::parse_xtream_creds;
-use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, quality_rank, CatalogStatus, CatalogStore};
+use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, quality_rank, zap_position, CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::Favorites;
 use crate::playback_health::{PlaybackHealth, ReloadBudget};
@@ -420,6 +420,8 @@ impl TvApp {
             if let Some(lw) = LastWatched::load(&app.storage.last_watched_path()) {
                 tracing::info!("resuming last watched ({})", lw.url);
                 app.set_toast("laatste zender hervatten...");
+                // Up/down then continues from this channel (see zap_delta).
+                app.current_stream_id = app.catalog.portal().live_stream_id(&lw.url);
                 app.load_url(lw.url, lw.live);
             }
         }
@@ -779,6 +781,13 @@ impl TvApp {
         self.kick_epg_fetch(sid);
     }
 
+    /// Where the playing channel sits in `zap`, also when it was resumed at
+    /// startup rather than zapped to (else arrow up lands on the list's end).
+    fn zap_index_of_current(&self, zap: &[LiveChannel]) -> Option<usize> {
+        let nav = self.catalog.quality_nav(self.current_stream_id?);
+        zap_position(zap, nav.ladder.first()?)
+    }
+
     /// Whether the portal refused live stream `sid` to this account this
     /// session (the relay saw its 407 - RTL 4 UHD, every time).
     fn is_refused(&self, sid: i64) -> bool {
@@ -820,7 +829,12 @@ impl TvApp {
             }
             return;
         }
-        let from = self.zap_pacer.waiting().map(|t| t.2).or(self.current_idx);
+        let from = self
+            .zap_pacer
+            .waiting()
+            .map(|t| t.2)
+            .or(self.current_idx)
+            .or_else(|| self.zap_index_of_current(&zap));
         if let Some(i) = shortcuts::next_live_idx(from, zap.len(), delta) {
             let name = zap[i].name.clone();
             let target = (zap[i].stream_id, name.clone(), i);
