@@ -56,5 +56,16 @@ mod tests {
         let cest = FixedOffset::east_opt(2 * 3600).unwrap();
         assert_eq!(hhmm_in(t, &cest), "20:30");
         assert_eq!(hhmm_in(t, &Utc), "18:30");
+
+        // Offsets with minutes, east and west of Greenwich.
+        let midday = Utc.with_ymd_and_hms(2026, 10, 11, 12, 15, 0).unwrap();
+        let india = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+        let newfoundland = FixedOffset::west_opt(3 * 3600 + 30 * 60).unwrap();
+        assert_eq!(hhmm_in(midday, &india), "17:45");
+        assert_eq!(hhmm_in(midday, &newfoundland), "08:45");
+
+        // The clock wraps over midnight: 23:30 UTC is already the next day at +02:00.
+        let late = Utc.with_ymd_and_hms(2026, 10, 11, 23, 30, 0).unwrap();
+        assert_eq!(hhmm_in(late, &cest), "01:30");
     }
 }

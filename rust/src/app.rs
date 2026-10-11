@@ -76,6 +76,130 @@ fn plays_as_live(status: ProgrammeStatus) -> bool {
     matches!(status, ProgrammeStatus::Live)
 }
 
+/// One line of the help overlay: the key(s) and what they do. Both are static
+/// texts (key names or `i18n` lookups), so the rows allocate no strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HelpRow {
+    key: &'static str,
+    action: &'static str,
+    /// The settings row: drawn as a link that opens them.
+    opens_settings: bool,
+}
+
+/// The help's rows per section, (key, action), in `lang` and with the zap row
+/// as the zap direction is set (reversing flips the arrows and the wheel,
+/// never the guide).
+fn help_rows(lang: Lang, swap_zap_keys: bool) -> [(T, Vec<HelpRow>); 2] {
+    let t = |k: T| crate::i18n::t(lang, k);
+    let row = |key: &'static str, action: &'static str| HelpRow {
+        key,
+        action,
+        opens_settings: false,
+    };
+    let link = |key: &'static str, action: &'static str| HelpRow {
+        key,
+        action,
+        opens_settings: true,
+    };
+    let zap = if swap_zap_keys {
+        T::HelpZapSwapped
+    } else {
+        T::HelpZap
+    };
+    [
+        (
+            T::HelpViewer,
+            vec![
+                row(t(T::KeyUpDownWheel), t(zap)),
+                row(t(T::KeyDigitsTap), t(T::HelpPresetRecall)),
+                row(t(T::KeyDigitsHold), t(T::HelpPresetStore)),
+                row("n", t(T::HelpNews)),
+                row("f", t(T::HelpSearch)),
+                row("Shift+F", t(T::HelpFavorites)),
+                row("*", t(T::HelpToggleFavorite)),
+                row("e", t(T::HelpEpgStrip)),
+                row("Shift+E", t(T::HelpEpgGrid)),
+                row("a / s", t(T::HelpAudioSubs)),
+                row("+ / -", t(T::HelpQuality)),
+                row(t(T::KeyLeftRight), t(T::HelpSeek)),
+                row(t(T::KeySpace), t(T::HelpPause)),
+                link("o", t(T::HelpSettings)),
+                row("F11", t(T::HelpFullscreen)),
+                row("F5", t(T::HelpRetryPortal)),
+                row("d", t(T::HelpDebug)),
+                row("g", t(T::HelpOpenGuide)),
+                row("t", t(T::HelpBorderless)),
+                row("?", t(T::HelpThisHelp)),
+                row("Esc", t(T::HelpCloseOverlays)),
+            ],
+        ),
+        (
+            T::HelpGuide,
+            vec![
+                row(t(T::KeyTypeLetters), t(T::HelpGuideFilter)),
+                row("Backspace", t(T::HelpGuideBackspace)),
+                row(t(T::KeyUpDown), t(T::HelpGuideRows)),
+                row(t(T::KeyLeftRight), t(T::HelpGuideColumns)),
+                row("PgUp / PgDn", t(T::HelpGuidePage)),
+                row("Home / End", t(T::HelpGuideHomeEnd)),
+                row("n / p", t(T::HelpGuideTimeMode)),
+                row("a / l / t", t(T::HelpGuideChannelMode)),
+                row("Enter", t(T::HelpGuidePlay)),
+                row(t(T::KeyEscOrG), t(T::HelpGuideClose)),
+            ],
+        ),
+    ]
+}
+
+/// Vertical padding inside the help's frame, in points.
+const HELP_FRAME_MARGIN: f32 = 14.0;
+/// Room the help keeps between its frame and the window's edge.
+const HELP_SCREEN_MARGIN: f32 = 12.0;
+/// What the help's footer needs below the rows: spacing, separator and one
+/// line of 11 pt text, with a little to spare.
+const HELP_FOOTER_HEIGHT: f32 = 30.0;
+/// The least height the rows keep, however small the window.
+const HELP_MIN_ROWS_HEIGHT: f32 = 66.0;
+/// How far one Up or Down press scrolls the help: two rows.
+const HELP_SCROLL_LINE: f32 = 44.0;
+
+/// Draws one row of the help. The settings row is a link: both texts
+/// underlined, and the key, the gap and the action are one click target and one
+/// Tab stop. True when that link was clicked (or got Enter or Space).
+fn paint_help_row(ui: &mut egui::Ui, row: &HelpRow) -> bool {
+    let key_text = egui::RichText::new(row.key)
+        .monospace()
+        .color(Color32::from_rgb(230, 220, 110))
+        .size(12.0);
+    let action_text = egui::RichText::new(row.action)
+        .color(Color32::from_white_alpha(220))
+        .size(12.0);
+    if !row.opens_settings {
+        ui.label(key_text);
+        ui.label(action_text);
+        return false;
+    }
+    // A slot behind the texts, filled once the row's extent is known.
+    let background = ui.painter().add(egui::Shape::Noop);
+    let key = ui.add(egui::Label::new(key_text.underline()).selectable(false));
+    let action = ui.add(egui::Label::new(action_text.underline()).selectable(false));
+    let rect = key.rect.union(action.rect);
+    let id = egui::Id::new("__help_settings__");
+    let response = ui
+        .interact(rect, id, egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, row.action));
+    if response.hovered() {
+        let hover = egui::Shape::rect_filled(rect, 3.0, Color32::from_rgb(44, 44, 54));
+        ui.painter().set(background, hover);
+    }
+    if response.has_focus() {
+        let ring = egui::Stroke::new(1.0, Color32::from_rgb(120, 180, 240));
+        ui.painter().rect_stroke(rect, 3.0, ring);
+    }
+    response.clicked()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeMode {
     /// Each column scrolls to its currently-airing programme on open / mode-switch.
@@ -2071,117 +2195,96 @@ impl TvApp {
             });
     }
 
-    /// The help rows per section, (key, action), in the current language and
-    /// with the zap direction as set.
-    fn help_rows(&self) -> [(T, Vec<(String, &'static str)>); 2] {
-        let t = |k: T| crate::i18n::t(self.lang, k);
-        let key = |s: &str| s.to_string();
-        let zap = if self.settings.swap_zap_keys {
-            T::HelpZapSwapped
-        } else {
-            T::HelpZap
-        };
-        [
-            (
-                T::HelpViewer,
-                vec![
-                    (t(T::KeyUpDownWheel).to_string(), t(zap)),
-                    (t(T::KeyDigitsTap).to_string(), t(T::HelpPresetRecall)),
-                    (t(T::KeyDigitsHold).to_string(), t(T::HelpPresetStore)),
-                    (key("n"), t(T::HelpNews)),
-                    (key("f"), t(T::HelpSearch)),
-                    (key("Shift+F"), t(T::HelpFavorites)),
-                    (key("*"), t(T::HelpToggleFavorite)),
-                    (key("e"), t(T::HelpEpgStrip)),
-                    (key("Shift+E"), t(T::HelpEpgGrid)),
-                    (key("a / s"), t(T::HelpAudioSubs)),
-                    (key("+ / -"), t(T::HelpQuality)),
-                    (t(T::KeyLeftRight).to_string(), t(T::HelpSeek)),
-                    (t(T::KeySpace).to_string(), t(T::HelpPause)),
-                    (key("o"), t(T::HelpSettings)),
-                    (key("F11"), t(T::HelpFullscreen)),
-                    (key("F5"), t(T::HelpRetryPortal)),
-                    (key("d"), t(T::HelpDebug)),
-                    (key("g"), t(T::HelpOpenGuide)),
-                    (key("t"), t(T::HelpBorderless)),
-                    (key("?"), t(T::HelpThisHelp)),
-                    (key("Esc"), t(T::HelpCloseOverlays)),
-                ],
-            ),
-            (
-                T::HelpGuide,
-                vec![
-                    (t(T::KeyTypeLetters).to_string(), t(T::HelpGuideFilter)),
-                    (key("Backspace"), t(T::HelpGuideBackspace)),
-                    (t(T::KeyUpDown).to_string(), t(T::HelpGuideRows)),
-                    (t(T::KeyLeftRight).to_string(), t(T::HelpGuideColumns)),
-                    (key("PgUp / PgDn"), t(T::HelpGuidePage)),
-                    (key("Home / End"), t(T::HelpGuideHomeEnd)),
-                    (key("n / p"), t(T::HelpGuideTimeMode)),
-                    (key("a / l / t"), t(T::HelpGuideChannelMode)),
-                    (key("Enter"), t(T::HelpGuidePlay)),
-                    (t(T::KeyEscOrG).to_string(), t(T::HelpGuideClose)),
-                ],
-            ),
-        ]
-    }
-
     /// Draws the help overlay; true when the user clicked the settings row.
     fn paint_help(&self, ctx: &egui::Context) -> bool {
         if !self.show_help {
             return false;
         }
         let mut open_settings = false;
+        let sections = help_rows(self.lang, self.settings.swap_zap_keys);
+        let window_height = ctx.screen_rect().height();
         egui::Area::new(egui::Id::new("__help__"))
+            // The settings row is the one Tab stop, not the frame (see
+            // paint_toast); not interactable(false) either, or the rows could
+            // not scroll with the wheel (see paint_epg_grid).
+            .sense(egui::Sense::hover())
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 egui::Frame::popup(&ctx.style())
                     .fill(Color32::from_rgb(20, 20, 26))
-                    .inner_margin(egui::Margin::symmetric(16.0, 14.0))
+                    .inner_margin(egui::Margin::symmetric(16.0, HELP_FRAME_MARGIN))
                     .show(ui, |ui| {
                         ui.set_max_width(720.0);
-                        ui.label(
-                            egui::RichText::new(self.tr(
-                                T::HelpTitle,
-                                &[crate::APP_NAME, env!("CARGO_PKG_VERSION")],
-                            ))
-                            .color(Color32::WHITE)
-                            .heading(),
-                        );
+                        // Visible whenever the rows do not all fit.
+                        ui.spacing_mut().scroll = egui::style::ScrollStyle::thin();
+                        let title =
+                            self.tr(T::HelpTitle, &[crate::APP_NAME, env!("CARGO_PKG_VERSION")]);
+                        ui.label(egui::RichText::new(title).color(Color32::WHITE).heading());
                         ui.add_space(8.0);
-                        for (si, (section, rows)) in self.help_rows().into_iter().enumerate() {
-                            ui.label(
-                                egui::RichText::new(self.t(section))
-                                    .color(Color32::from_rgb(120, 180, 240))
-                                    .strong()
-                                    .size(13.0),
-                            );
-                            ui.add_space(4.0);
-                            egui::Grid::new(("__help_grid__", si))
-                                .num_columns(2)
-                                .spacing([24.0, 4.0])
-                                .show(ui, |ui| {
-                                    for (key, action) in rows {
-                                        let key_text = egui::RichText::new(&key)
-                                            .monospace()
-                                            .color(Color32::from_rgb(230, 220, 110))
-                                            .size(12.0);
-                                        let action_text = egui::RichText::new(action)
-                                            .color(Color32::from_white_alpha(220))
-                                            .size(12.0);
-                                        if key == "o" {
-                                            // The settings row is a link to them.
-                                            let k = ui.link(key_text);
-                                            let a = ui.link(action_text);
-                                            open_settings |= k.clicked() || a.clicked();
-                                        } else {
-                                            ui.label(key_text);
-                                            ui.label(action_text);
-                                        }
-                                        ui.end_row();
-                                    }
-                                });
-                            ui.add_space(10.0);
+                        // The help never grows taller than its window: the rows
+                        // get what is left after the window's edge, the frame's
+                        // margins, the title above them and the footer below,
+                        // and scroll when they need more.
+                        let above = ui.cursor().min.y - ui.min_rect().min.y;
+                        let rows_height = (window_height
+                            - 2.0 * (HELP_SCREEN_MARGIN + HELP_FRAME_MARGIN)
+                            - above
+                            - HELP_FOOTER_HEIGHT)
+                            .max(HELP_MIN_ROWS_HEIGHT);
+                        let scrolled = egui::ScrollArea::vertical()
+                            .id_source("__help_rows__")
+                            .max_height(rows_height)
+                            // Dragging the rows would be one more Tab stop.
+                            .drag_to_scroll(false)
+                            .show(ui, |ui| {
+                                for (si, (section, rows)) in sections.into_iter().enumerate() {
+                                    ui.label(
+                                        egui::RichText::new(self.t(section))
+                                            .color(Color32::from_rgb(120, 180, 240))
+                                            .strong()
+                                            .size(13.0),
+                                    );
+                                    ui.add_space(4.0);
+                                    egui::Grid::new(("__help_grid__", si))
+                                        .num_columns(2)
+                                        .spacing([24.0, 4.0])
+                                        .show(ui, |ui| {
+                                            for row in &rows {
+                                                open_settings |= paint_help_row(ui, row);
+                                                ui.end_row();
+                                            }
+                                        });
+                                    ui.add_space(10.0);
+                                }
+                            });
+                        // Up/Down and PageUp/PageDown scroll the rows, wherever
+                        // the pointer is (the wheel needs it over them). The
+                        // viewer's and the guide's keys are all swallowed while
+                        // the help is open, so none of these zaps.
+                        let page =
+                            (scrolled.inner_rect.height() - HELP_SCROLL_LINE).max(HELP_SCROLL_LINE);
+                        let step = ctx.input(|i| {
+                            let mut step = 0.0;
+                            if i.key_pressed(Key::ArrowDown) {
+                                step += HELP_SCROLL_LINE;
+                            }
+                            if i.key_pressed(Key::ArrowUp) {
+                                step -= HELP_SCROLL_LINE;
+                            }
+                            if i.key_pressed(Key::PageDown) {
+                                step += page;
+                            }
+                            if i.key_pressed(Key::PageUp) {
+                                step -= page;
+                            }
+                            step
+                        });
+                        if step != 0.0 {
+                            let furthest =
+                                (scrolled.content_size.y - scrolled.inner_rect.height()).max(0.0);
+                            let mut state = scrolled.state;
+                            state.offset.y = (state.offset.y + step).clamp(0.0, furthest);
+                            state.store(ctx, scrolled.id);
                         }
                         ui.separator();
                         ui.label(
@@ -2677,7 +2780,11 @@ impl TvApp {
         self.current_name = Some(format!("{} - {}", channel.name, entry.title));
         self.current_stream_id = Some(channel.stream_id);
         self.current_epg = None;
-        let shown_tag = if tag == "LIVE" { "LIVE" } else { self.t(T::TagReplay) };
+        let shown_tag = if plays_as_live(status) {
+            "LIVE"
+        } else {
+            self.t(T::TagReplay)
+        };
         self.set_toast(format!(
             "[{}] {} | {} @ {}",
             shown_tag,
@@ -3459,5 +3566,56 @@ mod tests {
     fn a_live_guide_pick_plays_through_the_relay() {
         assert!(plays_as_live(ProgrammeStatus::Live));
         assert!(!plays_as_live(ProgrammeStatus::Catchup));
+    }
+
+    #[test]
+    fn the_help_zap_row_follows_the_zap_direction_and_nothing_else_does() {
+        for lang in Lang::ALL {
+            let normal = help_rows(lang, false);
+            let swapped = help_rows(lang, true);
+            let wheel = crate::i18n::t(lang, T::KeyUpDownWheel);
+            let zap = |rows: &[(T, Vec<HelpRow>); 2]| {
+                rows[0].1.iter().find(|r| r.key == wheel).map(|r| r.action)
+            };
+            assert_eq!(
+                zap(&normal),
+                Some(crate::i18n::t(lang, T::HelpZap)),
+                "{lang:?}"
+            );
+            assert_eq!(
+                zap(&swapped),
+                Some(crate::i18n::t(lang, T::HelpZapSwapped)),
+                "{lang:?}"
+            );
+            assert_ne!(zap(&normal), zap(&swapped), "{lang:?}");
+            // Reversing flips the arrows and the wheel; no other row and never the guide's keys.
+            let others = |rows: &[(T, Vec<HelpRow>); 2]| {
+                rows[0]
+                    .1
+                    .iter()
+                    .filter(|r| r.key != wheel)
+                    .copied()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(others(&normal), others(&swapped), "{lang:?}");
+            assert_eq!(normal[1], swapped[1], "{lang:?}");
+        }
+    }
+
+    #[test]
+    fn exactly_one_help_row_opens_the_settings_and_it_is_the_o_row() {
+        for lang in Lang::ALL {
+            for swap in [false, true] {
+                let sections = help_rows(lang, swap);
+                let links: Vec<&HelpRow> = sections
+                    .iter()
+                    .flat_map(|(_, rows)| rows.iter())
+                    .filter(|row| row.opens_settings)
+                    .collect();
+                assert_eq!(links.len(), 1, "{lang:?}, swapped: {swap}");
+                assert_eq!(links[0].key, "o");
+                assert_eq!(links[0].action, crate::i18n::t(lang, T::HelpSettings));
+            }
+        }
     }
 }
