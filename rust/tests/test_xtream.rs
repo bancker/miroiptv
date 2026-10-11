@@ -1,7 +1,8 @@
 use bongo_player::args::XtreamCreds;
 use bongo_player::portal::xtream::ConnCheck;
 use bongo_player::portal::{xtream::XtreamPortal, Portal};
-use wiremock::matchers::query_param_is_missing;
+use std::time::Duration;
+use wiremock::matchers::{query_param, query_param_is_missing};
 use wiremock::{
     matchers::{method, path},
     Mock, MockServer, ResponseTemplate,
@@ -178,11 +179,28 @@ fn stream_ref_reads_kind_and_id_from_portal_urls() {
     assert_eq!(stream_ref("http://h/player_api.php?username=u"), None);
 }
 
-async fn login(server: &MockServer, body: &str) {
+const GOOD_LOGIN: &str = r#"{"user_info":{"auth":1},"server_info":{}}"#;
+
+/// The portal's answer to a login (a player_api.php call without an action).
+async fn login_answering(server: &MockServer, answer: ResponseTemplate) {
     Mock::given(method("GET"))
         .and(path("/player_api.php"))
         .and(query_param_is_missing("action"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .respond_with(answer)
+        .mount(server)
+        .await;
+}
+
+async fn login(server: &MockServer, body: &str) {
+    login_answering(server, ResponseTemplate::new(200).set_body_string(body.to_string())).await;
+}
+
+/// The portal's answer to the live channel list.
+async fn live_list_answering(server: &MockServer, answer: ResponseTemplate) {
+    Mock::given(method("GET"))
+        .and(path("/player_api.php"))
+        .and(query_param("action", "get_live_streams"))
+        .respond_with(answer)
         .mount(server)
         .await;
 }
@@ -190,10 +208,10 @@ async fn login(server: &MockServer, body: &str) {
 #[tokio::test]
 async fn check_counts_the_channels_for_good_credentials() {
     let server = MockServer::start().await;
-    login(&server, r#"{"user_info":{"auth":1},"server_info":{}}"#).await;
+    login(&server, GOOD_LOGIN).await;
     mount_action(&server, "get_live_streams", fixtures("xtream_live")).await;
     let r = XtreamPortal::new(creds_for(&server)).check().await;
-    assert_eq!(r, ConnCheck::Ok { channels: 2 });
+    assert_eq!(r, ConnCheck::Ok { channels: Some(2) });
 }
 
 #[tokio::test]
@@ -219,4 +237,101 @@ async fn check_tells_an_unreachable_server() {
         port: 1,
     };
     assert_eq!(XtreamPortal::new(creds).check().await, ConnCheck::Unreachable);
+}
+
+#[tokio::test]
+async fn check_tells_a_login_the_portal_refuses_outright() {
+    // Some portals answer 401 or 403 instead of auth 0.
+    for status in [401u16, 403u16] {
+        let server = MockServer::start().await;
+        login_answering(&server, ResponseTemplate::new(status)).await;
+        let r = XtreamPortal::new(creds_for(&server)).check().await;
+        assert_eq!(r, ConnCheck::BadLogin, "status {status}");
+    }
+}
+
+#[tokio::test]
+async fn check_accepts_auth_as_a_string() {
+    let server = MockServer::start().await;
+    login(&server, r#"{"user_info":{"auth":"1"}}"#).await;
+    mount_action(&server, "get_live_streams", fixtures("xtream_live")).await;
+    let r = XtreamPortal::new(creds_for(&server)).check().await;
+    assert_eq!(r, ConnCheck::Ok { channels: Some(2) });
+}
+
+#[tokio::test]
+async fn a_good_login_is_ok_even_when_the_list_comes_too_late() {
+    // The login proves the credentials work; the count is only a bonus.
+    let server = MockServer::start().await;
+    login(&server, GOOD_LOGIN).await;
+    let slow = ResponseTemplate::new(200)
+        .set_body_string(fixtures("xtream_live"))
+        .set_delay(Duration::from_secs(3));
+    live_list_answering(&server, slow).await;
+    let r = XtreamPortal::new(creds_for(&server))
+        .check_within(Duration::from_millis(300))
+        .await;
+    assert_eq!(r, ConnCheck::Ok { channels: None });
+}
+
+#[tokio::test]
+async fn a_good_login_is_ok_even_when_the_portal_throttles_the_list() {
+    let server = MockServer::start().await;
+    login(&server, GOOD_LOGIN).await;
+    let busy = ResponseTemplate::new(503).set_body_string("<html>Service Unavailable</html>");
+    live_list_answering(&server, busy).await;
+    let r = XtreamPortal::new(creds_for(&server)).check().await;
+    assert_eq!(r, ConnCheck::Ok { channels: None });
+}
+
+#[tokio::test]
+async fn a_list_behind_an_error_status_is_not_counted() {
+    // Whatever the body holds, only a 2xx answer counts.
+    let server = MockServer::start().await;
+    login(&server, GOOD_LOGIN).await;
+    let busy = ResponseTemplate::new(503).set_body_string(fixtures("xtream_live"));
+    live_list_answering(&server, busy).await;
+    let r = XtreamPortal::new(creds_for(&server)).check().await;
+    assert_eq!(r, ConnCheck::Ok { channels: None });
+}
+
+#[tokio::test]
+async fn a_good_login_is_ok_even_when_the_list_is_no_json() {
+    let server = MockServer::start().await;
+    login(&server, GOOD_LOGIN).await;
+    mount_action(&server, "get_live_streams", "<html>not a list</html>".to_string()).await;
+    let r = XtreamPortal::new(creds_for(&server)).check().await;
+    assert_eq!(r, ConnCheck::Ok { channels: None });
+}
+
+#[tokio::test]
+async fn a_login_that_takes_longer_than_the_budget_is_unreachable() {
+    let server = MockServer::start().await;
+    let slow = ResponseTemplate::new(200)
+        .set_body_string(GOOD_LOGIN)
+        .set_delay(Duration::from_secs(3));
+    login_answering(&server, slow).await;
+    let r = XtreamPortal::new(creds_for(&server))
+        .check_within(Duration::from_millis(300))
+        .await;
+    assert_eq!(r, ConnCheck::Unreachable);
+}
+
+#[tokio::test]
+async fn the_budget_is_one_for_the_whole_test() {
+    // Login and list take 500 ms each: either fits in 800 ms, both together do not.
+    let server = MockServer::start().await;
+    let delay = Duration::from_millis(500);
+    let login_slowly = ResponseTemplate::new(200)
+        .set_body_string(GOOD_LOGIN)
+        .set_delay(delay);
+    login_answering(&server, login_slowly).await;
+    let list_slowly = ResponseTemplate::new(200)
+        .set_body_string(fixtures("xtream_live"))
+        .set_delay(delay);
+    live_list_answering(&server, list_slowly).await;
+    let r = XtreamPortal::new(creds_for(&server))
+        .check_within(Duration::from_millis(800))
+        .await;
+    assert_eq!(r, ConnCheck::Ok { channels: None });
 }

@@ -85,9 +85,18 @@ pub fn read_ini_creds(path: &std::path::Path) -> Option<String> {
 }
 
 /// Save credentials as the ini's only line, `portal=user:pass@host:port`; the
-/// key keeps an `=` in the user name from being read as one.
+/// key keeps an `=` in the user name from being read as one. Written to a temp
+/// file beside the ini, then renamed over it, so a failed write leaves the old
+/// ini as it was.
 pub fn write_ini_creds(path: &std::path::Path, creds: &str) -> std::io::Result<()> {
-    std::fs::write(path, format!("portal={creds}\n"))
+    let tmp = path.with_extension("ini.tmp");
+    let saved = std::fs::write(&tmp, format!("portal={creds}\n"))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if saved.is_err() {
+        // The temp file holds the password: do not leave it behind.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    saved
 }
 
 pub fn parse_xtream_creds(s: &str) -> Result<XtreamCreds, CredsError> {

@@ -79,6 +79,24 @@ pub enum ConnState {
     Done(ConnCheck),
     /// The fields cannot make credentials (e.g. a bad port).
     BadInput(T),
+    /// The login worked but BongoPlayer.ini could not be written, so nothing was
+    /// saved: where it should have gone and why not (the OS's words).
+    WriteFailed {
+        path: String,
+        error: String,
+    },
+}
+
+impl ConnState {
+    /// The test or the save did not go through. Shown in red.
+    pub fn is_failure(&self) -> bool {
+        matches!(
+            self,
+            ConnState::Done(ConnCheck::BadLogin | ConnCheck::Unreachable | ConnCheck::Invalid)
+                | ConnState::BadInput(_)
+                | ConnState::WriteFailed { .. }
+        )
+    }
 }
 
 /// The status line under the portal buttons.
@@ -86,13 +104,31 @@ pub fn conn_text(lang: Lang, conn: &ConnState) -> Option<String> {
     Some(match conn {
         ConnState::Idle => return None,
         ConnState::Testing => t(lang, T::Testing).to_string(),
-        ConnState::Done(ConnCheck::Ok { channels }) => {
-            tr(lang, T::ConnOk, &[&channels.to_string()])
-        }
+        ConnState::Done(ConnCheck::Ok {
+            channels: Some(channels),
+        }) => tr(lang, T::ConnOk, &[&channels.to_string()]),
+        ConnState::Done(ConnCheck::Ok { channels: None }) => t(lang, T::ConnOkNoCount).to_string(),
         ConnState::Done(ConnCheck::BadLogin) => t(lang, T::ConnBadLogin).to_string(),
         ConnState::Done(ConnCheck::Unreachable) => t(lang, T::ConnUnreachable).to_string(),
         ConnState::Done(ConnCheck::Invalid) => t(lang, T::ConnInvalid).to_string(),
         ConnState::BadInput(key) => t(lang, *key).to_string(),
+        ConnState::WriteFailed { path, error } => {
+            tr(lang, T::CannotWrite, &[path.as_str(), error.as_str()])
+        }
+    })
+}
+
+/// What a failed test is shown in: the setup prompt's old error red.
+const FAILURE_RED: Color32 = Color32::from_rgb(240, 130, 110);
+
+/// The status line as label text: red when the test did not go through, else
+/// the normal colour.
+pub fn conn_rich_text(lang: Lang, conn: &ConnState) -> Option<egui::RichText> {
+    let text = egui::RichText::new(conn_text(lang, conn)?);
+    Some(if conn.is_failure() {
+        text.color(FAILURE_RED)
+    } else {
+        text
     })
 }
 
@@ -313,7 +349,7 @@ impl SettingsUi {
                 actions.push(SettingsAction::SavePortal(creds()));
             }
         });
-        if let Some(text) = conn_text(lang, view.conn) {
+        if let Some(text) = conn_rich_text(lang, view.conn) {
             ui.label(text);
         }
     }
@@ -724,11 +760,18 @@ mod tests {
         assert_eq!(
             conn_text(
                 Lang::Nl,
-                &ConnState::Done(ConnCheck::Ok { channels: 13006 })
+                &ConnState::Done(ConnCheck::Ok {
+                    channels: Some(13006)
+                })
             )
             .as_deref(),
             Some("Verbonden: 13006 zenders")
         );
+        // A good login whose channel list did not come: connected all the same.
+        let no_count = ConnState::Done(ConnCheck::Ok { channels: None });
+        assert_eq!(conn_text(Lang::Nl, &no_count).as_deref(), Some("Verbonden"));
+        assert_eq!(conn_text(Lang::En, &no_count).as_deref(), Some("Connected"));
+        assert_eq!(conn_text(Lang::De, &no_count).as_deref(), Some("Verbunden"));
         assert_eq!(
             conn_text(Lang::En, &ConnState::Done(ConnCheck::BadLogin)).as_deref(),
             Some("Wrong username or password")
@@ -737,6 +780,125 @@ mod tests {
             conn_text(Lang::De, &ConnState::BadInput(T::CredsBadPort)).as_deref(),
             Some("ungültige Portnummer")
         );
+    }
+
+    #[test]
+    fn a_failed_write_names_the_file_and_the_reason_in_the_language_in_use() {
+        let failed = ConnState::WriteFailed {
+            path: r"C:\Apps\BongoPlayer.ini".into(),
+            error: "Access is denied. (os error 5)".into(),
+        };
+        assert_eq!(
+            conn_text(Lang::En, &failed).as_deref(),
+            Some(r"could not write C:\Apps\BongoPlayer.ini: Access is denied. (os error 5)")
+        );
+        assert_eq!(
+            conn_text(Lang::Nl, &failed).as_deref(),
+            Some(r"kon C:\Apps\BongoPlayer.ini niet schrijven: Access is denied. (os error 5)")
+        );
+        assert_eq!(
+            conn_text(Lang::De, &failed).as_deref(),
+            Some(
+                r"C:\Apps\BongoPlayer.ini konnte nicht geschrieben werden: Access is denied. (os error 5)"
+            )
+        );
+    }
+
+    #[test]
+    fn only_a_test_that_went_wrong_is_a_failure() {
+        let failures = [
+            ConnState::Done(ConnCheck::BadLogin),
+            ConnState::Done(ConnCheck::Unreachable),
+            ConnState::Done(ConnCheck::Invalid),
+            ConnState::BadInput(T::CredsBadPort),
+            ConnState::WriteFailed {
+                path: "BongoPlayer.ini".into(),
+                error: "disk full".into(),
+            },
+        ];
+        for state in failures {
+            assert!(state.is_failure(), "{state:?}");
+        }
+        let fine = [
+            ConnState::Idle,
+            ConnState::Testing,
+            ConnState::Done(ConnCheck::Ok { channels: Some(2) }),
+            ConnState::Done(ConnCheck::Ok { channels: None }),
+        ];
+        for state in fine {
+            assert!(!state.is_failure(), "{state:?}");
+        }
+    }
+
+    /// What pressing Test and then Save on the keyboard gives, for this portal
+    /// form and test state: into the Portal pane, Tab from the server field to
+    /// the buttons, Enter on each. A disabled button is no Tab stop and takes
+    /// no Enter.
+    fn press_test_and_save(form: PortalForm, conn: &ConnState) -> Vec<SettingsAction> {
+        let ctx = egui::Context::default();
+        let settings = Settings::default();
+        let view = SettingsView {
+            conn,
+            ..make_view(&settings)
+        };
+        let mut ui = SettingsUi::new();
+        ui.portal = Some(form);
+        let mut frame = |keys: &[Key]| {
+            let mut actions = Vec::new();
+            run_frame(&ctx, keys, |ctx| actions = ui.show(ctx, &view));
+            actions
+        };
+        frame(&[]);
+        frame(&[]);
+        frame(&[Key::ArrowDown]); // Portal
+        frame(&[Key::Enter]); // into it: the server field has the focus
+        let mut pressed = Vec::new();
+        for _ in 0..3 {
+            frame(&[Key::Tab]); // the user, the password, then Test
+        }
+        pressed.extend(frame(&[Key::Enter]));
+        frame(&[Key::Tab]); // Save
+        pressed.extend(frame(&[Key::Enter]));
+        pressed
+    }
+
+    #[test]
+    fn test_and_save_are_disabled_while_testing_and_while_a_field_is_empty() {
+        let form = |host: &str, user: &str, pass: &str| PortalForm {
+            host: host.into(),
+            user: user.into(),
+            pass: pass.into(),
+        };
+        // The control: filled in, nothing running, both buttons work.
+        let one_string = "bob:secret@srv.example.net:8080".to_string();
+        assert_eq!(
+            press_test_and_save(
+                form("srv.example.net:8080", "bob", "secret"),
+                &ConnState::Idle
+            ),
+            vec![
+                SettingsAction::TestConnection(one_string.clone()),
+                SettingsAction::SavePortal(one_string)
+            ]
+        );
+        // A test is still running.
+        let filled = form("srv.example.net:8080", "bob", "secret");
+        assert_eq!(press_test_and_save(filled, &ConnState::Testing), vec![]);
+        // One field empty; the server and the user also when they hold only blanks.
+        let one_missing = [
+            ("server", form("", "bob", "secret")),
+            ("blank server", form("  ", "bob", "secret")),
+            ("user", form("srv.example.net:8080", "", "secret")),
+            ("blank user", form("srv.example.net:8080", "  ", "secret")),
+            ("password", form("srv.example.net:8080", "bob", "")),
+        ];
+        for (what, incomplete) in one_missing {
+            assert_eq!(
+                press_test_and_save(incomplete, &ConnState::Idle),
+                vec![],
+                "{what}"
+            );
+        }
     }
 
     #[test]

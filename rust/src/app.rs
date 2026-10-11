@@ -11,7 +11,7 @@ use crate::portal::xtream::ConnCheck;
 use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};
 use crate::search::{self, ItemKind, SearchItem};
 use crate::settings::Settings;
-use crate::settings_ui::{ConnState, SettingsAction, SettingsUi, SettingsView};
+use crate::settings_ui::{conn_rich_text, ConnState, SettingsAction, SettingsUi, SettingsView};
 use crate::shortcuts;
 use crate::storage::Storage;
 use crate::zap::ZapPacer;
@@ -395,6 +395,14 @@ struct NewsPicker {
     selected: usize,
 }
 
+/// A finished credentials test, on its way from its background task to the UI.
+struct ConnResult {
+    check: ConnCheck,
+    /// What to keep if the login worked (a Save): the credentials as parsed and
+    /// as typed. `None` for a plain test.
+    keep: Option<(XtreamCreds, String)>,
+}
+
 pub struct TvApp {
     player: PlayerHandle,
     catalog: Arc<CatalogStore>,
@@ -485,7 +493,6 @@ pub struct TvApp {
     cfg_host: String,
     cfg_user: String,
     cfg_pass: String,
-    cfg_error: Option<String>,
 
     /// Preferences (settings.json).
     settings: Settings,
@@ -499,7 +506,7 @@ pub struct TvApp {
     settings_ui: Option<SettingsUi>,
     /// The portal credentials test (settings screen and setup prompt).
     conn_state: ConnState,
-    conn_slot: Arc<Mutex<Option<(ConnCheck, bool, String)>>>,
+    conn_slot: Arc<Mutex<Option<ConnResult>>>,
 }
 
 /// The translated text for a credentials error.
@@ -589,7 +596,6 @@ impl TvApp {
             cfg_host: String::new(),
             cfg_user: String::new(),
             cfg_pass: String::new(),
-            cfg_error: None,
             settings,
             lang,
             choosing_language,
@@ -1600,7 +1606,8 @@ impl TvApp {
     }
 
     /// First-run portal setup: shown when no credentials are configured.
-    /// Collects host/user/pass, writes BongoPlayer.ini and connects live.
+    /// Collects host/user/pass, tests them, and once they log in writes
+    /// BongoPlayer.ini and connects live.
     fn paint_portal_prompt(&mut self, ctx: &egui::Context) {
         let mut submit: Option<String> = None;
         let lang = self.lang;
@@ -1649,14 +1656,6 @@ impl TvApp {
                                 );
                                 ui.end_row();
                             });
-                        if let Some(err) = &self.cfg_error {
-                            ui.add_space(6.0);
-                            ui.label(
-                                egui::RichText::new(err)
-                                    .color(Color32::from_rgb(240, 130, 110))
-                                    .size(12.0),
-                            );
-                        }
                         ui.add_space(12.0);
                         let ready = !self.cfg_host.trim().is_empty()
                             && !self.cfg_user.trim().is_empty()
@@ -1668,8 +1667,8 @@ impl TvApp {
                                 egui::Button::new(crate::i18n::t(lang, T::ConnectAndSave)),
                             )
                             .clicked();
-                        if let Some(text) = crate::settings_ui::conn_text(lang, &self.conn_state) {
-                            ui.label(egui::RichText::new(text).size(12.0));
+                        if let Some(text) = conn_rich_text(lang, &self.conn_state) {
+                            ui.label(text.size(12.0));
                         }
                         let entered = ready && ctx.input(|i| i.key_pressed(Key::Enter));
                         if clicked || entered {
@@ -1689,7 +1688,7 @@ impl TvApp {
     }
 
     /// Test credentials in the background; with `save`, store and connect
-    /// them once the test succeeds. A failed test changes nothing.
+    /// them once the login works. A failed test changes nothing.
     fn start_conn_check(&mut self, creds_str: String, save: bool) {
         let creds = match parse_xtream_creds(&creds_str) {
             Ok(c) => c,
@@ -1701,43 +1700,42 @@ impl TvApp {
         self.conn_state = ConnState::Testing;
         let slot = self.conn_slot.clone();
         tokio::spawn(async move {
-            let result = XtreamPortal::new(creds).check().await;
-            *slot.lock() = Some((result, save, creds_str));
+            let portal = XtreamPortal::new(creds);
+            let check = portal.check().await;
+            let keep = save.then_some((portal.creds, creds_str));
+            *slot.lock() = Some(ConnResult { check, keep });
         });
     }
 
     /// When a credentials test has finished: say how it went and, if it was
-    /// to save and the login worked, save and connect.
+    /// to save and the login worked, save and connect. Whether the channel
+    /// count came does not matter: a login that works is all a save needs.
     fn drain_conn_check(&mut self) {
-        let Some((result, save, creds_str)) = self.conn_slot.lock().take() else {
+        let Some(ConnResult { check, keep }) = self.conn_slot.lock().take() else {
             return;
         };
-        tracing::info!("settings: connection check {:?}", result);
-        if save && matches!(result, ConnCheck::Ok { .. }) {
-            self.apply_creds_string(&creds_str);
-        }
-        self.conn_state = ConnState::Done(result);
+        tracing::info!("settings: connection check {:?}", check);
+        self.conn_state = match (check, keep) {
+            (check @ ConnCheck::Ok { .. }, Some((creds, line))) => {
+                match self.apply_creds(creds, &line) {
+                    Ok(()) => ConnState::Done(check),
+                    Err(failed) => failed,
+                }
+            }
+            (check, _) => ConnState::Done(check),
+        };
     }
 
-    /// Validate creds that logged in, persist them to BongoPlayer.ini, then
-    /// rebuild the catalog live and start fetching - no restart needed.
-    fn apply_creds_string(&mut self, creds_str: &str) {
-        let creds = match parse_xtream_creds(creds_str) {
-            Ok(c) => c,
-            Err(e) => {
-                self.cfg_error = Some(self.tr(T::InvalidDetails, &[self.t(creds_error_text(&e))]));
-                return;
-            }
-        };
+    /// Keep credentials that logged in: write BongoPlayer.ini (`line` is what
+    /// goes in it), then rebuild the catalog live and start fetching - no
+    /// restart needed. When the ini cannot be written nothing changes and the
+    /// failure comes back, to show in place of the test's verdict.
+    fn apply_creds(&mut self, creds: XtreamCreds, line: &str) -> Result<(), ConnState> {
         let path = crate::args::ini_path();
-        if let Err(e) = crate::args::write_ini_creds(&path, creds_str) {
-            let msg = self.tr(
-                T::CannotWrite,
-                &[&path.display().to_string(), &e.to_string()],
-            );
-            self.set_toast(msg.clone());
-            self.cfg_error = Some(msg);
-            return;
+        if let Err(e) = crate::args::write_ini_creds(&path, line) {
+            let (path, error) = (path.display().to_string(), e.to_string());
+            self.set_toast(self.tr(T::CannotWrite, &[&path, &error]));
+            return Err(ConnState::WriteFailed { path, error });
         }
         tracing::info!("settings: portal saved to {} - connecting", path.display());
         self.creds = Some(creds.clone());
@@ -1745,8 +1743,8 @@ impl TvApp {
         self.catalog = Arc::new(CatalogStore::new(portal));
         self.catalog.spawn_fetch();
         self.portal_state = PortalState::Configured;
-        self.cfg_error = None;
         self.set_toast(self.t(T::ConnectingPortal));
+        Ok(())
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {

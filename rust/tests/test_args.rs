@@ -126,3 +126,39 @@ fn a_user_name_with_an_equals_sign_reads_back_the_same() {
         }
     );
 }
+
+#[test]
+fn a_second_write_replaces_the_first_and_leaves_no_temp_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let ini = dir.path().join("BongoPlayer.ini");
+    bongo_player::args::write_ini_creds(&ini, "a:b@old.example.net:80").unwrap();
+    bongo_player::args::write_ini_creds(&ini, "c:d@new.example.net:81").unwrap();
+    assert_eq!(read_ini_creds(&ini).as_deref(), Some("c:d@new.example.net:81"));
+    let files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(files, ["BongoPlayer.ini"]);
+}
+
+#[test]
+fn a_write_that_fails_leaves_the_old_ini_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let ini = dir.path().join("BongoPlayer.ini");
+    bongo_player::args::write_ini_creds(&ini, "a:b@old.example.net:80").unwrap();
+    // A directory on the temp file's name: the new credentials cannot be written
+    // there. The ini is only replaced by the last step, so it must still be the old one.
+    std::fs::create_dir(ini.with_extension("ini.tmp")).unwrap();
+    assert!(bongo_player::args::write_ini_creds(&ini, "c:d@new.example.net:81").is_err());
+    assert_eq!(read_ini_creds(&ini).as_deref(), Some("a:b@old.example.net:80"));
+}
+
+#[test]
+fn a_failed_replace_leaves_no_temp_file_with_the_password_in_it() {
+    let dir = tempfile::tempdir().unwrap();
+    // A directory on the ini's name: the temp file is written, but cannot replace it.
+    let ini = dir.path().join("BongoPlayer.ini");
+    std::fs::create_dir(&ini).unwrap();
+    assert!(bongo_player::args::write_ini_creds(&ini, "c:d@new.example.net:81").is_err());
+    assert!(!ini.with_extension("ini.tmp").exists());
+}

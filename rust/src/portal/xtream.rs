@@ -3,6 +3,7 @@ use crate::args::XtreamCreds;
 use crate::epg::{Epg, EpgEntry};
 use chrono::{Local, NaiveDateTime, TimeZone, Utc};
 use serde::Deserialize;
+use std::time::Duration;
 
 /// What a portal stream URL points at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,51 +78,83 @@ impl XtreamPortal {
 /// Outcome of trying portal credentials (settings screen, setup prompt).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnCheck {
-    Ok { channels: usize },
+    /// The login works. `channels` is the number of live channels when the
+    /// portal's list arrived in time. The count is only a bonus: a slow, busy or
+    /// odd answer to the list leaves it `None`, and the credentials are good all
+    /// the same.
+    Ok { channels: Option<usize> },
+    /// The portal refuses the user name or the password.
     BadLogin,
+    /// No answer from the server within the time allowed.
     Unreachable,
+    /// The login got an answer that no Xtream portal gives.
     Invalid,
 }
 
+/// How long a whole credentials test may take.
+const CHECK_BUDGET: Duration = Duration::from_secs(10);
+
 impl XtreamPortal {
-    /// Log in with these credentials and count the live channels, within 10 s.
+    /// Log in with these credentials and count the live channels, all within 10 s.
     pub async fn check(&self) -> ConnCheck {
-        tokio::time::timeout(std::time::Duration::from_secs(10), self.check_inner())
-            .await
-            .unwrap_or(ConnCheck::Unreachable)
+        self.check_within(CHECK_BUDGET).await
     }
 
-    async fn check_inner(&self) -> ConnCheck {
-        let login = match self.client.get(self.api_url(&[])).send().await {
-            Ok(r) => r,
+    /// `check` with another time budget. It is one budget for the whole test,
+    /// login and list together. The tests use a short one.
+    pub async fn check_within(&self, budget: Duration) -> ConnCheck {
+        let deadline = tokio::time::Instant::now() + budget;
+        match tokio::time::timeout_at(deadline, self.login()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(refused)) => return refused,
             Err(_) => return ConnCheck::Unreachable,
-        };
-        if matches!(login.status().as_u16(), 401 | 403) {
-            return ConnCheck::BadLogin;
         }
-        let Ok(v) = login.json::<serde_json::Value>().await else {
-            return ConnCheck::Invalid;
-        };
-        let Some(auth) = v.get("user_info").and_then(|u| u.get("auth")) else {
-            return ConnCheck::Invalid;
-        };
-        if !(auth.as_i64() == Some(1) || auth.as_str() == Some("1")) {
-            return ConnCheck::BadLogin;
+        // The credentials work. Whatever goes wrong with the list, they do.
+        let channels = tokio::time::timeout_at(deadline, self.count_live())
+            .await
+            .ok()
+            .flatten();
+        ConnCheck::Ok { channels }
+    }
+
+    /// The login: `Ok` when `user_info.auth` is 1, else what was wrong.
+    async fn login(&self) -> Result<(), ConnCheck> {
+        let answer = self
+            .client
+            .get(self.api_url(&[]))
+            .send()
+            .await
+            .map_err(|_| ConnCheck::Unreachable)?;
+        if matches!(answer.status().as_u16(), 401 | 403) {
+            return Err(ConnCheck::BadLogin);
         }
-        match self
+        let body: serde_json::Value = answer.json().await.map_err(|_| ConnCheck::Invalid)?;
+        let auth = body
+            .get("user_info")
+            .and_then(|u| u.get("auth"))
+            .ok_or(ConnCheck::Invalid)?;
+        if auth.as_i64() == Some(1) || auth.as_str() == Some("1") {
+            Ok(())
+        } else {
+            Err(ConnCheck::BadLogin)
+        }
+    }
+
+    /// The number of live channels; `None` unless the portal answers with a
+    /// JSON array.
+    async fn count_live(&self) -> Option<usize> {
+        let answer = self
             .client
             .get(self.api_url(&[("action", "get_live_streams")]))
             .send()
             .await
-        {
-            Ok(r) => match r.json::<Vec<serde_json::Value>>().await {
-                Ok(list) => ConnCheck::Ok {
-                    channels: list.len(),
-                },
-                Err(_) => ConnCheck::Invalid,
-            },
-            Err(_) => ConnCheck::Unreachable,
+            .ok()?;
+        if !answer.status().is_success() {
+            return None;
         }
+        // Counted, not kept: a big portal's list is megabytes of channels.
+        let list: Vec<serde::de::IgnoredAny> = answer.json().await.ok()?;
+        Some(list.len())
     }
 }
 
