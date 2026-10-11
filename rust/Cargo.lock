@@ -312,6 +312,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
