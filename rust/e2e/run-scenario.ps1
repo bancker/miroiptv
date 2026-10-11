@@ -135,3 +135,4 @@ $fail = 0
 foreach ($e in $Expect) { if ($lines -match $e) { "PASS  expected: $e" } else { "FAIL  missing:  $e"; $fail++ } }
 foreach ($f in $Forbid) { if ($lines -match $f) { "FAIL  forbidden: $f"; $fail++ } else { "PASS  absent:   $f" } }
 if ($fail) { exit 1 }
+exit 0
