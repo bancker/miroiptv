@@ -128,3 +128,14 @@ fn movie_stream_url_uses_extension() {
         "http://h.example.com:80/movie/u/p/5001.mkv"
     );
 }
+
+#[tokio::test]
+async fn portal_errors_never_show_the_credentials() {
+    // reqwest puts the full request URL in its error text.
+    let e = reqwest::get("http://127.0.0.1:1/player_api.php?username=bob&password=s3cr3t&action=x")
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("s3cr3t"), "precondition: reqwest shows the URL");
+    let msg = bongo_player::portal::PortalError::from(e).to_string();
+    assert!(!msg.contains("bob") && !msg.contains("s3cr3t"), "{msg}");
+}

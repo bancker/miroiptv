@@ -7,7 +7,7 @@ pub use types::*;
 
 #[derive(Debug, Error)]
 pub enum PortalError {
-    #[error("http: {0}")]
+    #[error("http: {}", crate::redact::redact(&.0.to_string()))]
     Http(#[from] reqwest::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),

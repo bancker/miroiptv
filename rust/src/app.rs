@@ -446,7 +446,7 @@ impl TvApp {
             // (e.g. BongoPlayer.ini deleted) drop to the setup prompt instead of
             // silently replaying the last URL (whose credentials are baked in).
             if let Some(lw) = LastWatched::load(&app.storage.last_watched_path()) {
-                tracing::info!("resuming last watched ({})", lw.url);
+                tracing::info!("resuming last watched ({})", crate::redact::redact(&lw.url));
                 app.set_toast("laatste zender hervatten...");
                 // Up/down then continues from this channel (see zap_delta).
                 app.current_stream_id = app.catalog.portal().live_stream_id(&lw.url);

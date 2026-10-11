@@ -82,7 +82,7 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                 loop {
                     match cmd_rx.try_recv() {
                         Ok(Cmd::LoadUrl(url)) => {
-                            info!("loadfile {}", url);
+                            info!("loadfile {}", crate::redact::redact(&url));
                             if let Err(e) = mpv.command(&["loadfile", &url]) {
                                 warn!("loadfile failed: {}", e);
                                 let _ = evt_tx.send(Event::Error { msg: e.to_string() });
@@ -119,7 +119,7 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                     mpv_sys::MPV_EVENT_LOG_MESSAGE => {
                         if let Some((prefix, level, text)) = unsafe { events::log_message(evt) } {
                             let effective = effective_log_level(&prefix, &level, &text);
-                            let line = format!("[mpv:{}] {}", prefix, text);
+                            let line = format!("[mpv:{}] {}", prefix, crate::redact::redact(&text));
                             match effective {
                                 "fatal" | "error" => error!("{}", line),
                                 "warn" => warn!("{}", line),
