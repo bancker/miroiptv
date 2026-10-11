@@ -27,7 +27,9 @@ pub fn redact(text: &str) -> Cow<'_, str> {
 }
 
 /// `…/live/<user>/<pass>/…` → `…/live/<u>/<p>/…` wherever two path segments,
-/// each closed by '/', follow the marker.
+/// each closed by '/', follow the marker. The closing slashes are looked for in
+/// the rest of the line, not only up to the first space or quote: the stream
+/// URLs hold the raw user name and password, which may contain either.
 fn redact_path(s: &str, kind: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -35,11 +37,12 @@ fn redact_path(s: &str, kind: &str) -> String {
         let after = i + kind.len();
         out.push_str(&rest[..after]);
         let tail = &rest[after..];
-        let end_of_url = tail
-            .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
-            .unwrap_or(tail.len());
-        let url = &tail[..end_of_url];
-        match url.find('/').and_then(|a| url[a + 1..].find('/').map(|b| a + 1 + b)) {
+        let end_of_line = tail.find(['\n', '\r']).unwrap_or(tail.len());
+        let line = &tail[..end_of_line];
+        match line
+            .find('/')
+            .and_then(|a| line[a + 1..].find('/').map(|b| a + 1 + b))
+        {
             Some(second_slash) => {
                 out.push_str("<u>/<p>");
                 rest = &tail[second_slash..];
@@ -77,9 +80,18 @@ mod tests {
     #[test]
     fn masks_credentials_in_every_kind_of_stream_url() {
         for (url, want) in [
-            ("http://h:8080/live/bob/s3cr3t/42.m3u8", "http://h:8080/live/<u>/<p>/42.m3u8"),
-            ("http://h/movie/bob/s3cr3t/9.mkv", "http://h/movie/<u>/<p>/9.mkv"),
-            ("http://h/series/bob/s3cr3t/7.mp4", "http://h/series/<u>/<p>/7.mp4"),
+            (
+                "http://h:8080/live/bob/s3cr3t/42.m3u8",
+                "http://h:8080/live/<u>/<p>/42.m3u8",
+            ),
+            (
+                "http://h/movie/bob/s3cr3t/9.mkv",
+                "http://h/movie/<u>/<p>/9.mkv",
+            ),
+            (
+                "http://h/series/bob/s3cr3t/7.mp4",
+                "http://h/series/<u>/<p>/7.mp4",
+            ),
             (
                 "http://h/timeshift/bob/s3cr3t/35/2026-10-10:19-20/1.m3u8",
                 "http://h/timeshift/<u>/<p>/35/2026-10-10:19-20/1.m3u8",
@@ -111,5 +123,59 @@ mod tests {
         let line = "loadfile http://127.0.0.1:5555/live/0.ts";
         assert!(matches!(redact(line), Cow::Borrowed(_)));
         assert!(matches!(redact("nothing to see"), Cow::Borrowed(_)));
+    }
+
+    // The stream URLs hold the raw user name and password, and an account may
+    // use a space or a quote mark in either.
+    #[test]
+    fn masks_a_password_with_an_apostrophe() {
+        assert_eq!(
+            redact("resuming last watched (http://h:8080/live/bob/it's/3.m3u8)"),
+            "resuming last watched (http://h:8080/live/<u>/<p>/3.m3u8)"
+        );
+    }
+
+    #[test]
+    fn masks_a_password_with_a_space() {
+        assert_eq!(
+            redact("resuming last watched (http://h:8080/live/bob/my pass/3.m3u8)"),
+            "resuming last watched (http://h:8080/live/<u>/<p>/3.m3u8)"
+        );
+    }
+
+    #[test]
+    fn masks_a_password_with_a_double_quote() {
+        assert_eq!(
+            redact(r#"loadfile http://h/movie/bob/a"b/9.mkv"#),
+            "loadfile http://h/movie/<u>/<p>/9.mkv"
+        );
+    }
+
+    #[test]
+    fn masks_a_user_name_with_a_space_or_a_quote() {
+        for (url, want) in [
+            (
+                "http://h/live/my user/pw/3.m3u8",
+                "http://h/live/<u>/<p>/3.m3u8",
+            ),
+            (
+                "http://h/series/o'neil/pw/7.mp4",
+                "http://h/series/<u>/<p>/7.mp4",
+            ),
+        ] {
+            assert_eq!(redact(url), want);
+        }
+    }
+
+    #[test]
+    fn the_search_for_the_credentials_stops_at_a_line_break() {
+        // The relay's local URL has no credentials; what follows on the next
+        // line is no part of it.
+        for line in [
+            "loadfile http://127.0.0.1:5555/live/0.ts\nnext http://h/a/b/c",
+            "loadfile http://127.0.0.1:5555/live/0.ts\r\nnext http://h/a/b/c",
+        ] {
+            assert!(matches!(redact(line), Cow::Borrowed(_)), "{line:?}");
+        }
     }
 }
