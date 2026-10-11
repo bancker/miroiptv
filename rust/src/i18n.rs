@@ -291,11 +291,59 @@ pub fn t(lang: Lang, key: T) -> &'static str {
 /// The text for `key` with `{0}`, `{1}`, … filled from `args`; each language
 /// may put them in its own order.
 pub fn tr(lang: Lang, key: T, args: &[&str]) -> String {
-    let mut s = t(lang, key).to_string();
-    for (i, a) in args.iter().enumerate() {
-        s = s.replace(&format!("{{{i}}}"), a);
+    let template = t(lang, key);
+    let mut result = String::with_capacity(template.len() * 2);
+    let mut chars = template.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            // Try to parse a placeholder {N}
+            let mut num_str = String::new();
+            let mut is_placeholder = false;
+
+            // Collect digits
+            while let Some(&next_ch) = chars.peek() {
+                if next_ch.is_ascii_digit() {
+                    num_str.push(chars.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+
+            // Check if we have a closing }
+            if !num_str.is_empty() && chars.peek() == Some(&'}') {
+                chars.next(); // consume }
+                is_placeholder = true;
+            }
+
+            if is_placeholder {
+                // Parse the index and substitute if available
+                if let Ok(idx) = num_str.parse::<usize>() {
+                    if idx < args.len() {
+                        result.push_str(args[idx]);
+                    } else {
+                        // Missing arg: keep the placeholder
+                        result.push('{');
+                        result.push_str(&num_str);
+                        result.push('}');
+                    }
+                } else {
+                    // Invalid number: keep as-is
+                    result.push('{');
+                    result.push_str(&num_str);
+                    result.push('}');
+                }
+            } else {
+                // Not a valid placeholder: keep the { and any digits we collected
+                result.push('{');
+                result.push_str(&num_str);
+            }
+        } else {
+            result.push(ch);
+        }
     }
-    s
+
+    result
 }
 
 #[cfg(test)]
@@ -339,6 +387,35 @@ mod tests {
         assert_eq!(
             tr(Lang::De, T::GuideChannelsRange, &["1", "5", "40"]),
             "Sender 1-5 von 40"
+        );
+    }
+
+    #[test]
+    fn tr_does_not_re_expand_placeholders_in_values() {
+        // A value containing {1} should not be expanded again
+        assert_eq!(
+            tr(Lang::En, T::VariantUnavailable, &["Movie {1}", "FHD"]),
+            "[TV] Movie {1} (FHD not available)"
+        );
+        // Same for Dutch
+        assert_eq!(
+            tr(Lang::Nl, T::GuideNotAired, &["Tatort {1}", "20:15"]),
+            "nog niet uitgezonden: Tatort {1} (20:15)"
+        );
+    }
+
+    #[test]
+    fn tr_leaves_missing_args_as_placeholders() {
+        // Missing arg {1} should stay as {1}
+        assert_eq!(tr(Lang::En, T::PresetSaved, &["3"]), "preset 3 saved: {1}");
+    }
+
+    #[test]
+    fn tr_ignores_extra_args() {
+        // Extra args are ignored
+        assert_eq!(
+            tr(Lang::En, T::PresetEmpty, &["5", "x"]),
+            "preset 5 is empty - hold 5 to save"
         );
     }
 
