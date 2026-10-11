@@ -13,6 +13,7 @@ pub mod catalog;
 pub mod epg;
 pub mod favorites;
 pub mod legacy;
+pub mod news;
 pub mod playback_health;
 pub mod player;
 pub mod portal;
