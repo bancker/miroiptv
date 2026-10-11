@@ -1,4 +1,4 @@
-use crate::args::{parse_xtream_creds, XtreamCreds};
+use crate::args::{parse_xtream_creds, CredsError, XtreamCreds};
 use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, quality_rank, zap_position, CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::Favorites;
@@ -374,6 +374,15 @@ pub struct TvApp {
     settings_ui: Option<SettingsUi>,
 }
 
+/// The translated text for a credentials error.
+fn creds_error_text(e: &CredsError) -> T {
+    match e {
+        CredsError::NoAt => T::CredsNoAt,
+        CredsError::NoUserPass => T::CredsNoUserPass,
+        CredsError::BadPort => T::CredsBadPort,
+    }
+}
+
 impl TvApp {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -481,7 +490,7 @@ impl TvApp {
     /// Play what was playing when the app last closed.
     fn resume(&mut self, lw: LastWatched) {
         tracing::info!("resuming last watched ({})", crate::redact::redact(&lw.url));
-        self.set_toast("laatste zender hervatten...");
+        self.set_toast(self.t(T::ResumingLast));
         // Up/down then continues from this channel (see zap_delta).
         self.current_stream_id = self.catalog.portal().live_stream_id(&lw.url);
         self.load_url(lw.url, lw.live);
@@ -545,14 +554,26 @@ impl TvApp {
         }
     }
 
+    /// A fixed text in the UI language.
+    fn t(&self, key: T) -> &'static str {
+        crate::i18n::t(self.lang, key)
+    }
+
+    /// A text with values ({0}, {1}, ...) in the UI language.
+    fn tr(&self, key: T, args: &[&str]) -> String {
+        crate::i18n::tr(self.lang, key, args)
+    }
+
     fn set_toast(&mut self, s: impl Into<String>) {
-        self.toast = Some((s.into(), Instant::now(), Duration::from_secs(4)));
+        self.set_toast_for(s, 4);
     }
 
     /// Toast that lingers for a custom number of seconds. Used by the n/r news
     /// shortcuts so the "what we're watching" label stays up ~30s.
     fn set_toast_for(&mut self, s: impl Into<String>, secs: u64) {
-        self.toast = Some((s.into(), Instant::now(), Duration::from_secs(secs)));
+        let s = s.into();
+        tracing::debug!("toast: {}", s);
+        self.toast = Some((s, Instant::now(), Duration::from_secs(secs)));
     }
 
     /// Send a stream to the player and remember it as `current_url`. `watchdog`
@@ -628,7 +649,7 @@ impl TvApp {
             "video stalled ~{}s with no end-file/error - auto-reloading stream",
             self.last_progress_at.elapsed().as_secs()
         );
-        self.set_toast("herverbinden...");
+        self.set_toast(self.t(T::Reconnecting));
         self.load_url(url, true);
         self.last_recovery_at = Some(Instant::now());
     }
@@ -671,7 +692,7 @@ impl TvApp {
                         if let Some(url) = self.current_url.clone() {
                             if self.reload_budget.try_spend(Instant::now()) {
                                 tracing::warn!("live stream ended (eof) - auto-reloading");
-                                self.set_toast("herverbinden...");
+                                self.set_toast(self.t(T::Reconnecting));
                                 self.load_url(url, true);
                                 self.last_recovery_at = Some(Instant::now());
                                 continue;
@@ -689,7 +710,7 @@ impl TvApp {
                         if let Some(sid) = sid.filter(|s| self.is_refused(*s)) {
                             if !self.play_fallback_for(sid, self.current_idx) {
                                 self.stall_watchdog_armed = false;
-                                self.set_toast("zender niet beschikbaar voor dit abonnement");
+                                self.set_toast(self.t(T::ChannelNotInSubscription));
                             }
                             continue;
                         }
@@ -702,14 +723,14 @@ impl TvApp {
                         self.stall_watchdog_armed = false;
                     }
                     if reason == "error" || (reason == "eof" && live) {
-                        self.set_toast("stream error - zap up/down to retry");
+                        self.set_toast(self.t(T::StreamErrorRetry));
                     } else {
                         tracing::debug!("mpv end-file ({}) - toast suppressed", reason);
                     }
                 }
                 Event::Error { msg } => {
                     warn!("player error: {}", msg);
-                    self.set_toast(format!("error: {}", msg));
+                    self.set_toast(self.tr(T::ErrorMsg, &[&msg]));
                 }
                 Event::PropertyChanged { name, value } => {
                     if name == "paused-for-cache" {
@@ -908,7 +929,7 @@ impl TvApp {
     /// playing: paused, its relay stream would fall behind the live window.
     fn toggle_pause(&mut self) {
         if self.current_live {
-            self.set_toast("pauze: alleen bij films, series en terugkijken");
+            self.set_toast(self.t(T::PauseLiveOnly));
             return;
         }
         self.paused = !self.paused;
@@ -916,9 +937,9 @@ impl TvApp {
         tracing::info!("pause: {} (space)", if self.paused { "on" } else { "off" });
         if self.paused {
             // Stays up while paused; any other toast or a new stream replaces it.
-            self.set_toast_for("|| pauze  -  spatie om verder te kijken", 24 * 3600);
+            self.set_toast_for(self.t(T::Paused), 24 * 3600);
         } else {
-            self.set_toast("> verder");
+            self.set_toast(self.t(T::Resumed));
         }
     }
 
@@ -951,7 +972,7 @@ impl TvApp {
         };
         tracing::info!("zap: stream {} refused by the portal - playing {}", sid, alt.name);
         self.zap_to(alt.stream_id, &alt.name, idx);
-        self.set_toast(format!("[TV] {} ({} niet beschikbaar)", alt.name, refused));
+        self.set_toast(self.tr(T::VariantUnavailable, &[&alt.name, refused]));
         true
     }
 
@@ -964,9 +985,9 @@ impl TvApp {
         let zap = self.catalog.zap_channels();
         if zap.is_empty() {
             if !self.catalog.is_loaded() {
-                self.set_toast("catalog loading...");
+                self.set_toast(self.t(T::CatalogLoading));
             } else {
-                self.set_toast("no live channels in catalog");
+                self.set_toast(self.t(T::NoLiveChannels));
             }
             return;
         }
@@ -1010,25 +1031,25 @@ impl TvApp {
     /// down zapping stays parked on this channel. Runs only on a +/- keypress.
     fn quality_step(&mut self, dir: i32) {
         let Some(sid) = self.current_stream_id else {
-            self.set_toast("kwaliteit: geen live kanaal");
+            self.set_toast(self.t(T::QualityNoLive));
             return;
         };
         let nav = self.catalog.quality_nav(sid);
         if nav.ladder.len() <= 1 {
-            self.set_toast("kwaliteit: geen andere variant");
+            self.set_toast(self.t(T::QualityNoOther));
             return;
         }
         let Some(pos) = nav.pos else {
-            self.set_toast("kwaliteit: huidige variant onbekend");
+            self.set_toast(self.t(T::QualityUnknown));
             return;
         };
         let new = pos as i32 + dir;
         if new < 0 {
-            self.set_toast("kwaliteit: al op laagste");
+            self.set_toast(self.t(T::QualityLowest));
             return;
         }
         if new as usize >= nav.ladder.len() {
-            self.set_toast("kwaliteit: al op hoogste");
+            self.set_toast(self.t(T::QualityHighest));
             return;
         }
         let target = &nav.ladder[new as usize];
@@ -1037,8 +1058,12 @@ impl TvApp {
         self.zap_to(tsid, &tname, self.current_idx);
         // Override zap_to's "[TV] name" toast with explicit quality feedback:
         // the channel is unchanged, the user wants to see the new tier.
-        let dirn = if dir > 0 { "hoger" } else { "lager" };
-        self.set_toast(format!("kwaliteit {}: {}", dirn, quality_label(rank)));
+        let key = if dir > 0 {
+            T::QualityUp
+        } else {
+            T::QualityDown
+        };
+        self.set_toast(self.tr(key, &[quality_label(rank)]));
     }
 
     fn play_movie(&mut self, sid: i64, name: &str) {
@@ -1049,7 +1074,7 @@ impl TvApp {
         self.current_idx = None;
         self.current_stream_id = None;
         self.current_epg = None;
-        self.set_toast(format!("[FILM] {}", name));
+        self.set_toast(format!("[{}] {}", self.t(T::TagMovie), name));
     }
 
     /// Find and play the most recent NOS Journaal (npo=true) or RTL Nieuws
@@ -1105,10 +1130,10 @@ impl TvApp {
             }
         }
         if sources.is_empty() {
-            self.set_toast("geen nieuws-kanalen gevonden");
+            self.set_toast(self.t(T::NoNewsChannels));
             return;
         }
-        self.set_toast("nieuws ophalen...");
+        self.set_toast(self.t(T::FetchingNews));
         let portal = self.catalog.portal().clone();
         let slot = self.news_picker_slot.clone();
         tokio::spawn(async move {
@@ -1254,7 +1279,8 @@ impl TvApp {
         let dur = ((item.end - start).num_minutes() as u32).max(1);
         let url = self.catalog.portal().catchup_url(item.sid, start, dur);
         let label = format!(
-            "[TERUG] {}  {}",
+            "[{}] {}  {}",
+            self.t(T::TagReplay),
             item.title,
             item.start.with_timezone(&chrono::Local).format("%H:%M")
         );
@@ -1280,14 +1306,14 @@ impl TvApp {
                     .show(ui, |ui| {
                         ui.set_width(540.0);
                         ui.label(
-                            egui::RichText::new("Laatste nieuws")
+                            egui::RichText::new(self.t(T::NewsTitle))
                                 .heading()
                                 .color(Color32::WHITE),
                         );
                         ui.add_space(10.0);
                         if picker.items.is_empty() {
                             ui.label(
-                                egui::RichText::new("geen recente uitzendingen gevonden")
+                                egui::RichText::new(self.t(T::NoRecentNews))
                                     .italics()
                                     .color(Color32::from_white_alpha(150)),
                             );
@@ -1352,11 +1378,9 @@ impl TvApp {
                         }
                         ui.add_space(8.0);
                         ui.label(
-                            egui::RichText::new(
-                                "pijltjes = kiezen   /   Enter = afspelen   /   Esc = sluiten",
-                            )
-                            .size(12.0)
-                            .color(Color32::from_white_alpha(130)),
+                            egui::RichText::new(self.t(T::NewsFooter))
+                                .size(12.0)
+                                .color(Color32::from_white_alpha(130)),
                         );
                     });
             });
@@ -1364,7 +1388,7 @@ impl TvApp {
 
     fn toggle_favorite_current(&mut self) {
         let Some(sid) = self.current_stream_id else {
-            self.set_toast("no current channel to favorite");
+            self.set_toast(self.t(T::NoChannelToFavorite));
             return;
         };
         let name = self.current_name.clone().unwrap_or_default();
@@ -1372,9 +1396,9 @@ impl TvApp {
         self.favorites.toggle(sid, &name);
         let _ = self.favorites.save(&self.storage.favorites_path());
         if was {
-            self.set_toast(format!("[-] removed: {}", name));
+            self.set_toast(self.tr(T::FavoriteRemoved, &[&name]));
         } else {
-            self.set_toast(format!("[+] added: {}", name));
+            self.set_toast(self.tr(T::FavoriteAdded, &[&name]));
         }
     }
 
@@ -1420,23 +1444,20 @@ impl TvApp {
 
     fn save_preset(&mut self, digit: u8) {
         let Some(sid) = self.current_stream_id else {
-            self.set_toast(format!("preset {} - geen live zender actief", digit));
+            self.set_toast(self.tr(T::PresetNoLive, &[&digit.to_string()]));
             return;
         };
         let name = self.current_name.clone().unwrap_or_default();
         self.presets.set(digit, sid, &name);
         let _ = self.presets.save(&self.storage.presets_path());
-        self.set_toast(format!("preset {} opgeslagen: {}", digit, name));
+        self.set_toast(self.tr(T::PresetSaved, &[&digit.to_string(), &name]));
     }
 
     fn recall_preset(&mut self, digit: u8) {
         let target = self.presets.get(digit).map(|p| p.stream_id);
         match target {
             Some(sid) => self.zap_by_id(sid),
-            None => self.set_toast(format!(
-                "preset {} is leeg - houd {} ingedrukt om op te slaan",
-                digit, digit
-            )),
+            None => self.set_toast(self.tr(T::PresetEmpty, &[&digit.to_string()])),
         }
     }
 
@@ -1444,6 +1465,7 @@ impl TvApp {
     /// Collects host/user/pass, writes BongoPlayer.ini and connects live.
     fn paint_portal_prompt(&mut self, ctx: &egui::Context) {
         let mut submit: Option<String> = None;
+        let lang = self.lang;
         egui::Area::new(egui::Id::new("__portal_prompt__"))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
@@ -1453,37 +1475,35 @@ impl TvApp {
                     .show(ui, |ui| {
                         ui.set_width(430.0);
                         ui.label(
-                            egui::RichText::new("Portal instellen")
+                            egui::RichText::new(crate::i18n::t(lang, T::PortalSetupTitle))
                                 .heading()
                                 .color(Color32::WHITE),
                         );
                         ui.label(
-                            egui::RichText::new(
-                                "Vul je Xtream-gegevens in. Ze worden opgeslagen in BongoPlayer.ini naast de app.",
-                            )
-                            .color(Color32::from_white_alpha(150))
-                            .size(12.0),
+                            egui::RichText::new(crate::i18n::t(lang, T::PortalSetupIntro))
+                                .color(Color32::from_white_alpha(150))
+                                .size(12.0),
                         );
                         ui.add_space(12.0);
                         egui::Grid::new("__portal_grid__")
                             .num_columns(2)
                             .spacing([10.0, 8.0])
                             .show(ui, |ui| {
-                                ui.label("Server (host:poort)");
+                                ui.label(crate::i18n::t(lang, T::ServerLabel));
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.cfg_host)
-                                        .hint_text("m.hnlol.com:8080")
+                                        .hint_text("server.example.com:8080")
                                         .desired_width(250.0),
                                 );
                                 ui.end_row();
-                                ui.label("Gebruiker");
+                                ui.label(crate::i18n::t(lang, T::UserLabel));
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.cfg_user)
-                                        .hint_text("naam")
+                                        .hint_text(crate::i18n::t(lang, T::UserHint))
                                         .desired_width(250.0),
                                 );
                                 ui.end_row();
-                                ui.label("Wachtwoord");
+                                ui.label(crate::i18n::t(lang, T::PasswordLabel));
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.cfg_pass)
                                         .password(true)
@@ -1504,7 +1524,10 @@ impl TvApp {
                             && !self.cfg_user.trim().is_empty()
                             && !self.cfg_pass.is_empty();
                         let clicked = ui
-                            .add_enabled(ready, egui::Button::new("Verbinden en opslaan"))
+                            .add_enabled(
+                                ready,
+                                egui::Button::new(crate::i18n::t(lang, T::ConnectAndSave)),
+                            )
                             .clicked();
                         let entered = ready && ctx.input(|i| i.key_pressed(Key::Enter));
                         if clicked || entered {
@@ -1528,13 +1551,16 @@ impl TvApp {
         let creds = match parse_xtream_creds(creds_str) {
             Ok(c) => c,
             Err(e) => {
-                self.cfg_error = Some(format!("ongeldige gegevens: {}", e));
+                self.cfg_error = Some(self.tr(T::InvalidDetails, &[self.t(creds_error_text(&e))]));
                 return;
             }
         };
         let path = crate::args::ini_path();
         if let Err(e) = std::fs::write(&path, creds_str) {
-            self.cfg_error = Some(format!("kon {} niet schrijven: {}", path.display(), e));
+            self.cfg_error = Some(self.tr(
+                T::CannotWrite,
+                &[&path.display().to_string(), &e.to_string()],
+            ));
             return;
         }
         tracing::info!("portal creds saved to {} - connecting", path.display());
@@ -1544,7 +1570,7 @@ impl TvApp {
         self.catalog.spawn_fetch();
         self.portal_state = PortalState::Configured;
         self.cfg_error = None;
-        self.set_toast("verbinden met portal...");
+        self.set_toast(self.t(T::ConnectingPortal));
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -1719,11 +1745,11 @@ impl TvApp {
 
         if a_key {
             let _ = self.player.cmd_tx.send(Cmd::CycleAudio);
-            self.set_toast("cycle audio");
+            self.set_toast(self.t(T::CycleAudio));
         }
         if s_key {
             let _ = self.player.cmd_tx.send(Cmd::CycleSubtitle);
-            self.set_toast("cycle subtitle");
+            self.set_toast(self.t(T::CycleSubtitle));
         }
 
         if f11 {
@@ -1747,10 +1773,10 @@ impl TvApp {
             match self.portal_state {
                 PortalState::Configured => {
                     self.catalog.spawn_fetch();
-                    self.set_toast("retrying portal fetch...");
+                    self.set_toast(self.t(T::RetryingPortal));
                 }
                 PortalState::Missing | PortalState::Placeholder => {
-                    self.set_toast("no portal configured - edit run.bat");
+                    self.set_toast(self.t(T::NoPortalOpenSettings));
                 }
             }
         }
@@ -1771,13 +1797,13 @@ impl TvApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                 egui::WindowLevel::AlwaysOnTop,
             ));
-            self.set_toast("borderless + always-on-top  (press t again to restore)");
+            self.set_toast(self.t(T::BorderlessOn));
         } else {
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                 egui::WindowLevel::Normal,
             ));
-            self.set_toast("normal window");
+            self.set_toast(self.t(T::BorderlessOff));
         }
     }
 
@@ -1838,6 +1864,7 @@ impl TvApp {
             return;
         }
         let mut zap_pick: Option<(i64, String, ItemKind)> = None;
+        let lang = self.lang;
 
         egui::Area::new(egui::Id::new("__search__"))
             .anchor(egui::Align2::CENTER_TOP, [0.0, 60.0])
@@ -1857,7 +1884,7 @@ impl TvApp {
                         });
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut self.search_query)
-                                .hint_text("search live / movie / series...")
+                                .hint_text(crate::i18n::t(lang, T::SearchHint))
                                 .desired_width(540.0),
                         );
                         resp.request_focus();
@@ -1874,9 +1901,13 @@ impl TvApp {
                         ui.separator();
                         for (i, it) in self.search_hits.iter().take(12).enumerate() {
                             let tag = match it.kind {
-                                ItemKind::Live => "[LIVE]",
-                                ItemKind::Movie => "[FILM]",
-                                ItemKind::Series => "[SERIE]",
+                                ItemKind::Live => "[LIVE]".to_string(),
+                                ItemKind::Movie => {
+                                    format!("[{}]", crate::i18n::t(lang, T::TagMovie))
+                                }
+                                ItemKind::Series => {
+                                    format!("[{}]", crate::i18n::t(lang, T::TagSeries))
+                                }
                             };
                             if ui
                                 .selectable_label(
@@ -1910,7 +1941,7 @@ impl TvApp {
                 self.play_movie(id, name);
             }
             ItemKind::Series => {
-                self.set_toast(format!("series picker not in v1: {}", name));
+                self.set_toast(self.tr(T::SeriesNotYet, &[name]));
             }
         }
         self.show_search = false;
@@ -1924,6 +1955,7 @@ impl TvApp {
         let mut zap_id: Option<i64> = None;
         let mut remove_id: Option<i64> = None;
         let entries: Vec<_> = self.favorites.iter().cloned().collect();
+        let lang = self.lang;
 
         egui::Area::new(egui::Id::new("__favs__"))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -1932,10 +1964,13 @@ impl TvApp {
                     .fill(Color32::from_black_alpha(230))
                     .show(ui, |ui| {
                         ui.set_width(420.0);
-                        ui.heading("Favorites");
+                        ui.heading(crate::i18n::t(lang, T::FavoritesTitle));
                         ui.separator();
                         if entries.is_empty() {
-                            ui.label(egui::RichText::new("press * on a channel to add").italics());
+                            ui.label(
+                                egui::RichText::new(crate::i18n::t(lang, T::FavoritesEmpty))
+                                    .italics(),
+                            );
                         }
                         for entry in entries {
                             ui.horizontal(|ui| {
@@ -2162,17 +2197,20 @@ impl TvApp {
                         let (txt, col) = if self.health.is_buffering() {
                             match self.health.elapsed(now) {
                                 Some(d) => (
-                                    format!("playback: BUFFERING  {:.1}s", d.as_secs_f64()),
+                                    self.tr(
+                                        T::DebugBuffering,
+                                        &[&format!("{:.1}", d.as_secs_f64())],
+                                    ),
                                     Color32::from_rgb(255, 170, 60),
                                 ),
                                 None => (
-                                    "playback: buffering (startup)".to_string(),
+                                    self.t(T::DebugBufferingStartup).to_string(),
                                     Color32::from_rgb(210, 210, 130),
                                 ),
                             }
                         } else {
                             (
-                                "playback: live".to_string(),
+                                self.t(T::DebugLive).to_string(),
                                 Color32::from_rgb(120, 220, 120),
                             )
                         };
@@ -2182,18 +2220,24 @@ impl TvApp {
                             .last_freeze()
                             .map(|d| format!("{:.1}s", d.as_secs_f64()))
                             .unwrap_or_else(|| "-".to_string());
-                        ui.label(format!(
-                            "freezes: {}   total {:.1}s   last {}",
-                            self.health.freeze_count(),
-                            self.health.total_frozen().as_secs_f64(),
-                            last,
+                        ui.label(self.tr(
+                            T::DebugFreezes,
+                            &[
+                                &self.health.freeze_count().to_string(),
+                                &format!("{:.1}", self.health.total_frozen().as_secs_f64()),
+                                &last,
+                            ],
                         ));
                         if let Some(n) = &self.current_name {
-                            ui.label(format!("channel: {}", n));
+                            ui.label(self.tr(T::DebugChannel, &[n]));
                         }
-                        ui.label(format!("favs: {}", self.favorites.iter().count()));
-                        ui.label(format!("catalog: {:?}", self.catalog.status()));
-                        ui.label(format!("portal: {:?}", self.portal_state));
+                        ui.label(
+                            self.tr(T::DebugFavs, &[&self.favorites.iter().count().to_string()]),
+                        );
+                        ui.label(
+                            self.tr(T::DebugCatalog, &[&format!("{:?}", self.catalog.status())]),
+                        );
+                        ui.label(self.tr(T::DebugPortal, &[&format!("{:?}", self.portal_state)]));
                     });
             });
     }
@@ -2207,85 +2251,48 @@ impl TvApp {
                     .size(48.0),
             );
             ui.add_space(20.0);
-            match self.portal_state {
-                PortalState::Missing => {
+            if self.portal_state != PortalState::Configured {
+                return;
+            }
+            match self.catalog.status() {
+                CatalogStatus::Idle | CatalogStatus::Connecting | CatalogStatus::Fetching => {
+                    let key = match self.catalog.status() {
+                        CatalogStatus::Connecting => T::Connecting,
+                        CatalogStatus::Fetching => T::FetchingCatalog,
+                        _ => T::Preparing,
+                    };
                     ui.label(
-                        egui::RichText::new("no portal configured")
+                        egui::RichText::new(self.t(key))
                             .color(Color32::from_white_alpha(140))
                             .size(20.0),
                     );
-                    ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "Edit run.bat and set XTREAM_CREDS=user:pass@host:port,\n\
-                             or pass --xtream user:pass@host:port on the command line.",
-                        )
-                        .color(Color32::from_white_alpha(110)),
-                    );
                     ui.add_space(8.0);
+                    ui.spinner();
+                }
+                CatalogStatus::Loaded => {
                     ui.label(
-                        egui::RichText::new(
-                            "(A bare URL also works: BongoPlayer.exe https://example.com/some.m3u8)",
-                        )
-                        .italics()
-                        .color(Color32::from_white_alpha(80)),
+                        egui::RichText::new(self.t(T::CatalogLoadedHint))
+                            .color(Color32::from_white_alpha(140))
+                            .size(18.0),
                     );
                 }
-                PortalState::Placeholder => {
+                CatalogStatus::Failed(e) => {
                     ui.label(
-                        egui::RichText::new("placeholder credentials in run.bat")
-                            .color(Color32::from_rgb(255, 200, 80))
+                        egui::RichText::new(self.t(T::PortalFetchFailed))
+                            .color(Color32::from_rgb(255, 120, 120))
                             .size(20.0),
                     );
-                    ui.add_space(12.0);
+                    ui.add_space(8.0);
+                    // The portal's own error text, credentials already masked:
+                    // a technical detail, shown as written.
+                    ui.label(egui::RichText::new(e).color(Color32::from_white_alpha(140)));
+                    ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new(
-                            "The XTREAM_CREDS line in run.bat still has the example values\n\
-                             (user:pass@host.example.com:...). Edit it with your real portal\n\
-                             credentials and start the player again.",
-                        )
-                        .color(Color32::from_white_alpha(140)),
+                        egui::RichText::new(self.t(T::PressF5))
+                            .italics()
+                            .color(Color32::from_white_alpha(100)),
                     );
                 }
-                PortalState::Configured => match self.catalog.status() {
-                    CatalogStatus::Idle | CatalogStatus::Fetching(_) => {
-                        let msg = if let CatalogStatus::Fetching(s) = self.catalog.status() {
-                            s
-                        } else {
-                            "preparing...".into()
-                        };
-                        ui.label(
-                            egui::RichText::new(msg)
-                                .color(Color32::from_white_alpha(140))
-                                .size(20.0),
-                        );
-                        ui.add_space(8.0);
-                        ui.spinner();
-                    }
-                    CatalogStatus::Loaded => {
-                        ui.label(
-                            egui::RichText::new("catalog loaded - f = search, g = guide, 0-9 = presets")
-                                .color(Color32::from_white_alpha(140))
-                                .size(18.0),
-                        );
-                    }
-                    CatalogStatus::Failed(e) => {
-                        ui.label(
-                            egui::RichText::new("portal fetch failed")
-                                .color(Color32::from_rgb(255, 120, 120))
-                                .size(20.0),
-                        );
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(e).color(Color32::from_white_alpha(140)),
-                        );
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("press F5 to retry").italics()
-                                .color(Color32::from_white_alpha(100)),
-                        );
-                    }
-                },
             }
         });
     }

@@ -443,7 +443,10 @@ mod zap_tests {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogStatus {
     Idle,
-    Fetching(String),  // current step description
+    /// Opening the connection to the portal.
+    Connecting,
+    /// Downloading the catalog.
+    Fetching,
     Loaded,
     Failed(String),
 }
@@ -527,11 +530,11 @@ impl CatalogStore {
         let inner = self.inner.clone();
         let portal = self.portal.clone();
         let status = self.status.clone();
-        *status.write() = CatalogStatus::Fetching("connecting...".into());
+        *status.write() = CatalogStatus::Connecting;
 
         tokio::spawn(async move {
             let t0 = Instant::now();
-            *status.write() = CatalogStatus::Fetching("fetching catalog...".into());
+            *status.write() = CatalogStatus::Fetching;
             info!("catalog: starting fetch");
 
             match portal.fetch_catalog().await {
