@@ -1820,6 +1820,9 @@ impl TvApp {
             return;
         }
         egui::Area::new(egui::Id::new("__toast__"))
+            // Display only: an interactable Area's frame is a focusable widget,
+            // an invisible Tab stop in front of whatever has the keyboard.
+            .interactable(false)
             .anchor(egui::Align2::LEFT_BOTTOM, [12.0, -12.0])
             .show(ctx, |ui| {
                 egui::Frame::popup(&ctx.style())
@@ -1986,6 +1989,7 @@ impl TvApp {
         }
 
         egui::Area::new(egui::Id::new("__epg_strip__"))
+            .interactable(false) // display only, see paint_toast
             .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -60.0])
             .show(ctx, |ui| {
                 egui::Frame::popup(&ctx.style())
@@ -2004,6 +2008,10 @@ impl TvApp {
             return;
         };
         egui::Area::new(egui::Id::new("__epg_grid__"))
+            // No Tab stop for the frame (see paint_toast), but not
+            // interactable(false): the list scrolls with the mouse wheel, which
+            // needs the pointer to reach this layer.
+            .sense(egui::Sense::hover())
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 egui::Frame::popup(&ctx.style())
@@ -2139,6 +2147,7 @@ impl TvApp {
             return;
         }
         egui::Area::new(egui::Id::new("__debug__"))
+            .interactable(false) // display only, see paint_toast
             .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
             .show(ctx, |ui| {
                 egui::Frame::popup(&ctx.style())

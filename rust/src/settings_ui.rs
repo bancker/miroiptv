@@ -36,6 +36,16 @@ impl Section {
     }
 }
 
+/// The id of the overlay's Area. Everything it draws lies on the layer built
+/// from it (see `overlay_layer`).
+const AREA_ID: &str = "__settings__";
+
+/// The overlay's own layer: the Area is built from it, and a focused widget
+/// counts as the overlay's only when it lies on it.
+fn overlay_layer() -> egui::LayerId {
+    egui::LayerId::new(egui::Order::Foreground, egui::Id::new(AREA_ID))
+}
+
 /// What the user did in the overlay.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettingsAction {
@@ -73,12 +83,20 @@ impl SettingsUi {
     pub fn show(&mut self, ctx: &egui::Context, view: &SettingsView) -> Vec<SettingsAction> {
         let mut actions = Vec::new();
         let lang = view.lang;
-        // The mode follows the keyboard focus: a control that is not a list
-        // row having it puts the overlay in its section, whatever gave it the
-        // focus (Tab, Enter, a click).
+        // The mode follows the keyboard focus: a control of the overlay that
+        // is not a list row having it puts the overlay in its section, whatever
+        // gave it the focus (Tab, Enter, a click). Focus elsewhere never
+        // counts: another panel's frame (a toast, the favorites list) is a Tab
+        // stop too, and says nothing about the overlay.
         let focused = ctx.memory(|m| m.focused());
-        if focused.is_some_and(|id| !self.list_ids.contains(&id)) {
-            self.in_pane = true;
+        if let Some(id) = focused {
+            if !self.list_ids.contains(&id)
+                && ctx
+                    .read_response(id)
+                    .is_some_and(|r| r.layer_id == overlay_layer())
+            {
+                self.in_pane = true;
+            }
         }
         // Taken before any widget sees them: in the list, arrows and Enter
         // belong to the overlay, not to a focused control.
@@ -116,8 +134,9 @@ impl SettingsUi {
             }
         });
         let width = (ctx.screen_rect().width() - 40.0).clamp(480.0, 760.0);
-        egui::Area::new(egui::Id::new("__settings__"))
-            .order(egui::Order::Foreground)
+        let layer = overlay_layer();
+        egui::Area::new(layer.id)
+            .order(layer.order)
             // Its default click sense is a focusable widget: a first Tab stop
             // that shows nothing, and no list row or control.
             .sense(egui::Sense::hover())
@@ -296,19 +315,57 @@ mod tests {
         let _ = ctx.run(raw, draw);
     }
 
+    /// Another panel on screen: a default Area in the corner where the app's
+    /// toast sits. egui gives such an Area a click sense, so its frame is a
+    /// focusable widget (a Tab stop) that is created before the overlay's own
+    /// widgets. Nothing lies below it, so Down from there moves no focus.
+    fn show_other_panel(ctx: &egui::Context) {
+        egui::Area::new(egui::Id::new("__other__"))
+            .anchor(egui::Align2::LEFT_BOTTOM, [12.0, -12.0])
+            .show(ctx, |ui| {
+                ui.label("x");
+            });
+    }
+
+    /// The same kind of panel with a button; `focus` gives the button the
+    /// keyboard focus.
+    fn show_other_panel_with_button(ctx: &egui::Context, focus: bool) {
+        egui::Area::new(egui::Id::new("__other__"))
+            .anchor(egui::Align2::LEFT_BOTTOM, [12.0, -12.0])
+            .show(ctx, |ui| {
+                let button = ui.button("b");
+                if focus {
+                    button.request_focus();
+                }
+            });
+    }
+
     /// The overlay on a headless egui context, one frame per call.
     struct Overlay {
         ctx: egui::Context,
         ui: SettingsUi,
         settings: Settings,
+        /// Draw another default Area before the overlay in every frame.
+        other_panel: bool,
     }
 
     impl Overlay {
         fn new() -> Self {
+            Self::start(false)
+        }
+
+        /// With another default Area on screen in every frame, as while a
+        /// toast shows.
+        fn with_other_panel() -> Self {
+            Self::start(true)
+        }
+
+        fn start(other_panel: bool) -> Self {
             let mut overlay = Overlay {
                 ctx: egui::Context::default(),
                 ui: SettingsUi::new(),
                 settings: Settings::default(),
+                other_panel,
             };
             // Two empty frames first, so the widgets exist before the first key.
             overlay.frame(&[]);
@@ -320,7 +377,13 @@ mod tests {
         fn frame(&mut self, keys: &[Key]) -> Vec<SettingsAction> {
             let mut actions = Vec::new();
             let view = make_view(&self.settings);
-            run_frame(&self.ctx, keys, |ctx| actions = self.ui.show(ctx, &view));
+            let other_panel = self.other_panel;
+            run_frame(&self.ctx, keys, |ctx| {
+                if other_panel {
+                    show_other_panel(ctx);
+                }
+                actions = self.ui.show(ctx, &view)
+            });
             actions
         }
 
@@ -439,6 +502,51 @@ mod tests {
             o.frame(&[Key::Space]),
             vec![SettingsAction::SetSwapZap(true)]
         );
+    }
+
+    #[test]
+    fn with_another_panel_visible_tab_then_o_closes_the_overlay() {
+        // The first Tab lands on the other panel's frame, not on the overlay:
+        // the overlay is still in its list, so `o` closes it.
+        let mut o = Overlay::with_other_panel();
+        o.press(Key::Tab, 1);
+        assert_eq!(o.frame(&[Key::O]), vec![SettingsAction::Close]);
+    }
+
+    #[test]
+    fn with_another_panel_visible_tab_then_esc_closes_the_overlay() {
+        let mut o = Overlay::with_other_panel();
+        o.press(Key::Tab, 1);
+        assert_eq!(o.frame(&[Key::Escape]), vec![SettingsAction::Close]);
+    }
+
+    #[test]
+    fn with_another_panel_visible_the_arrows_still_choose_the_section() {
+        let mut o = Overlay::with_other_panel();
+        o.press(Key::Tab, 1);
+        o.press(Key::ArrowDown, 2); // Controls
+        o.press(Key::Enter, 1);
+        assert_eq!(
+            o.frame(&[Key::Space]),
+            vec![SettingsAction::SetSwapZap(true)]
+        );
+    }
+
+    #[test]
+    fn an_overlay_opened_while_a_button_elsewhere_has_the_focus_starts_in_its_list() {
+        let ctx = egui::Context::default();
+        let settings = Settings::default();
+        // A button in another panel has the keyboard focus when the overlay opens.
+        for _ in 0..2 {
+            run_frame(&ctx, &[], |ctx| show_other_panel_with_button(ctx, true));
+        }
+        let mut overlay = SettingsUi::new();
+        let mut actions = Vec::new();
+        run_frame(&ctx, &[Key::O], |ctx| {
+            show_other_panel_with_button(ctx, false);
+            actions = overlay.show(ctx, &make_view(&settings));
+        });
+        assert_eq!(actions, vec![SettingsAction::Close]);
     }
 
     #[test]
