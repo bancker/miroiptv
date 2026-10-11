@@ -139,3 +139,39 @@ async fn portal_errors_never_show_the_credentials() {
     let msg = bongo_player::portal::PortalError::from(e).to_string();
     assert!(!msg.contains("bob") && !msg.contains("s3cr3t"), "{msg}");
 }
+
+#[test]
+fn reads_the_adult_flag_in_every_form_the_portal_uses() {
+    use bongo_player::portal::{LiveChannel, Movie, Series};
+    let live: Vec<LiveChannel> = serde_json::from_str(
+        r#"[
+            {"stream_id": 1, "name": "a", "is_adult": "1"},
+            {"stream_id": 2, "name": "b", "is_adult": 1},
+            {"stream_id": 3, "name": "c", "is_adult": true},
+            {"stream_id": 4, "name": "d", "is_adult": "0"},
+            {"stream_id": 5, "name": "e"}
+        ]"#,
+    )
+    .unwrap();
+    let flags: Vec<bool> = live.iter().map(|c| c.is_adult).collect();
+    assert_eq!(flags, [true, true, true, false, false]);
+    let movies: Vec<Movie> =
+        serde_json::from_str(r#"[{"stream_id": 9, "name": "m", "is_adult": "1"}, {"stream_id": 10, "name": "n"}]"#)
+            .unwrap();
+    assert_eq!(movies.iter().map(|m| m.is_adult).collect::<Vec<_>>(), [true, false]);
+    let series: Vec<Series> = serde_json::from_str(r#"[{"series_id": 7, "name": "s", "is_adult": 1}]"#).unwrap();
+    assert!(series[0].is_adult);
+}
+
+#[test]
+fn stream_ref_reads_kind_and_id_from_portal_urls() {
+    use bongo_player::portal::xtream::{stream_ref, StreamKind};
+    assert_eq!(stream_ref("http://h:8080/live/u/p/42.m3u8"), Some((StreamKind::Live, 42)));
+    assert_eq!(stream_ref("http://h/movie/u/p/9001.mkv"), Some((StreamKind::Movie, 9001)));
+    assert_eq!(stream_ref("http://h/series/u/p/77.mp4"), Some((StreamKind::Series, 77)));
+    assert_eq!(
+        stream_ref("http://h/timeshift/u/p/35/2026-10-10:19-20/601.m3u8"),
+        Some((StreamKind::Timeshift, 601))
+    );
+    assert_eq!(stream_ref("http://h/player_api.php?username=u"), None);
+}

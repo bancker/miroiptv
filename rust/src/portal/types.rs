@@ -32,6 +32,25 @@ where
     })
 }
 
+/// Tolerant yes/no flag: `1`, `"1"`, `true` and `"true"` mean yes; anything
+/// else, null or a missing field mean no. The portal sends `is_adult` as
+/// `"0"`/`"1"`.
+fn deser_flag<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let v = Option::<serde_json::Value>::deserialize(d).unwrap_or(None);
+    Ok(match v {
+        Some(serde_json::Value::Bool(b)) => b,
+        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+        Some(serde_json::Value::String(s)) => {
+            matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true")
+        }
+        _ => false,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveChannel {
     #[serde(deserialize_with = "deser_id")]
@@ -53,6 +72,10 @@ pub struct LiveChannel {
     /// Days of catch-up history available on this archive channel.
     #[serde(default, deserialize_with = "deser_int_or_zero")]
     pub tv_archive_duration: i32,
+    /// The portal's adult flag (`is_adult`); see `catalog::is_adult_name` for
+    /// the name rule that backs it up.
+    #[serde(default, deserialize_with = "deser_flag")]
+    pub is_adult: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +85,10 @@ pub struct Movie {
     pub name: String,
     #[serde(default)]
     pub container_extension: Option<String>,
+    /// The portal's adult flag (`is_adult`); see `catalog::is_adult_name` for
+    /// the name rule that backs it up.
+    #[serde(default, deserialize_with = "deser_flag")]
+    pub is_adult: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +96,10 @@ pub struct Series {
     #[serde(deserialize_with = "deser_id")]
     pub series_id: i64,
     pub name: String,
+    /// The portal's adult flag (`is_adult`); see `catalog::is_adult_name` for
+    /// the name rule that backs it up.
+    #[serde(default, deserialize_with = "deser_flag")]
+    pub is_adult: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

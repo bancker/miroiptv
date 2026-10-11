@@ -4,6 +4,33 @@ use crate::epg::{Epg, EpgEntry};
 use chrono::{Local, NaiveDateTime, TimeZone, Utc};
 use serde::Deserialize;
 
+/// What a portal stream URL points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Live,
+    Movie,
+    Series,
+    Timeshift,
+}
+
+/// Kind and stream id of a portal URL (`…/live/u/p/42.m3u8` → live 42). The
+/// id is the last path segment without its extension. `None` for URLs that
+/// are not portal streams.
+pub fn stream_ref(url: &str) -> Option<(StreamKind, i64)> {
+    let path = url.split('?').next()?;
+    let kind = [
+        ("/live/", StreamKind::Live),
+        ("/movie/", StreamKind::Movie),
+        ("/series/", StreamKind::Series),
+        ("/timeshift/", StreamKind::Timeshift),
+    ]
+    .into_iter()
+    .find(|(marker, _)| path.contains(marker))?
+    .1;
+    let id = path.rsplit('/').next()?.split('.').next()?.parse().ok()?;
+    Some((kind, id))
+}
+
 #[derive(Debug, Clone)]
 pub struct XtreamPortal {
     pub creds: XtreamCreds,
@@ -310,9 +337,10 @@ impl Portal for XtreamPortal {
     }
 
     fn live_stream_id(&self, url: &str) -> Option<i64> {
-        let path = url.split('?').next()?;
-        let (_, rest) = path.split_once("/live/")?;
-        rest.rsplit('/').next()?.split('.').next()?.parse().ok()
+        match stream_ref(url) {
+            Some((StreamKind::Live, id)) => Some(id),
+            _ => None,
+        }
     }
 
     fn movie_stream_url(&self, stream_id: i64, container_ext: &str) -> String {

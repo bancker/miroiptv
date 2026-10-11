@@ -144,6 +144,7 @@ mod quality_tests {
             epg_channel_id: None,
             tv_archive,
             tv_archive_duration: 0,
+            is_adult: false,
         }
     }
 
@@ -311,6 +312,7 @@ mod zap_tests {
             epg_channel_id: None,
             tv_archive,
             tv_archive_duration: 0,
+            is_adult: false,
         }
     }
 
