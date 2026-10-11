@@ -3,7 +3,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use bongo_player::app::{PortalState, TvApp};
-use bongo_player::args::{ini_path, parse_xtream_creds, read_ini_creds, Cli, XtreamCreds};
+use bongo_player::args::{ini_path, read_ini_creds, resolve_creds, Cli, CredsSource, XtreamCreds};
 use bongo_player::catalog::CatalogStore;
 use bongo_player::legacy;
 use bongo_player::player;
@@ -65,14 +65,6 @@ mod win_console {
             }
         }
     }
-}
-
-fn is_placeholder_creds(creds: &XtreamCreds) -> bool {
-    let host = creds.host.to_lowercase();
-    host == "host.example.com"
-        || host == "example.com"
-        || host.is_empty()
-        || (creds.username == "user" && creds.password == "pass")
 }
 
 /// Initialize tracing: stderr + rolling daily file under
@@ -199,57 +191,38 @@ fn main() -> anyhow::Result<()> {
     let rt = Runtime::new()?;
     let _rt_guard = rt.enter();
 
-    // Resolve portal:
-    //   1. --xtream provided AND not placeholder -> real portal
-    //   2. otherwise -> "no portal" sentinel; UI shows configure-portal screen
-    // Credentials come from --xtream (explicit) or, failing that, BongoPlayer.ini
-    // in the app folder. If neither exists the app shows a first-run prompt
-    // that writes BongoPlayer.ini.
-    let creds_str = cli.xtream.clone().or_else(|| read_ini_creds(&ini_path()));
-    let (portal, portal_state): (Arc<dyn Portal>, PortalState) = if let Some(s) =
-        creds_str.as_deref()
-    {
-        match parse_xtream_creds(s) {
-            Ok(creds) if !is_placeholder_creds(&creds) => {
-                tracing::info!(
-                    "portal: xtream {}@{}:{}",
-                    creds.username,
-                    creds.host,
-                    creds.port
-                );
-                (Arc::new(XtreamPortal::new(creds)), PortalState::Configured)
-            }
-            Ok(creds) => {
-                tracing::warn!("portal: placeholder credentials detected ({:?}@{}:{}). Edit run.bat or pass --xtream user:pass@host:port.", creds.username, creds.host, creds.port);
-                (
-                    Arc::new(XtreamPortal::new(XtreamCreds {
-                        username: "anon".into(),
-                        password: "anon".into(),
-                        host: "127.0.0.1".into(),
-                        port: 1,
-                    })),
-                    PortalState::Placeholder,
-                )
-            }
-            Err(e) => {
-                tracing::error!("portal: --xtream parse failed: {}", e);
-                anyhow::bail!("invalid --xtream credentials: {}", e);
-            }
-        }
-    } else {
-        tracing::warn!(
-            "portal: no credentials (--xtream or {APP_ID}.ini). Showing first-run setup prompt."
-        );
-        (
-            Arc::new(XtreamPortal::new(XtreamCreds {
-                username: "anon".into(),
-                password: "anon".into(),
-                host: "127.0.0.1".into(),
-                port: 1,
-            })),
-            PortalState::Missing,
-        )
+    // Resolve portal (see args::resolve_creds): --xtream with real values wins,
+    // then BongoPlayer.ini in the app folder. Placeholder, missing or unreadable
+    // credentials never stop the app: it shows the setup prompt, which writes
+    // BongoPlayer.ini.
+    let ini_creds = read_ini_creds(&ini_path());
+    let anon = || -> Arc<dyn Portal> {
+        Arc::new(XtreamPortal::new(XtreamCreds {
+            username: "anon".into(),
+            password: "anon".into(),
+            host: "127.0.0.1".into(),
+            port: 1,
+        }))
     };
+    let (portal, portal_state, creds): (Arc<dyn Portal>, PortalState, Option<XtreamCreds>) =
+        match resolve_creds(cli.xtream.as_deref(), ini_creds.as_deref()) {
+            CredsSource::Configured(c) => {
+                tracing::info!("portal: xtream <user>@{}:{}", c.host, c.port);
+                (Arc::new(XtreamPortal::new(c.clone())), PortalState::Configured, Some(c))
+            }
+            CredsSource::Placeholder => {
+                tracing::warn!("portal: placeholder credentials - showing the setup prompt");
+                (anon(), PortalState::Placeholder, None)
+            }
+            CredsSource::Missing => {
+                tracing::warn!("portal: no credentials (--xtream or {APP_ID}.ini) - showing the setup prompt");
+                (anon(), PortalState::Missing, None)
+            }
+            CredsSource::Invalid(e) => {
+                tracing::warn!("portal: unreadable credentials ({e}) - showing the setup prompt");
+                (anon(), PortalState::Missing, None)
+            }
+        };
     let catalog = Arc::new(CatalogStore::new(portal));
 
     // Local relay for live HLS (see relay/mod.rs). Loopback only; if it can't
@@ -283,6 +256,7 @@ fn main() -> anyhow::Result<()> {
                 portal_state,
                 cli.url,
                 relay,
+                creds,
             ))
         }),
     );

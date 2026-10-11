@@ -1,4 +1,4 @@
-use crate::args::parse_xtream_creds;
+use crate::args::{parse_xtream_creds, XtreamCreds};
 use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, quality_rank, zap_position, CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::Favorites;
@@ -273,6 +273,9 @@ pub struct TvApp {
     favorites: Favorites,
     storage: Storage,
     portal_state: PortalState,
+    /// Portal credentials in use: the settings screen shows them and the PIN
+    /// reset checks the password against them.
+    creds: Option<XtreamCreds>,
 
     video_tex: Option<TextureHandle>,
     last_frame_version: u64,
@@ -366,6 +369,7 @@ impl TvApp {
         portal_state: PortalState,
         initial_url: Option<String>,
         relay: Option<Relay>,
+        creds: Option<XtreamCreds>,
     ) -> Self {
         // Whenever a new mpv frame is ready, ask egui to redraw.
         let ctx = cc.egui_ctx.clone();
@@ -388,6 +392,7 @@ impl TvApp {
             favorites,
             storage,
             portal_state,
+            creds,
             video_tex: None,
             last_frame_version: 0,
             current_idx: None,
@@ -1443,6 +1448,7 @@ impl TvApp {
             return;
         }
         tracing::info!("portal creds saved to {} - connecting", path.display());
+        self.creds = Some(creds.clone());
         let portal: Arc<dyn Portal> = Arc::new(XtreamPortal::new(creds));
         self.catalog = Arc::new(CatalogStore::new(portal));
         self.catalog.spawn_fetch();
