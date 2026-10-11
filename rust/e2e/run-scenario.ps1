@@ -17,6 +17,11 @@ by itself before the run ended, or it left a panic-*.log. Exit code 0 otherwise.
 -FirstStart asks for it. -ConfigDir reuses a folder across runs (restarts); its
 old BongoPlayer.log.* and panic-*.log are removed first, so a run is judged on
 its own log lines only.
+
+-NoPortal leaves out the --xtream arguments. A fresh isolated config folder has
+no BongoPlayer.ini either, so the app starts on the first-run setup prompt
+("portal: no credentials" in its log), e.g.
+  .\run-scenario.ps1 -NoPortal -Keys 'TEXT:onno' -Expect 'portal: no credentials'
 #>
 param(
     [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\BongoPlayer.exe'),
@@ -27,6 +32,7 @@ param(
     [string]$Settings = '',
     [switch]$FirstStart,    # no settings.json: the language screen shows
     [switch]$OldResumeFile, # last_watched.json as 0.5 wrote it (no adult flag)
+    [switch]$NoPortal,      # no --xtream arguments: the setup prompt shows
     [string]$ConfigDir = '',
     [string]$Keys = '',
     [int]$KeysAfter = 7,
@@ -100,9 +106,13 @@ try {
     $env:BONGO_CONFIG_DIR = $ConfigDir
     $env:BONGO_INI = Join-Path $ConfigDir 'BongoPlayer.ini'
     if ($MpvVerbose) { $env:MPV_LOG_LEVEL = 'v' }
-    $appArgs = @('--xtream', "tester:secret@127.0.0.1:$Port")
+    $appArgs = @()
+    if (-not $NoPortal) { $appArgs += '--xtream', "tester:secret@127.0.0.1:$Port" }
     if ($Url) { $appArgs += $Url }
-    $app = Start-Process $Exe -ArgumentList $appArgs -PassThru
+    # Start-Process rejects an empty -ArgumentList, which -NoPortal without -Url gives.
+    $start = @{ FilePath = $Exe; PassThru = $true }
+    if ($appArgs.Count) { $start.ArgumentList = $appArgs }
+    $app = Start-Process @start
     try { $null = $app.Handle } catch { }   # Start-Process -PassThru: keeps ExitCode readable
     if ($Keys) {
         Start-Sleep -Seconds $KeysAfter

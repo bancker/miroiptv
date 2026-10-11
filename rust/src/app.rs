@@ -3338,11 +3338,17 @@ impl eframe::App for TvApp {
         self.check_stall();
         self.forward_window_size(ctx);
         self.update_video_texture(ctx);
+        // The first-run setup prompt shows while there are no usable credentials.
+        let setup_prompt = matches!(
+            self.portal_state,
+            PortalState::Missing | PortalState::Placeholder
+        );
         // Guide owns input while it's open - we don't want `1`/`2`/`3` etc.
         // firing zaps when the user is typing into the channel filter.
         // The settings overlay owns the keyboard while it is open (it reads
-        // its keys in paint_settings).
-        if self.settings_ui.is_none() {
+        // its keys in paint_settings), and so does the setup prompt: typing a
+        // user name must not fire hotkeys.
+        if self.settings_ui.is_none() && !setup_prompt {
             if self.guide.open {
                 self.handle_guide_keys(ctx);
             } else {
@@ -3355,10 +3361,7 @@ impl eframe::App for TvApp {
         // work while the user is browsing the schedule.
         if self.guide.open {
             self.paint_guide(ctx);
-        } else if matches!(
-            self.portal_state,
-            PortalState::Missing | PortalState::Placeholder
-        ) {
+        } else if setup_prompt {
             // First-run: no credentials yet - show the portal setup prompt
             // over a dark background instead of the video surface.
             egui::CentralPanel::default()
