@@ -168,9 +168,16 @@ fn main() -> anyhow::Result<()> {
     // First start after the tvplayer -> Bongo Player rename: carry over the old
     // data and ini. Must run before ensure_config_dir (an existing config dir
     // means "already migrated"); results are logged once logging is up.
+    // Under the test override the old tvplayer data must not be copied in.
+    let isolated = std::env::var_os("BONGO_CONFIG_DIR").is_some();
     let migrated_config = legacy::legacy_config_dir()
+        .filter(|_| !isolated)
         .map(|old| legacy::migrate_config_dir(&old, storage.config_dir()));
-    let migrated_ini = legacy::migrate_file(&legacy::legacy_ini_path(), &ini_path());
+    let migrated_ini = if isolated {
+        Ok(false)
+    } else {
+        legacy::migrate_file(&legacy::legacy_ini_path(), &ini_path())
+    };
     storage.ensure_config_dir()?;
     let log_dir = init_logging(&storage);
     install_panic_hook(log_dir.clone());

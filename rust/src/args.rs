@@ -47,6 +47,9 @@ pub enum CredsError {
 /// Path to `BongoPlayer.ini` next to the executable (falls back to CWD if the
 /// exe path can't be resolved). This is the app's "root folder" config file.
 pub fn ini_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("BONGO_INI") {
+        return std::path::PathBuf::from(p);
+    }
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
