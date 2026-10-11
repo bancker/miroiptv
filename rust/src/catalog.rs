@@ -1,7 +1,9 @@
-use crate::portal::{Catalog as PortalCatalog, LiveChannel, Portal};
+use crate::portal::xtream::{stream_ref, StreamKind};
+use crate::portal::{Catalog as PortalCatalog, LiveChannel, Movie, Portal, Series};
 use crate::search::{rank, ItemKind, SearchItem};
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -27,6 +29,26 @@ pub fn normalize_channel_name(name: &str) -> String {
         .filter(|c| !c.is_whitespace())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+/// A name that marks adult content by itself: it starts with "XXX" (after
+/// leading spaces, any case). Backs up the portal's `is_adult` flag.
+pub fn is_adult_name(name: &str) -> bool {
+    name.trim_start()
+        .get(..3)
+        .is_some_and(|p| p.eq_ignore_ascii_case("xxx"))
+}
+
+fn adult_live(c: &LiveChannel) -> bool {
+    c.is_adult || is_adult_name(&c.name)
+}
+
+fn adult_movie(m: &Movie) -> bool {
+    m.is_adult || is_adult_name(&m.name)
+}
+
+fn adult_series(s: &Series) -> bool {
+    s.is_adult || is_adult_name(&s.name)
 }
 
 #[cfg(test)]
@@ -278,7 +300,7 @@ pub fn fallback_variant(
 /// [`normalize_channel_name`]), keeping the highest-scoring variant so the
 /// user doesn't zap through NPO1 HD / UHD / FHD / catch-up duplicates. Order
 /// follows each channel's first appearance in the portal list.
-pub fn dedupe_zap(channels: &[LiveChannel]) -> Vec<LiveChannel> {
+pub fn dedupe_zap<'a>(channels: impl IntoIterator<Item = &'a LiveChannel>) -> Vec<LiveChannel> {
     let mut order: Vec<String> = Vec::new();
     let mut best: HashMap<String, LiveChannel> = HashMap::new();
     for ch in channels {
@@ -407,6 +429,15 @@ mod zap_tests {
         assert_eq!(z.len(), 1);
         assert_eq!(z[0].stream_id, 2);
     }
+
+    #[test]
+    fn xxx_names_count_as_adult() {
+        assert!(is_adult_name("XXX | PLAYBOY TV"));
+        assert!(is_adult_name("  xxx Hot"));
+        assert!(!is_adult_name("NL | XXL Nostalgie"));
+        assert!(!is_adult_name("Né"));
+        assert!(!is_adult_name(""));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,6 +452,8 @@ pub struct CatalogStore {
     inner: Arc<RwLock<Option<PortalCatalog>>>,
     portal: Arc<dyn Portal>,
     status: Arc<RwLock<CatalogStatus>>,
+    /// Adult content shows only after the PIN unlocked it; never persisted.
+    adult_unlocked: AtomicBool,
 }
 
 impl CatalogStore {
@@ -429,7 +462,63 @@ impl CatalogStore {
             inner: Arc::new(RwLock::new(None)),
             portal,
             status: Arc::new(RwLock::new(CatalogStatus::Idle)),
+            adult_unlocked: AtomicBool::new(false),
         }
+    }
+
+    /// A store with a catalog already loaded (tests, tools).
+    pub fn from_catalog(portal: Arc<dyn Portal>, catalog: PortalCatalog) -> Self {
+        let store = Self::new(portal);
+        *store.inner.write() = Some(catalog);
+        *store.status.write() = CatalogStatus::Loaded;
+        store
+    }
+
+    pub fn set_adult_unlocked(&self, on: bool) {
+        self.adult_unlocked.store(on, Ordering::Relaxed);
+    }
+
+    pub fn adult_unlocked(&self) -> bool {
+        self.adult_unlocked.load(Ordering::Relaxed)
+    }
+
+    /// May this live channel show now?
+    fn shows_live(&self, c: &LiveChannel) -> bool {
+        self.adult_unlocked() || !adult_live(c)
+    }
+
+    /// Whether a stream URL plays adult content, whatever the lock state.
+    pub fn is_adult_url(&self, url: &str) -> bool {
+        let Some((kind, id)) = stream_ref(url) else {
+            return false;
+        };
+        let g = self.inner.read();
+        let Some(c) = g.as_ref() else {
+            return false;
+        };
+        match kind {
+            StreamKind::Live | StreamKind::Timeshift => {
+                c.live.iter().any(|x| x.stream_id == id && adult_live(x))
+            }
+            StreamKind::Movie => c.movies.iter().any(|m| m.stream_id == id && adult_movie(m)),
+            // Series URLs carry episode ids, not series ids.
+            StreamKind::Series => false,
+        }
+    }
+
+    /// Whether a saved favorite or preset must stay hidden now: adult and
+    /// locked. While the catalog is still loading only the name rule applies.
+    pub fn is_hidden_live(&self, sid: i64, name: &str) -> bool {
+        if self.adult_unlocked() {
+            return false;
+        }
+        if is_adult_name(name) {
+            return true;
+        }
+        self.inner
+            .read()
+            .as_ref()
+            .is_some_and(|c| c.live.iter().any(|x| x.stream_id == sid && adult_live(x)))
     }
 
     /// Spawn an async fetch on the current tokio runtime. Non-blocking.
@@ -492,7 +581,13 @@ impl CatalogStore {
         self.inner
             .read()
             .as_ref()
-            .map(|c| c.live.clone())
+            .map(|c| {
+                c.live
+                    .iter()
+                    .filter(|x| self.shows_live(x))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -502,7 +597,7 @@ impl CatalogStore {
         self.inner
             .read()
             .as_ref()
-            .map(|c| dedupe_zap(&c.live))
+            .map(|c| dedupe_zap(c.live.iter().filter(|x| self.shows_live(x))))
             .unwrap_or_default()
     }
 
@@ -518,6 +613,9 @@ impl CatalogStore {
         let Some(cur) = c.live.iter().find(|x| x.stream_id == sid) else {
             return QualityNav::default();
         };
+        if !self.shows_live(cur) {
+            return QualityNav::default();
+        }
         let key = normalize_channel_name(&cur.name);
         let ladder = quality_ladder(&c.live, &key);
         let pos = quality_pos(&ladder, sid, quality_rank(&cur.name));
@@ -535,7 +633,7 @@ impl CatalogStore {
             .map(|c| {
                 c.live
                     .iter()
-                    .filter(|x| x.tv_archive == 1)
+                    .filter(|x| x.tv_archive == 1 && self.shows_live(x))
                     .cloned()
                     .collect()
             })
@@ -550,7 +648,11 @@ impl CatalogStore {
         self.inner.read().as_ref().and_then(|c| {
             c.live
                 .iter()
-                .find(|x| x.tv_archive != 1 && normalize_channel_name(&x.name) == target)
+                .find(|x| {
+                    x.tv_archive != 1
+                        && normalize_channel_name(&x.name) == target
+                        && self.shows_live(x)
+                })
                 .map(|x| x.stream_id)
         })
     }
@@ -566,7 +668,11 @@ impl CatalogStore {
         self.inner.read().as_ref().and_then(|c| {
             c.live
                 .iter()
-                .find(|x| x.tv_archive == 1 && normalize_channel_name(&x.name) == target)
+                .find(|x| {
+                    x.tv_archive == 1
+                        && normalize_channel_name(&x.name) == target
+                        && self.shows_live(x)
+                })
                 .map(|x| x.stream_id)
         })
     }
@@ -578,25 +684,31 @@ impl CatalogStore {
         };
         let mut v = Vec::with_capacity(c.live.len() + c.movies.len() + c.series.len());
         for x in &c.live {
-            v.push(SearchItem {
-                id: x.stream_id,
-                name: x.name.clone(),
-                kind: ItemKind::Live,
-            });
+            if self.shows_live(x) {
+                v.push(SearchItem {
+                    id: x.stream_id,
+                    name: x.name.clone(),
+                    kind: ItemKind::Live,
+                });
+            }
         }
         for x in &c.movies {
-            v.push(SearchItem {
-                id: x.stream_id,
-                name: x.name.clone(),
-                kind: ItemKind::Movie,
-            });
+            if self.adult_unlocked() || !adult_movie(x) {
+                v.push(SearchItem {
+                    id: x.stream_id,
+                    name: x.name.clone(),
+                    kind: ItemKind::Movie,
+                });
+            }
         }
         for x in &c.series {
-            v.push(SearchItem {
-                id: x.series_id,
-                name: x.name.clone(),
-                kind: ItemKind::Series,
-            });
+            if self.adult_unlocked() || !adult_series(x) {
+                v.push(SearchItem {
+                    id: x.series_id,
+                    name: x.name.clone(),
+                    kind: ItemKind::Series,
+                });
+            }
         }
         v
     }
