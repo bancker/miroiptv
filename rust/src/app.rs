@@ -67,6 +67,12 @@ fn programme_status(
     }
 }
 
+/// Whether a guide pick plays as live TV: through the relay, with the stall
+/// watchdog armed and resumed as live. Catch-up plays as VOD.
+fn plays_as_live(status: ProgrammeStatus) -> bool {
+    matches!(status, ProgrammeStatus::Live)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeMode {
     /// Each column scrolls to its currently-airing programme on open / mode-switch.
@@ -2534,7 +2540,7 @@ impl TvApp {
             entry.start.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"),
             entry.end.with_timezone(&chrono::Local).format("%H:%M")
         );
-        self.load_url(url, false);
+        self.load_url(url, plays_as_live(status));
         self.current_name = Some(format!("{} - {}", channel.name, entry.title));
         self.current_stream_id = Some(channel.stream_id);
         self.current_epg = None;
@@ -3273,5 +3279,16 @@ impl eframe::App for TvApp {
         self.paint_help(ctx);
 
         ctx.request_repaint_after(Duration::from_millis(33));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_live_guide_pick_plays_through_the_relay() {
+        assert!(plays_as_live(ProgrammeStatus::Live));
+        assert!(!plays_as_live(ProgrammeStatus::Catchup));
     }
 }
