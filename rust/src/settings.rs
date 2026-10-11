@@ -22,12 +22,27 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// The saved preferences. A missing file gives the defaults; a broken one
-    /// too, with a warning; one bad value costs only that value.
+    /// The saved preferences. A missing file gives the defaults silently; an
+    /// unreadable or broken file logs a warning and returns defaults; one bad
+    /// value costs only that value.
     pub fn load(path: &Path) -> Self {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Self::default();
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "settings: {} is unreadable ({}) - using defaults",
+                        path.display(),
+                        e
+                    );
+                }
+                return Self::default();
+            }
         };
+        // Decode with lossy conversion: a stray byte becomes a replacement
+        // character, so the PIN survives an ANSI-saved file or UTF-16LE becomes
+        // garbage, triggering the JSON error path with a warning.
+        let text = String::from_utf8_lossy(&bytes);
         // Notepad's "UTF-8 with BOM" puts U+FEFF first; JSON does not allow it.
         let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
         match serde_json::from_str::<serde_json::Value>(text) {

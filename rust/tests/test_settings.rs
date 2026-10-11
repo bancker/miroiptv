@@ -89,3 +89,26 @@ fn no_news_rules_and_an_empty_list_differ() {
         "the user removed every rule"
     );
 }
+
+#[test]
+fn a_stray_non_utf8_byte_costs_only_that_character() {
+    // An ANSI character (0xE9 = "é") in a rule label should not drop the language and PIN.
+    let (_d, p) = temp();
+    let pin = PinHash::with_salt("1234", [9; 16]).unwrap();
+    let json = serde_json::json!({
+        "language": "en",
+        "pin": pin,
+        "news_rules": [{"channel": "test", "patterns": "*", "label": "TV", "skip_secs": 0}]
+    });
+    let mut bytes = json.to_string().into_bytes();
+    // Insert 0xE9 (invalid UTF-8) in the JSON to simulate ANSI-saved file
+    bytes.insert(50, 0xE9);
+    std::fs::write(&p, bytes).unwrap();
+    let s = Settings::load(&p);
+    assert_eq!(
+        s.language,
+        Some("en".into()),
+        "language survives stray byte"
+    );
+    assert_eq!(s.pin, Some(pin), "PIN survives stray byte");
+}
