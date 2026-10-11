@@ -2008,14 +2008,14 @@ impl TvApp {
             text.push_str(&format!(
                 "> {}  ({}-{})",
                 cur.title,
-                cur.start.format("%H:%M"),
-                cur.end.format("%H:%M")
+                crate::epg::hhmm(cur.start),
+                crate::epg::hhmm(cur.end)
             ));
         }
         if let Some(nxt) = epg.next_at(now) {
             text.push_str(&format!(
                 "    ->  {}  {}",
-                nxt.start.format("%H:%M"),
+                crate::epg::hhmm(nxt.start),
                 nxt.title
             ));
         }
@@ -2053,7 +2053,7 @@ impl TvApp {
                     .fill(Color32::from_black_alpha(230))
                     .show(ui, |ui| {
                         ui.set_width(560.0);
-                        ui.heading("EPG");
+                        ui.heading(self.t(T::EpgTitle));
                         ui.separator();
                         egui::ScrollArea::vertical()
                             .max_height(420.0)
@@ -2061,8 +2061,8 @@ impl TvApp {
                                 for e in epg.entries() {
                                     ui.label(format!(
                                         "{}-{}  {}",
-                                        e.start.format("%H:%M"),
-                                        e.end.format("%H:%M"),
+                                        crate::epg::hhmm(e.start),
+                                        crate::epg::hhmm(e.end),
                                         e.title
                                     ));
                                 }
@@ -2071,54 +2071,67 @@ impl TvApp {
             });
     }
 
-    fn paint_help(&self, ctx: &egui::Context) {
+    /// The help rows per section, (key, action), in the current language and
+    /// with the zap direction as set.
+    fn help_rows(&self) -> [(T, Vec<(String, &'static str)>); 2] {
+        let t = |k: T| crate::i18n::t(self.lang, k);
+        let key = |s: &str| s.to_string();
+        let zap = if self.settings.swap_zap_keys {
+            T::HelpZapSwapped
+        } else {
+            T::HelpZap
+        };
+        [
+            (
+                T::HelpViewer,
+                vec![
+                    (t(T::KeyUpDownWheel).to_string(), t(zap)),
+                    (t(T::KeyDigitsTap).to_string(), t(T::HelpPresetRecall)),
+                    (t(T::KeyDigitsHold).to_string(), t(T::HelpPresetStore)),
+                    (key("n"), t(T::HelpNews)),
+                    (key("f"), t(T::HelpSearch)),
+                    (key("Shift+F"), t(T::HelpFavorites)),
+                    (key("*"), t(T::HelpToggleFavorite)),
+                    (key("e"), t(T::HelpEpgStrip)),
+                    (key("Shift+E"), t(T::HelpEpgGrid)),
+                    (key("a / s"), t(T::HelpAudioSubs)),
+                    (key("+ / -"), t(T::HelpQuality)),
+                    (t(T::KeyLeftRight).to_string(), t(T::HelpSeek)),
+                    (t(T::KeySpace).to_string(), t(T::HelpPause)),
+                    (key("o"), t(T::HelpSettings)),
+                    (key("F11"), t(T::HelpFullscreen)),
+                    (key("F5"), t(T::HelpRetryPortal)),
+                    (key("d"), t(T::HelpDebug)),
+                    (key("g"), t(T::HelpOpenGuide)),
+                    (key("t"), t(T::HelpBorderless)),
+                    (key("?"), t(T::HelpThisHelp)),
+                    (key("Esc"), t(T::HelpCloseOverlays)),
+                ],
+            ),
+            (
+                T::HelpGuide,
+                vec![
+                    (t(T::KeyTypeLetters).to_string(), t(T::HelpGuideFilter)),
+                    (key("Backspace"), t(T::HelpGuideBackspace)),
+                    (t(T::KeyUpDown).to_string(), t(T::HelpGuideRows)),
+                    (t(T::KeyLeftRight).to_string(), t(T::HelpGuideColumns)),
+                    (key("PgUp / PgDn"), t(T::HelpGuidePage)),
+                    (key("Home / End"), t(T::HelpGuideHomeEnd)),
+                    (key("n / p"), t(T::HelpGuideTimeMode)),
+                    (key("a / l / t"), t(T::HelpGuideChannelMode)),
+                    (key("Enter"), t(T::HelpGuidePlay)),
+                    (t(T::KeyEscOrG).to_string(), t(T::HelpGuideClose)),
+                ],
+            ),
+        ]
+    }
+
+    /// Draws the help overlay; true when the user clicked the settings row.
+    fn paint_help(&self, ctx: &egui::Context) -> bool {
         if !self.show_help {
-            return;
+            return false;
         }
-        // ROWS: (key, action). Categorised via leading-space prefix on
-        // section headers so the layout stays compact and one column.
-        const SECTIONS: &[(&str, &[(&str, &str)])] = &[
-            (
-                "Viewer (when guide is closed)",
-                &[
-                    ("Up / Down  -  Mouse wheel", "previous / next channel"),
-                    ("0-9  (tap)", "recall channel preset"),
-                    ("0-9  (hold)", "store current channel as preset"),
-                    ("n", "nieuws kiezen: NOS / RTL / CNN / BBC / VRT / ZLD"),
-                    ("f", "cross-catalog search (live + films + series)"),
-                    ("Shift+F", "favorites panel"),
-                    ("*", "toggle current channel as favorite"),
-                    ("e", "EPG strip overlay (now + next)"),
-                    ("Shift+E", "EPG grid"),
-                    ("a / s", "cycle audio / subtitle track"),
-                    ("+ / -", "hogere / lagere kwaliteit (live)"),
-                    ("Left / Right", "VOD seek -30s / +30s"),
-                    ("Space", "pauze / verder (film, serie, terugkijken)"),
-                    ("F11", "fullscreen"),
-                    ("F5", "retry portal fetch"),
-                    ("d", "debug HUD"),
-                    ("g", "open guide"),
-                    ("t", "borderless + always-on-top  (toggle)"),
-                    ("?", "this help"),
-                    ("Esc", "close overlays"),
-                ],
-            ),
-            (
-                "Guide (when guide is open)",
-                &[
-                    ("type letters", "filter channels"),
-                    ("Backspace", "remove from filter"),
-                    ("Up / Down", "programme cursor in selected column"),
-                    ("Left / Right", "switch column"),
-                    ("PgUp / PgDn", "10 rows jump"),
-                    ("Home / End", "first / last programme"),
-                    ("n / p", "Nu & straks  /  Primetime time-mode"),
-                    ("a / l / t", "Alle  /  Live  /  Terugkijken channel-mode"),
-                    ("Enter", "play selected programme (live / catch-up)"),
-                    ("Esc or g", "close guide"),
-                ],
-            ),
-        ];
+        let mut open_settings = false;
         egui::Area::new(egui::Id::new("__help__"))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
@@ -2128,39 +2141,43 @@ impl TvApp {
                     .show(ui, |ui| {
                         ui.set_max_width(720.0);
                         ui.label(
-                            egui::RichText::new(format!(
-                                "{} v{}  -  hotkeys",
-                                crate::APP_NAME,
-                                env!("CARGO_PKG_VERSION")
+                            egui::RichText::new(self.tr(
+                                T::HelpTitle,
+                                &[crate::APP_NAME, env!("CARGO_PKG_VERSION")],
                             ))
                             .color(Color32::WHITE)
                             .heading(),
                         );
                         ui.add_space(8.0);
-                        for (section, rows) in SECTIONS {
+                        for (si, (section, rows)) in self.help_rows().into_iter().enumerate() {
                             ui.label(
-                                egui::RichText::new(*section)
+                                egui::RichText::new(self.t(section))
                                     .color(Color32::from_rgb(120, 180, 240))
                                     .strong()
                                     .size(13.0),
                             );
                             ui.add_space(4.0);
-                            egui::Grid::new(format!("__help_grid_{}", section))
+                            egui::Grid::new(("__help_grid__", si))
                                 .num_columns(2)
                                 .spacing([24.0, 4.0])
                                 .show(ui, |ui| {
-                                    for (key, action) in *rows {
-                                        ui.label(
-                                            egui::RichText::new(*key)
-                                                .monospace()
-                                                .color(Color32::from_rgb(230, 220, 110))
-                                                .size(12.0),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(*action)
-                                                .color(Color32::from_white_alpha(220))
-                                                .size(12.0),
-                                        );
+                                    for (key, action) in rows {
+                                        let key_text = egui::RichText::new(&key)
+                                            .monospace()
+                                            .color(Color32::from_rgb(230, 220, 110))
+                                            .size(12.0);
+                                        let action_text = egui::RichText::new(action)
+                                            .color(Color32::from_white_alpha(220))
+                                            .size(12.0);
+                                        if key == "o" {
+                                            // The settings row is a link to them.
+                                            let k = ui.link(key_text);
+                                            let a = ui.link(action_text);
+                                            open_settings |= k.clicked() || a.clicked();
+                                        } else {
+                                            ui.label(key_text);
+                                            ui.label(action_text);
+                                        }
                                         ui.end_row();
                                     }
                                 });
@@ -2168,13 +2185,14 @@ impl TvApp {
                         }
                         ui.separator();
                         ui.label(
-                            egui::RichText::new("(c) 2026 Bart    -    press ? or Esc to close")
+                            egui::RichText::new(self.t(T::HelpFooter))
                                 .italics()
                                 .color(Color32::from_white_alpha(140))
                                 .size(11.0),
                         );
                     });
             });
+        open_settings
     }
 
     fn paint_debug_hud(&self, ctx: &egui::Context) {
@@ -2303,7 +2321,7 @@ impl TvApp {
 
     fn toggle_guide(&mut self) {
         if !self.catalog.is_loaded() {
-            self.set_toast("catalog still loading - press g again in a moment");
+            self.set_toast(self.t(T::GuideCatalogLoading));
             return;
         }
         self.guide.open = !self.guide.open;
@@ -2609,7 +2627,7 @@ impl TvApp {
         let row = *self.guide.row_per_channel.get(&channel.stream_id).unwrap_or(&0);
         let maybe_epg = self.guide.epg_cache.lock().get(&channel.stream_id).cloned();
         let Some(epg) = maybe_epg else {
-            self.set_toast("EPG not loaded yet for this channel");
+            self.set_toast(self.t(T::GuideEpgNotLoaded));
             return;
         };
         let Some(entry) = epg.entries().get(row).cloned() else { return; };
@@ -2617,18 +2635,14 @@ impl TvApp {
         let status = programme_status(&entry, &channel, now);
         let (url, tag) = match status {
             ProgrammeStatus::Future => {
-                self.set_toast(format!(
-                    "not yet aired: {} ({})",
-                    entry.title,
-                    entry.start.with_timezone(&chrono::Local).format("%H:%M")
+                self.set_toast(self.tr(
+                    T::GuideNotAired,
+                    &[&entry.title, &crate::epg::hhmm(entry.start)],
                 ));
                 return;
             }
             ProgrammeStatus::PastUnavailable => {
-                self.set_toast(format!(
-                    "no catch-up for '{}': not an archive channel",
-                    channel.name
-                ));
+                self.set_toast(self.tr(T::GuideNoCatchup, &[&channel.name]));
                 return;
             }
             ProgrammeStatus::Live => {
@@ -2663,12 +2677,13 @@ impl TvApp {
         self.current_name = Some(format!("{} - {}", channel.name, entry.title));
         self.current_stream_id = Some(channel.stream_id);
         self.current_epg = None;
+        let shown_tag = if tag == "LIVE" { "LIVE" } else { self.t(T::TagReplay) };
         self.set_toast(format!(
             "[{}] {} | {} @ {}",
-            tag,
+            shown_tag,
             channel.name,
             entry.title,
-            entry.start.with_timezone(&chrono::Local).format("%H:%M")
+            crate::epg::hhmm(entry.start)
         ));
         self.guide.open = false;
     }
@@ -2851,6 +2866,7 @@ impl TvApp {
         }
 
         let now = chrono::Utc::now();
+        let lang = self.lang;
         let time_mode = self.guide.time_mode;
         let chan_mode = self.guide.channel_mode;
         let filter_visible = self.guide.filter.clone();
@@ -2912,7 +2928,7 @@ impl TvApp {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("TV-gids")
+                                egui::RichText::new(crate::i18n::t(lang, T::GuideTitle))
                                     .heading()
                                     .color(Color32::WHITE),
                             );
@@ -2930,29 +2946,34 @@ impl TvApp {
                                         ui.label(egui::RichText::new(label).color(fg).size(12.0));
                                     });
                             };
-                            mode_pill(ui, "Nu & straks  (n)", time_mode == TimeMode::NowAndNext, Color32::from_rgb(60, 110, 170));
+                            mode_pill(ui, crate::i18n::t(lang, T::GuideNowNext), time_mode == TimeMode::NowAndNext, Color32::from_rgb(60, 110, 170));
                             ui.add_space(6.0);
-                            mode_pill(ui, "Primetime  (p)", time_mode == TimeMode::Primetime, Color32::from_rgb(60, 110, 170));
+                            mode_pill(ui, crate::i18n::t(lang, T::GuidePrimetime), time_mode == TimeMode::Primetime, Color32::from_rgb(60, 110, 170));
 
                             ui.add_space(18.0);
                             ui.separator();
                             ui.add_space(6.0);
 
                             // Channel-mode pills
-                            mode_pill(ui, "Alle  (a)", chan_mode == ChannelMode::All, Color32::from_rgb(80, 100, 120));
+                            mode_pill(ui, crate::i18n::t(lang, T::GuideAll), chan_mode == ChannelMode::All, Color32::from_rgb(80, 100, 120));
                             ui.add_space(4.0);
-                            mode_pill(ui, "Live  (l)", chan_mode == ChannelMode::Live, Color32::from_rgb(70, 130, 70));
+                            mode_pill(ui, crate::i18n::t(lang, T::GuideLive), chan_mode == ChannelMode::Live, Color32::from_rgb(70, 130, 70));
                             ui.add_space(4.0);
-                            mode_pill(ui, "Terugkijken  (t)", chan_mode == ChannelMode::Catchup, Color32::from_rgb(110, 140, 200));
+                            mode_pill(ui, crate::i18n::t(lang, T::GuideCatchup), chan_mode == ChannelMode::Catchup, Color32::from_rgb(110, 140, 200));
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if n_visible > 0 {
                                     ui.label(
-                                        egui::RichText::new(format!(
-                                            "channels {}-{} of {}",
-                                            column_offset + 1,
-                                            (column_offset + col_data.len()).min(n_visible),
-                                            n_visible
+                                        egui::RichText::new(crate::i18n::tr(
+                                            lang,
+                                            T::GuideChannelsRange,
+                                            &[
+                                                &(column_offset + 1).to_string(),
+                                                &(column_offset + col_data.len())
+                                                    .min(n_visible)
+                                                    .to_string(),
+                                                &n_visible.to_string(),
+                                            ],
                                         ))
                                         .color(Color32::from_white_alpha(150))
                                         .size(12.0),
@@ -2961,10 +2982,14 @@ impl TvApp {
                                 if let Some(np) = &now_playing {
                                     ui.add_space(20.0);
                                     ui.label(
-                                        egui::RichText::new(format!("speelt: {}", np))
-                                            .color(Color32::from_rgb(120, 220, 100))
-                                            .size(12.0)
-                                            .strong(),
+                                        egui::RichText::new(crate::i18n::tr(
+                                            lang,
+                                            T::GuidePlaying,
+                                            &[np],
+                                        ))
+                                        .color(Color32::from_rgb(120, 220, 100))
+                                        .size(12.0)
+                                        .strong(),
                                     );
                                 }
                             });
@@ -2974,10 +2999,14 @@ impl TvApp {
                         if !filter_visible.is_empty() {
                             ui.add_space(4.0);
                             ui.label(
-                                egui::RichText::new(format!("filter: {}_", filter_visible))
-                                    .color(Color32::from_rgb(230, 220, 110))
-                                    .monospace()
-                                    .size(13.0),
+                                egui::RichText::new(crate::i18n::tr(
+                                    lang,
+                                    T::GuideFilter,
+                                    &[&filter_visible],
+                                ))
+                                .color(Color32::from_rgb(230, 220, 110))
+                                .monospace()
+                                .size(13.0),
                             );
                         }
                     });
@@ -2997,9 +3026,9 @@ impl TvApp {
                     ui.vertical_centered(|ui| {
                         ui.label(
                             egui::RichText::new(match chan_mode {
-                                ChannelMode::Catchup => "geen terugkijk-kanalen matchen filter",
-                                ChannelMode::Live => "geen live-kanalen matchen filter",
-                                ChannelMode::All => "geen kanalen matchen filter",
+                                ChannelMode::Catchup => crate::i18n::t(lang, T::GuideNoCatchupMatch),
+                                ChannelMode::Live => crate::i18n::t(lang, T::GuideNoLiveMatch),
+                                ChannelMode::All => crate::i18n::t(lang, T::GuideNoMatch),
                             })
                             .color(Color32::from_white_alpha(140))
                             .italics()
@@ -3059,7 +3088,11 @@ impl TvApp {
                                                     );
                                                 });
                                             ui.add_space(4.0);
-                                            let suffix = if is_archive { "  TK" } else { "" };
+                                            let suffix = if is_archive {
+                                                format!("  {}", crate::i18n::t(lang, T::GuideArchiveBadge))
+                                            } else {
+                                                String::new()
+                                            };
                                             ui.add(
                                                 egui::Label::new(
                                                     egui::RichText::new(format!(
@@ -3078,15 +3111,15 @@ impl TvApp {
                                 if cd.programmes.is_empty() {
                                     column_ui.add_space(8.0);
                                     let (msg, col_) = if cd.loading {
-                                        ("EPG laden...", Color32::from_white_alpha(120))
+                                        (crate::i18n::t(lang, T::GuideEpgLoading), Color32::from_white_alpha(120))
                                     } else if cd.failed {
                                         (
-                                            "EPG ophalen mislukt",
+                                            crate::i18n::t(lang, T::GuideEpgFailed),
                                             Color32::from_rgb(220, 130, 110),
                                         )
                                     } else {
                                         (
-                                            "portal heeft geen EPG voor dit kanaal",
+                                            crate::i18n::t(lang, T::GuideNoEpg),
                                             Color32::from_white_alpha(95),
                                         )
                                     };
@@ -3147,7 +3180,7 @@ impl TvApp {
                                                 ProgrammeStatus::Catchup => (
                                                     Color32::from_rgb(18, 18, 22),
                                                     Color32::from_white_alpha(210),
-                                                    Some(("TK", Color32::from_rgb(140, 180, 220))),
+                                                    Some((crate::i18n::t(lang, T::GuideArchiveBadge), Color32::from_rgb(140, 180, 220))),
                                                 ),
                                                 ProgrammeStatus::Future => (
                                                     Color32::from_rgb(18, 18, 22),
@@ -3300,11 +3333,9 @@ impl TvApp {
                 ui.add_space(4.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new(
-                            "type = filter   /   pijl = nav   /   PgUp/PgDn = sneller   /   Enter = afspelen   /   Esc of g = sluiten",
-                        )
-                        .color(Color32::from_white_alpha(95))
-                        .size(11.0),
+                        egui::RichText::new(crate::i18n::t(lang, T::GuideFooter))
+                            .color(Color32::from_white_alpha(95))
+                            .size(11.0),
                     );
                 });
             });
@@ -3410,7 +3441,10 @@ impl eframe::App for TvApp {
         // Help overlay paints last so it sits on top of everything,
         // including the guide. Whether the guide is open is irrelevant
         // for `?` - the help is a global overlay.
-        self.paint_help(ctx);
+        if self.paint_help(ctx) {
+            self.show_help = false;
+            self.open_settings();
+        }
         self.paint_settings(ctx);
 
         ctx.request_repaint_after(Duration::from_millis(33));
