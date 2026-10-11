@@ -604,7 +604,8 @@ impl CatalogStore {
     /// Quality ladder for the channel currently playing `sid`, plus the index
     /// within it — for the +/- quality switcher. One read-lock, no full-catalog
     /// clone (only this channel's handful of variants are cloned). Empty ladder
-    /// when the catalog isn't loaded or `sid` is unknown.
+    /// when the catalog isn't loaded, `sid` is unknown or hidden (adult while
+    /// locked); hidden variants of a shown channel are no rungs either.
     pub fn quality_nav(&self, sid: i64) -> QualityNav {
         let g = self.inner.read();
         let Some(c) = g.as_ref() else {
@@ -617,7 +618,9 @@ impl CatalogStore {
             return QualityNav::default();
         }
         let key = normalize_channel_name(&cur.name);
-        let ladder = quality_ladder(&c.live, &key);
+        let mut ladder = quality_ladder(&c.live, &key);
+        // Before `pos`: it indexes the ladder the user steps through.
+        ladder.retain(|x| self.shows_live(x));
         let pos = quality_pos(&ladder, sid, quality_rank(&cur.name));
         QualityNav { ladder, pos }
     }

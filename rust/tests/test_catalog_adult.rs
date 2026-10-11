@@ -1,6 +1,6 @@
 //! The catalog hides adult channels and films while locked, everywhere the
 //! app takes its lists from.
-use bongo_player::catalog::CatalogStore;
+use bongo_player::catalog::{fallback_variant, CatalogStore, QualityNav};
 use bongo_player::epg::Epg;
 use bongo_player::portal::{Catalog, Episode, LiveChannel, Movie, Portal, PortalError, Series};
 use std::sync::Arc;
@@ -94,6 +94,10 @@ fn series(id: i64, name: &str, adult: bool) -> Series {
         name: name.into(),
         is_adult: adult,
     }
+}
+
+fn rungs(nav: &QualityNav) -> Vec<i64> {
+    nav.ladder.iter().map(|c| c.stream_id).collect()
 }
 
 #[test]
@@ -209,4 +213,53 @@ fn a_store_without_a_catalog_does_not_panic_and_still_applies_the_name_rule() {
     assert!(s.zap_channels().is_empty());
     assert!(s.search_items().is_empty());
     assert!(s.quality_nav(1).ladder.is_empty());
+}
+
+#[test]
+fn a_hidden_variant_is_no_rung_on_a_visible_channels_ladder() {
+    // Channel 2 is hidden by the name rule but has channel 1's channel name.
+    let s = CatalogStore::from_catalog(
+        Arc::new(NullPortal),
+        Catalog {
+            live: vec![
+                live(1, "NL | Foo HD", false),
+                live(2, "XXX | Foo FHD", false),
+            ],
+            ..Catalog::default()
+        },
+    );
+    let nav = s.quality_nav(1);
+    assert_eq!(rungs(&nav), [1]);
+    assert_eq!(nav.pos, Some(0));
+    // The 407 fallback has nothing hidden to switch to.
+    assert!(fallback_variant(&nav.ladder, 1, |_| false).is_none());
+    s.set_adult_unlocked(true);
+    let nav = s.quality_nav(1);
+    assert_eq!(rungs(&nav), [1, 2]);
+    assert_eq!(nav.pos, Some(0));
+    let alt = fallback_variant(&nav.ladder, 1, |_| false);
+    assert_eq!(alt.map(|c| c.stream_id), Some(2));
+}
+
+#[test]
+fn the_ladder_position_counts_only_the_rungs_that_show() {
+    // Hidden 2 (HD) sits below the playing 1 (FHD), hidden 3 (UHD) above it.
+    let s = CatalogStore::from_catalog(
+        Arc::new(NullPortal),
+        Catalog {
+            live: vec![
+                live(1, "NL | Foo FHD", false),
+                live(2, "XXX | Foo HD", false),
+                live(3, "XXX | Foo UHD", false),
+            ],
+            ..Catalog::default()
+        },
+    );
+    let nav = s.quality_nav(1);
+    assert_eq!(rungs(&nav), [1]);
+    assert_eq!(nav.pos, Some(0));
+    s.set_adult_unlocked(true);
+    let nav = s.quality_nav(1);
+    assert_eq!(rungs(&nav), [2, 1, 3]);
+    assert_eq!(nav.pos, Some(1));
 }
