@@ -54,10 +54,15 @@ pub struct SettingsView<'a> {
 #[derive(Default)]
 pub struct SettingsUi {
     section: usize,
-    /// Keyboard focus is in the section's controls, not in the list.
+    /// Keyboard focus is in the section's controls, not in the list. Enter,
+    /// Right and a click on a row set it; so does any control that is not a
+    /// list row getting the focus (Tab, a click into a text field).
     in_pane: bool,
     /// Focus the section's first control on the next frame.
     focus_first: bool,
+    /// The list rows' widget ids from the last frame: they tell a focused row
+    /// from a focused control.
+    list_ids: Vec<egui::Id>,
 }
 
 impl SettingsUi {
@@ -68,6 +73,13 @@ impl SettingsUi {
     pub fn show(&mut self, ctx: &egui::Context, view: &SettingsView) -> Vec<SettingsAction> {
         let mut actions = Vec::new();
         let lang = view.lang;
+        // The mode follows the keyboard focus: a control that is not a list
+        // row having it puts the overlay in its section, whatever gave it the
+        // focus (Tab, Enter, a click).
+        let focused = ctx.memory(|m| m.focused());
+        if focused.is_some_and(|id| !self.list_ids.contains(&id)) {
+            self.in_pane = true;
+        }
         // Taken before any widget sees them: in the list, arrows and Enter
         // belong to the overlay, not to a focused control.
         ctx.input_mut(|i| {
@@ -93,6 +105,12 @@ impl SettingsUi {
             if i.consume_key(Modifiers::NONE, Key::Enter)
                 || i.consume_key(Modifiers::NONE, Key::ArrowRight)
             {
+                // On a focused row, that row's section opens.
+                if let Some(row) =
+                    focused.and_then(|id| self.list_ids.iter().position(|r| *r == id))
+                {
+                    self.section = row;
+                }
                 self.in_pane = true;
                 self.focus_first = true;
             }
@@ -100,6 +118,9 @@ impl SettingsUi {
         let width = (ctx.screen_rect().width() - 40.0).clamp(480.0, 760.0);
         egui::Area::new(egui::Id::new("__settings__"))
             .order(egui::Order::Foreground)
+            // Its default click sense is a focusable widget: a first Tab stop
+            // that shows nothing, and no list row or control.
+            .sense(egui::Sense::hover())
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 egui::Frame::popup(&ctx.style())
@@ -116,11 +137,12 @@ impl SettingsUi {
                         let row = ui.horizontal_top(|ui| {
                             let list = ui.vertical(|ui| {
                                 ui.set_width(170.0);
+                                self.list_ids.clear();
                                 for (i, s) in Section::ALL.iter().enumerate() {
-                                    if ui
-                                        .selectable_label(i == self.section, t(lang, s.title()))
-                                        .clicked()
-                                    {
+                                    let label =
+                                        ui.selectable_label(i == self.section, t(lang, s.title()));
+                                    self.list_ids.push(label.id);
+                                    if label.clicked() {
                                         self.section = i;
                                         self.in_pane = true;
                                         self.focus_first = true;
@@ -197,9 +219,13 @@ fn controls_pane(
 }
 
 /// The first-start language choice: three big buttons, each in its own
-/// language. Up/Down move, Enter or a click picks. Returns the choice.
+/// language. Up/Down move the highlight and Enter picks it; after Tab, Enter
+/// picks the button with the focus instead. A click picks too. Returns the
+/// choice.
 pub fn language_screen(ctx: &egui::Context, selected: &mut Lang) -> Option<Lang> {
     let mut picked = None;
+    // A focused button gets Enter itself: its click picks its language.
+    let nothing_focused = ctx.memory(|m| m.focused()).is_none();
     ctx.input_mut(|i| {
         let pos = Lang::ALL.iter().position(|l| l == selected).unwrap_or(0);
         if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
@@ -208,7 +234,7 @@ pub fn language_screen(ctx: &egui::Context, selected: &mut Lang) -> Option<Lang>
         if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
             *selected = Lang::ALL[pos.saturating_sub(1)];
         }
-        if i.consume_key(Modifiers::NONE, Key::Enter) {
+        if nothing_focused && i.consume_key(Modifiers::NONE, Key::Enter) {
             picked = Some(*selected);
         }
     });
@@ -235,4 +261,203 @@ pub fn language_screen(ctx: &egui::Context, selected: &mut Lang) -> Option<Lang>
             });
         });
     picked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The view the overlay is drawn with. Built here only, so a field added
+    /// to `SettingsView` is added in one place.
+    fn make_view(settings: &Settings) -> SettingsView<'_> {
+        SettingsView {
+            lang: Lang::En,
+            settings,
+        }
+    }
+
+    /// One headless frame in which these keys are pressed.
+    fn run_frame(ctx: &egui::Context, keys: &[Key], draw: impl FnOnce(&egui::Context)) {
+        let press = |key: Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            events: keys.iter().map(|&key| press(key)).collect(),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, draw);
+    }
+
+    /// The overlay on a headless egui context, one frame per call.
+    struct Overlay {
+        ctx: egui::Context,
+        ui: SettingsUi,
+        settings: Settings,
+    }
+
+    impl Overlay {
+        fn new() -> Self {
+            let mut overlay = Overlay {
+                ctx: egui::Context::default(),
+                ui: SettingsUi::new(),
+                settings: Settings::default(),
+            };
+            // Two empty frames first, so the widgets exist before the first key.
+            overlay.frame(&[]);
+            overlay.frame(&[]);
+            overlay
+        }
+
+        /// One frame with these keys pressed; what the overlay reports.
+        fn frame(&mut self, keys: &[Key]) -> Vec<SettingsAction> {
+            let mut actions = Vec::new();
+            let view = make_view(&self.settings);
+            run_frame(&self.ctx, keys, |ctx| actions = self.ui.show(ctx, &view));
+            actions
+        }
+
+        /// `times` frames with the same key; none may report anything.
+        fn press(&mut self, key: Key, times: usize) {
+            for _ in 0..times {
+                let actions = self.frame(&[key]);
+                assert!(actions.is_empty(), "{key:?} reported {actions:?}");
+            }
+        }
+    }
+
+    /// The first-start language screen on a headless egui context.
+    struct Screen {
+        ctx: egui::Context,
+        selected: Lang,
+    }
+
+    impl Screen {
+        /// English is preselected, as on a machine with an English Windows.
+        fn new() -> Self {
+            let mut screen = Screen {
+                ctx: egui::Context::default(),
+                selected: Lang::En,
+            };
+            screen.frame(&[]);
+            screen.frame(&[]);
+            screen
+        }
+
+        fn frame(&mut self, keys: &[Key]) -> Option<Lang> {
+            let mut picked = None;
+            run_frame(&self.ctx, keys, |ctx| {
+                picked = language_screen(ctx, &mut self.selected)
+            });
+            picked
+        }
+    }
+
+    #[test]
+    fn o_and_esc_close_the_overlay_from_the_list() {
+        assert_eq!(Overlay::new().frame(&[Key::O]), vec![SettingsAction::Close]);
+        assert_eq!(
+            Overlay::new().frame(&[Key::Escape]),
+            vec![SettingsAction::Close]
+        );
+    }
+
+    #[test]
+    fn up_and_down_choose_the_section_and_right_opens_it() {
+        let mut o = Overlay::new();
+        o.press(Key::ArrowDown, 3); // Adult
+        o.press(Key::ArrowUp, 1); // Controls, the third section
+        o.press(Key::ArrowRight, 1); // into it: the checkbox has the focus
+        assert_eq!(
+            o.frame(&[Key::Space]),
+            vec![SettingsAction::SetSwapZap(true)]
+        );
+    }
+
+    #[test]
+    fn enter_opens_the_language_section_on_its_first_radio() {
+        let mut o = Overlay::new();
+        o.press(Key::Enter, 1);
+        // The first radio is Nederlands; the view's language is English.
+        assert_eq!(
+            o.frame(&[Key::Space]),
+            vec![SettingsAction::SetLanguage(Lang::Nl)]
+        );
+    }
+
+    #[test]
+    fn in_a_section_o_is_just_a_letter_and_esc_goes_back_first() {
+        let mut o = Overlay::new();
+        o.press(Key::ArrowDown, 2);
+        o.press(Key::Enter, 1);
+        assert_eq!(o.frame(&[Key::O]), vec![]);
+        assert_eq!(o.frame(&[Key::Escape]), vec![]);
+        assert_eq!(o.frame(&[Key::Escape]), vec![SettingsAction::Close]);
+    }
+
+    #[test]
+    fn tabbing_through_the_list_rows_keeps_the_overlay_in_the_list() {
+        // The first Tab goes to the first row (the overlay's own frame is not
+        // a stop), and with a row focused `o` and Esc still close the overlay.
+        let mut o = Overlay::new();
+        o.press(Key::Tab, 2);
+        assert_eq!(o.frame(&[Key::O]), vec![SettingsAction::Close]);
+        let mut o = Overlay::new();
+        o.press(Key::Tab, 2);
+        assert_eq!(o.frame(&[Key::Escape]), vec![SettingsAction::Close]);
+    }
+
+    #[test]
+    fn tabbing_into_a_control_puts_the_overlay_in_its_section() {
+        let mut o = Overlay::new();
+        // The Controls section is shown; Tab walks its five list rows, then
+        // lands on the checkbox.
+        o.press(Key::ArrowDown, 2);
+        o.press(Key::Tab, 6);
+        // With the focus on a control `o` is just a letter, Esc goes back to
+        // the list and only the next Esc closes.
+        assert_eq!(o.frame(&[Key::O]), vec![]);
+        assert_eq!(o.frame(&[Key::Escape]), vec![]);
+        assert_eq!(o.frame(&[Key::Escape]), vec![SettingsAction::Close]);
+    }
+
+    #[test]
+    fn enter_on_a_focused_list_row_opens_that_rows_section() {
+        let mut o = Overlay::new();
+        // Tab to the third row (Controls) while the pane still shows Language.
+        o.press(Key::Tab, 3);
+        o.press(Key::Enter, 1);
+        // The Controls checkbox has the focus, not a Language radio.
+        assert_eq!(
+            o.frame(&[Key::Space]),
+            vec![SettingsAction::SetSwapZap(true)]
+        );
+    }
+
+    #[test]
+    fn enter_on_the_language_screen_picks_the_selected_language_when_nothing_has_focus() {
+        assert_eq!(Screen::new().frame(&[Key::Enter]), Some(Lang::En));
+        let mut screen = Screen::new();
+        assert_eq!(screen.frame(&[Key::ArrowDown]), None);
+        assert_eq!(screen.selected, Lang::De);
+        assert_eq!(screen.frame(&[Key::Enter]), Some(Lang::De));
+    }
+
+    #[test]
+    fn enter_on_the_language_screen_picks_the_button_with_the_focus() {
+        let mut screen = Screen::new();
+        // Tab walks Nederlands, English, Deutsch; English stays preselected.
+        for _ in 0..3 {
+            assert_eq!(screen.frame(&[Key::Tab]), None);
+        }
+        assert_eq!(screen.frame(&[Key::Enter]), Some(Lang::De));
+        assert_eq!(screen.selected, Lang::En);
+    }
 }
