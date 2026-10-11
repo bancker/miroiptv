@@ -361,6 +361,7 @@ pub struct TvApp {
 }
 
 impl TvApp {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         player: PlayerHandle,
