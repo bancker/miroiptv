@@ -23,6 +23,7 @@ pub mod presets;
 pub mod redact;
 pub mod relay;
 pub mod search;
+pub mod settings;
 pub mod shortcuts;
 pub mod storage;
 pub mod zap;
