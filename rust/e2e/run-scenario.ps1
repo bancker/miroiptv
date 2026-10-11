@@ -8,11 +8,15 @@ keys to its window and checks its log. Example:
 BACKSPACE SPACE, or one character such as o f n 1), TEXT:<text>, SLEEP:<ms>,
 MARK:<label>. Keys are posted to the app's window, so nothing reaches other
 windows and no focus is needed. Exit code 1 when an -Expect is missing or a
--Forbid matches.
+-Forbid matches, and also when the run proves nothing: no log (or no "starting"
+line), no window to post the keys to (waits up to 10 s for it), the app exited
+by itself before the run ended, or it left a panic-*.log. Exit code 0 otherwise.
 
 -Settings replaces settings.json; without it a folder that has none gets
 {"language":"nl"}, so the first-start language screen stays away unless
--FirstStart asks for it. -ConfigDir reuses a folder across runs (restarts).
+-FirstStart asks for it. -ConfigDir reuses a folder across runs (restarts); its
+old BongoPlayer.log.* and panic-*.log are removed first, so a run is judged on
+its own log lines only.
 #>
 param(
     [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\BongoPlayer.exe'),
@@ -79,8 +83,16 @@ if ($lastUrl) {
     $adult = if ($OldResumeFile) { '' } else { ',"adult":false' }
     Set-Content (Join-Path $ConfigDir 'last_watched.json') ('{"url":"' + $lastUrl + '","live":' + $live + $adult + '}') -Encoding ASCII -NoNewline
 }
+# A reused -ConfigDir still holds the previous run's log (the app appends to one
+# file per day) and panic files: clear them, so a run is judged on its own lines.
+$logDir = Join-Path $ConfigDir 'log'
+foreach ($old in 'BongoPlayer.log.*', 'panic-*.log') {
+    Get-ChildItem $logDir -Filter $old -ErrorAction SilentlyContinue | Remove-Item -Force
+}
 $mock = $null; $app = $null
 $saved = @{}
+$problems = @()   # reasons this run cannot pass, whatever the log says
+$exitedEarly = $false; $exitCode = $null
 try {
     foreach ($k in $MockEnv.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, [string]$MockEnv[$k]) }
     $mock = Start-Process py -ArgumentList '-3', (Join-Path $PSScriptRoot 'mock_portal.py'), $Port, $segs, $reqLog, $MockMode -PassThru -WindowStyle Hidden
@@ -91,32 +103,51 @@ try {
     $appArgs = @('--xtream', "tester:secret@127.0.0.1:$Port")
     if ($Url) { $appArgs += $Url }
     $app = Start-Process $Exe -ArgumentList $appArgs -PassThru
+    try { $null = $app.Handle } catch { }   # Start-Process -PassThru: keeps ExitCode readable
     if ($Keys) {
         Start-Sleep -Seconds $KeysAfter
-        $app.Refresh()
-        $hwnd = $app.MainWindowHandle
-        foreach ($step in $Keys -split ';') {
-            $kind, $arg = $step -split ':', 2
-            if ($null -eq $arg) { $arg = '' }
-            switch ($kind) {
-                'TEXT' { foreach ($c in $arg.ToCharArray()) { [E2E.Win]::Char($hwnd, $c); Start-Sleep -Milliseconds 40 } }
-                'SLEEP' { Start-Sleep -Milliseconds ([int]$arg) }
-                'MARK' { "  --- $arg at {0:HH:mm:ss.fff}" -f (Get-Date).ToUniversalTime() }
-                default {
-                    if ($named.ContainsKey($kind)) { [E2E.Win]::Key($hwnd, $named[$kind][0], $named[$kind][1]) }
-                    elseif ($kind -eq 'SPACE') { [E2E.Win]::Char($hwnd, [char]' ') }
-                    elseif ($kind.Length -eq 1) { [E2E.Win]::Char($hwnd, [char]$kind) }
-                    else { throw "unknown key step '$step'" }
-                    Start-Sleep -Milliseconds 150
+        # Keys are posted to the window by its handle; handle 0 would post to this
+        # script's own thread and silently do nothing. Wait up to 10 s for the window.
+        $hwnd = [IntPtr]::Zero
+        $until = (Get-Date).AddSeconds(10)
+        do {
+            if ($app.HasExited) { break }
+            $app.Refresh()
+            $hwnd = $app.MainWindowHandle
+            if ($hwnd -ne [IntPtr]::Zero) { break }
+            Start-Sleep -Milliseconds 200
+        } while ((Get-Date) -lt $until)
+        if ($hwnd -eq [IntPtr]::Zero) {
+            $problems += "no window: the app has no main window to post the keys to (waited $KeysAfter s plus up to 10 s), so no key was sent"
+        } else {
+            foreach ($step in $Keys -split ';') {
+                $kind, $arg = $step -split ':', 2
+                if ($null -eq $arg) { $arg = '' }
+                switch ($kind) {
+                    'TEXT' { foreach ($c in $arg.ToCharArray()) { [E2E.Win]::Char($hwnd, $c); Start-Sleep -Milliseconds 40 } }
+                    'SLEEP' { Start-Sleep -Milliseconds ([int]$arg) }
+                    'MARK' { "  --- $arg at {0:HH:mm:ss.fff}" -f (Get-Date).ToUniversalTime() }
+                    default {
+                        if ($named.ContainsKey($kind)) { [E2E.Win]::Key($hwnd, $named[$kind][0], $named[$kind][1]) }
+                        elseif ($kind -eq 'SPACE') { [E2E.Win]::Char($hwnd, [char]' ') }
+                        elseif ($kind.Length -eq 1) { [E2E.Win]::Char($hwnd, [char]$kind) }
+                        else { throw "unknown key step '$step'" }
+                        Start-Sleep -Milliseconds 150
+                    }
                 }
             }
+            Start-Sleep -Seconds ([Math]::Max(1, $Seconds - $KeysAfter))
         }
-        Start-Sleep -Seconds ([Math]::Max(1, $Seconds - $KeysAfter))
     } else {
         Start-Sleep -Seconds $Seconds
     }
 } finally {
-    if ($app -and -not $app.HasExited) { $app.Kill(); $app.WaitForExit(3000) | Out-Null }
+    if ($app) {
+        # An app that is already gone before we kill it quit or crashed by itself.
+        $exitedEarly = $app.HasExited
+        if ($exitedEarly) { try { $exitCode = $app.ExitCode } catch { } }
+        else { $app.Kill(); $app.WaitForExit(3000) | Out-Null }
+    }
     if ($mock -and -not $mock.HasExited) { $mock.Kill() }
     $env:BONGO_CONFIG_DIR = $null; $env:BONGO_INI = $null; $env:MPV_LOG_LEVEL = $null
     foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
@@ -132,6 +163,18 @@ $lines | Where-Object { $_ -match 'zap: |loadfile|resuming|resume:|settings:|adu
 '=== mock portal: live requests ==='
 if (Test-Path $reqLog) { Get-Content $reqLog | Where-Object { $_ -match '/live/' } | ForEach-Object { '  ' + $_ } }
 $fail = 0
+# A pass has to mean the app ran: with no log at all every -Forbid would pass.
+if (-not $log) { "FAIL  no log: the app wrote no BongoPlayer.log.* in $logDir"; $fail++ }
+elseif (-not ($lines -match ' starting')) { "FAIL  no ' starting' line in the log: the app did not start"; $fail++ }
+foreach ($problem in $problems) { "FAIL  $problem"; $fail++ }
+if ($exitedEarly) {
+    "FAIL  the app exited by itself before the run ended (exit code $(if ($null -ne $exitCode) { $exitCode } else { 'unknown' }))"; $fail++
+}
+foreach ($panic in @(Get-ChildItem $logDir -Filter 'panic-*.log' -ErrorAction SilentlyContinue)) {
+    "FAIL  the app panicked ($($panic.Name)):"
+    Get-Content $panic.FullName -TotalCount 2 | ForEach-Object { "        $_" }
+    $fail++
+}
 foreach ($e in $Expect) { if ($lines -match $e) { "PASS  expected: $e" } else { "FAIL  missing:  $e"; $fail++ } }
 foreach ($f in $Forbid) { if ($lines -match $f) { "FAIL  forbidden: $f"; $fail++ } else { "PASS  absent:   $f" } }
 if ($fail) { exit 1 }
