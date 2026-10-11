@@ -9,6 +9,7 @@ use bongo_player::legacy;
 use bongo_player::player;
 use bongo_player::portal::{xtream::XtreamPortal, Portal};
 use bongo_player::relay::{Relay, RelayConfig};
+use bongo_player::settings::Settings;
 use bongo_player::storage::Storage;
 use bongo_player::{APP_ID, APP_NAME};
 use clap::Parser;
@@ -237,6 +238,9 @@ fn main() -> anyhow::Result<()> {
 
     let player_handle = player::spawn(1280, 720)?;
 
+    // Read once here; the app writes it only when something changes.
+    let settings = Settings::load(&storage.settings_path());
+
     let mut options = eframe::NativeOptions::default();
     options.viewport = options
         .viewport
@@ -257,6 +261,7 @@ fn main() -> anyhow::Result<()> {
                 cli.url,
                 relay,
                 creds,
+                settings,
             ))
         }),
     );

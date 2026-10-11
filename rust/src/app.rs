@@ -2,12 +2,15 @@ use crate::args::{parse_xtream_creds, XtreamCreds};
 use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, quality_rank, zap_position, CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::Favorites;
+use crate::i18n::{Lang, T};
 use crate::playback_health::{PlaybackHealth, ReloadBudget};
 use crate::relay::Relay;
 use crate::player::{Cmd, Event, PlayerHandle, RgbaFrame};
 use crate::presets::Presets;
 use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};
 use crate::search::{self, ItemKind, SearchItem};
+use crate::settings::Settings;
+use crate::settings_ui::{SettingsAction, SettingsUi, SettingsView};
 use crate::shortcuts;
 use crate::storage::Storage;
 use crate::zap::ZapPacer;
@@ -358,6 +361,17 @@ pub struct TvApp {
     cfg_user: String,
     cfg_pass: String,
     cfg_error: Option<String>,
+
+    /// Preferences (settings.json).
+    settings: Settings,
+    /// The UI language: from the settings, else the Windows language.
+    lang: Lang,
+    /// First start: the language screen shows, with this one preselected.
+    choosing_language: Option<Lang>,
+    /// A resume held back until the language is chosen (first start).
+    pending_resume: Option<LastWatched>,
+    /// The settings overlay (`o`) while it is open.
+    settings_ui: Option<SettingsUi>,
 }
 
 impl TvApp {
@@ -371,6 +385,7 @@ impl TvApp {
         initial_url: Option<String>,
         relay: Option<Relay>,
         creds: Option<XtreamCreds>,
+        settings: Settings,
     ) -> Self {
         // Whenever a new mpv frame is ready, ask egui to redraw.
         let ctx = cc.egui_ctx.clone();
@@ -387,6 +402,8 @@ impl TvApp {
             catalog.spawn_fetch();
         }
 
+        let lang = settings.lang().unwrap_or_else(crate::i18n::system_lang);
+        let choosing_language = settings.lang().is_none().then_some(lang);
         let mut app = Self {
             player,
             catalog,
@@ -436,6 +453,11 @@ impl TvApp {
             cfg_user: String::new(),
             cfg_pass: String::new(),
             cfg_error: None,
+            settings,
+            lang,
+            choosing_language,
+            pending_resume: None,
+            settings_ui: None,
         };
         // Initial stream: an explicit --url / bare URL wins; otherwise resume
         // whatever we were watching last session (persisted by load_url).
@@ -446,14 +468,81 @@ impl TvApp {
             // (e.g. BongoPlayer.ini deleted) drop to the setup prompt instead of
             // silently replaying the last URL (whose credentials are baked in).
             if let Some(lw) = LastWatched::load(&app.storage.last_watched_path()) {
-                tracing::info!("resuming last watched ({})", crate::redact::redact(&lw.url));
-                app.set_toast("laatste zender hervatten...");
-                // Up/down then continues from this channel (see zap_delta).
-                app.current_stream_id = app.catalog.portal().live_stream_id(&lw.url);
-                app.load_url(lw.url, lw.live);
+                if app.choosing_language.is_some() {
+                    app.pending_resume = Some(lw);
+                } else {
+                    app.resume(lw);
+                }
             }
         }
         app
+    }
+
+    /// Play what was playing when the app last closed.
+    fn resume(&mut self, lw: LastWatched) {
+        tracing::info!("resuming last watched ({})", crate::redact::redact(&lw.url));
+        self.set_toast("laatste zender hervatten...");
+        // Up/down then continues from this channel (see zap_delta).
+        self.current_stream_id = self.catalog.portal().live_stream_id(&lw.url);
+        self.load_url(lw.url, lw.live);
+    }
+
+    fn open_settings(&mut self) {
+        self.settings_ui = Some(SettingsUi::new());
+        tracing::info!("settings: opened");
+    }
+
+    /// A failed write keeps the change until the app closes, with a notice.
+    fn save_settings(&mut self) {
+        if let Err(e) = self.settings.save(&self.storage.settings_path()) {
+            tracing::warn!("settings: save failed: {}", e);
+            self.set_toast(crate::i18n::t(self.lang, T::SaveFailed));
+        }
+    }
+
+    fn choose_language(&mut self, l: Lang) {
+        self.lang = l;
+        self.choosing_language = None;
+        self.settings.language = Some(l.code().to_string());
+        self.save_settings();
+        tracing::info!("settings: language set to {}", l.code());
+        if let Some(lw) = self.pending_resume.take() {
+            self.resume(lw);
+        }
+    }
+
+    fn apply_settings_action(&mut self, action: SettingsAction) {
+        match action {
+            SettingsAction::Close => {
+                self.settings_ui = None;
+                tracing::info!("settings: closed");
+            }
+            SettingsAction::SetLanguage(l) => {
+                self.lang = l;
+                self.settings.language = Some(l.code().to_string());
+                self.save_settings();
+                tracing::info!("settings: language set to {}", l.code());
+            }
+            SettingsAction::SetSwapZap(on) => {
+                self.settings.swap_zap_keys = on;
+                self.save_settings();
+                tracing::info!("settings: zap keys {}", if on { "reversed" } else { "normal" });
+            }
+        }
+    }
+
+    fn paint_settings(&mut self, ctx: &egui::Context) {
+        let Some(overlay) = self.settings_ui.as_mut() else {
+            return;
+        };
+        let view = SettingsView {
+            lang: self.lang,
+            settings: &self.settings,
+        };
+        let actions = overlay.show(ctx, &view);
+        for a in actions {
+            self.apply_settings_action(a);
+        }
     }
 
     fn set_toast(&mut self, s: impl Into<String>) {
@@ -1556,18 +1645,25 @@ impl TvApp {
             self.show_help = true;
             return;
         }
+        // Consumed, or the overlay would see this same press and close again.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::O)) {
+            self.open_settings();
+            return;
+        }
 
+        // Down = next channel, unless the user reversed zapping (wheel too).
+        let next = if self.settings.swap_zap_keys { -1 } else { 1 };
         if down {
-            self.zap_delta(1, arrow_repeat);
+            self.zap_delta(next, arrow_repeat);
         }
         if up {
-            self.zap_delta(-1, arrow_repeat);
+            self.zap_delta(-next, arrow_repeat);
         }
         if scroll > 0.5 {
-            self.zap_delta(-1, false);
+            self.zap_delta(-next, false);
         }
         if scroll < -0.5 {
-            self.zap_delta(1, false);
+            self.zap_delta(next, false);
         }
 
         if space {
@@ -3227,6 +3323,14 @@ impl eframe::App for TvApp {
         self.drain_events();
         self.drain_epg();
         self.drain_news_picker();
+        // First start: nothing else until a language is chosen.
+        if let Some(selected) = self.choosing_language.as_mut() {
+            if let Some(l) = crate::settings_ui::language_screen(ctx, selected) {
+                self.choose_language(l);
+            }
+            ctx.request_repaint_after(Duration::from_millis(33));
+            return;
+        }
         // The channel the user stopped flipping on.
         if let Some((sid, name, idx)) = self.zap_pacer.due(Instant::now()) {
             self.zap_to(sid, &name, Some(idx));
@@ -3236,10 +3340,14 @@ impl eframe::App for TvApp {
         self.update_video_texture(ctx);
         // Guide owns input while it's open - we don't want `1`/`2`/`3` etc.
         // firing zaps when the user is typing into the channel filter.
-        if self.guide.open {
-            self.handle_guide_keys(ctx);
-        } else {
-            self.handle_keys(ctx);
+        // The settings overlay owns the keyboard while it is open (it reads
+        // its keys in paint_settings).
+        if self.settings_ui.is_none() {
+            if self.guide.open {
+                self.handle_guide_keys(ctx);
+            } else {
+                self.handle_keys(ctx);
+            }
         }
 
         // Guide takes over the full window when open. Skipping the video
@@ -3284,6 +3392,7 @@ impl eframe::App for TvApp {
         // including the guide. Whether the guide is open is irrelevant
         // for `?` - the help is a global overlay.
         self.paint_help(ctx);
+        self.paint_settings(ctx);
 
         ctx.request_repaint_after(Duration::from_millis(33));
     }

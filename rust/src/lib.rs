@@ -24,6 +24,7 @@ pub mod redact;
 pub mod relay;
 pub mod search;
 pub mod settings;
+pub mod settings_ui;
 pub mod shortcuts;
 pub mod storage;
 pub mod zap;
