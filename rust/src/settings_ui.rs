@@ -3,7 +3,9 @@
 //! right. Both draw themselves and report what the user did as actions;
 //! app.rs carries those out.
 
-use crate::i18n::{t, Lang, T};
+use crate::args::XtreamCreds;
+use crate::i18n::{t, tr, Lang, T};
+use crate::portal::xtream::ConnCheck;
 use crate::settings::Settings;
 use egui::{Color32, Key, Modifiers};
 
@@ -52,12 +54,54 @@ pub enum SettingsAction {
     Close,
     SetLanguage(Lang),
     SetSwapZap(bool),
+    /// Try these credentials (`user:pass@host:port`) without keeping them.
+    TestConnection(String),
+    /// Try these credentials (`user:pass@host:port`); keep and use them if
+    /// they work.
+    SavePortal(String),
 }
 
 /// What the overlay shows but app.rs owns.
 pub struct SettingsView<'a> {
     pub lang: Lang,
     pub settings: &'a Settings,
+    /// The portal credentials in use, if any: the portal form starts from them.
+    pub creds: Option<&'a XtreamCreds>,
+    /// How the connection test stands.
+    pub conn: &'a ConnState,
+}
+
+/// The connection test's state, shown under the portal buttons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnState {
+    Idle,
+    Testing,
+    Done(ConnCheck),
+    /// The fields cannot make credentials (e.g. a bad port).
+    BadInput(T),
+}
+
+/// The status line under the portal buttons.
+pub fn conn_text(lang: Lang, conn: &ConnState) -> Option<String> {
+    Some(match conn {
+        ConnState::Idle => return None,
+        ConnState::Testing => t(lang, T::Testing).to_string(),
+        ConnState::Done(ConnCheck::Ok { channels }) => {
+            tr(lang, T::ConnOk, &[&channels.to_string()])
+        }
+        ConnState::Done(ConnCheck::BadLogin) => t(lang, T::ConnBadLogin).to_string(),
+        ConnState::Done(ConnCheck::Unreachable) => t(lang, T::ConnUnreachable).to_string(),
+        ConnState::Done(ConnCheck::Invalid) => t(lang, T::ConnInvalid).to_string(),
+        ConnState::BadInput(key) => t(lang, *key).to_string(),
+    })
+}
+
+/// The portal fields while the section is open.
+#[derive(Default)]
+struct PortalForm {
+    host: String,
+    user: String,
+    pass: String,
 }
 
 /// The overlay's own state while it is open.
@@ -73,6 +117,9 @@ pub struct SettingsUi {
     /// The list rows' widget ids from the last frame: they tell a focused row
     /// from a focused control.
     list_ids: Vec<egui::Id>,
+    /// The portal form: made when the section is first shown, from the
+    /// credentials in use, and kept while the overlay is open.
+    portal: Option<PortalForm>,
 }
 
 impl SettingsUi {
@@ -178,11 +225,14 @@ impl SettingsUi {
                                     Section::Language => {
                                         language_pane(ui, view, focus_first, &mut actions)
                                     }
+                                    Section::Portal => {
+                                        self.portal_pane(ui, view, focus_first, &mut actions)
+                                    }
                                     Section::Controls => {
                                         controls_pane(ui, view, focus_first, &mut actions)
                                     }
-                                    // Filled in by Tasks 15-17.
-                                    Section::Portal | Section::Adult | Section::News => {}
+                                    // Filled in by Tasks 16-17.
+                                    Section::Adult | Section::News => {}
                                 }
                             });
                             list.response.rect.right() + 11.0
@@ -201,6 +251,71 @@ impl SettingsUi {
                     });
             });
         actions
+    }
+
+    /// Server, user and password, then the test and save buttons and how the
+    /// test went. Test and Save hand app.rs the credentials as one string.
+    fn portal_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: &SettingsView,
+        focus_first: bool,
+        actions: &mut Vec<SettingsAction>,
+    ) {
+        let lang = view.lang;
+        let form = self.portal.get_or_insert_with(|| match view.creds {
+            Some(c) => PortalForm {
+                host: format!("{}:{}", c.host, c.port),
+                user: c.username.clone(),
+                pass: c.password.clone(),
+            },
+            None => PortalForm::default(),
+        });
+        ui.label(t(lang, T::ServerLabel));
+        let first = ui.add(
+            egui::TextEdit::singleline(&mut form.host)
+                .hint_text("server.example.com:8080")
+                .desired_width(320.0),
+        );
+        if focus_first {
+            first.request_focus();
+        }
+        ui.label(t(lang, T::UserLabel));
+        ui.add(
+            egui::TextEdit::singleline(&mut form.user)
+                .hint_text(t(lang, T::UserHint))
+                .desired_width(320.0),
+        );
+        ui.label(t(lang, T::PasswordLabel));
+        ui.add(
+            egui::TextEdit::singleline(&mut form.pass)
+                .password(true)
+                .desired_width(320.0),
+        );
+        let ready = !form.host.trim().is_empty()
+            && !form.user.trim().is_empty()
+            && !form.pass.is_empty()
+            && *view.conn != ConnState::Testing;
+        // Built when a button is pressed, not every frame.
+        let creds = || format!("{}:{}@{}", form.user.trim(), form.pass, form.host.trim());
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(ready, egui::Button::new(t(lang, T::TestConnection)))
+                .clicked()
+            {
+                actions.push(SettingsAction::TestConnection(creds()));
+            }
+            if ui
+                .add_enabled(ready, egui::Button::new(t(lang, T::Save)))
+                .clicked()
+            {
+                actions.push(SettingsAction::SavePortal(creds()));
+            }
+        });
+        if let Some(text) = conn_text(lang, view.conn) {
+            ui.label(text);
+        }
     }
 }
 
@@ -292,24 +407,43 @@ mod tests {
         SettingsView {
             lang: Lang::En,
             settings,
+            creds: None,
+            conn: &ConnState::Idle,
+        }
+    }
+
+    /// A key press or release as egui gets it from the window.
+    fn key_event(key: Key, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::NONE,
         }
     }
 
     /// One headless frame in which these keys are pressed.
     fn run_frame(ctx: &egui::Context, keys: &[Key], draw: impl FnOnce(&egui::Context)) {
-        let press = |key: Key| egui::Event::Key {
-            key,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: Modifiers::NONE,
-        };
+        run_events(
+            ctx,
+            keys.iter().map(|&key| key_event(key, true)).collect(),
+            draw,
+        );
+    }
+
+    /// One headless frame in which these events arrive.
+    fn run_events(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        draw: impl FnOnce(&egui::Context),
+    ) {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(1280.0, 720.0),
             )),
-            events: keys.iter().map(|&key| press(key)).collect(),
+            events,
             ..Default::default()
         };
         let _ = ctx.run(raw, draw);
@@ -375,10 +509,25 @@ mod tests {
 
         /// One frame with these keys pressed; what the overlay reports.
         fn frame(&mut self, keys: &[Key]) -> Vec<SettingsAction> {
+            self.frame_with(keys.iter().map(|&key| key_event(key, true)).collect())
+        }
+
+        /// One frame in which this character is typed, as a keyboard makes it:
+        /// the key press, the text it produces, the release.
+        fn type_char(&mut self, key: Key, c: char) -> Vec<SettingsAction> {
+            self.frame_with(vec![
+                key_event(key, true),
+                egui::Event::Text(c.to_string()),
+                key_event(key, false),
+            ])
+        }
+
+        /// One frame with these events; what the overlay reports.
+        fn frame_with(&mut self, events: Vec<egui::Event>) -> Vec<SettingsAction> {
             let mut actions = Vec::new();
             let view = make_view(&self.settings);
             let other_panel = self.other_panel;
-            run_frame(&self.ctx, keys, |ctx| {
+            run_events(&self.ctx, events, |ctx| {
                 if other_panel {
                     show_other_panel(ctx);
                 }
@@ -567,5 +716,85 @@ mod tests {
         }
         assert_eq!(screen.frame(&[Key::Enter]), Some(Lang::De));
         assert_eq!(screen.selected, Lang::En);
+    }
+
+    #[test]
+    fn the_status_line_says_how_the_test_went() {
+        assert_eq!(conn_text(Lang::Nl, &ConnState::Idle), None);
+        assert_eq!(
+            conn_text(
+                Lang::Nl,
+                &ConnState::Done(ConnCheck::Ok { channels: 13006 })
+            )
+            .as_deref(),
+            Some("Verbonden: 13006 zenders")
+        );
+        assert_eq!(
+            conn_text(Lang::En, &ConnState::Done(ConnCheck::BadLogin)).as_deref(),
+            Some("Wrong username or password")
+        );
+        assert_eq!(
+            conn_text(Lang::De, &ConnState::BadInput(T::CredsBadPort)).as_deref(),
+            Some("ungültige Portnummer")
+        );
+    }
+
+    #[test]
+    fn keys_typed_into_the_server_field_stay_in_the_field() {
+        let mut o = Overlay::new();
+        o.press(Key::ArrowDown, 1); // Portal
+        o.press(Key::Enter, 1); // into it: the server field has the focus
+        for (key, c) in [
+            (Key::O, 'o'),
+            (Key::Num1, '1'),
+            (Key::Space, ' '),
+            (Key::F, 'f'),
+        ] {
+            let actions = o.type_char(key, c);
+            assert!(actions.is_empty(), "typing {c:?} reported {actions:?}");
+        }
+        let host = o.ui.portal.as_ref().map(|form| form.host.as_str());
+        assert_eq!(host, Some("o1 f"));
+    }
+
+    #[test]
+    fn test_and_save_hand_back_the_credentials_in_use_as_one_string() {
+        // '@', '=' and ':' in the password come back exactly as they went in.
+        let creds = XtreamCreds {
+            username: "bob".into(),
+            password: "p@ss=w:rd".into(),
+            host: "srv.example.net".into(),
+            port: 8080,
+        };
+        let ctx = egui::Context::default();
+        let settings = Settings::default();
+        let view = SettingsView {
+            creds: Some(&creds),
+            ..make_view(&settings)
+        };
+        let mut ui = SettingsUi::new();
+        let mut frame = |keys: &[Key]| {
+            let mut actions = Vec::new();
+            run_frame(&ctx, keys, |ctx| actions = ui.show(ctx, &view));
+            actions
+        };
+        frame(&[]);
+        frame(&[]);
+        frame(&[Key::ArrowDown]); // Portal
+        frame(&[Key::Enter]); // into it: the server field has the focus
+        for _ in 0..3 {
+            frame(&[Key::Tab]); // the user, the password, then Test
+        }
+        let one_string = "bob:p@ss=w:rd@srv.example.net:8080";
+        assert_eq!(
+            frame(&[Key::Enter]),
+            vec![SettingsAction::TestConnection(one_string.into())]
+        );
+        frame(&[Key::Tab]); // Save
+        assert_eq!(
+            frame(&[Key::Enter]),
+            vec![SettingsAction::SavePortal(one_string.into())]
+        );
+        assert_eq!(crate::args::parse_xtream_creds(one_string).unwrap(), creds);
     }
 }

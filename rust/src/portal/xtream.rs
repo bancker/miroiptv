@@ -74,6 +74,57 @@ impl XtreamPortal {
     }
 }
 
+/// Outcome of trying portal credentials (settings screen, setup prompt).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnCheck {
+    Ok { channels: usize },
+    BadLogin,
+    Unreachable,
+    Invalid,
+}
+
+impl XtreamPortal {
+    /// Log in with these credentials and count the live channels, within 10 s.
+    pub async fn check(&self) -> ConnCheck {
+        tokio::time::timeout(std::time::Duration::from_secs(10), self.check_inner())
+            .await
+            .unwrap_or(ConnCheck::Unreachable)
+    }
+
+    async fn check_inner(&self) -> ConnCheck {
+        let login = match self.client.get(self.api_url(&[])).send().await {
+            Ok(r) => r,
+            Err(_) => return ConnCheck::Unreachable,
+        };
+        if matches!(login.status().as_u16(), 401 | 403) {
+            return ConnCheck::BadLogin;
+        }
+        let Ok(v) = login.json::<serde_json::Value>().await else {
+            return ConnCheck::Invalid;
+        };
+        let Some(auth) = v.get("user_info").and_then(|u| u.get("auth")) else {
+            return ConnCheck::Invalid;
+        };
+        if !(auth.as_i64() == Some(1) || auth.as_str() == Some("1")) {
+            return ConnCheck::BadLogin;
+        }
+        match self
+            .client
+            .get(self.api_url(&[("action", "get_live_streams")]))
+            .send()
+            .await
+        {
+            Ok(r) => match r.json::<Vec<serde_json::Value>>().await {
+                Ok(list) => ConnCheck::Ok {
+                    channels: list.len(),
+                },
+                Err(_) => ConnCheck::Invalid,
+            },
+            Err(_) => ConnCheck::Unreachable,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct EpgWrapper {
     #[serde(default)]

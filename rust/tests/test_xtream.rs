@@ -1,5 +1,7 @@
 use bongo_player::args::XtreamCreds;
+use bongo_player::portal::xtream::ConnCheck;
 use bongo_player::portal::{xtream::XtreamPortal, Portal};
+use wiremock::matchers::query_param_is_missing;
 use wiremock::{
     matchers::{method, path},
     Mock, MockServer, ResponseTemplate,
@@ -174,4 +176,47 @@ fn stream_ref_reads_kind_and_id_from_portal_urls() {
         Some((StreamKind::Timeshift, 601))
     );
     assert_eq!(stream_ref("http://h/player_api.php?username=u"), None);
+}
+
+async fn login(server: &MockServer, body: &str) {
+    Mock::given(method("GET"))
+        .and(path("/player_api.php"))
+        .and(query_param_is_missing("action"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn check_counts_the_channels_for_good_credentials() {
+    let server = MockServer::start().await;
+    login(&server, r#"{"user_info":{"auth":1},"server_info":{}}"#).await;
+    mount_action(&server, "get_live_streams", fixtures("xtream_live")).await;
+    let r = XtreamPortal::new(creds_for(&server)).check().await;
+    assert_eq!(r, ConnCheck::Ok { channels: 2 });
+}
+
+#[tokio::test]
+async fn check_tells_a_wrong_login() {
+    let server = MockServer::start().await;
+    login(&server, r#"{"user_info":{"auth":0}}"#).await;
+    assert_eq!(XtreamPortal::new(creds_for(&server)).check().await, ConnCheck::BadLogin);
+}
+
+#[tokio::test]
+async fn check_tells_something_that_is_no_portal() {
+    let server = MockServer::start().await;
+    login(&server, "<html>hello</html>").await;
+    assert_eq!(XtreamPortal::new(creds_for(&server)).check().await, ConnCheck::Invalid);
+}
+
+#[tokio::test]
+async fn check_tells_an_unreachable_server() {
+    let creds = XtreamCreds {
+        username: "u".into(),
+        password: "p".into(),
+        host: "127.0.0.1".into(),
+        port: 1,
+    };
+    assert_eq!(XtreamPortal::new(creds).check().await, ConnCheck::Unreachable);
 }

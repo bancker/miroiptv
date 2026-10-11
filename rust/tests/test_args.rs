@@ -91,3 +91,38 @@ fn missing_placeholder_and_unreadable_credentials_are_told_apart() {
     assert_eq!(resolve_creds(Some("user:pass@host.example.com"), None), CredsSource::Placeholder);
     assert!(matches!(resolve_creds(None, Some("nonsense@")), CredsSource::Invalid(_)));
 }
+
+#[test]
+fn credentials_written_by_the_app_read_back_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let ini = dir.path().join("BongoPlayer.ini");
+    bongo_player::args::write_ini_creds(&ini, "bob:p@ss=w:rd@srv.example.net:8080").unwrap();
+    let back = parse_xtream_creds(&read_ini_creds(&ini).unwrap()).unwrap();
+    assert_eq!(
+        back,
+        XtreamCreds {
+            username: "bob".into(),
+            password: "p@ss=w:rd".into(),
+            host: "srv.example.net".into(),
+            port: 8080,
+        }
+    );
+}
+
+#[test]
+fn a_user_name_with_an_equals_sign_reads_back_the_same() {
+    // Written as a bare line, "b=ob:..." would read as the key "b" with the value "ob:...".
+    let dir = tempfile::tempdir().unwrap();
+    let ini = dir.path().join("BongoPlayer.ini");
+    bongo_player::args::write_ini_creds(&ini, "b=ob:p@ss=w:rd@srv.example.net:8080").unwrap();
+    let back = parse_xtream_creds(&read_ini_creds(&ini).unwrap()).unwrap();
+    assert_eq!(
+        back,
+        XtreamCreds {
+            username: "b=ob".into(),
+            password: "p@ss=w:rd".into(),
+            host: "srv.example.net".into(),
+            port: 8080,
+        }
+    );
+}

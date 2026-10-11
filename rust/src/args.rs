@@ -84,6 +84,12 @@ pub fn read_ini_creds(path: &std::path::Path) -> Option<String> {
     None
 }
 
+/// Save credentials as the ini's only line, `portal=user:pass@host:port`; the
+/// key keeps an `=` in the user name from being read as one.
+pub fn write_ini_creds(path: &std::path::Path, creds: &str) -> std::io::Result<()> {
+    std::fs::write(path, format!("portal={creds}\n"))
+}
+
 pub fn parse_xtream_creds(s: &str) -> Result<XtreamCreds, CredsError> {
     // The LAST '@' separates the server: a password may contain '@', a host
     // never does.

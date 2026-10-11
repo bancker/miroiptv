@@ -7,10 +7,11 @@ use crate::playback_health::{PlaybackHealth, ReloadBudget};
 use crate::relay::Relay;
 use crate::player::{Cmd, Event, PlayerHandle, RgbaFrame};
 use crate::presets::Presets;
+use crate::portal::xtream::ConnCheck;
 use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};
 use crate::search::{self, ItemKind, SearchItem};
 use crate::settings::Settings;
-use crate::settings_ui::{SettingsAction, SettingsUi, SettingsView};
+use crate::settings_ui::{ConnState, SettingsAction, SettingsUi, SettingsView};
 use crate::shortcuts;
 use crate::storage::Storage;
 use crate::zap::ZapPacer;
@@ -496,6 +497,9 @@ pub struct TvApp {
     pending_resume: Option<LastWatched>,
     /// The settings overlay (`o`) while it is open.
     settings_ui: Option<SettingsUi>,
+    /// The portal credentials test (settings screen and setup prompt).
+    conn_state: ConnState,
+    conn_slot: Arc<Mutex<Option<(ConnCheck, bool, String)>>>,
 }
 
 /// The translated text for a credentials error.
@@ -591,6 +595,8 @@ impl TvApp {
             choosing_language,
             pending_resume: None,
             settings_ui: None,
+            conn_state: ConnState::Idle,
+            conn_slot: Arc::new(Mutex::new(None)),
         };
         // Initial stream: an explicit --url / bare URL wins; otherwise resume
         // whatever we were watching last session (persisted by load_url).
@@ -622,6 +628,10 @@ impl TvApp {
 
     fn open_settings(&mut self) {
         self.settings_ui = Some(SettingsUi::new());
+        // An earlier visit's verdict is stale; a test still running is not.
+        if self.conn_state != ConnState::Testing {
+            self.conn_state = ConnState::Idle;
+        }
         tracing::info!("settings: opened");
     }
 
@@ -661,6 +671,8 @@ impl TvApp {
                 self.save_settings();
                 tracing::info!("settings: zap keys {}", if on { "reversed" } else { "normal" });
             }
+            SettingsAction::TestConnection(s) => self.start_conn_check(s, false),
+            SettingsAction::SavePortal(s) => self.start_conn_check(s, true),
         }
     }
 
@@ -671,6 +683,8 @@ impl TvApp {
         let view = SettingsView {
             lang: self.lang,
             settings: &self.settings,
+            creds: self.creds.as_ref(),
+            conn: &self.conn_state,
         };
         let actions = overlay.show(ctx, &view);
         for a in actions {
@@ -1646,13 +1660,17 @@ impl TvApp {
                         ui.add_space(12.0);
                         let ready = !self.cfg_host.trim().is_empty()
                             && !self.cfg_user.trim().is_empty()
-                            && !self.cfg_pass.is_empty();
+                            && !self.cfg_pass.is_empty()
+                            && self.conn_state != ConnState::Testing;
                         let clicked = ui
                             .add_enabled(
                                 ready,
                                 egui::Button::new(crate::i18n::t(lang, T::ConnectAndSave)),
                             )
                             .clicked();
+                        if let Some(text) = crate::settings_ui::conn_text(lang, &self.conn_state) {
+                            ui.label(egui::RichText::new(text).size(12.0));
+                        }
                         let entered = ready && ctx.input(|i| i.key_pressed(Key::Enter));
                         if clicked || entered {
                             submit = Some(format!(
@@ -1665,12 +1683,44 @@ impl TvApp {
                     });
             });
         if let Some(s) = submit {
-            self.apply_creds_string(&s);
+            // Saving tests first: only credentials that log in are kept.
+            self.start_conn_check(s, true);
         }
     }
 
-    /// Validate prompt creds, persist to BongoPlayer.ini, then rebuild the catalog
-    /// live and start fetching - no restart needed.
+    /// Test credentials in the background; with `save`, store and connect
+    /// them once the test succeeds. A failed test changes nothing.
+    fn start_conn_check(&mut self, creds_str: String, save: bool) {
+        let creds = match parse_xtream_creds(&creds_str) {
+            Ok(c) => c,
+            Err(e) => {
+                self.conn_state = ConnState::BadInput(creds_error_text(&e));
+                return;
+            }
+        };
+        self.conn_state = ConnState::Testing;
+        let slot = self.conn_slot.clone();
+        tokio::spawn(async move {
+            let result = XtreamPortal::new(creds).check().await;
+            *slot.lock() = Some((result, save, creds_str));
+        });
+    }
+
+    /// When a credentials test has finished: say how it went and, if it was
+    /// to save and the login worked, save and connect.
+    fn drain_conn_check(&mut self) {
+        let Some((result, save, creds_str)) = self.conn_slot.lock().take() else {
+            return;
+        };
+        tracing::info!("settings: connection check {:?}", result);
+        if save && matches!(result, ConnCheck::Ok { .. }) {
+            self.apply_creds_string(&creds_str);
+        }
+        self.conn_state = ConnState::Done(result);
+    }
+
+    /// Validate creds that logged in, persist them to BongoPlayer.ini, then
+    /// rebuild the catalog live and start fetching - no restart needed.
     fn apply_creds_string(&mut self, creds_str: &str) {
         let creds = match parse_xtream_creds(creds_str) {
             Ok(c) => c,
@@ -1680,14 +1730,16 @@ impl TvApp {
             }
         };
         let path = crate::args::ini_path();
-        if let Err(e) = std::fs::write(&path, creds_str) {
-            self.cfg_error = Some(self.tr(
+        if let Err(e) = crate::args::write_ini_creds(&path, creds_str) {
+            let msg = self.tr(
                 T::CannotWrite,
                 &[&path.display().to_string(), &e.to_string()],
-            ));
+            );
+            self.set_toast(msg.clone());
+            self.cfg_error = Some(msg);
             return;
         }
-        tracing::info!("portal creds saved to {} - connecting", path.display());
+        tracing::info!("settings: portal saved to {} - connecting", path.display());
         self.creds = Some(creds.clone());
         let portal: Arc<dyn Portal> = Arc::new(XtreamPortal::new(creds));
         self.catalog = Arc::new(CatalogStore::new(portal));
@@ -3477,6 +3529,7 @@ impl eframe::App for TvApp {
         self.drain_events();
         self.drain_epg();
         self.drain_news_picker();
+        self.drain_conn_check();
         // First start: nothing else until a language is chosen.
         if let Some(selected) = self.choosing_language.as_mut() {
             if let Some(l) = crate::settings_ui::language_screen(ctx, selected) {
