@@ -3,6 +3,7 @@ use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, qu
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::{Entry as FavoriteEntry, Favorites};
 use crate::i18n::{Lang, T};
+use crate::news::NewsRule;
 use crate::pin::{PinGate, PinHash};
 use crate::playback_health::{PlaybackHealth, ReloadBudget};
 use crate::relay::Relay;
@@ -463,17 +464,36 @@ struct NewsItem {
     live: bool,  // 24h news channel with no catch-up - play it live
 }
 
-/// A news source for the `n` picker: which catch-up channel, and which
-/// programmes on it count as "news".
-struct NewsSrc {
-    /// Normalized channel-name key (matched exact first, then substring).
-    chan: &'static str,
-    /// Lowercase title substring required; "" = any programme (news channel).
-    title: &'static str,
-    /// Title substrings to drop (regional/sport/kids variants).
-    excl: &'static [&'static str],
-    tag: &'static str,
-    offset: i64,
+/// What the "found" lines of the news settings were worked out for: the rules'
+/// channel names and the catalog's state. Typing in a rule's patterns, label or
+/// seconds changes none of it.
+struct NewsLookup {
+    channels: Vec<String>,
+    loaded: bool,
+    unlocked: bool,
+}
+
+impl NewsLookup {
+    fn new(rules: &[NewsRule], loaded: bool, unlocked: bool) -> Self {
+        Self {
+            channels: rules.iter().map(|r| r.channel.clone()).collect(),
+            loaded,
+            unlocked,
+        }
+    }
+
+    /// Whether the lines must be worked out again for these rules and this
+    /// catalog state. Compared where it lies: nothing is built per frame.
+    fn is_stale(&self, rules: &[NewsRule], loaded: bool, unlocked: bool) -> bool {
+        self.loaded != loaded
+            || self.unlocked != unlocked
+            || self.channels.len() != rules.len()
+            || self
+                .channels
+                .iter()
+                .zip(rules)
+                .any(|(channel, rule)| *channel != rule.channel)
+    }
 }
 
 /// Modal "latest news" chooser opened with `n` (RTL + NOS combined).
@@ -600,6 +620,15 @@ pub struct TvApp {
     adult_note: Option<T>,
     /// After a stop, the stopped stream's frames must not show again.
     frame_fence: FrameFence,
+    /// The channel each news rule points at ("gevonden: ..."), for the
+    /// settings; worked out again only when `news_found_for` says it is stale,
+    /// never per frame.
+    news_found: Vec<Option<String>>,
+    news_found_for: Option<NewsLookup>,
+    /// Settings changed in memory and not written yet: the news rules change
+    /// with every key typed, so they are saved when the overlay closes. Cleared
+    /// by a write that worked only.
+    settings_dirty: bool,
 }
 
 /// The translated text for a credentials error.
@@ -699,6 +728,9 @@ impl TvApp {
             pin_gate: PinGate::new(),
             adult_note: None,
             frame_fence: FrameFence::default(),
+            news_found: Vec::new(),
+            news_found_for: None,
+            settings_dirty: false,
         };
         // Initial stream: an explicit --url / bare URL wins; otherwise resume
         // whatever we were watching last session (persisted by load_url).
@@ -753,11 +785,15 @@ impl TvApp {
         tracing::info!("settings: opened");
     }
 
-    /// A failed write keeps the change until the app closes, with a notice.
+    /// Writes every setting, the news rules included. A failed write keeps the
+    /// change (and `settings_dirty`) until the app closes, with a notice.
     fn save_settings(&mut self) {
-        if let Err(e) = self.settings.save(&self.storage.settings_path()) {
-            tracing::warn!("settings: save failed: {}", e);
-            self.set_toast(crate::i18n::t(self.lang, T::SaveFailed));
+        match self.settings.save(&self.storage.settings_path()) {
+            Ok(()) => self.settings_dirty = false,
+            Err(e) => {
+                tracing::warn!("settings: save failed: {}", e);
+                self.set_toast(crate::i18n::t(self.lang, T::SaveFailed));
+            }
         }
     }
 
@@ -793,11 +829,14 @@ impl TvApp {
     /// The channel lists changed under whatever points into them: adult content
     /// shown or hidden, or another portal's catalog. The playing channel is
     /// found in the zap list again on the next arrow press, search results are
-    /// searched again, and the guide rebuilds its cached channel indices.
+    /// searched again, the guide rebuilds its cached channel indices, and the
+    /// news settings look their channels up again (a portal saved while the
+    /// settings were closed leaves the lookup's key looking the same).
     fn forget_list_positions(&mut self) {
         self.current_idx = None;
         self.search_hits_for = None;
         self.guide.visible_filter_snapshot.clear();
+        self.news_found_for = None;
     }
 
     fn set_adult_visible(&mut self, on: bool) {
@@ -836,6 +875,10 @@ impl TvApp {
     fn apply_settings_action(&mut self, action: SettingsAction) {
         match action {
             SettingsAction::Close => {
+                // A write that fails here is tried again when the app closes.
+                if self.settings_dirty {
+                    self.save_settings();
+                }
                 self.settings_ui = None;
                 tracing::info!("settings: closed");
             }
@@ -909,10 +952,37 @@ impl TvApp {
                     self.stop_playback();
                 }
             }
+            SettingsAction::SetNewsRules(rules) => {
+                self.settings.news_rules = Some(rules);
+                self.settings_dirty = true;
+            }
         }
     }
 
+    /// The channel each news rule points at, for the settings. A pass over every
+    /// channel, so it runs when the rules' channel names, the catalog or the
+    /// adult lock changed, not per frame.
+    fn refresh_news_found(&mut self) {
+        let rules = self.settings.news_rules();
+        let (loaded, unlocked) = (self.catalog.is_loaded(), self.catalog.adult_unlocked());
+        let fresh = |key: &NewsLookup| !key.is_stale(rules, loaded, unlocked);
+        if self.news_found_for.as_ref().is_some_and(fresh) {
+            return;
+        }
+        self.news_found = self
+            .catalog
+            .resolve_news(rules)
+            .into_iter()
+            .map(|found| found.map(|(_, _, name)| name))
+            .collect();
+        self.news_found_for = Some(NewsLookup::new(rules, loaded, unlocked));
+    }
+
     fn paint_settings(&mut self, ctx: &egui::Context) {
+        if self.settings_ui.is_none() {
+            return;
+        }
+        self.refresh_news_found();
         let Some(overlay) = self.settings_ui.as_mut() else {
             return;
         };
@@ -928,6 +998,8 @@ impl TvApp {
                 .wait_left(Instant::now())
                 .map(|d| d.as_secs().max(1)),
             adult_note: self.adult_note,
+            news_rules: self.settings.news_rules(),
+            news_found: &self.news_found,
         };
         let actions = overlay.show(ctx, &view);
         for a in actions {
@@ -1472,56 +1544,28 @@ impl TvApp {
         self.set_toast(format!("[{}] {}", self.t(T::TagMovie), name));
     }
 
-    /// Find and play the most recent NOS Journaal (npo=true) or RTL Nieuws
-    /// (npo=false) via catch-up. Resolves the news channel's archive
-    /// (tv_archive=1) twin - where both the EPG and the timeshift live -
-    /// fetches its day-EPG async, and hands the result to drain_news.
-    /// Open the `n` news chooser: fetch NOS Journaal (NPO 1+2) and RTL Nieuws
-    /// (RTL 4) catch-up EPG concurrently, build one newest-first list (max 5),
-    /// then pop the modal picker. Fully async - the current channel keeps
-    /// playing and the toast is just a projection.
+    /// Open the `n` news chooser: per news rule (settings, else the
+    /// defaults) find the channel, fetch the day EPGs concurrently, keep the
+    /// matching past programmes (3 per rule, 10 in total, newest first), then
+    /// pop the modal picker. Fully async - the current channel keeps playing.
     fn open_news_picker(&mut self) {
-        const JOURNAAL_EXCL: &[&str] = &["sport", "jeugd", "regio", "makkelijke taal", "gebaren"];
-        const SOURCES: &[NewsSrc] = &[
-            NewsSrc { chan: "npo1", title: "journaal", excl: JOURNAAL_EXCL, tag: "NOS", offset: 0 },
-            NewsSrc { chan: "npo2", title: "journaal", excl: JOURNAAL_EXCL, tag: "NOS", offset: 0 },
-            NewsSrc { chan: "rtl4", title: "rtl nieuws", excl: &[], tag: "RTL", offset: 30 },
-            NewsSrc { chan: "cnn", title: "", excl: &[], tag: "CNN", offset: 0 },
-            NewsSrc { chan: "bbcnews", title: "", excl: &[], tag: "BBC", offset: 0 },
-            NewsSrc { chan: "vrt1", title: "journaal", excl: &[], tag: "VRT", offset: 0 },
-            NewsSrc { chan: "omroepzeeland", title: "nieuws", excl: &[], tag: "ZLD", offset: 0 },
-        ];
-
-        // Resolve each source to its catch-up (tv_archive=1) channel - that's
-        // where both the EPG and the timeshift live. Exact normalized match
-        // first, then substring (handles "CNN" vs "CNN International").
-        let live = self.catalog.live_channels();
-        let mut sources: Vec<(i64, bool, &'static NewsSrc)> = Vec::new();
-        for src in SOURCES {
-            // Prefer the catch-up (tv_archive=1) twin. If there's none - e.g.
-            // CNN / BBC, 24h news with no catch-up - fall back to the LIVE
-            // channel and play it live.
-            let pick = |archive: bool| {
-                live.iter()
-                    .find(|c| {
-                        (c.tv_archive == 1) == archive
-                            && normalize_channel_name(&c.name) == src.chan
-                    })
-                    .or_else(|| {
-                        live.iter().find(|c| {
-                            (c.tv_archive == 1) == archive
-                                && normalize_channel_name(&c.name).contains(src.chan)
-                        })
-                    })
-                    .map(|c| c.stream_id)
-            };
-            let resolved = pick(true)
-                .map(|sid| (sid, true))
-                .or_else(|| pick(false).map(|sid| (sid, false)));
-            match resolved {
-                Some((sid, _)) if sources.iter().any(|(s, _, _)| *s == sid) => {}
-                Some((sid, is_archive)) => sources.push((sid, is_archive, src)),
-                None => tracing::info!("news source {} ({}) not in catalog", src.tag, src.chan),
+        let rules = self.settings.news_rules_or_default();
+        if rules.is_empty() {
+            tracing::info!("news picker: no rules");
+            self.set_toast(self.t(T::NoNewsRules));
+            return;
+        }
+        // Each rule finds its catch-up (tv_archive=1) channel - that's where
+        // both the EPG and the timeshift live - else the live one. Only channels
+        // that show count, so while locked a rule pointing at an adult channel
+        // finds nothing.
+        let resolved = self.catalog.resolve_news(&rules);
+        let mut sources: Vec<(i64, bool, NewsRule)> = Vec::new();
+        for (rule, found) in rules.into_iter().zip(resolved) {
+            match found {
+                Some((sid, _, _)) if sources.iter().any(|(s, _, _)| *s == sid) => {}
+                Some((sid, is_archive, _)) => sources.push((sid, is_archive, rule)),
+                None => tracing::info!("news source {} not in catalog", rule.channel),
             }
         }
         if sources.is_empty() {
@@ -1535,19 +1579,20 @@ impl TvApp {
             let now = chrono::Utc::now();
             let handles: Vec<_> = sources
                 .into_iter()
-                .map(|(sid, is_archive, src)| {
+                .map(|(sid, is_archive, rule)| {
                     let p = portal.clone();
                     (
                         sid,
                         is_archive,
-                        src,
+                        rule,
                         tokio::spawn(async move { p.fetch_day_epg(sid).await.ok() }),
                     )
                 })
                 .collect();
             let mut items: Vec<NewsItem> = Vec::new();
-            for (sid, is_archive, src, h) in handles {
+            for (sid, is_archive, rule, h) in handles {
                 let epg = h.await.ok().flatten();
+                let tag = crate::news::rule_label(&rule);
                 if !is_archive {
                     // 24h news channel (CNN/BBC): no catch-up - one live item,
                     // titled with whatever it's showing now if EPG is available.
@@ -1561,31 +1606,27 @@ impl TvApp {
                         title,
                         start: now,
                         end: now,
-                        tag: src.tag.to_string(),
+                        tag,
                         offset: 0,
                         live: true,
                     });
                     continue;
                 }
                 if let Some(epg) = epg {
-                    // Per source: matching past entries, newest first, capped at
+                    // Per rule: matching past entries, newest first, capped at
                     // 3 so a 24h news channel can't flood the combined list.
                     let mut found: Vec<NewsItem> = epg
                         .entries()
                         .iter()
                         .filter(|e| e.start <= now)
-                        .filter(|e| {
-                            let t = e.title.to_lowercase();
-                            (src.title.is_empty() || t.contains(src.title))
-                                && !src.excl.iter().any(|x| t.contains(x))
-                        })
+                        .filter(|e| crate::news::title_matches(&rule.patterns, &e.title))
                         .map(|e| NewsItem {
                             sid,
                             title: e.title.clone(),
                             start: e.start,
                             end: e.end,
-                            tag: src.tag.to_string(),
-                            offset: src.offset,
+                            tag: tag.clone(),
+                            offset: i64::from(rule.skip_secs),
                             live: false,
                         })
                         .collect();
@@ -3780,6 +3821,11 @@ impl TvApp {
 impl Drop for TvApp {
     fn drop(&mut self) {
         let _ = self.favorites.save(&self.storage.favorites_path());
+        // Rules typed in settings that were still open, or not written yet
+        // when they closed.
+        if self.settings_dirty {
+            let _ = self.settings.save(&self.storage.settings_path());
+        }
         let _ = self.player.cmd_tx.send(Cmd::Quit);
     }
 }
@@ -4100,6 +4146,45 @@ mod tests {
             assert_eq!(others(&normal), others(&swapped), "{lang:?}");
             assert_eq!(normal[1], swapped[1], "{lang:?}");
         }
+    }
+
+    fn news_rule(channel: &str) -> NewsRule {
+        NewsRule {
+            channel: channel.into(),
+            patterns: "*".into(),
+            label: String::new(),
+            skip_secs: 0,
+        }
+    }
+
+    #[test]
+    fn the_found_lines_are_worked_out_again_only_when_a_channel_or_the_catalog_changes() {
+        let rules = vec![news_rule("NPO 1"), news_rule("CNN")];
+        let lookup = NewsLookup::new(&rules, true, false);
+        let stale = |rules: &[NewsRule], loaded, unlocked| lookup.is_stale(rules, loaded, unlocked);
+        assert!(!stale(&rules, true, false), "nothing changed");
+        // Typing in the patterns, the label or the seconds never moves a rule to
+        // another channel.
+        let mut typed = rules.clone();
+        typed[0].patterns = "*journaal*; !*sport*".into();
+        typed[1].label = "C".into();
+        typed[1].skip_secs = 30;
+        assert!(!stale(&typed, true, false));
+        // A channel name does.
+        let mut renamed = rules.clone();
+        renamed[1].channel = "CNN International".into();
+        assert!(stale(&renamed, true, false));
+        let swapped = vec![news_rule("CNN"), news_rule("NPO 1")];
+        assert!(stale(&swapped, true, false));
+        // So does a rule more or less, which is a line more or less.
+        let mut added = rules.clone();
+        added.push(news_rule("BBC News"));
+        assert!(stale(&added, true, false));
+        assert!(stale(&rules[..1], true, false));
+        assert!(stale(&[], true, false));
+        // The catalog loading, and the adult lock changing which channels show.
+        assert!(stale(&rules, false, false));
+        assert!(stale(&rules, true, true));
     }
 
     #[test]

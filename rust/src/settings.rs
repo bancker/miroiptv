@@ -2,7 +2,7 @@
 //! credentials stay in BongoPlayer.ini next to the exe (see args.rs).
 
 use crate::i18n::Lang;
-use crate::news::{default_rules, NewsRule};
+use crate::news::{default_rules, default_rules_static, NewsRule};
 use crate::pin::PinHash;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -93,7 +93,45 @@ impl Settings {
         self.language.as_deref().and_then(Lang::from_code)
     }
 
+    /// The rules in force, borrowed: the saved ones, else the defaults.
+    pub fn news_rules(&self) -> &[NewsRule] {
+        match &self.news_rules {
+            Some(rules) => rules,
+            None => default_rules_static(),
+        }
+    }
+
+    /// The same rules as an owned list, for whoever moves them elsewhere.
     pub fn news_rules_or_default(&self) -> Vec<NewsRule> {
         self.news_rules.clone().unwrap_or_else(default_rules)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_rules_in_force_are_borrowed_the_saved_ones_else_the_defaults() {
+        let mut s = Settings::default();
+        assert_eq!(s.news_rules(), default_rules().as_slice());
+        // Borrowed, not built per call: the same shared copy every time.
+        assert!(std::ptr::eq(s.news_rules(), s.news_rules()));
+        // The user's own choice, an empty list included, replaces the defaults.
+        s.news_rules = Some(Vec::new());
+        assert!(s.news_rules().is_empty());
+        let mine = vec![NewsRule {
+            channel: "CNN".into(),
+            patterns: "*".into(),
+            label: String::new(),
+            skip_secs: 0,
+        }];
+        s.news_rules = Some(mine.clone());
+        assert_eq!(s.news_rules(), mine.as_slice());
+        let saved = s.news_rules.as_deref().unwrap_or_default();
+        assert!(
+            std::ptr::eq(s.news_rules(), saved),
+            "no copy of the saved rules"
+        );
     }
 }

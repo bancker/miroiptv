@@ -1,3 +1,4 @@
+use crate::news::{resolve_channels, NewsRule};
 use crate::portal::xtream::{stream_ref, StreamKind};
 use crate::portal::{Catalog as PortalCatalog, LiveChannel, Movie, Portal, Series};
 use crate::search::{rank, ItemKind, SearchItem};
@@ -682,6 +683,18 @@ impl CatalogStore {
         QualityNav { ladder, pos }
     }
 
+    /// Where each news rule points ([`crate::news::resolve_channels`]), among the
+    /// channels that show now: while locked, a rule pointing at an adult channel
+    /// finds nothing. One read lock and one pass, no copy of the catalog (see
+    /// `quality_nav`); an unloaded catalog resolves every rule to nothing.
+    pub fn resolve_news(&self, rules: &[NewsRule]) -> Vec<Option<(i64, bool, String)>> {
+        let g = self.inner.read();
+        match g.as_ref() {
+            Some(c) => resolve_channels(c.live.iter().filter(|x| self.shows_live(x)), rules),
+            None => vec![None; rules.len()],
+        }
+    }
+
     /// Archive (catch-up) channels: `tv_archive == 1`. These serve
     /// `/timeshift/...` and `get_simple_data_table` returns the full
     /// catch-up history; the matching live channel (`tv_archive == 0`)
@@ -809,5 +822,83 @@ impl CatalogStore {
             .and_then(|c| c.movies.iter().find(|m| m.stream_id == stream_id))
             .and_then(|m| m.container_extension.clone())
             .unwrap_or_else(|| "mkv".to_owned())
+    }
+}
+
+#[cfg(test)]
+mod news_tests {
+    use super::*;
+    use crate::args::XtreamCreds;
+    use crate::portal::xtream::XtreamPortal;
+
+    /// A portal that is never asked anything: the catalog only needs one to exist.
+    fn idle_portal() -> Arc<dyn Portal> {
+        Arc::new(XtreamPortal::new(XtreamCreds {
+            username: "u".into(),
+            password: "p".into(),
+            host: "h".into(),
+            port: 80,
+        }))
+    }
+
+    fn ch(stream_id: i64, name: &str, is_adult: bool) -> LiveChannel {
+        LiveChannel {
+            stream_id,
+            name: name.into(),
+            category_id: None,
+            epg_channel_id: None,
+            tv_archive: 0,
+            tv_archive_duration: 0,
+            is_adult,
+        }
+    }
+
+    fn rule(channel: &str) -> NewsRule {
+        NewsRule {
+            channel: channel.into(),
+            patterns: "*".into(),
+            label: String::new(),
+            skip_secs: 0,
+        }
+    }
+
+    #[test]
+    fn a_news_rule_finds_only_the_channels_that_show() {
+        let store = CatalogStore::from_catalog(
+            idle_portal(),
+            PortalCatalog {
+                live: vec![
+                    ch(1, "NL | NPO 1", false),
+                    ch(2, "24/7 | NIGHT NEWS", true), // adult by the portal's flag
+                    ch(3, "XXX | AFTER DARK", false), // adult by its name
+                ],
+                ..PortalCatalog::default()
+            },
+        );
+        let rules = [rule("NPO 1"), rule("NIGHT NEWS"), rule("AFTER DARK")];
+        let npo = Some((1, false, "NL | NPO 1".to_string()));
+        // Locked: a rule pointing at an adult channel finds nothing.
+        assert_eq!(store.resolve_news(&rules), [npo.clone(), None, None]);
+        store.set_adult_unlocked(true);
+        assert_eq!(
+            store.resolve_news(&rules),
+            [
+                npo.clone(),
+                Some((2, false, "24/7 | NIGHT NEWS".to_string())),
+                Some((3, false, "XXX | AFTER DARK".to_string())),
+            ]
+        );
+        store.set_adult_unlocked(false);
+        assert_eq!(store.resolve_news(&rules), [npo, None, None]);
+    }
+
+    #[test]
+    fn an_unloaded_catalog_resolves_every_rule_to_nothing() {
+        let store = CatalogStore::new(idle_portal());
+        assert_eq!(
+            store.resolve_news(&[rule("NPO 1"), rule("CNN")]),
+            [None, None]
+        );
+        assert!(store.resolve_news(&[]).is_empty());
     }
 }

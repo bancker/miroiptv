@@ -2,7 +2,10 @@
 //! count as news there, the badge to show and how many seconds to skip at the
 //! start (RTL's ads).
 
+use crate::catalog::normalize_channel_name;
+use crate::portal::LiveChannel;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewsRule {
@@ -41,6 +44,12 @@ pub fn default_rules() -> Vec<NewsRule> {
     ]
 }
 
+/// The default rules as one shared copy, for whoever only reads them.
+pub fn default_rules_static() -> &'static [NewsRule] {
+    static RULES: OnceLock<Vec<NewsRule>> = OnceLock::new();
+    RULES.get_or_init(default_rules)
+}
+
 /// Whether `title` counts as news: it matches at least one plain pattern (or
 /// there is none) and no `!`-pattern. Case-insensitive.
 pub fn title_matches(patterns: &str, title: &str) -> bool {
@@ -70,6 +79,74 @@ pub fn rule_label(rule: &NewsRule) -> String {
         .next()
         .unwrap_or("")
         .to_uppercase()
+}
+
+/// The first channel of one kind (catch-up or live) that a rule's name
+/// matches exactly, and the first one that merely contains it.
+#[derive(Default)]
+struct Matches<'a> {
+    exact: Option<&'a LiveChannel>,
+    containing: Option<&'a LiveChannel>,
+}
+
+impl<'a> Matches<'a> {
+    fn best(&self) -> Option<&'a LiveChannel> {
+        self.exact.or(self.containing)
+    }
+}
+
+/// Where each rule points, in the order of `rules`: the channel's stream id,
+/// whether it is the catch-up twin, and its name. A rule takes its catch-up
+/// twin when there is one (EPG and replays live there), else the live channel.
+/// Within a kind, the exact normalized name wins over a name that contains it
+/// ("CNN" finds "CNN International"), whatever their order in the catalog. A
+/// rule whose name normalizes to nothing finds nothing.
+///
+/// One pass over the channels (a portal has some 13,000): every catalog name is
+/// normalized once, not once per rule and per attempt.
+pub fn resolve_channels<'a>(
+    channels: impl IntoIterator<Item = &'a LiveChannel>,
+    rules: &[NewsRule],
+) -> Vec<Option<(i64, bool, String)>> {
+    let keys: Vec<String> = rules
+        .iter()
+        .map(|r| normalize_channel_name(&r.channel))
+        .collect();
+    // Per rule: its matches among the catch-up channels, then among the live ones.
+    let mut found: Vec<[Matches<'a>; 2]> = keys.iter().map(|_| Default::default()).collect();
+    for channel in channels {
+        let name = normalize_channel_name(&channel.name);
+        let kind = usize::from(channel.tv_archive != 1);
+        for (key, kinds) in keys.iter().zip(found.iter_mut()) {
+            let slot = &mut kinds[kind];
+            // An exact match settles the slot: nothing later can change it.
+            if key.is_empty() || slot.exact.is_some() {
+                continue;
+            }
+            if name == *key {
+                slot.exact = Some(channel);
+            } else if slot.containing.is_none() && name.contains(key.as_str()) {
+                slot.containing = Some(channel);
+            }
+        }
+    }
+    found
+        .iter()
+        .map(|[archive, live]| {
+            let pick = |c: &LiveChannel, is_archive| (c.stream_id, is_archive, c.name.clone());
+            archive
+                .best()
+                .map(|c| pick(c, true))
+                .or_else(|| live.best().map(|c| pick(c, false)))
+        })
+        .collect()
+}
+
+/// The channel one rule points at (see [`resolve_channels`]).
+pub fn resolve_channel(live: &[LiveChannel], rule: &NewsRule) -> Option<(i64, bool, String)> {
+    resolve_channels(live, std::slice::from_ref(rule))
+        .pop()
+        .flatten()
 }
 
 /// `*`-only wildcard match over the whole text.
@@ -206,5 +283,141 @@ mod tests {
             skip_secs: 0,
         };
         assert_eq!(rule_label(&r), "OMROEP");
+    }
+
+    fn lc(id: i64, name: &str, archive: i32) -> crate::portal::LiveChannel {
+        crate::portal::LiveChannel {
+            stream_id: id,
+            name: name.into(),
+            category_id: None,
+            epg_channel_id: None,
+            tv_archive: archive,
+            tv_archive_duration: 0,
+            is_adult: false,
+        }
+    }
+
+    fn rule(channel: &str) -> NewsRule {
+        NewsRule {
+            channel: channel.into(),
+            patterns: "*".into(),
+            label: String::new(),
+            skip_secs: 0,
+        }
+    }
+
+    #[test]
+    fn a_rule_finds_the_catch_up_twin_first() {
+        let live = vec![
+            lc(1, "NL | NPO 1", 0),
+            lc(2, "NL | NPO1 HD", 1),
+            lc(3, "CNN International", 0),
+        ];
+        assert_eq!(
+            resolve_channel(&live, &rule("NPO 1")),
+            Some((2, true, "NL | NPO1 HD".into()))
+        );
+        assert_eq!(
+            resolve_channel(&live, &rule("CNN")),
+            Some((3, false, "CNN International".into()))
+        );
+        assert_eq!(resolve_channel(&live, &rule("RTL 4")), None);
+        assert_eq!(resolve_channel(&live, &rule("  ")), None);
+    }
+
+    /// A catalog in which every way of matching has its trap.
+    fn trap_catalog() -> Vec<crate::portal::LiveChannel> {
+        vec![
+            lc(1, "CNN International", 0), // contains "cnn", and comes before the exact one
+            lc(2, "NL | CNN", 0),
+            lc(3, "NL | NPO 1", 0),
+            lc(4, "NL | NPO1 HD", 1), // the catch-up twin
+            lc(5, "NL | RTL 4", 0),
+            lc(6, "NL | RTL 4 Plus", 1), // catch-up, but only contains "rtl4"
+            lc(7, "BBC News", 0),
+            lc(8, "BBC News HD", 0), // the same channel again
+        ]
+    }
+
+    #[test]
+    fn an_exact_name_beats_a_containing_one_that_comes_first() {
+        let live = trap_catalog();
+        assert_eq!(
+            resolve_channel(&live, &rule("CNN")),
+            Some((2, false, "NL | CNN".into()))
+        );
+        // Without the exact one, the containing name is what is left.
+        let without_exact: Vec<_> = live.iter().filter(|c| c.stream_id != 2).collect();
+        assert_eq!(
+            resolve_channels(without_exact, &[rule("CNN")]),
+            [Some((1, false, "CNN International".into()))]
+        );
+    }
+
+    #[test]
+    fn a_containing_catch_up_name_beats_an_exact_live_one() {
+        // Replays and the EPG live on the catch-up channel, so it wins even when the
+        // live channel is the exact match.
+        let live = trap_catalog();
+        assert_eq!(
+            resolve_channel(&live, &rule("RTL 4")),
+            Some((6, true, "NL | RTL 4 Plus".into()))
+        );
+    }
+
+    #[test]
+    fn the_first_of_several_exact_names_wins() {
+        let live = trap_catalog();
+        assert_eq!(
+            resolve_channel(&live, &rule("BBC News")),
+            Some((7, false, "BBC News".into()))
+        );
+    }
+
+    #[test]
+    fn a_rule_that_normalizes_to_nothing_finds_nothing() {
+        // Not even the first channel of a catalog whose names all "contain" nothing.
+        let live = trap_catalog();
+        for channel in ["", "  ", "NL | ", "|"] {
+            assert_eq!(resolve_channel(&live, &rule(channel)), None, "{channel:?}");
+        }
+    }
+
+    #[test]
+    fn one_pass_over_several_rules_gives_what_each_rule_gives_alone() {
+        let live = trap_catalog();
+        let rules = vec![
+            rule("CNN"),
+            rule("NPO 1"),
+            rule("RTL 4"),
+            rule("bbc news"),
+            rule("RTL Z"), // in no channel's name
+            rule("  "),
+            rule("NPO1 HD"), // names the same channel as "NPO 1"
+            rule("NPO 1"),   // the very same rule twice
+        ];
+        let batch = resolve_channels(&live, &rules);
+        assert_eq!(batch.len(), rules.len());
+        for (rule, found) in rules.iter().zip(&batch) {
+            assert_eq!(found, &resolve_channel(&live, rule), "{:?}", rule.channel);
+        }
+        // The cases above are not all the same answer.
+        assert_eq!(batch[1], Some((4, true, "NL | NPO1 HD".into())));
+        assert_eq!(batch[1], batch[6], "two rules may name one channel");
+        assert_eq!(batch[1], batch[7]);
+        assert_eq!(batch[4], None);
+        assert_eq!(batch[5], None);
+    }
+
+    #[test]
+    fn no_rules_or_no_channels_resolve_to_nothing() {
+        assert!(resolve_channels(&trap_catalog(), &[]).is_empty());
+        assert_eq!(resolve_channels(&[], &[rule("CNN")]), [None]);
+    }
+
+    #[test]
+    fn the_default_rules_are_one_shared_copy() {
+        assert_eq!(default_rules_static(), default_rules().as_slice());
+        assert!(std::ptr::eq(default_rules_static(), default_rules_static()));
     }
 }

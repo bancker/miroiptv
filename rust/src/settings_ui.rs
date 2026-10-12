@@ -5,6 +5,7 @@
 
 use crate::args::XtreamCreds;
 use crate::i18n::{t, tr, Lang, T};
+use crate::news::{default_rules, NewsRule};
 use crate::pin::valid_pin;
 use crate::portal::xtream::ConnCheck;
 use crate::settings::Settings;
@@ -43,6 +44,26 @@ impl Section {
 /// from it (see `overlay_layer`).
 const AREA_ID: &str = "__settings__";
 
+/// Room the overlay keeps between its frame and the window's edge.
+const OVERLAY_SCREEN_MARGIN: f32 = 12.0;
+/// Space between the overlay's frame and what is in it.
+const OVERLAY_FRAME_MARGIN: f32 = 16.0;
+
+// The columns of the news rules, in points. The patterns box takes what is left
+// of the row.
+const NEWS_CHANNEL_WIDTH: f32 = 110.0;
+const NEWS_LABEL_WIDTH: f32 = 50.0;
+const NEWS_REMOVE_WIDTH: f32 = 20.0;
+/// The patterns box is never narrower than this, whatever the window.
+const NEWS_PATTERNS_MIN_WIDTH: f32 = 60.0;
+/// The rules never get less height than this, whatever the window.
+const NEWS_MIN_ROWS_HEIGHT: f32 = 60.0;
+/// The scroll marker's width, the room it takes beside the rules, and the least
+/// it is long.
+const NEWS_MARKER_WIDTH: f32 = 3.0;
+const NEWS_MARKER_ROOM: f32 = 6.0;
+const NEWS_MARKER_MIN_LENGTH: f32 = 12.0;
+
 /// The overlay's own layer: the Area is built from it, and a focused widget
 /// counts as the overlay's only when it lies on it.
 fn overlay_layer() -> egui::LayerId {
@@ -72,6 +93,9 @@ pub enum SettingsAction {
     ResetPin(String),
     /// Hide adult content again.
     Lock,
+    /// The news rules as they stand now: sent with every change, so a typed
+    /// letter is one of these.
+    SetNewsRules(Vec<NewsRule>),
 }
 
 /// What the overlay shows but app.rs owns.
@@ -89,6 +113,10 @@ pub struct SettingsView<'a> {
     pub pin_wait_secs: Option<u64>,
     /// The last PIN outcome (wrong PIN, PIN changed, ...).
     pub adult_note: Option<T>,
+    /// The news rules in force; the news section starts from them.
+    pub news_rules: &'a [NewsRule],
+    /// Per news rule, the channel it points at, if any (the catalog's word).
+    pub news_found: &'a [Option<String>],
 }
 
 /// The connection test's state, shown under the portal buttons.
@@ -205,6 +233,12 @@ pub struct SettingsUi {
     /// Why a PIN was turned down before it left the dialog (not 4 digits, not
     /// the same twice); what the app says about a PIN comes with the view.
     local_note: Option<T>,
+    /// The news rules being edited: made when the section is first shown, from
+    /// the rules in force, and kept while the overlay is open.
+    news: Option<Vec<NewsRule>>,
+    /// The rule whose channel field takes the focus on the next frame (a rule
+    /// just added, or the one that took a removed rule's place).
+    news_focus: Option<usize>,
 }
 
 impl SettingsUi {
@@ -282,7 +316,7 @@ impl SettingsUi {
             .show(ctx, |ui| {
                 egui::Frame::popup(&ctx.style())
                     .fill(Color32::from_rgb(22, 22, 28))
-                    .inner_margin(egui::Margin::same(16.0))
+                    .inner_margin(egui::Margin::same(OVERLAY_FRAME_MARGIN))
                     .show(ui, |ui| {
                         ui.set_width(width);
                         ui.label(
@@ -291,6 +325,18 @@ impl SettingsUi {
                                 .color(Color32::WHITE),
                         );
                         ui.add_space(8.0);
+                        // The overlay never grows taller than its window: a section
+                        // gets the height that is left after the window's edge, the
+                        // frame's margins, the title above and the key hints below,
+                        // and scrolls what does not fit in it.
+                        let above = ui.cursor().min.y - ui.min_rect().min.y;
+                        let hints = 8.0
+                            + 2.0 * ui.spacing().item_spacing.y
+                            + ui.text_style_height(&egui::TextStyle::Small);
+                        let section_height = ctx.screen_rect().height()
+                            - 2.0 * (OVERLAY_SCREEN_MARGIN + OVERLAY_FRAME_MARGIN)
+                            - above
+                            - hints;
                         let row = ui.horizontal_top(|ui| {
                             let list = ui.vertical(|ui| {
                                 ui.set_width(170.0);
@@ -325,8 +371,13 @@ impl SettingsUi {
                                     Section::Adult => {
                                         self.adult_pane(ui, view, focus_first, &mut actions)
                                     }
-                                    // Filled in by Task 17.
-                                    Section::News => {}
+                                    Section::News => self.news_pane(
+                                        ui,
+                                        view,
+                                        focus_first,
+                                        &mut actions,
+                                        section_height,
+                                    ),
                                 }
                             });
                             list.response.rect.right() + 11.0
@@ -599,6 +650,186 @@ impl SettingsUi {
             ui.label(t(lang, note));
         }
     }
+
+    /// The news rules: a header, then per rule a row (channel, title patterns,
+    /// badge label, seconds to skip, remove) with the channel it found under it,
+    /// then Add and Restore defaults and a hint on the patterns. The rules scroll
+    /// when `max_height` cannot hold them; the rest stays in view.
+    fn news_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: &SettingsView,
+        focus_first: bool,
+        actions: &mut Vec<SettingsAction>,
+        max_height: f32,
+    ) {
+        let lang = view.lang;
+        let rules = self.news.get_or_insert_with(|| view.news_rules.to_vec());
+        // The rule whose channel field takes the focus: the first when the section
+        // was just entered, else the one an Add or a Remove asked for.
+        let focus_row = self.news_focus.take().or(focus_first.then_some(0));
+        let last = rules.len().saturating_sub(1);
+        let (mut changed, mut remove) = (false, None);
+
+        let (gap, row_height) = (ui.spacing().item_spacing.x, ui.spacing().interact_size.y);
+        let skip_width = ui.spacing().interact_size.x;
+        // The rows leave room for the marker that shows where the rules are
+        // scrolled to, whether it shows or not: the columns do not shift.
+        let row_width = ui.available_width() - NEWS_MARKER_ROOM;
+        let fixed = NEWS_CHANNEL_WIDTH + NEWS_LABEL_WIDTH + skip_width + NEWS_REMOVE_WIDTH;
+        let patterns_width = (row_width - fixed - 4.0 * gap).max(NEWS_PATTERNS_MIN_WIDTH);
+
+        ui.horizontal_top(|ui| {
+            news_header(ui, NEWS_CHANNEL_WIDTH, t(lang, T::NewsColChannel));
+            news_header(ui, patterns_width, t(lang, T::NewsColPatterns));
+            news_header(ui, NEWS_LABEL_WIDTH, t(lang, T::NewsColLabel));
+            let skip_and_remove = skip_width + gap + NEWS_REMOVE_WIDTH;
+            news_header(ui, skip_and_remove, t(lang, T::NewsColSkip));
+        });
+        // What is left for the rules: the buttons and the hint (a second line of
+        // it, should it wrap) stay in view below them.
+        let above = ui.cursor().min.y - ui.min_rect().min.y;
+        let below = ui.spacing().interact_size.y
+            + 2.0 * ui.text_style_height(&egui::TextStyle::Small)
+            + 3.0 * ui.spacing().item_spacing.y;
+        let scrolled = egui::ScrollArea::vertical()
+            .id_source("__news_rules__")
+            .max_height((max_height - above - below).max(NEWS_MIN_ROWS_HEIGHT))
+            .auto_shrink([false, true])
+            // Dragging the rules would be one more Tab stop, and so is a scroll
+            // bar: the wheel scrolls, and the marker below only shows where.
+            .drag_to_scroll(false)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            // Tab jumps to a rule; no gliding there.
+            .animated(false)
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                for (i, r) in rules.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        let size = |width| egui::vec2(width, row_height);
+                        let channel = ui.add_sized(
+                            size(NEWS_CHANNEL_WIDTH),
+                            egui::TextEdit::singleline(&mut r.channel),
+                        );
+                        if focus_row.is_some_and(|row| row.min(last) == i) {
+                            channel.request_focus();
+                        }
+                        let patterns = ui.add_sized(
+                            size(patterns_width),
+                            egui::TextEdit::singleline(&mut r.patterns),
+                        );
+                        let label = ui.add_sized(
+                            size(NEWS_LABEL_WIDTH),
+                            egui::TextEdit::singleline(&mut r.label),
+                        );
+                        let skip = ui.add_sized(
+                            size(skip_width),
+                            egui::DragValue::new(&mut r.skip_secs).clamp_range(0..=600),
+                        );
+                        let x = ui
+                            .add_sized(size(NEWS_REMOVE_WIDTH), egui::Button::new("x"))
+                            .on_hover_text(t(lang, T::NewsRemove));
+                        for response in [&channel, &patterns, &label, &skip, &x] {
+                            reveal_on_focus(response);
+                        }
+                        changed |= channel.changed()
+                            | patterns.changed()
+                            | label.changed()
+                            | skip.changed();
+                        if x.clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                    let found = match view.news_found.get(i) {
+                        Some(Some(name)) => tr(lang, T::NewsFound, &[name.as_str()]),
+                        _ => t(lang, T::NewsNotFound).to_string(),
+                    };
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(found)
+                                .small()
+                                .color(Color32::from_white_alpha(120)),
+                        )
+                        .truncate(true),
+                    );
+                }
+            });
+        paint_scroll_marker(ui, &scrolled);
+        if let Some(i) = remove {
+            rules.remove(i);
+            changed = true;
+            self.news_focus = Some(i);
+        }
+        ui.horizontal(|ui| {
+            let add = ui.button(t(lang, T::NewsAddRule));
+            // Without rules there is no first field: start on this button.
+            if focus_row.is_some() && rules.is_empty() {
+                add.request_focus();
+            }
+            if add.clicked() {
+                rules.push(NewsRule {
+                    channel: String::new(),
+                    patterns: "*".into(),
+                    label: String::new(),
+                    skip_secs: 0,
+                });
+                self.news_focus = Some(rules.len() - 1);
+                changed = true;
+            }
+            if ui.button(t(lang, T::NewsRestoreDefaults)).clicked() {
+                *rules = default_rules();
+                changed = true;
+            }
+        });
+        ui.label(
+            egui::RichText::new(t(lang, T::NewsPatternsHelp))
+                .small()
+                .color(Color32::from_white_alpha(120)),
+        );
+        if changed {
+            actions.push(SettingsAction::SetNewsRules(rules.clone()));
+        }
+    }
+}
+
+/// A column header of the news rules: `width` wide, on a second line where the
+/// text needs one.
+fn news_header(ui: &mut egui::Ui, width: f32, text: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_width(width);
+            ui.add(egui::Label::new(egui::RichText::new(text).small()).wrap(true));
+        },
+    );
+}
+
+/// Tab does not scroll to the widget it focuses, so a rule below the fold has to
+/// ask for it.
+fn reveal_on_focus(response: &egui::Response) {
+    if response.gained_focus() {
+        response.scroll_to_me(None);
+    }
+}
+
+/// A thin bar along the right edge of a scroll area that does not fit its
+/// content, showing which part of it is in view. It senses nothing: egui's own
+/// scroll bar is a Tab stop.
+fn paint_scroll_marker<R>(ui: &egui::Ui, scrolled: &egui::scroll_area::ScrollAreaOutput<R>) {
+    let (view, total) = (scrolled.inner_rect, scrolled.content_size.y);
+    if total <= view.height() {
+        return;
+    }
+    let handle = (view.height() * view.height() / total).max(NEWS_MARKER_MIN_LENGTH);
+    let passed = (scrolled.state.offset.y / (total - view.height())).clamp(0.0, 1.0);
+    let top = view.top() + (view.height() - handle) * passed;
+    let bar = egui::Rect::from_min_size(
+        egui::pos2(view.right() - NEWS_MARKER_WIDTH, top),
+        egui::vec2(NEWS_MARKER_WIDTH, handle),
+    );
+    ui.painter()
+        .rect_filled(bar, NEWS_MARKER_WIDTH / 2.0, Color32::from_white_alpha(90));
 }
 
 /// A masked PIN field: anything but digits is dropped as it is typed, and it
@@ -731,6 +962,8 @@ mod tests {
             has_pin: false,
             pin_wait_secs: None,
             adult_note: None,
+            news_rules: settings.news_rules(),
+            news_found: &[],
         }
     }
 
@@ -765,21 +998,43 @@ mod tests {
         );
     }
 
+    /// The window the headless frames are drawn in, unless a test says otherwise.
+    const SCREEN: egui::Vec2 = egui::vec2(1280.0, 720.0);
+
     /// One headless frame in which these events arrive.
     fn run_events(
         ctx: &egui::Context,
         events: Vec<egui::Event>,
         draw: impl FnOnce(&egui::Context),
     ) {
+        let _ = run_events_in(ctx, SCREEN, events, draw);
+    }
+
+    /// One headless frame in a window of this size; what it painted.
+    fn run_events_in(
+        ctx: &egui::Context,
+        screen: egui::Vec2,
+        events: Vec<egui::Event>,
+        draw: impl FnOnce(&egui::Context),
+    ) -> egui::FullOutput {
         let raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1280.0, 720.0),
-            )),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
             events,
             ..Default::default()
         };
-        let _ = ctx.run(raw, draw);
+        ctx.run(raw, draw)
+    }
+
+    /// Every text a frame painted.
+    fn painted_texts(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Another panel on screen: a default Area in the corner where the app's
@@ -818,20 +1073,33 @@ mod tests {
         adult_unlocked: bool,
         has_pin: bool,
         pin_wait_secs: Option<u64>,
+        /// The window the overlay is drawn in.
+        screen: egui::Vec2,
+        /// The language the overlay is drawn in.
+        lang: Lang,
+        /// What app.rs would tell the News section it found.
+        news_found: Vec<Option<String>>,
+        /// Every text the last frame painted.
+        painted: Vec<String>,
     }
 
     impl Overlay {
         fn new() -> Self {
-            Self::start(false)
+            Self::start(false, SCREEN)
         }
 
         /// With another default Area on screen in every frame, as while a
         /// toast shows.
         fn with_other_panel() -> Self {
-            Self::start(true)
+            Self::start(true, SCREEN)
         }
 
-        fn start(other_panel: bool) -> Self {
+        /// In a window of this size.
+        fn in_window(width: f32, height: f32) -> Self {
+            Self::start(false, egui::vec2(width, height))
+        }
+
+        fn start(other_panel: bool, screen: egui::Vec2) -> Self {
             let mut overlay = Overlay {
                 ctx: egui::Context::default(),
                 ui: SettingsUi::new(),
@@ -840,6 +1108,10 @@ mod tests {
                 adult_unlocked: false,
                 has_pin: false,
                 pin_wait_secs: None,
+                screen,
+                lang: Lang::En,
+                news_found: Vec::new(),
+                painted: Vec::new(),
             };
             // Two empty frames first, so the widgets exist before the first key.
             overlay.frame(&[]);
@@ -866,19 +1138,50 @@ mod tests {
         fn frame_with(&mut self, events: Vec<egui::Event>) -> Vec<SettingsAction> {
             let mut actions = Vec::new();
             let view = SettingsView {
+                lang: self.lang,
                 adult_unlocked: self.adult_unlocked,
                 has_pin: self.has_pin,
                 pin_wait_secs: self.pin_wait_secs,
+                news_found: &self.news_found,
                 ..make_view(&self.settings)
             };
             let other_panel = self.other_panel;
-            run_events(&self.ctx, events, |ctx| {
+            let output = run_events_in(&self.ctx, self.screen, events, |ctx| {
                 if other_panel {
                     show_other_panel(ctx);
                 }
                 actions = self.ui.show(ctx, &view)
             });
+            self.painted = painted_texts(&output);
             actions
+        }
+
+        /// Into the News section: its first control has the focus, the first
+        /// rule's channel field (the Add button without rules).
+        fn open_news_pane(&mut self) {
+            self.press(Key::ArrowDown, 4);
+            self.press(Key::Enter, 1);
+        }
+
+        fn screen_rect(&self) -> egui::Rect {
+            egui::Rect::from_min_size(egui::Pos2::ZERO, self.screen)
+        }
+
+        /// Where the overlay is, as of the last frame.
+        fn overlay_rect(&self) -> egui::Rect {
+            let area = egui::Id::new(AREA_ID);
+            self.ctx
+                .memory(|m| m.area_rect(area))
+                .expect("the overlay has been drawn")
+        }
+
+        /// The widget with the keyboard focus, as of the last frame.
+        fn focused_response(&self) -> egui::Response {
+            let id = self
+                .ctx
+                .memory(|m| m.focused())
+                .expect("a widget has the focus");
+            self.ctx.read_response(id).expect("it was drawn")
         }
 
         /// `times` frames with the same key; none may report anything.
@@ -1643,5 +1946,268 @@ mod tests {
             o.frame(&[Key::Enter]),
             vec![SettingsAction::ResetPin("foo bar".into())]
         );
+    }
+
+    fn news_rule(channel: &str) -> NewsRule {
+        NewsRule {
+            channel: channel.into(),
+            patterns: "*".into(),
+            label: String::new(),
+            skip_secs: 0,
+        }
+    }
+
+    /// 12 rules, as someone who follows many channels has.
+    fn twelve_rules() -> Vec<NewsRule> {
+        (1..=12)
+            .map(|i| news_rule(&format!("Channel {i}")))
+            .collect()
+    }
+
+    /// The rules `actions` carry, which must be exactly one `SetNewsRules`.
+    fn one_set_news_rules(actions: Vec<SettingsAction>) -> Vec<NewsRule> {
+        match <[SettingsAction; 1]>::try_from(actions) {
+            Ok([SettingsAction::SetNewsRules(rules)]) => rules,
+            other => panic!("expected one SetNewsRules, got {other:?}"),
+        }
+    }
+
+    fn channels(rules: &[NewsRule]) -> Vec<&str> {
+        rules.iter().map(|r| r.channel.as_str()).collect()
+    }
+
+    #[test]
+    fn keys_typed_into_a_news_rule_stay_in_its_field_and_esc_backs_out_one_level() {
+        let mut o = Overlay::new();
+        o.settings.news_rules = Some(vec![news_rule("")]);
+        o.open_news_pane();
+        let mut rules = Vec::new();
+        for (key, c) in [
+            (Key::N, 'n'),
+            (Key::O, 'o'),
+            (Key::S, 's'),
+            (Key::Space, ' '),
+            (Key::O, 'o'),
+        ] {
+            // Each key changes the rule and nothing else: `o` is a letter here,
+            // not the key that closes the overlay.
+            rules = one_set_news_rules(o.type_char(key, c));
+        }
+        assert_eq!(channels(&rules), ["nos o"]);
+        // Esc leaves the field for the list, and only the next one closes.
+        assert_eq!(o.frame(&[Key::Escape]), vec![]);
+        assert_eq!(o.frame(&[Key::Escape]), vec![SettingsAction::Close]);
+    }
+
+    #[test]
+    fn typing_in_the_other_fields_of_a_rule_changes_that_rule_only() {
+        let mut o = Overlay::new();
+        o.settings.news_rules = Some(vec![news_rule("NPO 1"), news_rule("CNN")]);
+        o.open_news_pane();
+        o.press(Key::Tab, 1); // the patterns, which hold "*"
+        let rules = one_set_news_rules(o.type_char(Key::J, 'j'));
+        assert_eq!(rules[0].patterns, "*j");
+        o.press(Key::Tab, 1); // the label
+        let rules = one_set_news_rules(o.type_char(Key::N, 'N'));
+        assert_eq!(rules[0].label, "N");
+        assert_eq!(rules[1], news_rule("CNN"));
+        assert_eq!(rules[0].channel, "NPO 1");
+    }
+
+    #[test]
+    fn what_was_typed_stays_while_the_overlay_is_open() {
+        let mut o = Overlay::new();
+        o.settings.news_rules = Some(vec![news_rule("")]);
+        o.open_news_pane();
+        o.type_char(Key::A, 'a');
+        // To the list, to another section and back: the rule is as it was left,
+        // although the app has not handed the new rules back in the view.
+        o.frame(&[Key::Escape]);
+        o.press(Key::ArrowUp, 1);
+        o.press(Key::ArrowDown, 1);
+        o.press(Key::Enter, 1);
+        let rules = one_set_news_rules(o.type_char(Key::B, 'b'));
+        assert_eq!(channels(&rules), ["ab"]);
+    }
+
+    #[test]
+    fn with_no_saved_rules_the_news_section_starts_from_the_defaults() {
+        let mut o = Overlay::new();
+        assert_eq!(o.settings.news_rules, None);
+        o.open_news_pane();
+        let rules = one_set_news_rules(o.type_char(Key::X, 'x'));
+        assert_eq!(rules.len(), default_rules().len());
+        assert_eq!(rules[0].channel, "NPO 1x");
+        assert_eq!(rules[1..], default_rules()[1..]);
+    }
+
+    #[test]
+    fn without_rules_the_news_section_starts_on_the_add_button_and_space_adds_one() {
+        let mut o = Overlay::new();
+        o.settings.news_rules = Some(Vec::new());
+        o.open_news_pane();
+        let rules = one_set_news_rules(o.frame(&[Key::Space]));
+        assert_eq!(rules, [news_rule("")]);
+    }
+
+    #[test]
+    fn a_rule_just_added_takes_the_keyboard_in_its_channel_field() {
+        let mut o = Overlay::new();
+        o.settings.news_rules = Some(vec![news_rule("CNN")]);
+        o.open_news_pane();
+        o.press(Key::Tab, 5); // past the rule's five controls: the Add button
+        let rules = one_set_news_rules(o.frame(&[Key::Space]));
+        assert_eq!(channels(&rules), ["CNN", ""]);
+        assert_eq!(o.frame(&[]), vec![]); // the new rule is drawn and takes the focus
+        let rules = one_set_news_rules(o.type_char(Key::C, 'c'));
+        assert_eq!(channels(&rules), ["CNN", "c"]);
+    }
+
+    #[test]
+    fn removing_a_rule_leaves_the_keyboard_on_the_rule_that_took_its_place() {
+        let mut o = Overlay::new();
+        o.settings.news_rules = Some(vec![news_rule("A"), news_rule("B"), news_rule("C")]);
+        o.open_news_pane();
+        // B's channel field is the 6th control; its remove button the 10th.
+        o.press(Key::Tab, 9);
+        let rules = one_set_news_rules(o.frame(&[Key::Space]));
+        assert_eq!(channels(&rules), ["A", "C"]);
+        assert_eq!(o.frame(&[]), vec![]);
+        let rules = one_set_news_rules(o.type_char(Key::Z, 'z'));
+        assert_eq!(channels(&rules), ["A", "Cz"]);
+    }
+
+    #[test]
+    fn removing_the_last_rule_leaves_the_keyboard_on_the_add_button() {
+        let mut o = Overlay::new();
+        o.settings.news_rules = Some(vec![news_rule("A")]);
+        o.open_news_pane();
+        o.press(Key::Tab, 4); // the remove button
+        let rules = one_set_news_rules(o.frame(&[Key::Space]));
+        assert_eq!(rules, []);
+        assert_eq!(o.frame(&[]), vec![]);
+        let rules = one_set_news_rules(o.frame(&[Key::Space]));
+        assert_eq!(rules, [news_rule("")]);
+    }
+
+    #[test]
+    fn restore_defaults_brings_back_the_default_rules() {
+        let mut o = Overlay::new();
+        o.settings.news_rules = Some(Vec::new());
+        o.open_news_pane(); // the Add button has the focus
+        o.press(Key::Tab, 1); // Restore defaults
+        let rules = one_set_news_rules(o.frame(&[Key::Space]));
+        assert_eq!(rules, default_rules());
+    }
+
+    #[test]
+    fn each_news_rule_says_what_it_found_and_the_section_names_its_columns() {
+        let mut o = Overlay::new();
+        o.settings.news_rules = Some(vec![news_rule("NPO 1"), news_rule("Nowhere")]);
+        o.news_found = vec![Some("NL | NPO1 HD".into()), None];
+        o.open_news_pane();
+        for text in [
+            "found: NL | NPO1 HD",
+            "not found",
+            t(Lang::En, T::NewsColChannel),
+            t(Lang::En, T::NewsColPatterns),
+            t(Lang::En, T::NewsColLabel),
+            t(Lang::En, T::NewsColSkip),
+            t(Lang::En, T::NewsPatternsHelp),
+        ] {
+            assert!(
+                o.painted.iter().any(|p| p == text),
+                "{text:?} in {:?}",
+                o.painted
+            );
+        }
+    }
+
+    #[test]
+    fn the_news_section_never_makes_the_overlay_bigger_than_its_window() {
+        // The smallest window the app allows, and some bigger ones; German has
+        // the longest texts.
+        for (width, height) in [(640.0, 360.0), (800.0, 450.0), (1280.0, 720.0)] {
+            for lang in Lang::ALL {
+                let mut o = Overlay::in_window(width, height);
+                o.lang = lang;
+                o.settings.news_rules = Some(twelve_rules());
+                o.open_news_pane();
+                assert_eq!(o.frame(&[]), vec![]);
+                let (screen, overlay) = (o.screen_rect(), o.overlay_rect());
+                let name = format!("{width}x{height}, {lang:?}");
+                assert!(
+                    screen.contains_rect(overlay),
+                    "{name}: {overlay:?} is not inside {screen:?}"
+                );
+                // The rules fit the pane: they do not widen the overlay.
+                let designed = (width - 40.0).clamp(480.0, 760.0) + 32.0;
+                assert!(
+                    overlay.width() <= designed + 0.5,
+                    "{name}: {} wide, designed for {designed}",
+                    overlay.width()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tab_scrolls_a_rule_below_the_fold_into_view() {
+        let mut o = Overlay::in_window(640.0, 360.0);
+        o.settings.news_rules = Some(twelve_rules());
+        o.open_news_pane();
+        // From the first rule's channel field to the last one's: 11 rules of
+        // five controls each.
+        o.press(Key::Tab, 55);
+        assert_eq!(o.frame(&[]), vec![]); // the scroll shows in the frame after the Tab
+        let field = o.focused_response();
+        assert_eq!(
+            field.interact_rect, field.rect,
+            "cut off by the list's edge"
+        );
+        assert!(o.overlay_rect().contains_rect(field.rect));
+        assert!(o.screen_rect().contains_rect(o.overlay_rect()));
+        // And it is the last rule's channel field.
+        let rules = one_set_news_rules(o.type_char(Key::X, 'x'));
+        assert_eq!(rules[11].channel, "Channel 12x");
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_news_rules() {
+        let mut o = Overlay::in_window(640.0, 360.0);
+        o.settings.news_rules = Some(twelve_rules());
+        o.open_news_pane();
+        let before = o.focused_response().rect; // the first rule's channel field
+        o.frame_with(vec![egui::Event::PointerMoved(before.center())]);
+        o.frame_with(vec![egui::Event::Scroll(egui::vec2(0.0, -120.0))]);
+        // The wheel's delta is spread over a few frames.
+        for _ in 0..10 {
+            assert_eq!(o.frame(&[]), vec![]);
+        }
+        let after = o.focused_response().rect;
+        assert!(
+            after.top() < before.top() - 100.0,
+            "the rules moved from {before:?} to {after:?}"
+        );
+    }
+
+    #[test]
+    fn the_scrolling_list_adds_no_tab_stop_of_its_own() {
+        let mut o = Overlay::in_window(640.0, 360.0);
+        o.settings.news_rules = Some(twelve_rules());
+        o.open_news_pane();
+        // Backwards from the first field is the News row of the list, not
+        // something the scroll area put in front of the rules. (egui moves the
+        // focus back one frame after the key.)
+        o.frame_with(vec![shift_tab()]);
+        assert_eq!(o.frame(&[]), vec![]);
+        let row = o.ctx.memory(|m| m.focused()).expect("a row has the focus");
+        assert_eq!(o.ui.list_ids.last(), Some(&row));
+        // 12 rules of five controls: the 60th Tab from the first field is the Add
+        // button, as it would be without a scroll area and its scroll bar.
+        o.press(Key::Tab, 1); // back to the first field
+        o.press(Key::Tab, 60);
+        let rules = one_set_news_rules(o.frame(&[Key::Space]));
+        assert_eq!(rules.len(), 13);
     }
 }
