@@ -44,4 +44,10 @@ impl Storage {
     pub fn settings_path(&self) -> PathBuf {
         self.root.join("settings.json")
     }
+
+    /// What the app can build again (the guide's EPG, logos): `cache\` in the
+    /// config folder, so `BONGO_CONFIG_DIR` takes it along.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root.join("cache")
+    }
 }
