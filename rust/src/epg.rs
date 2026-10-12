@@ -79,7 +79,9 @@ fn merge_archive(a: Option<bool>, b: Option<bool>) -> Option<bool> {
 ///   - with the same title (trimmed, any case) is merged into it, which then
 ///     ends at the later of the two ends;
 ///   - that starts together with it, or lies wholly inside it, is dropped;
-///   - otherwise ends that one: it ends where this one starts.
+///   - otherwise ends that one: it ends where this one starts, and its
+///     `has_archive` becomes unknown, because the portal's flag described the
+///     uncut programme.
 ///
 /// The result is sorted, no two entries overlap, and each ends after it starts.
 pub fn clean_entries(mut entries: Vec<EpgEntry>) -> Vec<EpgEntry> {
@@ -100,6 +102,7 @@ pub fn clean_entries(mut entries: Vec<EpgEntry>) -> Vec<EpgEntry> {
             // The one already kept stays.
         } else {
             prev.end = e.start;
+            prev.has_archive = None;
             out.push(e);
         }
     }

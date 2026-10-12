@@ -142,6 +142,23 @@ fn merged_entries_are_watchable_when_either_says_so() {
 }
 
 #[test]
+fn a_cut_programme_no_longer_knows_whether_it_was_kept() {
+    // The portal's flag described "Lang" as it ran to 11:00. Cut at 10:50, the
+    // programme that is left is not the one the flag was about.
+    let mut lang = e("Lang", 600, 660);
+    lang.has_archive = Some(false);
+    let mut kort = e("Kort", 650, 700);
+    kort.has_archive = Some(true);
+    let epg = Epg::new(vec![lang, kort]);
+    assert_eq!(
+        spans(&epg),
+        [span("Lang", 600, 650), span("Kort", 650, 700)]
+    );
+    assert_eq!(epg.entries()[0].has_archive, None);
+    assert_eq!(epg.entries()[1].has_archive, Some(true));
+}
+
+#[test]
 fn no_two_programmes_ever_run_at_the_same_moment() {
     // A messy listing: 300 entries of 5 titles at pseudo-random times, some empty.
     let mut seed: u64 = 42;
