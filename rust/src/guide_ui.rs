@@ -1023,6 +1023,7 @@ impl GuideView {
             .hint_text(i18n::t(lang, T::GuideFilterHint))
             .font(font)
             .margin(pad)
+            .interactive(data.keys)
             .desired_width(bar.filter.width() - pad.left - pad.right);
         let response = ui
             .allocate_ui_at_rect(bar.filter, |ui| ui.add_enabled(data.keys, edit))

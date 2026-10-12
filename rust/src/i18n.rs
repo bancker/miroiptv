@@ -190,48 +190,29 @@ texts! {
     HelpSettings => ["instellingen", "settings", "Einstellungen"],
     HelpThisHelp => ["deze hulp", "this help", "diese Hilfe"],
     HelpCloseOverlays => ["vensters sluiten", "close overlays", "Fenster schließen"],
-    KeyTypeLetters => ["letters typen", "type letters", "Buchstaben tippen"],
-    HelpGuideFilter => ["zenders filteren", "filter channels", "Sender filtern"],
-    HelpGuideBackspace => ["laatste letter wissen", "remove from filter", "aus dem Filter löschen"],
-    KeyUpDown => ["Omhoog / Omlaag", "Up / Down", "Hoch / Runter"],
+    HelpGuideFilter => ["filter: zender of programma", "filter: channel or programme", "Filter: Sender oder Sendung"],
     HelpGuideRows => ["programma kiezen in de kolom", "programme cursor in the column", "Sendung in der Spalte wählen"],
     HelpGuideColumns => ["andere kolom", "switch column", "Spalte wechseln"],
-    HelpGuidePage => ["10 rijen verspringen", "jump 10 rows", "10 Zeilen springen"],
+    HelpGuidePages => ["vorige / volgende pagina zenders", "previous / next page of channels", "vorige / nächste Seite Sender"],
+    HelpGuideDate => ["datum kiezen", "choose the date", "Datum wählen"],
+    HelpGuideEsc => ["filter wissen, anders gids sluiten", "clear the filter, else close the guide", "Filter löschen, sonst Programm schließen"],
     HelpGuideHomeEnd => ["eerste / laatste programma", "first / last programme", "erste / letzte Sendung"],
     HelpGuideTimeMode => ["Nu & straks  /  Primetime", "Now & next  /  Primetime", "Jetzt & gleich  /  Primetime"],
-    HelpGuideChannelMode => ["Alle  /  Live  /  Terugkijken", "All  /  Live  /  Catch-up", "Alle  /  Live  /  Wiederholung"],
     HelpGuidePlay => ["gekozen programma afspelen (live / terugkijken)", "play the selected programme (live / catch-up)", "gewählte Sendung abspielen (live / Wiederholung)"],
-    KeyEscOrG => ["Esc of g", "Esc or g", "Esc oder g"],
     HelpGuideClose => ["gids sluiten", "close guide", "Programm schließen"],
-    // The current guide (part 2 replaces it)
+    // The guide of 0.6.0 (part 2)
     GuideCatalogLoading => ["catalogus laadt nog - druk zo nog eens op g", "catalog still loading - press g again in a moment", "Katalog lädt noch - gleich nochmal g drücken"],
-    GuideEpgNotLoaded => ["gids voor deze zender nog niet geladen", "guide not loaded yet for this channel", "Programm für diesen Sender noch nicht geladen"],
-    GuideNotAired => ["nog niet uitgezonden: {0} ({1})", "not aired yet: {0} ({1})", "noch nicht gesendet: {0} ({1})"],
-    GuideNoCatchup => ["geen terugkijken voor '{0}': geen archiefzender", "no catch-up for '{0}': not an archive channel", "keine Wiederholung für '{0}': kein Archivsender"],
-    GuideTitle => ["TV-gids", "TV guide", "TV-Programm"],
-    GuideNowNext => ["Nu & straks  (n)", "Now & next  (n)", "Jetzt & gleich  (n)"],
-    GuidePrimetime => ["Primetime  (p)", "Primetime  (p)", "Primetime  (p)"],
-    GuideAll => ["Alle  (a)", "All  (a)", "Alle  (a)"],
-    GuideLive => ["Live  (l)", "Live  (l)", "Live  (l)"],
-    GuideCatchup => ["Terugkijken  (t)", "Catch-up  (t)", "Wiederholung  (t)"],
     GuideChannelsRange => ["zenders {0}-{1} van {2}", "channels {0}-{1} of {2}", "Sender {0}-{1} von {2}"],
     GuidePlaying => ["speelt: {0}", "playing: {0}", "läuft: {0}"],
-    GuideFilter => ["filter: {0}_", "filter: {0}_", "Filter: {0}_"],
-    GuideNoCatchupMatch => ["geen terugkijk-zenders passen bij het filter", "no catch-up channels match the filter", "keine Wiederholungssender passen zum Filter"],
-    GuideNoLiveMatch => ["geen live-zenders passen bij het filter", "no live channels match the filter", "keine Live-Sender passen zum Filter"],
-    GuideNoMatch => ["geen zenders passen bij het filter", "no channels match the filter", "keine Sender passen zum Filter"],
-    GuideArchiveBadge => ["TK", "RP", "WH"],
-    GuideEpgLoading => ["gids laden...", "loading guide...", "Programm wird geladen..."],
-    GuideEpgFailed => ["gids ophalen mislukt", "guide fetch failed", "Programmabruf fehlgeschlagen"],
-    GuideNoEpg => ["portal heeft geen gids voor deze zender", "the portal has no guide for this channel", "das Portal hat kein Programm für diesen Sender"],
-    GuideFooter => ["typen = filter   /   pijlen = navigeren   /   PgUp/PgDn = sneller   /   Enter = afspelen   /   Esc of g = sluiten", "type = filter   /   arrows = navigate   /   PgUp/PgDn = faster   /   Enter = play   /   Esc or g = close", "tippen = Filter   /   Pfeile = navigieren   /   PgUp/PgDn = schneller   /   Enter = abspielen   /   Esc oder g = schließen"],
-    // The guide of 0.6.0 (part 2)
     GuideNow => ["Nu & straks", "Now & next", "Jetzt & gleich"],
     GuidePrime => ["Primetime", "Primetime", "Primetime"],
     GuideFilterHint => ["zender of programma", "channel or programme", "Sender oder Sendung"],
     GuideNoChannels => ["geen zenders met programma-informatie", "no channels with programme information", "keine Sender mit Programminformationen"],
     GuideNothingFound => ["niets gevonden voor '{0}'", "nothing found for '{0}'", "nichts gefunden für '{0}'"],
     GuideLiveBadge => ["LIVE", "LIVE", "LIVE"],
+    GuideStartsAt => ["begint om {0}", "starts at {0}", "beginnt um {0}"],
+    GuideNotReplayable => ["niet terug te kijken", "not available to watch back", "nicht als Wiederholung verfügbar"],
+    GuideLiveToast => ["[LIVE] {0} · {1}", "[LIVE] {0} · {1}", "[LIVE] {0} · {1}"],
     GuideKeysFooter => ["pijlen = navigeren   /   PgUp/PgDn = andere zenders   /   Enter = afspelen   /   n / p = nu / primetime   /   d = datum   /   f = filter   /   Esc of g = sluiten", "arrows = navigate   /   PgUp/PgDn = other channels   /   Enter = play   /   n / p = now / primetime   /   d = date   /   f = filter   /   Esc or g = close", "Pfeile = navigieren   /   PgUp/PgDn = andere Sender   /   Enter = abspielen   /   n / p = jetzt / Primetime   /   d = Datum   /   f = Filter   /   Esc oder g = schließen"],
     // Days in the guide
     DayYesterday => ["Gisteren", "Yesterday", "Gestern"],
@@ -454,8 +435,8 @@ mod tests {
         );
         // Same for Dutch
         assert_eq!(
-            tr(Lang::Nl, T::GuideNotAired, &["Tatort {1}", "20:15"]),
-            "nog niet uitgezonden: Tatort {1} (20:15)"
+            tr(Lang::Nl, T::VariantUnavailable, &["Tatort {1}", "FHD"]),
+            "[TV] Tatort {1} (FHD niet beschikbaar)"
         );
     }
 

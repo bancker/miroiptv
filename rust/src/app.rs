@@ -1,8 +1,13 @@
 use crate::args::{credentials_line, parse_xtream_creds, CredsError, XtreamCreds};
+use crate::catalog::GuideChannel;
 use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, quality_rank, zap_position, CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::{Entry as FavoriteEntry, Favorites};
-use crate::guide_ui::{channel_accent_color, channel_badge_label};
+use crate::guide::fetch::EpgFetcher;
+use crate::guide::logos::LogoStore;
+use crate::guide::store::{fetch_order, ChannelEpg, EpgStore};
+use crate::guide::time::Playable;
+use crate::guide_ui::{GuideAction, GuideData, GuideView};
 use crate::i18n::{Lang, T};
 use crate::news::NewsRule;
 use crate::pin::{PinGate, PinHash};
@@ -23,7 +28,6 @@ use crate::storage::Storage;
 use crate::zap::ZapPacer;
 use egui::{Color32, ColorImage, Key, TextureHandle, TextureOptions};
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -49,42 +53,6 @@ impl LastWatched {
             let _ = std::fs::write(path, s);
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProgrammeStatus {
-    /// Currently airing.
-    Live,
-    /// Already aired and the channel exposes catch-up (`tv_archive=1`).
-    Catchup,
-    /// Not yet aired.
-    Future,
-    /// Past programme on a channel with no catch-up - shown dim, not playable.
-    PastUnavailable,
-}
-
-fn programme_status(
-    entry: &EpgEntry,
-    channel: &LiveChannel,
-    now: chrono::DateTime<chrono::Utc>,
-) -> ProgrammeStatus {
-    if entry.start <= now && now < entry.end {
-        ProgrammeStatus::Live
-    } else if entry.end <= now {
-        if channel.tv_archive == 1 {
-            ProgrammeStatus::Catchup
-        } else {
-            ProgrammeStatus::PastUnavailable
-        }
-    } else {
-        ProgrammeStatus::Future
-    }
-}
-
-/// Whether a guide pick plays as live TV: through the relay, with the stall
-/// watchdog armed and resumed as live. Catch-up plays as VOD.
-fn plays_as_live(status: ProgrammeStatus) -> bool {
-    matches!(status, ProgrammeStatus::Live)
 }
 
 /// What to do with the last-watched stream at startup.
@@ -241,16 +209,16 @@ fn help_rows(lang: Lang, swap_zap_keys: bool) -> [(T, Vec<HelpRow>); 2] {
         (
             T::HelpGuide,
             vec![
-                row(t(T::KeyTypeLetters), t(T::HelpGuideFilter)),
-                row("Backspace", t(T::HelpGuideBackspace)),
-                row(t(T::KeyUpDown), t(T::HelpGuideRows)),
                 row(t(T::KeyLeftRight), t(T::HelpGuideColumns)),
-                row("PgUp / PgDn", t(T::HelpGuidePage)),
+                row(t(T::KeyUpDownWheel), t(T::HelpGuideRows)),
+                row("PgUp / PgDn", t(T::HelpGuidePages)),
                 row("Home / End", t(T::HelpGuideHomeEnd)),
-                row("n / p", t(T::HelpGuideTimeMode)),
-                row("a / l / t", t(T::HelpGuideChannelMode)),
                 row("Enter", t(T::HelpGuidePlay)),
-                row(t(T::KeyEscOrG), t(T::HelpGuideClose)),
+                row("n / p", t(T::HelpGuideTimeMode)),
+                row("d", t(T::HelpGuideDate)),
+                row("f", t(T::HelpGuideFilter)),
+                row("Esc", t(T::HelpGuideEsc)),
+                row("g", t(T::HelpGuideClose)),
             ],
         ),
     ]
@@ -303,105 +271,6 @@ fn paint_help_row(ui: &mut egui::Ui, row: &HelpRow) -> bool {
         ui.painter().rect_stroke(rect, 3.0, ring);
     }
     response.clicked()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TimeMode {
-    /// Each column scrolls to its currently-airing programme on open / mode-switch.
-    NowAndNext,
-    /// Each column scrolls to ~20:00 (start of prime-time block).
-    Primetime,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChannelMode {
-    /// All channels including tv_archive=1 archive duplicates (prefixed [TK]).
-    All,
-    /// Only tv_archive=0 - the live-only channels.
-    Live,
-    /// Only tv_archive=1 - the catch-up archive channels.
-    Catchup,
-}
-
-/// NLZIET-style column EPG guide opened with `g`.
-///
-/// Layout: top filter/time bar, then N vertical channel columns side-by-side.
-/// Each column has its own virtualized programme list. Cursor lives at
-/// (selected_col, selected_row_per_channel[chan_id]) so jumping between
-/// columns preserves where the user was in each channel.
-struct GuideState {
-    open: bool,
-    /// Free-text filter (typed in the top bar; matches channel name substring).
-    filter: String,
-    /// Indices into `catalog.live_channels()` for entries matching `filter`.
-    /// Rebuilt when filter or catalog changes.
-    visible: Vec<usize>,
-    visible_filter_snapshot: String,
-    /// Index INTO `visible` of the LEFTMOST channel currently rendered.
-    column_offset: usize,
-    /// Which visible column has cursor focus (0..num_visible_columns).
-    selected_col: usize,
-    /// Programme-row cursor per channel, keyed by stream_id so it survives
-    /// horizontal scrolling and time-mode changes.
-    row_per_channel: HashMap<i64, usize>,
-
-    /// EPG cache: stream_id -> Epg. Filled by background tokio tasks; never
-    /// evicted during session (~50 KB per channel, bounded by channels visited).
-    epg_cache: Arc<Mutex<HashMap<i64, Epg>>>,
-    /// Set of stream_ids with an in-flight fetch (prevents duplicate requests
-    /// when the user pans back and forth across the same column).
-    epg_pending: Arc<Mutex<HashSet<i64>>>,
-    /// When did the visible-column SET last change? Debounce so rapid
-    /// horizontal panning doesn't fire dozens of HTTP calls.
-    visible_set_settled_since: Instant,
-    visible_set_settled_snapshot: Vec<i64>,
-
-    time_mode: TimeMode,
-    /// While true, every visible column's current-programme row is forced to
-    /// the vertical centre each frame (the "now line"). Set on open / time-mode
-    /// change / left-right pan; cleared when the user browses with up/down.
-    auto_center: bool,
-    /// Stream IDs whose last EPG fetch returned an error or returned with
-    /// zero entries after our fallback attempt. UI shows a distinct
-    /// 'EPG mislukt' message instead of the ambiguous 'geen EPG' that
-    /// could mean either failure or successful-but-empty.
-    epg_failed: Arc<Mutex<HashSet<i64>>>,
-
-    channel_mode: ChannelMode,
-}
-
-impl Default for GuideState {
-    fn default() -> Self {
-        Self {
-            open: false,
-            filter: String::new(),
-            visible: Vec::new(),
-            visible_filter_snapshot: String::new(),
-            column_offset: 0,
-            selected_col: 0,
-            row_per_channel: HashMap::new(),
-            epg_cache: Arc::new(Mutex::new(HashMap::new())),
-            epg_pending: Arc::new(Mutex::new(HashSet::new())),
-            visible_set_settled_since: Instant::now(),
-            visible_set_settled_snapshot: Vec::new(),
-            time_mode: TimeMode::NowAndNext,
-            auto_center: true,
-            epg_failed: Arc::new(Mutex::new(HashSet::new())),
-            channel_mode: ChannelMode::All,
-        }
-    }
-}
-
-impl GuideState {
-    /// Another portal's catalog took over: everything kept per stream id means
-    /// other channels now. Fetches of the old portal still in flight finish into
-    /// the old maps, which they alone still hold.
-    fn forget_portal(&mut self) {
-        self.row_per_channel.clear();
-        self.epg_cache = Arc::new(Mutex::new(HashMap::new()));
-        self.epg_pending = Arc::new(Mutex::new(HashSet::new()));
-        self.epg_failed = Arc::new(Mutex::new(HashSet::new()));
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -564,7 +433,27 @@ pub struct TvApp {
     /// Highlighted result (arrow keys); Enter plays it.
     search_sel: usize,
 
-    guide: GuideState,
+    /// The guide (`g`) is open.
+    guide_open: bool,
+    /// The guide's state: it opens as it was left.
+    guide_view: GuideView,
+    /// The guide's columns, the catalog's channels with catch-up, as the
+    /// catalog and the lock stood at `guide_channels_for` (catalog generation,
+    /// loaded, unlocked).
+    guide_channels: Vec<GuideChannel>,
+    guide_channels_for: Option<(u64, bool, bool)>,
+    /// Counts every new `guide_channels`: what the guide works out from the
+    /// list is worked out again when it moves.
+    guide_channels_revision: u64,
+    /// The guide's EPG, fetched in the background once the guide was opened.
+    epg_store: EpgStore,
+    epg_fetcher: EpgFetcher,
+    /// The guide was opened this session: its EPG is fetched from then on.
+    guide_fetching: bool,
+    logos: LogoStore,
+    /// When the stream that loads now went to the player; its first frame
+    /// clears it. EPG fetching waits meanwhile (10 s at most): zapping first.
+    stream_starting_since: Option<Instant>,
     /// Tracks borderless+always-on-top toggle (`t` key).
     borderless: bool,
     /// `?` toggles a centered help overlay listing every hotkey.
@@ -715,6 +604,9 @@ impl TvApp {
 
         let lang = settings.lang().unwrap_or_else(crate::i18n::system_lang);
         let choosing_language = settings.lang().is_none().then_some(lang);
+        let epg_fetcher = EpgFetcher::new(catalog.portal().clone());
+        let logos = LogoStore::new(storage.cache_dir().join("logos"));
+        let today = crate::guide::time::day_of(chrono::Utc::now());
         let mut app = Self {
             player,
             catalog,
@@ -745,7 +637,16 @@ impl TvApp {
             search_hits: Vec::new(),
             search_hits_for: None,
             search_sel: 0,
-            guide: GuideState::default(),
+            guide_open: false,
+            guide_view: GuideView::new(today),
+            guide_channels: Vec::new(),
+            guide_channels_for: None,
+            guide_channels_revision: 0,
+            epg_store: EpgStore::default(),
+            epg_fetcher,
+            guide_fetching: false,
+            logos,
+            stream_starting_since: None,
             borderless: false,
             show_help: false,
             current_url: None,
@@ -866,7 +767,7 @@ impl TvApp {
         self.show_search = false;
         self.search_query.clear();
         self.show_epg_grid = false;
-        self.guide.open = false;
+        self.guide_open = false;
         self.news_picker = None;
     }
 
@@ -925,13 +826,13 @@ impl TvApp {
     /// The channel lists changed under whatever points into them: adult content
     /// shown or hidden, or another portal's catalog. The playing channel is
     /// found in the zap list again on the next arrow press, search results are
-    /// searched again, the guide rebuilds its cached channel indices, and the
-    /// news settings look their channels up again (a portal saved while the
-    /// settings were closed leaves the lookup's key looking the same).
+    /// searched again, the guide's channel list is worked out again
+    /// (`refresh_guide_channels` notices the lock), and the news settings look
+    /// their channels up again (a portal saved while the settings were closed
+    /// leaves the lookup's key looking the same).
     fn forget_list_positions(&mut self) {
         self.current_idx = None;
         self.search_hits_for = None;
-        self.guide.visible_filter_snapshot.clear();
         self.news_found_for = None;
     }
 
@@ -957,6 +858,7 @@ impl TvApp {
         self.current_epg = None;
         self.playing_resumed = false;
         self.stall_watchdog_armed = false;
+        self.stream_starting_since = None;
         self.frame_fence.stop();
         self.video_tex = None;
         tracing::info!("player: stop");
@@ -1204,6 +1106,7 @@ impl TvApp {
         // before the load goes out, so no frame of the new stream is counted.
         self.frame_fence.load(self.player.frames.version());
         let _ = self.player.cmd_tx.send(Cmd::LoadUrl(play));
+        self.stream_starting_since = Some(Instant::now());
         // Remember as last-watched so the next launch resumes it, unless it is
         // adult content (what is known about that: see last_watched_record).
         if let Some(record) = last_watched_record(&self.catalog, &url, watchdog, adult_hint, reload)
@@ -1271,6 +1174,7 @@ impl TvApp {
                     // First frame shown — arm freeze counting. Buffering before
                     // this point (startup/zap) is shown live but not tallied.
                     self.health.mark_started();
+                    self.stream_starting_since = None;
                 }
                 Event::EndOfFile { reason } => {
                     // mpv fires end-file on EVERY channel switch: loadfile stops
@@ -2211,7 +2115,11 @@ impl TvApp {
         // positions and the guide's per-channel data are of no use. The new
         // catalog starts locked, so the last PIN outcome no longer applies.
         self.forget_list_positions();
-        self.guide.forget_portal();
+        // The old portal's EPG and fetches mean other channels now.
+        self.epg_store.clear();
+        self.epg_fetcher.reset(self.catalog.portal().clone());
+        self.guide_view = GuideView::new(crate::guide::time::day_of(chrono::Utc::now()));
+        self.guide_fetching = false;
         self.adult_note = None;
         // Whatever waited for the old portal's catalog, or was told by it, means
         // nothing to the new one: a 0.5 resume would play the old portal's URL
@@ -2438,7 +2346,21 @@ impl TvApp {
         }
 
         if g_key {
-            self.toggle_guide();
+            // Spent, whatever the modifiers: the guide that opens reads its keys
+            // in this same frame, and its `g` closes it again.
+            ctx.input_mut(|i| {
+                i.events.retain(|e| {
+                    !matches!(
+                        e,
+                        egui::Event::Key {
+                            key: Key::G,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                })
+            });
+            self.open_guide();
         }
 
         if t_key {
@@ -2957,1043 +2879,173 @@ impl TvApp {
     }
 
     // ------------------------------------------------------------------
-    // Guide (`g` key): NLZIET-style vertical-column EPG browser
+    // Guide (`g` key): one column per channel with catch-up. guide_ui.rs
+    // draws it and hands back what the user did.
     // ------------------------------------------------------------------
 
-    fn toggle_guide(&mut self) {
+    /// The guide's columns again when the catalog, its loading or the lock
+    /// changed; three comparisons otherwise.
+    fn refresh_guide_channels(&mut self) {
+        let key = (
+            self.catalog_generation,
+            self.catalog.is_loaded(),
+            self.catalog.adult_unlocked(),
+        );
+        if self.guide_channels_for == Some(key) {
+            return;
+        }
+        self.guide_channels = self.catalog.guide_channels();
+        self.guide_channels_for = Some(key);
+        self.guide_channels_revision += 1;
+    }
+
+    /// `g`: the guide opens as it was left (in Nu & straks: on now). From now on
+    /// its EPG is fetched in the background.
+    fn open_guide(&mut self) {
         if !self.catalog.is_loaded() {
             self.set_toast(self.t(T::GuideCatalogLoading));
             return;
         }
-        self.guide.open = !self.guide.open;
-        if self.guide.open {
-            self.guide.filter.clear();
-            self.guide.column_offset = 0;
-            self.guide.selected_col = 0;
-            // Each opened guide starts fresh: re-center every column on
-            // its current programme.
-            self.guide.auto_center = true;
-            // visible list (re)builds on next paint via refresh_visible_if_stale
+        self.refresh_guide_channels();
+        self.guide_view
+            .opened(crate::guide::time::day_of(chrono::Utc::now()));
+        self.guide_open = true;
+        self.guide_fetching = true;
+        tracing::info!("guide: opened ({} channels)", self.guide_channels.len());
+    }
+
+    fn close_guide(&mut self) {
+        if self.guide_open {
+            self.guide_open = false;
+            tracing::info!("guide: closed");
         }
     }
 
-    /// Re-derive `visible` (channel indices matching the filter + channel
-    /// mode) when EITHER input changes. Snapshot encodes both so we can
-    /// short-circuit per-frame.
-    fn refresh_visible_if_stale(&mut self, channels: &[LiveChannel]) {
-        let f = self.guide.filter.trim().to_lowercase();
-        let mode = self.guide.channel_mode;
-        // Mode, filter and list length: unlocking or locking adult content
-        // (or a new portal) changes the list under the cached indices.
-        let snapshot = match mode {
-            ChannelMode::All => format!("A|{}|{}", channels.len(), f),
-            ChannelMode::Live => format!("L|{}|{}", channels.len(), f),
-            ChannelMode::Catchup => format!("C|{}|{}", channels.len(), f),
-        };
-        if self.guide.visible_filter_snapshot == snapshot && !self.guide.visible.is_empty() {
-            return;
-        }
-        let mode_pass = move |c: &LiveChannel| -> bool {
-            match mode {
-                ChannelMode::All => true,
-                ChannelMode::Live => c.tv_archive == 0,
-                ChannelMode::Catchup => c.tv_archive == 1,
+    /// Takes the finished EPG fetches in and starts what may start: 2 at a time
+    /// with the guide open, 1 with it closed, none while a stream starts.
+    fn tick_epg(&mut self) {
+        let now = Instant::now();
+        let landed = self.epg_fetcher.drain(now);
+        let any = !landed.is_empty();
+        for fetched in landed {
+            if let Ok(epg) = fetched.result {
+                self.epg_store
+                    .insert(fetched.archive_id, ChannelEpg::new(epg, chrono::Utc::now()));
             }
-        };
-        self.guide.visible = channels
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| mode_pass(c))
-            .filter(|(_, c)| f.is_empty() || c.name.to_lowercase().contains(&f))
-            .map(|(i, _)| i)
-            .collect();
-        self.guide.visible_filter_snapshot = snapshot;
-        if self.guide.column_offset >= self.guide.visible.len() {
-            self.guide.column_offset = 0;
         }
-        self.guide.selected_col = 0;
-    }
-
-    /// How many columns fit at the current window width. Adaptive.
-    fn guide_num_visible_cols(&self, ctx: &egui::Context) -> usize {
-        const COL_PX: f32 = 230.0;
-        let w = ctx
-            .input(|i| i.viewport().inner_rect.map(|r| r.width()))
-            .unwrap_or(1280.0);
-        let usable = (w - 60.0).max(COL_PX);
-        ((usable / COL_PX) as usize).clamp(1, 10)
-    }
-
-    fn guide_visible_channel_at<'a>(
-        &self,
-        visible_col: usize,
-        channels: &'a [LiveChannel],
-    ) -> Option<&'a LiveChannel> {
-        let abs = self.guide.column_offset.checked_add(visible_col)?;
-        let ch_idx = *self.guide.visible.get(abs)?;
-        channels.get(ch_idx)
-    }
-
-    /// Kick EPG fetches for the visible-column set when it's been stable for
-    /// 200 ms and we don't already have / aren't already fetching the data.
-    /// Naively fetching on every column-offset change would fire 1 HTTP call
-    /// per arrow-press while the user is panning - the debounce makes the
-    /// guide feel snappy regardless of catalog size.
-    fn guide_kick_visible_fetches(&mut self, channels: &[LiveChannel], num_cols: usize) {
-        let visible_ids: Vec<i64> = (0..num_cols)
-            .filter_map(|col| self.guide_visible_channel_at(col, channels).map(|c| c.stream_id))
-            .collect();
-        if visible_ids != self.guide.visible_set_settled_snapshot {
-            self.guide.visible_set_settled_snapshot = visible_ids;
-            self.guide.visible_set_settled_since = Instant::now();
-            return;
-        }
-        if self.guide.visible_set_settled_since.elapsed() < Duration::from_millis(200) {
-            return;
-        }
-        let cache_g = self.guide.epg_cache.lock();
-        let pend_g = self.guide.epg_pending.lock();
-        let failed_g = self.guide.epg_failed.lock();
-        // Skip channels that are cached, pending, OR have already failed -
-        // no point hammering the portal with a request that just errored.
-        let to_fetch: Vec<i64> = self
-            .guide
-            .visible_set_settled_snapshot
-            .iter()
-            .copied()
-            .filter(|sid| {
-                !cache_g.contains_key(sid)
-                    && !pend_g.contains(sid)
-                    && !failed_g.contains(sid)
-            })
-            .collect();
-        drop(failed_g);
-        drop(pend_g);
-        drop(cache_g);
-        for sid in to_fetch {
-            // Resolve channel name for clearer logs.
-            let ch_meta = channels
-                .iter()
-                .find(|c| c.stream_id == sid)
-                .map(|c| (c.name.clone(), c.tv_archive == 1));
-            let (name, is_archive) = ch_meta
-                .unwrap_or_else(|| ("?".to_owned(), false));
-            self.guide.epg_pending.lock().insert(sid);
-
-            // hnlol-style portals only populate EPG against tv_archive=1
-            // stream_ids. For a live channel, try the archive twin's
-            // stream_id first; cache the result under the live sid so the
-            // UI shows it in the live column.
-            let fetch_sid = if !is_archive {
-                self.catalog
-                    .archive_id_by_name(&name)
-                    .unwrap_or(sid)
-            } else {
-                sid
-            };
-            let via_twin = fetch_sid != sid;
+        if any && self.epg_fetcher.in_flight().is_empty() {
             tracing::info!(
-                "guide: epg fetch starting for {} (display sid={}, archive={}, fetch sid={}{})",
-                name,
-                sid,
-                is_archive,
-                fetch_sid,
-                if via_twin { " [via archive twin]" } else { "" }
+                "guide: epg store {} channels, {} programmes",
+                self.epg_store.len(),
+                self.epg_store.programmes()
             );
-            let cache = self.guide.epg_cache.clone();
-            let pending = self.guide.epg_pending.clone();
-            let failed = self.guide.epg_failed.clone();
-            let portal = self.catalog.portal().clone();
-            let log_name = name.clone();
-            let _ = is_archive; // captured by log line above
-            tokio::spawn(async move {
-                // PRIMARY = fetch_day_epg (get_simple_data_table) for ALL
-                // channels. We need PAST entries above the current
-                // programme so each column can scroll the LIVE row to the
-                // same vertical middle as every other column - without
-                // past entries (get_short_epg only returns now + future)
-                // the LIVE row clamps to the top of the viewport and the
-                // horizontal alignment across columns breaks.
-                let primary = portal.fetch_day_epg(fetch_sid).await;
-                let final_epg = match primary {
-                    Ok(epg) if !epg.entries().is_empty() => {
-                        let first = epg.entries().first().map(|e| {
-                            e.start.with_timezone(&chrono::Local).format("%H:%M").to_string()
-                        });
-                        let last = epg.entries().last().map(|e| {
-                            e.end.with_timezone(&chrono::Local).format("%H:%M").to_string()
-                        });
-                        tracing::info!(
-                            "guide: epg ok for {} (sid={}, {} entries, {}..{})",
-                            log_name,
-                            sid,
-                            epg.entries().len(),
-                            first.as_deref().unwrap_or("?"),
-                            last.as_deref().unwrap_or("?")
-                        );
-                        Some(epg)
-                    }
-                    Ok(empty_epg) => {
-                        // Day endpoint returned empty. Fall back to the
-                        // short endpoint - some portals only expose data
-                        // there. Result has no past entries so the LIVE
-                        // row won't centre, but it's better than nothing.
-                        tracing::info!(
-                            "guide: day-EPG empty for {} (sid={}); retrying via fetch_epg",
-                            log_name,
-                            sid
-                        );
-                        match portal.fetch_epg(fetch_sid).await {
-                            Ok(epg) if !epg.entries().is_empty() => {
-                                tracing::info!(
-                                    "guide: fallback short-EPG ok for {} (sid={}, {} entries - no past)",
-                                    log_name,
-                                    sid,
-                                    epg.entries().len()
-                                );
-                                Some(epg)
-                            }
-                            Ok(_) => {
-                                tracing::info!(
-                                    "guide: portal has no EPG for {} (sid={}) - empty on both endpoints",
-                                    log_name,
-                                    sid
-                                );
-                                Some(empty_epg)
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "guide: fallback fetch_epg failed for {} (sid={}): {}",
-                                    log_name,
-                                    sid,
-                                    e
-                                );
-                                Some(empty_epg)
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "guide: day-EPG failed for {} (sid={}): {} - trying short endpoint",
-                            log_name,
-                            sid,
-                            e
-                        );
-                        match portal.fetch_epg(fetch_sid).await {
-                            Ok(epg) if !epg.entries().is_empty() => {
-                                tracing::info!(
-                                    "guide: rescue short-EPG ok for {} (sid={}, {} entries - no past)",
-                                    log_name,
-                                    sid,
-                                    epg.entries().len()
-                                );
-                                Some(epg)
-                            }
-                            _ => {
-                                tracing::warn!(
-                                    "guide: both endpoints failed for {} (sid={})",
-                                    log_name,
-                                    sid
-                                );
-                                failed.lock().insert(sid);
-                                None
-                            }
-                        }
-                    }
-                };
-                if let Some(epg) = final_epg {
-                    cache.lock().insert(sid, epg);
-                }
-                pending.lock().remove(&sid);
-            });
         }
-    }
-
-    /// Row to scroll-to for the current `time_mode` given a channel's EPG.
-    fn guide_target_row(epg: &Epg, mode: TimeMode, now: chrono::DateTime<chrono::Utc>) -> usize {
-        let entries = epg.entries();
-        if entries.is_empty() {
-            return 0;
-        }
-        match mode {
-            TimeMode::NowAndNext => entries
-                .iter()
-                .position(|e| e.end > now)
-                .unwrap_or(entries.len() - 1),
-            TimeMode::Primetime => {
-                use chrono::TimeZone;
-                let target = chrono::Local::now()
-                    .date_naive()
-                    .and_hms_opt(20, 0, 0)
-                    .and_then(|n| chrono::Local.from_local_datetime(&n).single())
-                    .map(|l| l.with_timezone(&chrono::Utc))
-                    .unwrap_or(now);
-                entries
-                    .iter()
-                    .position(|e| e.start >= target)
-                    .unwrap_or(entries.len() - 1)
-            }
-        }
-    }
-
-    /// Update `row_per_channel` for every visible column whose EPG has
-    /// landed in cache, setting it to the row that matches the current
-    /// `time_mode`. This drives both the cursor position and the scroll
-    /// target (paint_guide will center on this row for not-yet-centered
-    /// channels). Re-runs every paint so channels whose EPG arrives late
-    /// still get their cursor positioned correctly.
-    fn guide_sync_target_rows(&mut self, channels: &[LiveChannel], num_cols: usize) {
-        // While auto-centring, park every visible column's cursor on its
-        // current programme every frame, so the now-line follows time and
-        // newly-revealed columns line up. Once the user browses with up/down
-        // we stop overriding their cursor.
-        if !self.guide.auto_center {
+        if !self.guide_fetching {
             return;
         }
-        let now = chrono::Utc::now();
-        let cache = self.guide.epg_cache.lock();
-        for col in 0..num_cols {
-            let Some(ch) = self.guide_visible_channel_at(col, channels) else { continue; };
-            if let Some(epg) = cache.get(&ch.stream_id) {
-                let row = Self::guide_target_row(epg, self.guide.time_mode, now);
-                self.guide.row_per_channel.insert(ch.stream_id, row);
-            }
-        }
-    }
-
-    fn guide_play(&mut self, channels: &[LiveChannel]) {
-        let Some(channel) = self
-            .guide_visible_channel_at(self.guide.selected_col, channels)
-            .cloned()
-        else { return; };
-        let row = *self.guide.row_per_channel.get(&channel.stream_id).unwrap_or(&0);
-        let maybe_epg = self.guide.epg_cache.lock().get(&channel.stream_id).cloned();
-        let Some(epg) = maybe_epg else {
-            self.set_toast(self.t(T::GuideEpgNotLoaded));
-            return;
-        };
-        let Some(entry) = epg.entries().get(row).cloned() else { return; };
-        let now = chrono::Utc::now();
-        let status = programme_status(&entry, &channel, now);
-        let (url, tag) = match status {
-            ProgrammeStatus::Future => {
-                self.set_toast(self.tr(
-                    T::GuideNotAired,
-                    &[&entry.title, &crate::epg::hhmm(entry.start)],
-                ));
-                return;
-            }
-            ProgrammeStatus::PastUnavailable => {
-                self.set_toast(self.tr(T::GuideNoCatchup, &[&channel.name]));
-                return;
-            }
-            ProgrammeStatus::Live => {
-                let live_sid = if channel.tv_archive == 1 {
-                    self.catalog
-                        .live_id_by_name(&channel.name)
-                        .unwrap_or(channel.stream_id)
-                } else {
-                    channel.stream_id
-                };
-                (self.catalog.portal().live_stream_url(live_sid), "LIVE")
-            }
-            ProgrammeStatus::Catchup => {
-                let dur_min = ((entry.end - entry.start).num_minutes() as u32).max(1);
-                (
-                    self.catalog
-                        .portal()
-                        .catchup_url(channel.stream_id, entry.start, dur_min),
-                    "CATCHUP",
-                )
-            }
-        };
-        tracing::info!(
-            "guide: [{}] {} | {} ({} -> {})",
-            tag,
-            channel.name,
-            entry.title,
-            entry.start.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"),
-            entry.end.with_timezone(&chrono::Local).format("%H:%M")
-        );
-        self.load_url(url, plays_as_live(status));
-        // Up/down continues from this channel, not from the one zapped to before.
-        self.current_idx = None;
-        self.current_name = Some(format!("{} - {}", channel.name, entry.title));
-        self.current_stream_id = Some(channel.stream_id);
-        self.current_epg = None;
-        let shown_tag = if plays_as_live(status) {
-            "LIVE"
+        let starting = self
+            .stream_starting_since
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(10));
+        let limit = if starting {
+            0
+        } else if self.guide_open {
+            2
         } else {
-            self.t(T::TagReplay)
+            1
         };
-        self.set_toast(format!(
-            "[{}] {} | {} @ {}",
-            shown_tag,
-            channel.name,
-            entry.title,
-            crate::epg::hhmm(entry.start)
-        ));
-        self.guide.open = false;
+        let (start, count) = self.guide_view.visible_window();
+        let channels = &self.guide_channels;
+        let order = fetch_order(start..start + count.max(1), channels.len())
+            .map(|i| channels[i].archive_id);
+        self.epg_fetcher
+            .tick(&self.epg_store, order, limit, now, chrono::Utc::now());
     }
 
-    fn handle_guide_keys(&mut self, ctx: &egui::Context) {
-        let (
-            esc, g_key, up, down, left, right, pgup, pgdn, home, end, enter, backspace,
-            n_key, p_key, a_key, t_key, l_key, qmark,
-        ) = ctx.input(|i| (
-            i.key_pressed(Key::Escape),
-            i.key_pressed(Key::G),
-            i.key_pressed(Key::ArrowUp),
-            i.key_pressed(Key::ArrowDown),
-            i.key_pressed(Key::ArrowLeft),
-            i.key_pressed(Key::ArrowRight),
-            i.key_pressed(Key::PageUp),
-            i.key_pressed(Key::PageDown),
-            i.key_pressed(Key::Home),
-            i.key_pressed(Key::End),
-            i.key_pressed(Key::Enter),
-            i.key_pressed(Key::Backspace),
-            i.key_pressed(Key::N),
-            i.key_pressed(Key::P),
-            i.key_pressed(Key::A),
-            i.key_pressed(Key::T),
-            i.key_pressed(Key::L),
-            i.events
-                .iter()
-                .any(|e| matches!(e, egui::Event::Text(t) if t == "?")),
-        ));
-        // Help overlay takes priority over guide input.
+    /// The guide over the whole window, and what the user did in it. Under the
+    /// help it takes no keys; `?` or Esc closes the help.
+    fn paint_guide(&mut self, ctx: &egui::Context) {
+        let keys = !self.show_help;
         if self.show_help {
-            if qmark || esc {
+            let (question, esc) = ctx.input(|i| {
+                (
+                    i.events
+                        .iter()
+                        .any(|e| matches!(e, egui::Event::Text(t) if t == "?")),
+                    i.key_pressed(Key::Escape),
+                )
+            });
+            if question || esc {
                 self.show_help = false;
             }
-            return;
         }
-        if qmark {
-            self.show_help = true;
-            return;
-        }
-        if esc || g_key {
-            self.guide.open = false;
-            return;
-        }
-        // Typed chars feed the filter, EXCEPT mode hotkeys (n/p time mode,
-        // a/l/t channel mode) which we reserve. The filter still accepts
-        // any other letter/digit normally.
-        let typed: String = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| match e {
-                    egui::Event::Text(t)
-                        if t != "n"
-                            && t != "p"
-                            && t != "a"
-                            && t != "l"
-                            && t != "t"
-                            && t != "?" =>
-                    {
-                        Some(t.clone())
-                    }
-                    _ => None,
-                })
-                .collect()
-        });
-        if !typed.is_empty() {
-            self.guide.filter.push_str(&typed);
-            self.guide.column_offset = 0;
-            self.guide.selected_col = 0;
-        }
-        if backspace && !self.guide.filter.is_empty() {
-            self.guide.filter.pop();
-            self.guide.column_offset = 0;
-            self.guide.selected_col = 0;
-        }
-        if n_key && self.guide.time_mode != TimeMode::NowAndNext {
-            self.guide.time_mode = TimeMode::NowAndNext;
-            // New time-mode: re-center every column on the new target.
-            self.guide.auto_center = true;
-        }
-        if p_key && self.guide.time_mode != TimeMode::Primetime {
-            self.guide.time_mode = TimeMode::Primetime;
-            self.guide.auto_center = true;
-        }
-        if a_key && self.guide.channel_mode != ChannelMode::All {
-            self.guide.channel_mode = ChannelMode::All;
-            self.guide.column_offset = 0;
-        }
-        if l_key && self.guide.channel_mode != ChannelMode::Live {
-            self.guide.channel_mode = ChannelMode::Live;
-            self.guide.column_offset = 0;
-        }
-        if t_key && self.guide.channel_mode != ChannelMode::Catchup {
-            self.guide.channel_mode = ChannelMode::Catchup;
-            self.guide.column_offset = 0;
-        }
-
-        let channels = self.catalog.live_channels();
-        self.refresh_visible_if_stale(&channels);
-        let num_cols = self.guide_num_visible_cols(ctx);
-        let n_visible = self.guide.visible.len();
-
-        // Up/down browse programmes - release auto-centring so the user's
-        // cursor is respected. Left/right pan channels - keep centring so the
-        // now-line stays put as columns scroll in.
-        if up || down || pgup || pgdn || home || end {
-            self.guide.auto_center = false;
-        }
-        if left || right {
-            self.guide.auto_center = true;
-        }
-
-        // Programme cursor (up/down/pgup/pgdn/home/end) acts on the
-        // selected column.
-        if (up || down || pgup || pgdn || home || end) && n_visible > 0 {
-            if let Some(ch) = self.guide_visible_channel_at(self.guide.selected_col, &channels) {
-                let sid = ch.stream_id;
-                let total = self
-                    .guide
-                    .epg_cache
-                    .lock()
-                    .get(&sid)
-                    .map(|e| e.entries().len())
-                    .unwrap_or(0);
-                if total > 0 {
-                    let cur = *self.guide.row_per_channel.get(&sid).unwrap_or(&0);
-                    let new = if down { (cur + 1).min(total - 1) }
-                        else if up { cur.saturating_sub(1) }
-                        else if pgdn { (cur + 10).min(total - 1) }
-                        else if pgup { cur.saturating_sub(10) }
-                        else if home { 0 }
-                        else { total - 1 };
-                    self.guide.row_per_channel.insert(sid, new);
-                }
-            }
-        }
-
-        // Column selection (left/right) - shifts selected_col within
-        // the visible window; when bumping into the edge, scrolls the
-        // window via column_offset.
-        if left {
-            if self.guide.selected_col > 0 {
-                self.guide.selected_col -= 1;
-            } else if self.guide.column_offset > 0 {
-                self.guide.column_offset -= 1;
-            }
-        }
-        if right {
-            let last_visible_abs = self.guide.column_offset + self.guide.selected_col + 1;
-            if self.guide.selected_col + 1 < num_cols && last_visible_abs < n_visible {
-                self.guide.selected_col += 1;
-            } else if self.guide.column_offset + num_cols < n_visible {
-                self.guide.column_offset += 1;
-            }
-        }
-
-        if enter {
-            self.guide_play(&channels);
+        let now = chrono::Utc::now();
+        let data = GuideData {
+            lang: self.lang,
+            channels: &self.guide_channels,
+            channels_revision: self.guide_channels_revision,
+            store: &self.epg_store,
+            fetching: self.epg_fetcher.in_flight(),
+            playing: self.current_name.as_deref(),
+            now,
+            today: crate::guide::time::day_of(now),
+            keys,
+        };
+        let action = self.guide_view.show(ctx, &data, &mut self.logos);
+        match action {
+            Some(GuideAction::Play {
+                channel,
+                entry,
+                playable,
+            }) => self.guide_play(channel, entry, playable),
+            Some(GuideAction::Close) => self.close_guide(),
+            Some(GuideAction::Help) => self.show_help = true,
+            None => {}
         }
     }
 
-    fn paint_guide(&mut self, ctx: &egui::Context) {
-        if !self.guide.open { return; }
-        let channels = self.catalog.live_channels();
-        self.refresh_visible_if_stale(&channels);
-        let num_cols = self.guide_num_visible_cols(ctx);
-        self.guide_kick_visible_fetches(&channels, num_cols);
-        // Park each visible column's cursor on the row that matches the
-        // current time-mode (cheap; no-op for already-centered channels).
-        self.guide_sync_target_rows(&channels, num_cols);
-
-        let n_visible = self.guide.visible.len();
-        let max_offset = n_visible.saturating_sub(num_cols);
-        if self.guide.column_offset > max_offset {
-            self.guide.column_offset = max_offset;
-        }
-        if self.guide.selected_col >= num_cols {
-            self.guide.selected_col = num_cols.saturating_sub(1);
-        }
-
-        let now = chrono::Utc::now();
-        let lang = self.lang;
-        let time_mode = self.guide.time_mode;
-        let chan_mode = self.guide.channel_mode;
-        let filter_visible = self.guide.filter.clone();
-        let selected_col = self.guide.selected_col;
-        let column_offset = self.guide.column_offset;
-        let now_playing = self.current_name.clone();
-
-        // Snapshot the visible column slice into owned data BEFORE we
-        // hand a &mut Ui into the draw closure. Keeps `self` free so the
-        // click-handler post-draw can mutate row_per_channel + dispatch
-        // play actions without fighting the borrow checker.
-        struct ColData {
-            channel: LiveChannel,
-            programmes: Vec<EpgEntry>,
-            row: usize,
-            loading: bool,
-            /// True when the last fetch attempt errored (HTTP / parse).
-            /// Distinct from `loading=false && programmes empty` which
-            /// means the portal genuinely returned no EPG data.
-            failed: bool,
-        }
-
-        let col_data: Vec<ColData> = {
-            let cache = self.guide.epg_cache.lock();
-            let pending = self.guide.epg_pending.lock();
-            let failed = self.guide.epg_failed.lock();
-            (0..num_cols)
-                .filter_map(|col| {
-                    let ch = self.guide_visible_channel_at(col, &channels)?.clone();
-                    let sid = ch.stream_id;
-                    let programmes = cache
-                        .get(&sid)
-                        .map(|e| e.entries().to_vec())
-                        .unwrap_or_default();
-                    let row = *self.guide.row_per_channel.get(&sid).unwrap_or(&0);
-                    let loading = pending.contains(&sid);
-                    let did_fail = failed.contains(&sid);
-                    Some(ColData {
-                        channel: ch,
-                        programmes,
-                        row,
-                        loading,
-                        failed: did_fail,
-                    })
-                })
-                .collect()
-        };
-        // Click intents (col, row) collected during draw, applied after.
-        let mut clicked: Option<(usize, usize)> = None;
-
-        // Full-window dark background. CentralPanel replaces the video
-        // surface entirely while the guide is open - no bleed-through.
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(Color32::from_rgb(14, 14, 18)))
-            .show(ctx, |ui| {
-                // ---------- Top bar ----------
-                egui::Frame::none()
-                    .inner_margin(egui::Margin::symmetric(16.0, 10.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(crate::i18n::t(lang, T::GuideTitle))
-                                    .heading()
-                                    .color(Color32::WHITE),
-                            );
-                            ui.add_space(20.0);
-
-                            // Time-mode pills
-                            let mode_pill = |ui: &mut egui::Ui, label: &str, active: bool, accent: Color32| {
-                                let bg = if active { accent } else { Color32::from_rgb(32, 32, 38) };
-                                let fg = if active { Color32::WHITE } else { Color32::from_white_alpha(180) };
-                                egui::Frame::none()
-                                    .fill(bg)
-                                    .rounding(14.0)
-                                    .inner_margin(egui::Margin::symmetric(12.0, 5.0))
-                                    .show(ui, |ui| {
-                                        ui.label(egui::RichText::new(label).color(fg).size(12.0));
-                                    });
-                            };
-                            mode_pill(ui, crate::i18n::t(lang, T::GuideNowNext), time_mode == TimeMode::NowAndNext, Color32::from_rgb(60, 110, 170));
-                            ui.add_space(6.0);
-                            mode_pill(ui, crate::i18n::t(lang, T::GuidePrimetime), time_mode == TimeMode::Primetime, Color32::from_rgb(60, 110, 170));
-
-                            ui.add_space(18.0);
-                            ui.separator();
-                            ui.add_space(6.0);
-
-                            // Channel-mode pills
-                            mode_pill(ui, crate::i18n::t(lang, T::GuideAll), chan_mode == ChannelMode::All, Color32::from_rgb(80, 100, 120));
-                            ui.add_space(4.0);
-                            mode_pill(ui, crate::i18n::t(lang, T::GuideLive), chan_mode == ChannelMode::Live, Color32::from_rgb(70, 130, 70));
-                            ui.add_space(4.0);
-                            mode_pill(ui, crate::i18n::t(lang, T::GuideCatchup), chan_mode == ChannelMode::Catchup, Color32::from_rgb(110, 140, 200));
-
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if n_visible > 0 {
-                                    ui.label(
-                                        egui::RichText::new(crate::i18n::tr(
-                                            lang,
-                                            T::GuideChannelsRange,
-                                            &[
-                                                &(column_offset + 1).to_string(),
-                                                &(column_offset + col_data.len())
-                                                    .min(n_visible)
-                                                    .to_string(),
-                                                &n_visible.to_string(),
-                                            ],
-                                        ))
-                                        .color(Color32::from_white_alpha(150))
-                                        .size(12.0),
-                                    );
-                                }
-                                if let Some(np) = &now_playing {
-                                    ui.add_space(20.0);
-                                    ui.label(
-                                        egui::RichText::new(crate::i18n::tr(
-                                            lang,
-                                            T::GuidePlaying,
-                                            &[np],
-                                        ))
-                                        .color(Color32::from_rgb(120, 220, 100))
-                                        .size(12.0)
-                                        .strong(),
-                                    );
-                                }
-                            });
-                        });
-
-                        // Filter line (only when active)
-                        if !filter_visible.is_empty() {
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(crate::i18n::tr(
-                                    lang,
-                                    T::GuideFilter,
-                                    &[&filter_visible],
-                                ))
-                                .color(Color32::from_rgb(230, 220, 110))
-                                .monospace()
-                                .size(13.0),
-                            );
-                        }
-                    });
-
-                // Thin separator line between top bar and grid
-                let sep_rect = ui.available_rect_before_wrap();
-                ui.painter().hline(
-                    sep_rect.x_range(),
-                    sep_rect.top(),
-                    egui::Stroke::new(1.0, Color32::from_rgb(35, 35, 42)),
+    /// A programme picked in the guide: live through the relay, catch-up from
+    /// its start on the catch-up twin, or a word on why not.
+    fn guide_play(&mut self, channel: GuideChannel, entry: EpgEntry, playable: Playable) {
+        let (from, to) = (crate::epg::hhmm(entry.start), crate::epg::hhmm(entry.end));
+        match playable {
+            Playable::Future => self.set_toast(self.tr(T::GuideStartsAt, &[&from])),
+            Playable::Unavailable => self.set_toast(self.t(T::GuideNotReplayable)),
+            Playable::Live => {
+                tracing::info!(
+                    "guide: [LIVE] {} | {} ({} -> {})",
+                    channel.name,
+                    entry.title,
+                    from,
+                    to
                 );
-                ui.add_space(2.0);
-
-                // ---------- Empty-state ----------
-                if col_data.is_empty() {
-                    ui.add_space(40.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            egui::RichText::new(match chan_mode {
-                                ChannelMode::Catchup => crate::i18n::t(lang, T::GuideNoCatchupMatch),
-                                ChannelMode::Live => crate::i18n::t(lang, T::GuideNoLiveMatch),
-                                ChannelMode::All => crate::i18n::t(lang, T::GuideNoMatch),
-                            })
-                            .color(Color32::from_white_alpha(140))
-                            .italics()
-                            .size(16.0),
-                        );
-                    });
-                    return;
-                }
-
-                // ---------- Column grid ----------
-                // Leave a bit of room at the bottom for the keybinding hint.
-                let grid_bottom_reserve = 26.0;
-                let grid_rect = ui.available_rect_before_wrap();
-                let grid_height = (grid_rect.height() - grid_bottom_reserve).max(100.0);
-                let _ = ui.allocate_ui_with_layout(
-                    egui::vec2(grid_rect.width(), grid_height),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.columns(col_data.len(), |cols| {
-                            for (vi, cd) in col_data.iter().enumerate() {
-                                let column_ui = &mut cols[vi];
-                                let is_selected_col = vi == selected_col;
-                                let is_archive = cd.channel.tv_archive == 1;
-                                let accent = channel_accent_color(&cd.channel.name);
-                                let badge_label = channel_badge_label(&cd.channel.name);
-
-                                // ---- Column header (colored top band + badge + name) ----
-                                // 3px coloured accent strip
-                                let strip_rect = column_ui.available_rect_before_wrap();
-                                let (strip, _) = column_ui.allocate_exact_size(
-                                    egui::vec2(strip_rect.width(), 3.0),
-                                    egui::Sense::hover(),
-                                );
-                                column_ui.painter().rect_filled(strip, 0.0, accent);
-
-                                let header_bg = if is_selected_col {
-                                    Color32::from_rgb(40, 55, 80)
-                                } else {
-                                    Color32::from_rgb(24, 24, 30)
-                                };
-                                egui::Frame::none()
-                                    .fill(header_bg)
-                                    .inner_margin(egui::Margin::symmetric(6.0, 5.0))
-                                    .show(column_ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            // Round-ish badge with channel number / initial
-                                            egui::Frame::none()
-                                                .fill(accent)
-                                                .rounding(10.0)
-                                                .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-                                                .show(ui, |ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(&badge_label)
-                                                            .color(Color32::WHITE)
-                                                            .strong()
-                                                            .size(11.0),
-                                                    );
-                                                });
-                                            ui.add_space(4.0);
-                                            let suffix = if is_archive {
-                                                format!("  {}", crate::i18n::t(lang, T::GuideArchiveBadge))
-                                            } else {
-                                                String::new()
-                                            };
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(format!(
-                                                        "{}{}",
-                                                        cd.channel.name, suffix
-                                                    ))
-                                                    .color(Color32::WHITE)
-                                                    .strong()
-                                                    .size(12.0),
-                                                )
-                                                .truncate(true),
-                                            );
-                                        });
-                                    });
-
-                                if cd.programmes.is_empty() {
-                                    column_ui.add_space(8.0);
-                                    let (msg, col_) = if cd.loading {
-                                        (crate::i18n::t(lang, T::GuideEpgLoading), Color32::from_white_alpha(120))
-                                    } else if cd.failed {
-                                        (
-                                            crate::i18n::t(lang, T::GuideEpgFailed),
-                                            Color32::from_rgb(220, 130, 110),
-                                        )
-                                    } else {
-                                        (
-                                            crate::i18n::t(lang, T::GuideNoEpg),
-                                            Color32::from_white_alpha(95),
-                                        )
-                                    };
-                                    column_ui.label(
-                                        egui::RichText::new(msg)
-                                            .color(col_)
-                                            .italics()
-                                            .size(11.0),
-                                    );
-                                    continue;
-                                }
-
-                                let cursor = cd.row;
-                                let mut clicked_in_col: Option<usize> = None;
-
-                                // egui's ScrollArea offset is unreliable on a
-                                // virtualised list, so we DON'T scroll. Instead
-                                // we render only the window of programmes that
-                                // fills the viewport and use a top spacer to pin
-                                // the focus row (current programme, or the cursor
-                                // while browsing) to the vertical centre. Every
-                                // column does the same -> all the green LIVE rows
-                                // line up on one centre line, and the content
-                                // never exceeds the viewport so nothing scrolls.
-                                // Fixed window: 3 past + current + 4 upcoming,
-                                // sized so those 8 rows fill the column height.
-                                // A top spacer keeps the current programme at the
-                                // same height in every column (the now-line).
-                                const ABOVE: usize = 3;
-                                const BELOW: usize = 4;
-                                let view_h = column_ui.available_height().max(80.0);
-                                let row_h = view_h / (ABOVE + BELOW + 1) as f32;
-                                let title_sz = (row_h * 0.26).clamp(15.0, 22.0);
-                                let time_sz = (row_h * 0.22).clamp(13.0, 18.0);
-                                let n = cd.programmes.len();
-                                let focus = cd.row.min(n.saturating_sub(1));
-                                let start = focus.saturating_sub(ABOVE);
-                                let above = focus - start;
-                                let pad_top = (ABOVE - above) as f32 * row_h;
-                                let end = (focus + BELOW + 1).min(n);
-                                egui::ScrollArea::vertical()
-                                    .id_source(format!("guide_col_{}", cd.channel.stream_id))
-                                    .auto_shrink([false, false])
-                                    .show(column_ui, |ui| {
-                                        ui.add_space(pad_top);
-                                        for p in start..end {
-                                            let e = &cd.programmes[p];
-                                            let status = programme_status(e, &cd.channel, now);
-                                            let local_start = e.start.with_timezone(&chrono::Local);
-                                            let time_label = local_start.format("%H:%M").to_string();
-
-                                            let (bg, fg, badge) = match status {
-                                                ProgrammeStatus::Live => (
-                                                    Color32::from_rgb(28, 58, 30),
-                                                    Color32::WHITE,
-                                                    Some(("LIVE", Color32::from_rgb(120, 230, 100))),
-                                                ),
-                                                ProgrammeStatus::Catchup => (
-                                                    Color32::from_rgb(18, 18, 22),
-                                                    Color32::from_white_alpha(210),
-                                                    Some((crate::i18n::t(lang, T::GuideArchiveBadge), Color32::from_rgb(140, 180, 220))),
-                                                ),
-                                                ProgrammeStatus::Future => (
-                                                    Color32::from_rgb(18, 18, 22),
-                                                    Color32::WHITE,
-                                                    None,
-                                                ),
-                                                ProgrammeStatus::PastUnavailable => (
-                                                    Color32::from_rgb(18, 18, 22),
-                                                    Color32::from_white_alpha(95),
-                                                    None,
-                                                ),
-                                            };
-                                            let is_selected = p == cursor && is_selected_col;
-                                            let row_bg = if is_selected {
-                                                // Subtle highlight overlay - blend selection with status colour
-                                                match status {
-                                                    ProgrammeStatus::Live => Color32::from_rgb(36, 75, 50),
-                                                    _ => Color32::from_rgb(40, 55, 80),
-                                                }
-                                            } else {
-                                                bg
-                                            };
-                                            // Selected row gets a 2px accent-color left border drawn
-                                            // by painting a small strip BEFORE the row frame.
-                                            let frame_response = egui::Frame::none()
-                                                .fill(row_bg)
-                                                .inner_margin(egui::Margin {
-                                                    left: if is_selected { 6.0 } else { 4.0 },
-                                                    right: 4.0,
-                                                    top: 1.0,
-                                                    bottom: 1.0,
-                                                })
-                                                .show(ui, |ui| {
-                                                    let row_rect = ui.available_rect_before_wrap();
-                                                    if is_selected {
-                                                        let mut bar = row_rect;
-                                                        bar.set_left(row_rect.left() - 4.0);
-                                                        bar.set_right(row_rect.left() - 2.0);
-                                                        ui.painter().rect_filled(bar, 0.0, accent);
-                                                    }
-                                                    ui.horizontal(|ui| {
-                                                        // Time column - fixed
-                                                        // narrow width so titles
-                                                        // get the rest of the
-                                                        // row to themselves.
-                                                        ui.add_sized(
-                                                            egui::vec2(52.0, row_h - 6.0),
-                                                            egui::Label::new(
-                                                                egui::RichText::new(&time_label)
-                                                                    .color(Color32::from_white_alpha(165))
-                                                                    .monospace()
-                                                                    .size(time_sz),
-                                                            ),
-                                                        );
-                                                        // Reserve space for the
-                                                        // right-side badge so the
-                                                        // title truncates cleanly
-                                                        // without overrunning it.
-                                                        let badge_w = if badge.is_some() { 52.0 } else { 0.0 };
-                                                        let title_w = (ui.available_width()
-                                                            - badge_w - 4.0)
-                                                            .max(40.0);
-                                                        ui.allocate_ui_with_layout(
-                                                            egui::vec2(title_w, row_h - 6.0),
-                                                            egui::Layout::left_to_right(
-                                                                egui::Align::Center,
-                                                            ),
-                                                            |ui| {
-                                                                // Clip so a long
-                                                                // wrapped title
-                                                                // never bleeds
-                                                                // into the next
-                                                                // row.
-                                                                ui.set_clip_rect(ui.max_rect());
-                                                                ui.add(
-                                                                    egui::Label::new(
-                                                                        egui::RichText::new(&e.title)
-                                                                            .color(fg)
-                                                                            .size(title_sz)
-                                                                            .strong(),
-                                                                    )
-                                                                    .wrap(true),
-                                                                );
-                                                            },
-                                                        );
-                                                        if let Some((b_txt, b_col)) = badge {
-                                                            ui.with_layout(
-                                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                                |ui| {
-                                                                    egui::Frame::none()
-                                                                        .fill(b_col)
-                                                                        .rounding(8.0)
-                                                                        .inner_margin(egui::Margin::symmetric(6.0, 1.5))
-                                                                        .show(ui, |ui| {
-                                                                            ui.label(
-                                                                                egui::RichText::new(b_txt)
-                                                                                    .color(Color32::from_rgb(20, 20, 20))
-                                                                                    .size(9.5)
-                                                                                    .strong(),
-                                                                            );
-                                                                        });
-                                                                },
-                                                            );
-                                                        }
-                                                    });
-                                                    // 2px progress bar at bottom of LIVE row only.
-                                                    if matches!(status, ProgrammeStatus::Live) {
-                                                        let total = (e.end - e.start).num_seconds().max(1) as f32;
-                                                        let elapsed = (now - e.start).num_seconds().max(0) as f32;
-                                                        let progress = (elapsed / total).clamp(0.0, 1.0);
-                                                        let bar_rect = ui.available_rect_before_wrap();
-                                                        let (full, _) = ui.allocate_exact_size(
-                                                            egui::vec2(bar_rect.width(), 2.0),
-                                                            egui::Sense::hover(),
-                                                        );
-                                                        ui.painter().rect_filled(full, 1.0, Color32::from_white_alpha(35));
-                                                        let mut done = full;
-                                                        done.set_width(full.width() * progress);
-                                                        ui.painter().rect_filled(
-                                                            done,
-                                                            1.0,
-                                                            Color32::from_rgb(120, 230, 100),
-                                                        );
-                                                    }
-                                                })
-                                                .response;
-                                            // Thin divider under each row (NLZIET-style).
-                                            ui.painter().hline(
-                                                frame_response.rect.x_range(),
-                                                frame_response.rect.bottom(),
-                                                egui::Stroke::new(
-                                                    1.0,
-                                                    Color32::from_white_alpha(18),
-                                                ),
-                                            );
-                                            if frame_response.interact(egui::Sense::click()).clicked() {
-                                                clicked_in_col = Some(p);
-                                            }
-                                        }
-                                    });
-                                if let Some(row) = clicked_in_col {
-                                    clicked = Some((vi, row));
-                                }
-                            }
-                        });
-                    },
+                let url = self.catalog.portal().live_stream_url(channel.live_id);
+                self.load_url(url, true);
+                // Up/down continues from this channel.
+                self.current_idx = None;
+                self.current_stream_id = Some(channel.live_id);
+                self.current_name = Some(channel.name.clone());
+                self.current_epg = None;
+                self.set_toast(self.tr(T::GuideLiveToast, &[&channel.name, &entry.title]));
+                self.close_guide();
+            }
+            Playable::Replay => {
+                tracing::info!(
+                    "guide: [CATCHUP] {} | {} ({} {} -> {})",
+                    channel.name,
+                    entry.title,
+                    entry.start.with_timezone(&chrono::Local).format("%Y-%m-%d"),
+                    from,
+                    to
                 );
-
-                // ---------- Footer hint ----------
-                ui.add_space(4.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(crate::i18n::t(lang, T::GuideFooter))
-                            .color(Color32::from_white_alpha(95))
-                            .size(11.0),
-                    );
-                });
-            });
-
-        // Apply clicks now that the borrow on `self` from .show() is gone.
-        if let Some((col, row)) = clicked {
-            if let Some(ch) = self.guide_visible_channel_at(col, &channels).cloned() {
-                self.guide.selected_col = col;
-                self.guide.row_per_channel.insert(ch.stream_id, row);
-                self.guide_play(&channels);
+                let minutes = (entry.end - entry.start).num_minutes().max(1) as u32;
+                let portal = self.catalog.portal();
+                let url = portal.catchup_url(channel.archive_id, entry.start, minutes);
+                self.load_url(url, false);
+                self.current_idx = None;
+                self.current_stream_id = Some(channel.archive_id);
+                self.current_name = Some(format!("{} - {}", channel.name, entry.title));
+                self.current_epg = None;
+                self.close_guide();
             }
         }
     }
@@ -4032,6 +3084,9 @@ impl TvApp {
         self.drain_epg();
         self.drain_news_picker();
         self.drain_conn_check();
+        self.refresh_guide_channels();
+        self.tick_epg();
+        self.logos.drain();
         // First start: nothing else until a language is chosen.
         if let Some(selected) = self.choosing_language.as_mut() {
             if let Some(l) = crate::settings_ui::language_screen(ctx, selected) {
@@ -4065,23 +3120,17 @@ impl TvApp {
             self.portal_state,
             PortalState::Missing | PortalState::Placeholder
         );
-        // Guide owns input while it's open - we don't want `1`/`2`/`3` etc.
-        // firing zaps when the user is typing into the channel filter.
-        // The settings overlay owns the keyboard while it is open (it reads
-        // its keys in paint_settings), and so does the setup prompt: typing a
-        // user name must not fire hotkeys.
-        if self.settings_ui.is_none() && !setup_prompt {
-            if self.guide.open {
-                self.handle_guide_keys(ctx);
-            } else {
-                self.handle_keys(ctx);
-            }
+        // The open guide reads its own keys in paint_guide, as the settings
+        // overlay does in paint_settings (typing in its filter must not fire
+        // hotkeys); the setup prompt owns the keyboard.
+        if self.settings_ui.is_none() && !setup_prompt && !self.guide_open {
+            self.handle_keys(ctx);
         }
 
         // Guide takes over the full window when open. Skipping the video
         // texture upload in this branch removes ~5 MB of per-frame memcpy
         // work while the user is browsing the schedule.
-        if self.guide.open {
+        if self.guide_open {
             self.paint_guide(ctx);
         } else if setup_prompt {
             // First-run: no credentials yet - show the portal setup prompt
@@ -4137,12 +3186,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_live_guide_pick_plays_through_the_relay() {
-        assert!(plays_as_live(ProgrammeStatus::Live));
-        assert!(!plays_as_live(ProgrammeStatus::Catchup));
-    }
-
-    #[test]
     fn an_old_last_watched_file_has_an_unknown_adult_flag() {
         let old: LastWatched =
             serde_json::from_str(r#"{"url":"http://h/live/u/p/1.m3u8","live":true}"#).unwrap();
@@ -4184,6 +3227,31 @@ mod tests {
             ],
             ..Default::default()
         }
+    }
+
+    /// The guide's channels: TEST 03 with its catch-up twin 13, and the adult
+    /// 901 with its twin 911.
+    fn guide_catalog() -> Arc<CatalogStore> {
+        let ch = |stream_id: i64, name: &str, archive: i32, is_adult: bool| LiveChannel {
+            stream_id,
+            name: name.into(),
+            category_id: None,
+            epg_channel_id: None,
+            tv_archive: archive,
+            tv_archive_duration: 7 * archive,
+            is_adult,
+            stream_icon: None,
+        };
+        let catalog = crate::portal::Catalog {
+            live: vec![
+                ch(3, "TEST 03", 0, false),
+                ch(13, "TEST 03 HD", 1, false),
+                ch(901, "24/7 | ADULT A", 0, true),
+                ch(911, "24/7 | ADULT A HD", 1, true),
+            ],
+            ..Default::default()
+        };
+        Arc::new(CatalogStore::from_catalog(idle_portal(), catalog))
     }
 
     #[test]
@@ -4269,27 +3337,6 @@ mod tests {
             recalled(&catalog),
             [None, Some(901), Some(902), Some(3), Some(77), None]
         );
-    }
-
-    #[test]
-    fn another_portal_leaves_the_guide_nothing_kept_by_the_old_ones_stream_ids() {
-        let mut guide = GuideState::default();
-        guide.epg_cache.lock().insert(7, Epg::new(Vec::new()));
-        guide.epg_pending.lock().insert(8);
-        guide.epg_failed.lock().insert(9);
-        guide.row_per_channel.insert(7, 3);
-        // A fetch of the old portal that is still in flight holds the old maps.
-        let (old_cache, old_pending) = (guide.epg_cache.clone(), guide.epg_pending.clone());
-        guide.forget_portal();
-        assert!(guide.epg_cache.lock().is_empty());
-        assert!(guide.epg_pending.lock().is_empty());
-        assert!(guide.epg_failed.lock().is_empty());
-        assert!(guide.row_per_channel.is_empty());
-        // It finishes into the old maps, which the guide no longer reads.
-        old_cache.lock().insert(8, Epg::new(Vec::new()));
-        old_pending.lock().remove(&8);
-        assert!(guide.epg_cache.lock().is_empty());
-        assert!(guide.epg_pending.lock().is_empty());
     }
 
     #[test]
@@ -4606,22 +3653,32 @@ mod tests {
         assert!(h.app.favorites.contains(3), "and nothing deleted");
     }
 
-    /// A guide on `h` with one programme airing now on the channel TEST 03, so the
-    /// guide has a cell to click; or, without `programme`, an empty guide.
+    /// The guide open on `h`. With `programme`, TEST 03's catch-up twin (13) has
+    /// an hour-long programme on now ("Journaal 0", since 10 minutes), the two
+    /// before it and the two after it. Within three hours of local midnight they
+    /// are shorter, so that the ones next to the one on now are still on the
+    /// day the guide shows: these tests run at any time of day.
     fn open_guide(h: &mut Harness, programme: bool) {
-        let now = chrono::Utc::now();
-        let entries = if programme {
-            vec![EpgEntry {
-                title: "Journaal".into(),
-                start: now - chrono::Duration::minutes(10),
-                end: now + chrono::Duration::minutes(20),
-                has_archive: None,
-            }]
-        } else {
-            Vec::new()
-        };
-        h.app.guide.epg_cache.lock().insert(3, Epg::new(entries));
-        h.app.guide.open = true;
+        if programme {
+            let now = chrono::Utc::now();
+            let (from, to) = crate::guide::time::day_bounds(crate::guide::time::day_of(now));
+            let hour = chrono::Duration::hours(1).min((now - from).min(to - now) / 3);
+            let entries = (-2..3)
+                .map(|k: i32| {
+                    let start = now + hour * k - hour / 6;
+                    EpgEntry {
+                        title: format!("Journaal {k}"),
+                        start,
+                        end: start + hour,
+                        has_archive: None,
+                    }
+                })
+                .collect();
+            h.app
+                .epg_store
+                .insert(13, ChannelEpg::new(Epg::new(entries), now));
+        }
+        h.app.open_guide();
         h.frame(&[]);
         h.frame(&[]);
     }
@@ -4642,7 +3699,7 @@ mod tests {
     #[tokio::test]
     async fn the_help_link_closes_the_guide() {
         let dir = tempfile::tempdir().unwrap();
-        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
         open_guide(&mut h, false);
         h.app.show_help = true;
         h.frame(&[]);
@@ -4653,13 +3710,13 @@ mod tests {
         );
         h.frame(&[Key::Enter]);
         assert!(h.app.settings_ui.is_some(), "the settings opened");
-        assert!(!h.app.guide.open, "the guide closed");
+        assert!(!h.app.guide_open, "the guide closed");
     }
 
     #[tokio::test]
     async fn no_guide_cell_lies_under_the_settings_overlay_for_the_mouse_either() {
         let dir = tempfile::tempdir().unwrap();
-        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
         open_guide(&mut h, true);
         h.app.open_settings();
         h.frame(&[]);
@@ -4679,7 +3736,7 @@ mod tests {
         app.show_search = true;
         app.search_query = "ab".into();
         app.show_epg_grid = true;
-        app.guide.open = true;
+        app.guide_open = true;
         app.news_picker = Some(NewsPicker {
             items: Vec::new(),
             selected: 0,
@@ -4690,9 +3747,96 @@ mod tests {
         app.open_settings();
         assert!(app.settings_ui.is_some());
         assert!(!app.show_favs && !app.show_search && !app.show_epg_grid);
-        assert!(!app.guide.open && app.news_picker.is_none());
+        assert!(!app.guide_open && app.news_picker.is_none());
         assert!(app.search_query.is_empty());
         assert!(app.show_epg_strip && app.show_debug);
+    }
+
+    #[tokio::test]
+    async fn g_opens_the_guide_and_stays_open_and_the_next_g_closes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        // The press that opens the guide must not close it again in its own frame.
+        h.press(&[Key::G]);
+        assert!(h.app.guide_open, "g opens the guide");
+        h.frame(&[]);
+        assert!(h.app.guide_open, "and it stays open");
+        h.press(&[Key::G]);
+        assert!(!h.app.guide_open, "the next g closes it");
+    }
+
+    #[tokio::test]
+    async fn enter_in_the_guide_plays_the_programme_on_now_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, true);
+        assert!(h.app.guide_open);
+        assert_eq!(h.app.guide_channels.len(), 1, "locked: no adult column");
+        h.sent();
+        h.press(&[Key::Enter]);
+        let sent = h.sent();
+        assert!(
+            sent.iter()
+                .any(|c| matches!(c, Cmd::LoadUrl(u) if *u == live_url(3))),
+            "{sent:?}"
+        );
+        assert!(!h.app.guide_open, "the guide closes");
+        assert_eq!(h.app.current_stream_id, Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_past_programme_plays_from_its_start_on_the_catch_up_twin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, true);
+        h.sent();
+        h.press(&[Key::ArrowUp, Key::Enter]);
+        let sent = h.sent();
+        let is_catch_up = |c: &Cmd| match c {
+            Cmd::LoadUrl(u) => u.contains("/timeshift/") && u.ends_with("/13.m3u8"),
+            _ => false,
+        };
+        assert!(sent.iter().any(is_catch_up), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn a_programme_still_to_come_plays_nothing_and_says_when_it_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, true);
+        h.sent();
+        h.press(&[Key::ArrowDown, Key::Enter]);
+        assert!(!zapped(&h.sent()));
+        let toast = h
+            .app
+            .toast
+            .as_ref()
+            .map(|(t, _, _)| t.clone())
+            .unwrap_or_default();
+        assert!(toast.starts_with("starts at"), "{toast}");
+        assert!(h.app.guide_open, "the guide stays");
+    }
+
+    #[tokio::test]
+    async fn locking_with_the_guide_open_drops_the_adult_column_and_keeps_the_page_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        h.app.set_adult_visible(true);
+        open_guide(&mut h, true);
+        assert_eq!(h.app.guide_channels.len(), 2);
+        h.press(&[Key::ArrowRight]);
+        h.app.set_adult_visible(false);
+        h.frame(&[]);
+        h.frame(&[]);
+        assert_eq!(h.app.guide_channels.len(), 1);
+        assert!(
+            !h.painted.iter().any(|t| t.contains("ADULT")),
+            "{:?}",
+            h.painted
+        );
+        h.sent();
+        h.press(&[Key::Enter]);
+        assert!(zapped(&h.sent()), "the cursor is back on TEST 03");
     }
 
     #[test]
@@ -5117,6 +4261,127 @@ mod tests {
         );
         assert_eq!(h.app.current_stream_id, None);
         assert!(!h.app.playing_resumed);
+    }
+
+    #[tokio::test]
+    async fn a_portal_save_empties_the_guide_of_the_old_portals_epg() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, true);
+        assert_eq!(h.app.epg_store.len(), 1);
+        let creds = XtreamCreds {
+            username: "u2".into(),
+            password: "p2".into(),
+            host: "127.0.0.1".into(),
+            port: 1,
+        };
+        let saved = h.app.apply_creds(creds, "u2:p2@127.0.0.1:1");
+        std::env::remove_var("BONGO_INI");
+        assert!(saved.is_ok());
+        assert!(
+            h.app.epg_store.is_empty(),
+            "the old portal's ids mean other channels now"
+        );
+        assert!(h.app.epg_fetcher.in_flight().is_empty());
+    }
+
+    // ---- the guide's EPG fetching ----
+
+    /// An app on a catalog of three channels with catch-up, whose portal holds
+    /// every day EPG back: a fetch that starts stays in flight.
+    fn epg_app(root: &std::path::Path) -> Harness {
+        let live = vec![
+            archive_channel(601, "NL | NPO1 HD"),
+            archive_channel(602, "NL | NPO2 HD"),
+            archive_channel(603, "NL | NPO3 HD"),
+        ];
+        let portal = FakePortal::new(live.clone(), Vec::new());
+        let catalog = CatalogStore::from_catalog(
+            portal,
+            crate::portal::Catalog {
+                live,
+                ..Default::default()
+            },
+        );
+        Harness::start(root, Arc::new(catalog), PortalState::Configured, None)
+    }
+
+    #[tokio::test]
+    async fn the_guide_fetches_two_epgs_at_a_time_while_open_and_one_while_closed() {
+        for open in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut h = epg_app(dir.path());
+            h.app.open_guide();
+            if !open {
+                h.app.close_guide();
+            }
+            h.frame(&[]);
+            let at_once = h.app.epg_fetcher.in_flight().len();
+            assert_eq!(at_once, if open { 2 } else { 1 }, "guide open: {open}");
+        }
+    }
+
+    #[tokio::test]
+    async fn epg_fetching_waits_while_a_stream_starts_ten_seconds_at_most() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = epg_app(dir.path());
+        h.app.open_guide();
+        h.app.close_guide();
+        // A stream goes to the player: zapping first, the EPG waits.
+        h.app.load_url(live_url(601), true);
+        assert!(h.app.stream_starting_since.is_some());
+        h.frame(&[]);
+        h.frame(&[]);
+        assert!(h.app.epg_fetcher.in_flight().is_empty());
+        // Not for ever: a stream without a frame for 10 s no longer holds it up.
+        h.app.stream_starting_since = Instant::now().checked_sub(Duration::from_secs(11));
+        h.frame(&[]);
+        assert_eq!(h.app.epg_fetcher.in_flight().len(), 1);
+        // A stop ends the wait too.
+        h.app.stop_playback();
+        assert!(h.app.stream_starting_since.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_locked_guide_fetches_no_adult_epg() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, false);
+        let fetching: Vec<i64> = h.app.epg_fetcher.in_flight().iter().copied().collect();
+        assert_eq!(fetching, [13], "TEST 03's catch-up twin, not the adult 911");
+    }
+
+    #[tokio::test]
+    async fn a_portal_save_drops_the_fetches_and_columns_of_the_old_portal() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let mut h = epg_app(dir.path());
+        h.app.open_guide();
+        h.frame(&[]);
+        assert_eq!(h.app.epg_fetcher.in_flight().len(), 2);
+        assert_eq!(h.app.guide_channels.len(), 3);
+        let creds = XtreamCreds {
+            username: "u2".into(),
+            password: "p2".into(),
+            host: "127.0.0.1".into(),
+            port: 1,
+        };
+        let saved = h.app.apply_creds(creds, "u2:p2@127.0.0.1:1");
+        std::env::remove_var("BONGO_INI");
+        assert!(saved.is_ok());
+        assert!(h.app.epg_fetcher.in_flight().is_empty());
+        assert!(
+            !h.app.guide_fetching,
+            "no fetching until the guide opens again"
+        );
+        h.frame(&[]);
+        assert!(
+            h.app.guide_channels.is_empty(),
+            "the new catalog has not loaded"
+        );
     }
 
     // ---- the news picker ----
