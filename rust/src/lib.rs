@@ -13,6 +13,7 @@ pub mod catalog;
 pub mod epg;
 pub mod favorites;
 pub mod guide;
+pub mod guide_ui;
 pub mod i18n;
 pub mod legacy;
 pub mod news;

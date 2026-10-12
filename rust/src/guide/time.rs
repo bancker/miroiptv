@@ -25,10 +25,13 @@ pub enum Playable {
 
 /// What `entry` is at `now` on a channel whose catch-up reaches `archive_days`
 /// back (0: the portal did not say, so every past programme counts). The
-/// programme's own `has_archive` counts only when `trust_flag` is set, that is
-/// when the portal sends `has_archive = 1` for some programme of this channel:
-/// a portal that sends 0 (or nothing) for everything would otherwise make
-/// nothing watchable.
+/// programme's own `has_archive` counts only when `trust_flag` is set; the
+/// caller passes [`crate::guide::store::ChannelEpg::trusts_flag_for`] for
+/// `entry`, which holds when the portal sends `has_archive = 1` for some
+/// programme of this channel and `entry` had ended when the EPG was fetched.
+/// Without the first, a portal that sends 0 (or nothing) for everything would
+/// make nothing watchable; without the second, the 0 it sent for a programme
+/// still running then would keep it unwatchable once it is over.
 pub fn playable(
     entry: &EpgEntry,
     archive_days: u32,
@@ -83,15 +86,32 @@ pub fn day_of_in<Tz: TimeZone>(t: DateTime<Utc>, tz: &Tz) -> NaiveDate {
     t.with_timezone(tz).date_naive()
 }
 
-/// The programmes of `day` in a cleaned listing (sorted, no overlaps; see
-/// [`crate::epg::clean_entries`]): those that start on that day, plus the one
-/// that runs at its midnight. Two binary searches: cheap enough per frame.
-pub fn day_slice_in<Tz: TimeZone>(entries: &[EpgEntry], day: NaiveDate, tz: &Tz) -> Range<usize> {
-    let from = day_start_in(day, tz);
-    let to = day_start_in(day.succ_opt().unwrap_or(day), tz);
+/// Local midnight at the start of `day` and of the next day in `tz`, as UTC:
+/// the bounds [`slice_between`] takes. Two time-zone conversions, so they are
+/// worked out when the day changes, never per frame.
+pub fn day_bounds_in<Tz: TimeZone>(day: NaiveDate, tz: &Tz) -> (DateTime<Utc>, DateTime<Utc>) {
+    (
+        day_start_in(day, tz),
+        day_start_in(day.succ_opt().unwrap_or(day), tz),
+    )
+}
+
+/// The programmes of a cleaned listing that overlap `from..to`: two binary
+/// searches and no time-zone work, cheap enough per frame.
+pub fn slice_between(entries: &[EpgEntry], from: DateTime<Utc>, to: DateTime<Utc>) -> Range<usize> {
     let first = entries.partition_point(|e| e.end <= from);
     let end = entries.partition_point(|e| e.start < to);
     first..end.max(first)
+}
+
+/// The programmes of `day` in a cleaned listing (sorted, no overlaps; see
+/// [`crate::epg::clean_entries`]): those that start on that day, plus the one
+/// that runs at its midnight. It converts local time twice (an OS call each),
+/// so code that runs per frame keeps the day's [`day_bounds_in`] and slices
+/// with [`slice_between`] instead.
+pub fn day_slice_in<Tz: TimeZone>(entries: &[EpgEntry], day: NaiveDate, tz: &Tz) -> Range<usize> {
+    let (from, to) = day_bounds_in(day, tz);
+    slice_between(entries, from, to)
 }
 
 /// [`at_hour_in`] in the computer's local time.
@@ -107,6 +127,11 @@ pub fn day_start(day: NaiveDate) -> DateTime<Utc> {
 /// [`day_of_in`] in the computer's local time.
 pub fn day_of(t: DateTime<Utc>) -> NaiveDate {
     day_of_in(t, &Local)
+}
+
+/// [`day_bounds_in`] in the computer's local time.
+pub fn day_bounds(day: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
+    day_bounds_in(day, &Local)
 }
 
 /// [`day_slice_in`] in the computer's local time.
@@ -318,6 +343,29 @@ mod tests {
         // 13 October: only "Avond", which runs at its midnight.
         assert_eq!(day_slice_in(&entries, date(2026, 10, 13), &cest), 3..4);
         assert!(day_slice_in(&entries, date(2026, 10, 20), &cest).is_empty());
+    }
+
+    #[test]
+    fn slice_between_takes_what_overlaps() {
+        let t = |h: u32, m: u32| utc(2026, 10, 12, h, m);
+        // 10:00-11:00 A, 11:00-12:00 B, a gap, 14:00-15:00 C.
+        let entries = vec![
+            entry("A", t(10, 0), t(11, 0)),
+            entry("B", t(11, 0), t(12, 0)),
+            entry("C", t(14, 0), t(15, 0)),
+        ];
+        // Bounds inside programmes: those programmes overlap, so they count.
+        assert_eq!(slice_between(&entries, t(10, 30), t(11, 30)), 0..2);
+        assert_eq!(slice_between(&entries, t(0, 0), t(23, 0)), 0..3);
+        // Touching is not overlapping: A ends at `from`, C starts at `to`.
+        assert_eq!(slice_between(&entries, t(11, 0), t(14, 0)), 1..2);
+        // Bounds in a gap: nothing, as an empty range at the right index.
+        assert_eq!(slice_between(&entries, t(12, 30), t(13, 30)), 2..2);
+        assert_eq!(slice_between(&entries, t(8, 0), t(9, 0)), 0..0);
+        assert_eq!(slice_between(&entries, t(16, 0), t(17, 0)), 3..3);
+        // Backwards bounds and no entries: empty, never an inverted range.
+        assert_eq!(slice_between(&entries, t(14, 30), t(10, 30)), 2..2);
+        assert_eq!(slice_between(&[], t(10, 0), t(11, 0)), 0..0);
     }
 
     #[test]
