@@ -218,6 +218,12 @@ texts! {
     DayYesterday => ["Gisteren", "Yesterday", "Gestern"],
     DayToday => ["Vandaag", "Today", "Heute"],
     DayTomorrow => ["Morgen", "Tomorrow", "Morgen"],
+    // The wait screen while catch-up loads
+    WaitLoading => ["programma wordt geladen…", "loading the programme…", "Sendung wird geladen…"],
+    WaitFailed => ["Terugkijken lukt niet: {0}", "Catch-up failed: {0}", "Wiederholung nicht möglich: {0}"],
+    WaitStreamEnded => ["de stream stopte", "the stream stopped", "der Stream brach ab"],
+    WaitEscBack => ["Esc = terug naar de gids", "Esc = back to the guide", "Esc = zurück zum Programm"],
+    WaitWhen => ["{0} · {1}–{2}", "{0} · {1}–{2}", "{0} · {1}–{2}"],
     // Debug HUD
     DebugBuffering => ["afspelen: BUFFEREN  {0}s", "playback: BUFFERING  {0}s", "Wiedergabe: PUFFERN  {0}s"],
     DebugBufferingStartup => ["afspelen: bufferen (start)", "playback: buffering (startup)", "Wiedergabe: puffern (Start)"],

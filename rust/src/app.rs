@@ -7,7 +7,7 @@ use crate::guide::fetch::EpgFetcher;
 use crate::guide::logos::LogoStore;
 use crate::guide::store::{fetch_order, ChannelEpg, EpgStore};
 use crate::guide::time::Playable;
-use crate::guide_ui::{GuideAction, GuideData, GuideView};
+use crate::guide_ui::{paint_wait_screen, GuideAction, GuideData, GuideView, WaitInfo};
 use crate::i18n::{Lang, T};
 use crate::news::NewsRule;
 use crate::pin::{PinGate, PinHash};
@@ -295,6 +295,16 @@ struct NewsItem {
     live: bool,  // 24h news channel with no catch-up - play it live
 }
 
+/// A catch-up programme loading behind the wait screen.
+struct PendingCatchup {
+    channel: GuideChannel,
+    title: String,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+    /// Why it failed before its first frame, once it did.
+    failed: Option<String>,
+}
+
 /// What the "found" lines of the news settings were worked out for: the rules'
 /// channel names and the catalog's state. Typing in a rule's patterns, label or
 /// seconds changes none of it.
@@ -454,6 +464,8 @@ pub struct TvApp {
     /// When the stream that loads now went to the player; its first frame
     /// clears it. EPG fetching waits meanwhile (10 s at most): zapping first.
     stream_starting_since: Option<Instant>,
+    /// A catch-up pick loading behind the wait screen.
+    pending_catchup: Option<PendingCatchup>,
     /// Tracks borderless+always-on-top toggle (`t` key).
     borderless: bool,
     /// `?` toggles a centered help overlay listing every hotkey.
@@ -536,6 +548,24 @@ pub struct TvApp {
     /// with every key typed, so they are saved when the overlay closes. Cleared
     /// by a write that worked only.
     settings_dirty: bool,
+}
+
+/// Spends a key press before anything else reads it in this frame: its `Key`
+/// events, whatever the modifiers, and, for a letter, the character it types.
+/// What opens a view on a key press must do this when the view reads its keys
+/// in the same frame.
+fn spend_key(ctx: &egui::Context, key: Key) {
+    ctx.input_mut(|i| {
+        i.events.retain(|e| match e {
+            egui::Event::Key {
+                key: pressed,
+                pressed: true,
+                ..
+            } => *pressed != key,
+            egui::Event::Text(typed) => !typed.eq_ignore_ascii_case(key.name()),
+            _ => true,
+        })
+    });
 }
 
 /// The translated text for a credentials error.
@@ -647,6 +677,7 @@ impl TvApp {
             guide_fetching: false,
             logos,
             stream_starting_since: None,
+            pending_catchup: None,
             borderless: false,
             show_help: false,
             current_url: None,
@@ -1175,8 +1206,25 @@ impl TvApp {
                     // this point (startup/zap) is shown live but not tallied.
                     self.health.mark_started();
                     self.stream_starting_since = None;
+                    if self.pending_catchup.take().is_some() {
+                        tracing::info!("catch-up: first frame");
+                    }
                 }
                 Event::EndOfFile { reason } => {
+                    // Before its first frame a catch-up pick that ends has failed; the
+                    // stop of the stream before it ("stop") is no failure.
+                    if reason == "error" || reason == "eof" {
+                        if let Some(wait) = self.pending_catchup.as_mut() {
+                            if wait.failed.is_none() {
+                                tracing::warn!(
+                                    "catch-up: failed before its first frame ({reason})"
+                                );
+                                wait.failed =
+                                    Some(crate::i18n::t(self.lang, T::WaitStreamEnded).to_string());
+                            }
+                            continue;
+                        }
+                    }
                     // mpv fires end-file on EVERY channel switch: loadfile stops
                     // the previous stream with reason=stop. Surfacing that as a
                     // toast overwrote the "[TV] <channel>" zap toast (single slot)
@@ -1236,7 +1284,12 @@ impl TvApp {
                 }
                 Event::Error { msg } => {
                     warn!("player error: {}", msg);
-                    self.set_toast(self.tr(T::ErrorMsg, &[&msg]));
+                    match self.pending_catchup.as_mut() {
+                        Some(wait) => {
+                            wait.failed.get_or_insert(msg);
+                        }
+                        None => self.set_toast(self.tr(T::ErrorMsg, &[&msg])),
+                    }
                 }
                 Event::PropertyChanged { name, value } => {
                     if name == "paused-for-cache" {
@@ -2346,20 +2399,9 @@ impl TvApp {
         }
 
         if g_key {
-            // Spent, whatever the modifiers: the guide that opens reads its keys
-            // in this same frame, and its `g` closes it again.
-            ctx.input_mut(|i| {
-                i.events.retain(|e| {
-                    !matches!(
-                        e,
-                        egui::Event::Key {
-                            key: Key::G,
-                            pressed: true,
-                            ..
-                        }
-                    )
-                })
-            });
+            // The guide that opens reads its keys in this same frame, and its
+            // `g` closes it again.
+            spend_key(ctx, Key::G);
             self.open_guide();
         }
 
@@ -3067,8 +3109,49 @@ impl TvApp {
                 self.current_name = Some(format!("{} - {}", channel.name, entry.title));
                 self.current_epg = None;
                 self.close_guide();
+                tracing::info!("catch-up: waiting for the first frame");
+                self.pending_catchup = Some(PendingCatchup {
+                    channel,
+                    title: entry.title,
+                    start: entry.start,
+                    end: entry.end,
+                    failed: None,
+                });
             }
         }
+    }
+
+    /// The wait screen takes Esc and g only: the load stops and the guide comes
+    /// back as it was left.
+    fn handle_wait_keys(&mut self, ctx: &egui::Context) {
+        let (esc, g) = ctx.input(|i| (i.key_pressed(Key::Escape), i.key_pressed(Key::G)));
+        if esc || g {
+            self.pending_catchup = None;
+            self.stop_playback();
+            tracing::info!("catch-up: cancelled");
+            // The guide that opens reads its keys in this same frame: its `g`
+            // would close it again, its Esc run the Esc chain (the filter, else
+            // closing).
+            spend_key(ctx, Key::Escape);
+            spend_key(ctx, Key::G);
+            self.open_guide();
+        }
+    }
+
+    fn paint_wait(&mut self, ctx: &egui::Context) {
+        let Some(wait) = &self.pending_catchup else {
+            return;
+        };
+        let info = WaitInfo {
+            lang: self.lang,
+            channel: &wait.channel,
+            title: &wait.title,
+            start: wait.start,
+            end: wait.end,
+            today: crate::guide::time::day_of(chrono::Utc::now()),
+            failed: wait.failed.as_deref(),
+        };
+        paint_wait_screen(ctx, &info, &mut self.logos);
     }
 }
 
@@ -3143,15 +3226,23 @@ impl TvApp {
         );
         // The open guide reads its own keys in paint_guide, as the settings
         // overlay does in paint_settings (typing in its filter must not fire
-        // hotkeys); the setup prompt owns the keyboard.
-        if self.settings_ui.is_none() && !setup_prompt && !self.guide_open {
-            self.handle_keys(ctx);
+        // hotkeys); the setup prompt owns the keyboard. The wait screen of a
+        // catch-up pick takes Esc and g only.
+        if self.settings_ui.is_none() && !setup_prompt {
+            if self.pending_catchup.is_some() {
+                self.handle_wait_keys(ctx);
+            } else if !self.guide_open {
+                self.handle_keys(ctx);
+            }
         }
 
-        // Guide takes over the full window when open. Skipping the video
-        // texture upload in this branch removes ~5 MB of per-frame memcpy
-        // work while the user is browsing the schedule.
-        if self.guide_open {
+        // The wait screen of a catch-up pick takes over the full window, and so
+        // does the guide when open. Skipping the video texture upload in this
+        // branch removes ~5 MB of per-frame memcpy work while the user is
+        // browsing the schedule.
+        if self.pending_catchup.is_some() {
+            self.paint_wait(ctx);
+        } else if self.guide_open {
             self.paint_guide(ctx);
         } else if setup_prompt {
             // First-run: no credentials yet - show the portal setup prompt
@@ -3534,6 +3625,8 @@ mod tests {
         app: TvApp,
         ctx: egui::Context,
         cmds: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+        /// Player events for the app, as mpv sends them.
+        events: tokio::sync::mpsc::UnboundedSender<Event>,
         /// Every text the last frame painted.
         painted: Vec<String>,
     }
@@ -3548,7 +3641,7 @@ mod tests {
             initial_url: Option<&str>,
         ) -> Self {
             let (cmd_tx, cmds) = tokio::sync::mpsc::unbounded_channel();
-            let (_events, evt_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (events, evt_rx) = tokio::sync::mpsc::unbounded_channel();
             let player = PlayerHandle {
                 cmd_tx,
                 evt_rx: Mutex::new(evt_rx),
@@ -3579,6 +3672,7 @@ mod tests {
                 app,
                 ctx: egui::Context::default(),
                 cmds,
+                events,
                 painted: Vec::new(),
             };
             harness.frame(&[]);
@@ -3933,6 +4027,298 @@ mod tests {
             "and the new column is drawn: {:?}",
             h.painted
         );
+    }
+
+    // ---- the wait screen of a catch-up pick ----
+
+    /// The programme before the one on now, picked in the open guide.
+    fn pick_catch_up(h: &mut Harness) {
+        open_guide(h, true);
+        h.press(&[Key::ArrowUp, Key::Enter]);
+    }
+
+    #[tokio::test]
+    async fn a_catch_up_pick_shows_the_wait_screen_until_the_first_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        assert!(h.app.pending_catchup.is_some());
+        h.frame(&[]);
+        assert!(
+            h.painted.iter().any(|t| t == "loading the programme…"),
+            "{:?}",
+            h.painted
+        );
+        assert!(h.painted.iter().any(|t| t == "Journaal -1"));
+        // The file opening is not the first frame: the stream is still starting.
+        h.events.send(Event::FileLoaded).unwrap();
+        h.frame(&[]);
+        assert!(h.app.pending_catchup.is_some());
+        assert!(h.app.stream_starting_since.is_some());
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.frame(&[]);
+        assert!(
+            h.app.pending_catchup.is_none(),
+            "the first frame ends the wait"
+        );
+        assert!(
+            h.app.stream_starting_since.is_none(),
+            "and the EPG fetching, held back while the stream started, goes on"
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_on_the_wait_screen_stops_the_load_and_brings_the_guide_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        h.sent();
+        h.press(&[Key::Escape]);
+        let sent = h.sent();
+        assert!(sent.iter().any(|c| matches!(c, Cmd::Stop)), "{sent:?}");
+        assert!(h.app.pending_catchup.is_none());
+        assert!(h.app.guide_open, "back in the guide");
+    }
+
+    #[test]
+    fn spending_a_key_takes_its_presses_and_the_letter_it_types_and_nothing_else() {
+        let key_event = |key, pressed, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        let text = |s: &str| egui::Event::Text(s.into());
+        let none = egui::Modifiers::NONE;
+        let release = key_event(Key::G, false, none);
+        let events = vec![
+            key_event(Key::G, true, none),
+            key_event(Key::G, true, egui::Modifiers::SHIFT),
+            text("g"),
+            text("G"),
+            release.clone(),
+            key_event(Key::H, true, none),
+            text("h"),
+        ];
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let mut left = Vec::new();
+        let _ = ctx.run(raw, |ctx| {
+            spend_key(ctx, Key::G);
+            left = ctx.input(|i| i.events.clone());
+        });
+        // The release, and another key with its letter, stay.
+        assert_eq!(left, [release, key_event(Key::H, true, none), text("h")]);
+    }
+
+    // The guide that comes back reads its keys in the frame of the key that
+    // brought it: a `g` there closes it again, an Esc runs its own chain (the
+    // filter, else closing). These press the key as a keyboard makes it.
+
+    #[tokio::test]
+    async fn g_on_the_wait_screen_brings_the_guide_back_and_it_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        h.sent();
+        h.frame_with(vec![key_press(Key::G), egui::Event::Text("g".into())]);
+        assert!(
+            h.app.guide_open,
+            "the guide is back in the frame of the key"
+        );
+        assert!(h.app.pending_catchup.is_none());
+        assert!(h.sent().iter().any(|c| matches!(c, Cmd::Stop)));
+        h.frame(&[]);
+        assert!(h.app.guide_open, "and it stays");
+        h.press(&[Key::G]);
+        assert!(!h.app.guide_open, "the next g closes it, as ever");
+    }
+
+    #[tokio::test]
+    async fn shift_g_on_the_wait_screen_is_the_same_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        let shift_g = egui::Event::Key {
+            key: Key::G,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        };
+        h.frame_with(vec![shift_g, egui::Event::Text("G".into())]);
+        assert!(h.app.guide_open, "whatever the modifiers");
+        h.frame(&[]);
+        assert!(h.app.guide_open, "and it stays");
+    }
+
+    #[tokio::test]
+    async fn esc_on_the_wait_screen_brings_the_guide_back_and_it_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        h.frame(&[Key::Escape]);
+        assert!(
+            h.app.guide_open,
+            "the guide is back in the frame of the key"
+        );
+        assert!(h.app.pending_catchup.is_none());
+        h.frame(&[]);
+        assert!(h.app.guide_open, "and it stays");
+        h.press(&[Key::Escape]);
+        assert!(!h.app.guide_open, "the next Esc closes it, as ever");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_fails_before_its_first_frame_says_so_on_the_wait_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        // The stream before it stopping is no failure.
+        h.events
+            .send(Event::EndOfFile {
+                reason: "stop".into(),
+            })
+            .unwrap();
+        h.frame(&[]);
+        assert!(h.app.pending_catchup.as_ref().unwrap().failed.is_none());
+        h.events
+            .send(Event::EndOfFile {
+                reason: "error".into(),
+            })
+            .unwrap();
+        h.frame(&[]);
+        h.frame(&[]);
+        assert!(
+            h.painted.iter().any(|t| t.starts_with("Catch-up failed")),
+            "{:?}",
+            h.painted
+        );
+        h.press(&[Key::Escape]);
+        assert!(h.app.guide_open);
+    }
+
+    #[tokio::test]
+    async fn an_eof_before_the_first_frame_is_a_failure_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        h.sent();
+        h.events
+            .send(Event::EndOfFile {
+                reason: "eof".into(),
+            })
+            .unwrap();
+        h.frame(&[]);
+        h.frame(&[]);
+        let said = "Catch-up failed: the stream stopped";
+        assert!(h.painted.iter().any(|t| t == said), "{:?}", h.painted);
+        assert!(!zapped(&h.sent()), "a catch-up that ended is not reloaded");
+        assert!(h.app.toast.is_none(), "and no toast says it");
+    }
+
+    #[tokio::test]
+    async fn a_player_error_before_the_first_frame_goes_to_the_wait_screen_not_to_a_toast() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        let error = |msg: &str| Event::Error { msg: msg.into() };
+        h.events.send(error("boom")).unwrap();
+        h.frame(&[]);
+        h.frame(&[]);
+        assert!(
+            h.painted.iter().any(|t| t == "Catch-up failed: boom"),
+            "{:?}",
+            h.painted
+        );
+        assert!(h.app.toast.is_none(), "no toast over the wait screen");
+        // The first reason stays: what comes after it explains nothing better.
+        h.events.send(error("later")).unwrap();
+        h.events
+            .send(Event::EndOfFile {
+                reason: "error".into(),
+            })
+            .unwrap();
+        h.frame(&[]);
+        let wait = h.app.pending_catchup.as_ref().unwrap();
+        assert_eq!(wait.failed.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn after_the_first_frame_the_wait_screen_leaves_errors_to_the_toast() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.events.send(Event::Error { msg: "boom".into() }).unwrap();
+        h.frame(&[]);
+        let toast = |h: &Harness| h.app.toast.as_ref().map(|(t, _, _)| t.clone());
+        assert_eq!(toast(&h).as_deref(), Some("error: boom"));
+        h.events
+            .send(Event::EndOfFile {
+                reason: "error".into(),
+            })
+            .unwrap();
+        h.frame(&[]);
+        let retry = "stream error - zap up or down to retry";
+        assert_eq!(toast(&h).as_deref(), Some(retry));
+        assert!(h.app.pending_catchup.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_wait_screen_takes_no_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        h.sent();
+        h.press(&[Key::ArrowDown, Key::Enter, Key::O]);
+        assert!(!zapped(&h.sent()));
+        assert!(h.app.settings_ui.is_none());
+        assert!(h.app.pending_catchup.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_wait_screen_logs_what_the_regression_scenarios_look_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        // With one dispatcher registered, tracing works a log line's interest out
+        // from whoever hits it first: another test's thread, which has none, would
+        // silence the line for this one. A second dispatcher stops that.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let log = LogBuffer::default();
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+        // Cancelled, failed, and shown at last.
+        pick_catch_up(&mut h);
+        h.press(&[Key::Escape]);
+        h.press(&[Key::ArrowUp, Key::Enter]);
+        h.events
+            .send(Event::EndOfFile {
+                reason: "error".into(),
+            })
+            .unwrap();
+        h.press(&[Key::Escape]);
+        h.press(&[Key::ArrowUp, Key::Enter]);
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.frame(&[]);
+        let text = log.text();
+        let count = |what: &str| text.lines().filter(|l| l.contains(what)).count();
+        assert_eq!(count("catch-up: waiting for the first frame"), 3, "{text}");
+        assert_eq!(count("catch-up: cancelled"), 2, "{text}");
+        assert_eq!(
+            count("catch-up: failed before its first frame (error)"),
+            1,
+            "{text}"
+        );
+        assert_eq!(count("catch-up: first frame"), 1, "{text}");
     }
 
     #[test]

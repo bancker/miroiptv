@@ -1593,6 +1593,86 @@ pub(crate) fn channel_badge_label(name: &str) -> String {
         .unwrap_or_else(|| "?".into())
 }
 
+/// What the wait screen shows while a catch-up programme loads.
+pub struct WaitInfo<'a> {
+    pub lang: Lang,
+    pub channel: &'a GuideChannel,
+    pub title: &'a str,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub today: NaiveDate,
+    /// Why it failed, once it did.
+    pub failed: Option<&'a str>,
+}
+
+/// The wait screen over the whole window while a catch-up programme loads:
+/// the portal makes its playlist in 2.5 to 10+ seconds.
+pub fn paint_wait_screen(ctx: &egui::Context, info: &WaitInfo, logos: &mut LogoStore) {
+    egui::CentralPanel::default()
+        .frame(egui::Frame::none().fill(BG))
+        .show(ctx, |ui| {
+            let card = Rect::from_center_size(ui.max_rect().center(), Vec2::new(440.0, 230.0));
+            ui.painter().rect_filled(card, 10.0, PANEL);
+            let header = Rect::from_min_size(
+                card.min + Vec2::new(20.0, 16.0),
+                Vec2::new(card.width() - 40.0, HEADER_H),
+            );
+            paint_header(ui, logos, info.channel, header, false);
+            let p = ui.painter();
+            let left = card.left() + 24.0;
+            let title = p.layout_job(single_line(
+                info.title,
+                FontId::proportional(20.0),
+                Color32::WHITE,
+                card.width() - 48.0,
+            ));
+            p.galley(Pos2::new(left, card.top() + 84.0), title, Color32::WHITE);
+            let day = i18n::day_label(info.lang, time::day_of(info.start), info.today);
+            let (from, to) = (crate::epg::hhmm(info.start), crate::epg::hhmm(info.end));
+            p.text(
+                Pos2::new(left, card.top() + 124.0),
+                Align2::LEFT_CENTER,
+                i18n::tr(info.lang, T::WaitWhen, &[&day, &from, &to]),
+                FontId::proportional(14.0),
+                Color32::from_white_alpha(170),
+            );
+            let line = card.top() + 166.0;
+            match info.failed {
+                None => {
+                    let spot =
+                        Rect::from_center_size(Pos2::new(left + 9.0, line), Vec2::splat(18.0));
+                    egui::Spinner::new()
+                        .size(18.0)
+                        .color(LIVE_GREEN)
+                        .paint_at(ui, spot);
+                    p.text(
+                        Pos2::new(left + 30.0, line),
+                        Align2::LEFT_CENTER,
+                        i18n::t(info.lang, T::WaitLoading),
+                        FontId::proportional(15.0),
+                        Color32::WHITE,
+                    );
+                }
+                Some(why) => {
+                    p.text(
+                        Pos2::new(left, line),
+                        Align2::LEFT_CENTER,
+                        i18n::tr(info.lang, T::WaitFailed, &[why]),
+                        FontId::proportional(15.0),
+                        Color32::from_rgb(240, 130, 110),
+                    );
+                }
+            }
+            p.text(
+                Pos2::new(left, card.bottom() - 22.0),
+                Align2::LEFT_CENTER,
+                i18n::t(info.lang, T::WaitEscBack),
+                FontId::proportional(12.0),
+                Color32::from_white_alpha(120),
+            );
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3322,5 +3402,128 @@ mod tests {
                 "{lang:?}: {hint:?} is {width} px wide in a box with {room} px of room"
             );
         }
+    }
+
+    // ---- the wait screen ----
+
+    /// A wait screen for a programme that ran for an hour on the day before
+    /// `today`, in English.
+    fn wait_info<'a>(
+        channel: &'a GuideChannel,
+        title: &'a str,
+        failed: Option<&'a str>,
+    ) -> WaitInfo<'a> {
+        let start = now() - Duration::hours(25);
+        WaitInfo {
+            lang: Lang::En,
+            channel,
+            title,
+            start,
+            end: start + Duration::hours(1),
+            today: time::day_of(start) + Duration::days(1),
+            failed,
+        }
+    }
+
+    /// The shapes of one frame of the wait screen in a window `width` x `height`.
+    fn wait_shapes(info: &WaitInfo, width: f32, height: f32) -> Vec<egui::epaint::ClippedShape> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut logos = LogoStore::new(dir.path().to_path_buf());
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, height))),
+            ..Default::default()
+        };
+        let output = egui::Context::default().run(raw, |ctx| {
+            paint_wait_screen(ctx, info, &mut logos);
+        });
+        output.shapes
+    }
+
+    /// The texts of those shapes.
+    fn wait_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_wait_screen_names_the_programme_and_what_it_waits_for_in_every_language() {
+        let ch = channel(601);
+        for lang in Lang::ALL {
+            let info = WaitInfo {
+                lang,
+                ..wait_info(&ch, "Journaal", None)
+            };
+            let (from, to) = (crate::epg::hhmm(info.start), crate::epg::hhmm(info.end));
+            let yesterday = i18n::t(lang, T::DayYesterday);
+            let when = i18n::tr(lang, T::WaitWhen, &[yesterday, &from, &to]);
+            let texts = wait_texts(&wait_shapes(&info, 1280.0, 720.0));
+            let wanted = [
+                "Journaal",
+                when.as_str(),
+                i18n::t(lang, T::WaitLoading),
+                i18n::t(lang, T::WaitEscBack),
+            ];
+            for want in wanted {
+                assert!(
+                    texts.iter().any(|t| t == want),
+                    "{lang:?}: {want:?} is not drawn: {texts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_wait_screen_says_why_instead_of_that_it_loads() {
+        let ch = channel(601);
+        for lang in Lang::ALL {
+            let why = i18n::t(lang, T::WaitStreamEnded);
+            let info = WaitInfo {
+                lang,
+                ..wait_info(&ch, "Journaal", Some(why))
+            };
+            let texts = wait_texts(&wait_shapes(&info, 1280.0, 720.0));
+            let said = i18n::tr(lang, T::WaitFailed, &[why]);
+            assert!(texts.contains(&said), "{lang:?}: {said:?} in {texts:?}");
+            let loading = i18n::t(lang, T::WaitLoading);
+            assert!(!texts.iter().any(|t| t == loading), "{lang:?}: {texts:?}");
+            let way_out = i18n::t(lang, T::WaitEscBack);
+            assert!(texts.iter().any(|t| t == way_out), "{lang:?}: the way out");
+        }
+    }
+
+    #[test]
+    fn a_long_title_is_cut_off_and_the_wait_screen_fits_the_narrowest_window() {
+        let ch = channel(601);
+        let title = "Een heel lang programma ".repeat(20);
+        let shapes = wait_shapes(&wait_info(&ch, &title, None), 640.0, 360.0);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 360.0));
+        let card = Rect::from_center_size(screen.center(), Vec2::new(440.0, 230.0));
+        let mut as_drawn = None;
+        for shape in &shapes {
+            let egui::Shape::Text(t) = &shape.shape else {
+                continue;
+            };
+            let rect =
+                Rect::from_min_size(t.pos + t.galley.rect.min.to_vec2(), t.galley.rect.size());
+            let text = t.galley.text();
+            assert!(
+                card.expand(0.5).contains_rect(rect),
+                "{text:?} leaves the card"
+            );
+            if text == title {
+                as_drawn = Some(t.galley.rows[0].text());
+            }
+        }
+        let as_drawn = as_drawn.expect("the title is drawn");
+        assert!(
+            as_drawn.ends_with('…'),
+            "it is cut off, and says so: {as_drawn:?}"
+        );
+        assert!(as_drawn.len() < title.len());
     }
 }
