@@ -1,11 +1,14 @@
 <#
-The regression set of 0.6.0 part 1: the keyboard-only end-to-end scenarios that passed when part 1
-was released (0.5.2). Each run opens the app's window once; run it when nobody minds windows
-coming and going.
+The regression set of 0.6.0: the keyboard-only end-to-end scenarios of part 1 that passed when it was
+released (0.5.2; groups R, B, C, N, X) and those of part 2's guide (group G). Each scenario opens the
+app's window once, a full run about a hundred times; run it when nobody minds windows coming and
+going.
 
   powershell -NoProfile -ExecutionPolicy Bypass -File e2e\regression.ps1 -Group R      # one group
-  powershell -NoProfile -ExecutionPolicy Bypass -File e2e\regression.ps1 -Group R,B,C,N,X
+  powershell -NoProfile -ExecutionPolicy Bypass -File e2e\regression.ps1 -Group R,B,C,N,X,G
   powershell -NoProfile -ExecutionPolicy Bypass -File e2e\regression.ps1 -Summary
+
+Without -Group the groups are R,B,C,N: X and G have to be named.
 
 Groups
   R  the R49 re-runs: first-focus scenarios with commands that pass on a normal keyboard after item I.1
@@ -13,11 +16,14 @@ Groups
   C  scenarios whose commands changed with this wave (the PIN dialogs stay open: T16-D, R36, L; R41ab)
   N  new scenarios for the fixes (A, C, D, F, G, H, J, L, M)
   X  the other extras of the Task 12-17 reports that run through run-scenario.ps1 alone
+  G  the guide of 0.6.0 part 2 (MOCK_GUIDE)
 
 Everything goes through rust\e2e\run-scenario.ps1 (mock portal, isolated config folder). No mouse, no
 SendInput: keys are posted to the app's window by the harness. The script refuses to start while a key
-is held (the harness does too). Results: one JSON line per scenario in $Results, the harness output of a
-failing scenario in $Results\<ID>.txt.
+is held (the harness does too). Results go to -Results (default %TEMP%\bongo-regression): one JSON
+line per scenario in results.jsonl, and per attempt (a failing scenario gets a second one) the harness
+output in <ID>.attemptN.txt. A failed attempt also leaves the app's own log in <ID>.attemptN.applog.txt
+and what the mock portal saw in <ID>.attemptN.requests.txt.
 #>
 param(
     [string[]]$Group = @('R', 'B', 'C', 'N'),
@@ -300,8 +306,34 @@ function Group-X {
     Scn 'T17-A' @{ MockEnv = $N; Settings = '{"language":"nl","news_rules":[]}'; Resume = 3; Keys = 'o;DOWN;DOWN;DOWN;DOWN;ENTER;TAB;SLEEP:300;ESC;ESC;n'; Expect = 'settings: closed', 'news picker: no rules'; Forbid = 'news picker 1 items' }
     Scn 'T17-G' @{ MockEnv = $N; Resume = 3; Keys = 'o;DOWN;DOWN;DOWN;DOWN;SLEEP:500;ESC;ESC'; Expect = 'settings: news lookup \(7 rules\)' }
     Scn 'T17-I' @{ MockEnv = $N; Resume = 3; Keys = 'o;DOWN;ENTER;TAB;TAB;TAB;TAB;ENTER;SLEEP:2500;ESC;ESC'; Expect = 'settings: portal saved'; Forbid = 'news lookup' }
-    Scn 'GUIDE-live' @{ MockEnv = $N; ConfigDir = (Fresh 'guide-live'); Resume = 3; Seconds = 22; Keys = 'g;SLEEP:2500;l;o;SLEEP:3500;ENTER'; Expect = 'guide: \[LIVE\] NL \| NPO 1 \| Tussen Kunst en Kitsch'; Forbid = 'video stalled', '/vod/' }
-    Scn 'GUIDE-catchup' @{ MockEnv = $N; ConfigDir = (Fresh 'guide-catchup'); Resume = 3; Seconds = 26; Keys = 'g;SLEEP:2500;t;SLEEP:3500;UP;ENTER'; Expect = 'guide: \[CATCHUP\] NL \| NPO1 HD \| NOS Jeugdjournaal', 'relay: catch-up playlist in' }
+    # The old guide's two scenarios, as the new guide has it: one column per channel with catch-up (no l / t),
+    # and the catch-up carries the channel's name.
+    Scn 'GUIDE-live' @{ MockEnv = $N; ConfigDir = (Fresh 'guide-live'); Resume = 3; Seconds = 22; Keys = 'g;SLEEP:3000;ENTER'; Expect = 'guide: \[LIVE\] NL \| NPO 1 \| Tussen Kunst en Kitsch'; Forbid = 'video stalled', '/vod/' }
+    # Run it after 01:00: just after midnight the bulletin before the one on now is yesterday's.
+    Scn 'GUIDE-catchup' @{ MockEnv = $N; ConfigDir = (Fresh 'guide-catchup'); Resume = 3; Seconds = 26; Keys = 'g;SLEEP:3000;UP;ENTER'; Expect = 'guide: \[CATCHUP\] NL \| NPO 1 \| NOS Jeugdjournaal', 'relay: catch-up playlist in', 'catch-up: first frame' }
+}
+
+# ---- G: the guide of 0.6.0 part 2 --------------------------------------------------------------
+function Group-G {
+    'G: the guide of 0.6.0 part 2'
+    $G = @{ MOCK_GUIDE = '1' }
+    # Ten columns, EPG fetched, logos: PNG ready, the GIF of channel 9 (second page) is none.
+    Scn 'G-open' @{ MockEnv = $G; ConfigDir = (Fresh 'g-open'); Resume = 3; Seconds = 22; Keys = 'g;SLEEP:2500;PGDN;SLEEP:2000'; Expect = 'guide: opened \(10 channels\)', 'epg: day table for sid=801', 'logo: 127\.0\.0\.1:18080 ready', 'logo: 127\.0\.0\.1:18080 is no PNG' }
+    Scn 'G-live' @{ MockEnv = $G; Resume = 3; Seconds = 22; Keys = 'g;SLEEP:3000;ENTER'; Expect = 'guide: \[LIVE\] NL \| GIDS 1 \|', 'guide: closed' }
+    # G-catchup and G-wait-esc step UP from the programme on now: run them after 01:00 (as GUIDE-catchup), when
+    # that programme is not the first of today's guide day.
+    Scn 'G-catchup' @{ MockEnv = $G; Resume = 3; Seconds = 26; Keys = 'g;SLEEP:3000;UP;ENTER'; Expect = 'guide: \[CATCHUP\] NL \| GIDS 1 \|', 'catch-up: waiting for the first frame', 'relay: catch-up playlist in', 'catch-up: first frame' }
+    # The mock takes 2.5 s to make a catch-up playlist: Esc comes before the first frame.
+    Scn 'G-wait-esc' @{ MockEnv = $G; Resume = 3; Seconds = 20; Keys = 'g;SLEEP:3000;UP;ENTER;SLEEP:800;ESC'; Expect = 'catch-up: cancelled'; Forbid = 'catch-up: first frame' }
+    Scn 'G-date' @{ MockEnv = $G; Resume = 3; Seconds = 26; Keys = 'g;SLEEP:3000;d;SLEEP:300;UP;ENTER;SLEEP:800;ENTER'; Expect = 'guide: primetime on', 'guide: \[CATCHUP\] NL \| GIDS 1 \| Journaal 1' }
+    Scn 'G-filter' @{ MockEnv = $G; Resume = 3; Seconds = 22; Keys = 'g;SLEEP:3000;f;TEXT:gids 3;ENTER;SLEEP:800;ENTER'; Expect = 'guide: \[LIVE\] NL \| GIDS 3 \|' }
+    # Letters in the filter box are no hotkeys; Esc leaves the box, wipes the filter, closes.
+    Scn 'G-filter-keys' @{ MockEnv = $G; Resume = 3; Seconds = 20; Keys = 'g;SLEEP:3000;f;TEXT:np dg;ESC;SLEEP:300;ESC;SLEEP:300;ESC'; Expect = 'guide: closed'; Forbid = 'guide: primetime', 'guide: now and next' }
+    Scn 'G-page' @{ MockEnv = $G; Resume = 3; Seconds = 22; Keys = 'g;SLEEP:3000;PGDN;SLEEP:2000;ENTER'; Expect = 'guide: \[LIVE\] NL \| GIDS 6 \|' }
+    # The cache file: the second start has the whole guide from the first.
+    $dc = Fresh 'g-cache'
+    Scn 'G-cache-1' @{ MockEnv = $G; ConfigDir = $dc; Resume = 3; Seconds = 24; Keys = 'g'; Expect = 'guide: epg cache written \(10 channels' }
+    Scn 'G-cache-2' @{ MockEnv = $G; ConfigDir = $dc; Resume = 3; Seconds = 14; Expect = 'guide: epg cache read \(10 channels' }
 }
 
 # ====================================================================================================
@@ -309,7 +341,7 @@ if ($Summary) {
     $latest = [ordered]@{}
     foreach ($line in Get-Content $jsonl -ErrorAction SilentlyContinue) { $o = $line | ConvertFrom-Json; $latest[$o.id] = $o }
     $rows = @($latest.Values)
-    foreach ($g in 'R', 'N', 'C', 'B', 'X') {
+    foreach ($g in 'R', 'N', 'C', 'B', 'X', 'G') {
         $m = @($rows | Where-Object { $_.group -eq $g })
         if (-not $m.Count) { continue }
         "{0}: {1} scenario(s): {2} PASS, {3} PASS on re-run, {4} FAIL, {5} refused-for-good; {6} refusal(s) retried" -f $g, $m.Count,
@@ -327,6 +359,7 @@ foreach ($g in $Group) {
         'C' { Group-C }
         'N' { Group-N }
         'X' { Group-X }
+        'G' { Group-G }
         default { Write-Warning "unknown group $g" }
     }
 }

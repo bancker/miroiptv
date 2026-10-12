@@ -4,8 +4,8 @@ keys to its window and checks its log. Example:
 
   .\run-scenario.ps1 -Resume 10 -Keys 'UP' -Expect 'zap: -> TEST 09'
 
--Keys: steps separated by ';' - a key (UP DOWN LEFT RIGHT ENTER ESC TAB
-BACKSPACE SPACE, or one character such as o f n 1), TEXT:<text> (followed by a
+-Keys: steps separated by ';' - a key (UP DOWN LEFT RIGHT PGUP PGDN HOME END
+ENTER ESC TAB BACKSPACE SPACE, or one character such as o f n 1), TEXT:<text> (followed by a
 300 ms pause, so that its last character and the next key share no frame unless
 the app stalls that long),
 SLEEP:<ms>, MARK:<label>. Keys are posted to the app's window, so nothing
@@ -83,6 +83,7 @@ public static void Char(IntPtr hwnd, char c) {
 }
 '@
 $named = @{ UP = @(0x26, $true); DOWN = @(0x28, $true); LEFT = @(0x25, $true); RIGHT = @(0x27, $true)
+            PGUP = @(0x21, $true); PGDN = @(0x22, $true); END = @(0x23, $true); HOME = @(0x24, $true)
             ENTER = @(0x0D, $false); ESC = @(0x1B, $false); TAB = @(0x09, $false); BACKSPACE = @(0x08, $false) }
 $segs = Join-Path $PSScriptRoot 'segs'
 if (-not (Test-Path (Join-Path $segs 'seg0.ts'))) { throw "no segments: run make-segments.ps1 first" }

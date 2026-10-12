@@ -33,15 +33,24 @@ Environment:
                      e.g. 503 or 509, the real portal's busy answers
   MOCK_EPG_DELAY=S   day-EPG requests (the news fetch) answer after S seconds, so
                      a test can press n again while a fetch is in flight
+  MOCK_GUIDE=1       ten channels "NL | GIDS k" (701..710) with catch-up twins
+                     "NL | GIDSk HD" (801..810, 7 days): logos /logo/k.png (a GIF for
+                     9, none for 10) and EPG from a week back to three days ahead,
+                     "Journaal k" at 19:00 local every day; the programme on now comes
+                     twice (5 minutes apart) with an overlapping one at its end, as the
+                     real portal sends it; channel 2 sends no has_archive
 """
 import base64
+import datetime
 import http.server
 import json
 import os
+import struct
 import sys
 import threading
 import time
 import urllib.parse
+import zlib
 
 PORT, SEGDIR, LOG = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 MODE = sys.argv[4] if len(sys.argv) > 4 else "none"
@@ -82,6 +91,8 @@ def live_streams():
         out += [ch(501, "NL | NPO 1"), ch(601, "NL | NPO1 HD", archive=1)]
     if ENV("MOCK_XXX") == "1":
         out += [ch(903, "XXX Something")]
+    if ENV("MOCK_GUIDE") == "1":
+        out += guide_streams()
     return out
 
 
@@ -106,6 +117,69 @@ def news_epg():
              "description": b64(""), "channel_id": "npo1", "start_timestamp": str(s),
              "stop_timestamp": str(e), "now_playing": 0, "has_archive": 1}
             for i, (t, s, e) in enumerate(progs, 1)]
+
+
+GUIDE_N = 10
+
+
+def guide_streams():
+    """MOCK_GUIDE's channels: live and catch-up twin per channel, logos."""
+    out = []
+    for k in range(1, GUIDE_N + 1):
+        if k <= 8:
+            logo = f"http://127.0.0.1:{PORT}/logo/{k}.png"
+        elif k == 9:
+            logo = f"http://127.0.0.1:{PORT}/logo/{k}.gif"
+        else:
+            logo = ""
+        out.append({"stream_id": 700 + k, "name": f"NL | GIDS {k}", "category_id": "2",
+                    "epg_channel_id": "", "tv_archive": 0, "is_adult": "0", "stream_icon": logo})
+        out.append({"stream_id": 800 + k, "name": f"NL | GIDS{k} HD", "category_id": "2",
+                    "epg_channel_id": "", "tv_archive": 1, "tv_archive_duration": 7,
+                    "is_adult": "0", "stream_icon": ""})
+    return out
+
+
+def guide_epg(k):
+    """Hour-long programmes from local midnight a week ago to three days ahead,
+    "Journaal k" at 19:00. The programme on now twice and an overlap at its end;
+    has_archive 1 for the past week (0 before it and ahead), none on channel 2."""
+    now = time.time()
+    first = datetime.datetime.combine(datetime.date.today() - datetime.timedelta(days=7),
+                                      datetime.time())
+    progs = []
+    for h in range(24 * 10):
+        at = first + datetime.timedelta(hours=h)
+        title = f"Journaal {k}" if at.hour == 19 else f"Programma {k}-{h}"
+        progs.append((title, at.timestamp(), at.timestamp() + 3600))
+    on_now = next(p for p in progs if p[1] <= now < p[2])
+    progs.append((on_now[0], on_now[1] + 300, on_now[2] + 300))
+    progs.append((f"Overlap {k}", on_now[2] - 600, on_now[2] + 1200))
+    fmt = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+    out = []
+    for i, (t, s, e) in enumerate(progs, 1):
+        item = {"id": str(i), "epg_id": str(i), "title": b64(t), "lang": "",
+                "start": fmt(s), "end": fmt(e), "description": b64(""),
+                "channel_id": f"gids{k}", "start_timestamp": str(int(s)),
+                "stop_timestamp": str(int(e)), "now_playing": 0}
+        if k != 2:
+            item["has_archive"] = 1 if now - 7 * 86400 <= s and e <= now else 0
+        out.append(item)
+    return out
+
+
+def png(k):
+    """A 96x36 logo in a colour of its own."""
+    w, h = 96, 36
+    rgb = bytes([(40 * k) % 256, (90 + 30 * k) % 256, (200 - 15 * k) % 256])
+    raw = b"".join(b"\x00" + rgb * w for _ in range(h))
+
+    def chunk(kind, data):
+        crc = zlib.crc32(kind + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -143,6 +217,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if action == "get_simple_data_table" and ENV("MOCK_EPG_DELAY"):
                 time.sleep(float(ENV("MOCK_EPG_DELAY")))
             if action in ("get_simple_data_table", "get_short_epg"):
+                sid = q.get("stream_id", "")
+                if ENV("MOCK_GUIDE") == "1" and sid.isdigit() and 801 <= int(sid) <= 800 + GUIDE_N:
+                    return self.json({"epg_listings": guide_epg(int(sid) - 800)})
                 if q.get("stream_id") == "601" and ENV("MOCK_NEWS") == "1":
                     return self.json({"epg_listings": news_epg()})
                 return self.json({"epg_listings": []})
@@ -187,6 +264,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             n = int(p.rsplit("/", 1)[1].split(".")[0])
             with open(os.path.join(SEGDIR, f"seg{n % NSEG}.ts"), "rb") as f:
                 return self.reply(200, f.read(), "video/mp2t")
+        if p.startswith("/logo/"):
+            name = p.rsplit("/", 1)[1]
+            if name.endswith(".png"):
+                return self.reply(200, png(int(name.split(".")[0])), "image/png")
+            return self.reply(200, b"GIF89a\x01\x00\x01\x00", "image/gif")
         self.reply(404, b"not found")
 
     def log_message(self, *args):

@@ -10,7 +10,14 @@ Once: `.\make-segments.ps1` (needs ffmpeg). Then build the release exe
     .\run-scenario.ps1 -Resume 3 -Expect 'relay: first bytes'
 
 See the parameter block in `run-scenario.ps1` and the docstring in
-`mock_portal.py` for what the mock can do.
+`mock_portal.py` for what the mock can do. Its options are environment variables
+(`-MockEnv @{ MOCK_NEWS = '1' }`). `MOCK_GUIDE=1` is the one the guide's
+scenarios (group `G`, below) run on: ten channels `NL | GIDS k` (701..710) with
+catch-up twins `NL | GIDSk HD` (801..810, 7 days), logos the mock serves itself
+(`/logo/k.png`, a GIF for channel 9, none for channel 10), and an EPG from a week
+back to three days ahead with `Journaal k` at 19:00 local every day. The
+programme on now comes twice (5 minutes apart) with an overlapping one at its
+end, as the real portal sends it; channel 2 sends no `has_archive`.
 
 `run-scenario.ps1` and `measure-startup.ps1` refuse to start while Tab, Shift,
 Ctrl, Alt, Enter, Esc, Space or an arrow key is held down (`held-keys.ps1`):
@@ -18,6 +25,10 @@ winit turns a key that Windows reports as down into a key press when the window
 gets the focus, which would make a run depend on the keyboard's state. Press and
 release the key once and run again. `test-held-keys.ps1` checks that guard against
 a fake keyboard (nothing is pressed or sent).
+
+`-Keys` takes steps separated by `;`: the named keys `UP DOWN LEFT RIGHT PGUP
+PGDN HOME END ENTER ESC TAB BACKSPACE SPACE`, any other single character (`o`,
+`f`, `1`), `TEXT:<text>`, `SLEEP:<ms>` and `MARK:<label>`.
 
 Keys are posted to the window as messages (key down, the character, key up),
 never injected, and winit takes them like real ones. Two things follow. A `TEXT:`
@@ -39,9 +50,16 @@ real portal credentials).
 
 ## Regression set
 
-`regression.ps1` runs the keyboard-only scenarios of 0.6.0 part 1 (and, from part 2 on, the guide's
-group `G`) through `run-scenario.ps1`, one JSON line per scenario in `%TEMP%\bongo-regression`.
+`regression.ps1` runs the keyboard-only scenarios of 0.6.0 through `run-scenario.ps1`: groups `R`,
+`B`, `C`, `N` and `X` are part 1's, group `G` is the guide of part 2 (against `MOCK_GUIDE=1`). The
+default `-Group` is `R,B,C,N`, so `X` and `G` have to be named: `-Group R,B,C,N,X,G` is everything.
+A full run opens the app's window about a hundred times (once per scenario, more for re-runs), so
+start it when nobody minds windows coming and going.
+
 `-Group` picks groups, `-Only` scenario ids (wildcards), `-DryRun` prints the commands, `-Summary`
-sums up the last results. A scenario that fails is run once more; one that the held-key guard
-refuses waits 10 s and tries again (up to 3 times). Typing scenarios can fail once on a doubled
-character (see above), so a pass on the re-run counts.
+sums up the last results. Results go to `-Results` (default `%TEMP%\bongo-regression`): one JSON line
+per scenario in `results.jsonl`, and per attempt the harness output in `<ID>.attemptN.txt`; an
+attempt that fails also leaves the app's own log (`<ID>.attemptN.applog.txt`) and what the mock
+portal saw (`<ID>.attemptN.requests.txt`) there. A scenario that fails is run once more; one that the
+held-key guard refuses waits 10 s and tries again (up to 3 times). Typing scenarios can fail once on a
+doubled character (see above), so a pass on the re-run counts.
