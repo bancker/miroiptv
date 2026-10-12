@@ -76,6 +76,9 @@ pub struct LiveChannel {
     /// content (see `catalog::adult_live`).
     #[serde(default, deserialize_with = "deser_flag")]
     pub is_adult: bool,
+    /// The channel's logo URL, if the portal has one (often empty).
+    #[serde(default)]
+    pub stream_icon: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

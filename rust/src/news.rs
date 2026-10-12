@@ -294,6 +294,7 @@ mod tests {
             tv_archive: archive,
             tv_archive_duration: 0,
             is_adult: false,
+            stream_icon: None,
         }
     }
 

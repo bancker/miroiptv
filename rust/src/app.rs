@@ -4239,6 +4239,7 @@ mod tests {
             tv_archive: 0,
             tv_archive_duration: 0,
             is_adult,
+            stream_icon: None,
         };
         crate::portal::Catalog {
             live: vec![
@@ -5194,6 +5195,7 @@ mod tests {
             tv_archive: 1,
             tv_archive_duration: 0,
             is_adult: false,
+            stream_icon: None,
         }
     }
 

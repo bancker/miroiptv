@@ -49,6 +49,7 @@ fn live(id: i64, name: &str, adult: bool) -> LiveChannel {
         tv_archive: 0,
         tv_archive_duration: 0,
         is_adult: adult,
+        stream_icon: None,
     }
 }
 

@@ -1,0 +1,141 @@
+use bongo_player::args::XtreamCreds;
+use bongo_player::catalog::{guide_channels_of, CatalogStore};
+use bongo_player::portal::xtream::XtreamPortal;
+use bongo_player::portal::{Catalog, LiveChannel};
+use std::sync::Arc;
+
+fn ch(id: i64, name: &str, archive: i32) -> LiveChannel {
+    LiveChannel {
+        stream_id: id,
+        name: name.into(),
+        category_id: None,
+        epg_channel_id: None,
+        tv_archive: archive,
+        tv_archive_duration: if archive == 1 { 7 } else { 0 },
+        is_adult: false,
+        stream_icon: None,
+    }
+}
+
+fn with_icon(mut c: LiveChannel, icon: &str) -> LiveChannel {
+    c.stream_icon = Some(icon.into());
+    c
+}
+
+fn adult(mut c: LiveChannel) -> LiveChannel {
+    c.is_adult = true;
+    c
+}
+
+fn portal() -> Arc<XtreamPortal> {
+    Arc::new(XtreamPortal::new(XtreamCreds {
+        username: "u".into(),
+        password: "p".into(),
+        host: "h".into(),
+        port: 80,
+    }))
+}
+
+fn store(live: Vec<LiveChannel>) -> CatalogStore {
+    CatalogStore::from_catalog(
+        portal(),
+        Catalog {
+            live,
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn a_channel_with_a_catch_up_twin_is_one_column() {
+    let live = vec![
+        ch(501, "NL | NPO 1", 0),
+        ch(502, "NL | NPO 1 UHD", 0),
+        ch(503, "NL | NPO 1 FHD", 0),
+        ch(601, "NL | NPO1 HD", 1),
+    ];
+    let g = guide_channels_of(&live);
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].archive_id, 601);
+    assert_eq!(g[0].live_id, 503, "the variant zapping picks: FHD first");
+    assert_eq!(g[0].name, "NL | NPO 1 FHD");
+    assert_eq!(g[0].archive_days, 7);
+    assert!(!g[0].adult);
+}
+
+#[test]
+fn a_channel_without_catch_up_is_no_column() {
+    let live = [ch(1, "INFO CHANNEL PANDORA", 0), ch(2, "NL | OPENHAARD", 0)];
+    assert!(guide_channels_of(&live).is_empty());
+}
+
+#[test]
+fn a_catch_up_channel_without_a_live_one_plays_live_through_itself() {
+    let g = guide_channels_of(&[ch(701, "NL | REGIO HD", 1)]);
+    assert_eq!((g[0].live_id, g[0].archive_id), (701, 701));
+    assert_eq!(g[0].name, "NL | REGIO HD");
+}
+
+#[test]
+fn columns_keep_the_order_in_which_channels_first_appear() {
+    let live = vec![
+        ch(602, "NL | NPO2 HD", 1),
+        ch(501, "NL | NPO 1", 0),
+        ch(502, "NL | NPO 2", 0),
+        ch(601, "NL | NPO1 HD", 1),
+    ];
+    let ids: Vec<i64> = guide_channels_of(&live)
+        .iter()
+        .map(|g| g.archive_id)
+        .collect();
+    assert_eq!(ids, [602, 601]);
+}
+
+#[test]
+fn the_logo_comes_from_the_live_variant_else_the_catch_up_one() {
+    let live = vec![
+        with_icon(ch(501, "NL | NPO 1", 0), "  "),
+        with_icon(ch(601, "NL | NPO1 HD", 1), "http://logos/npo1.png"),
+    ];
+    assert_eq!(
+        guide_channels_of(&live)[0].logo.as_deref(),
+        Some("http://logos/npo1.png")
+    );
+    let live = vec![
+        with_icon(ch(501, "NL | NPO 1", 0), "http://logos/live.png"),
+        with_icon(ch(601, "NL | NPO1 HD", 1), "http://logos/tk.png"),
+    ];
+    assert_eq!(
+        guide_channels_of(&live)[0].logo.as_deref(),
+        Some("http://logos/live.png")
+    );
+    assert_eq!(
+        guide_channels_of(&[ch(601, "NL | NPO1 HD", 1)])[0].logo,
+        None
+    );
+}
+
+#[test]
+fn the_catalog_leaves_adult_columns_out_while_locked() {
+    let catalog = store(vec![
+        ch(501, "NL | NPO 1", 0),
+        ch(601, "NL | NPO1 HD", 1),
+        adult(ch(901, "24/7 | ADULT A", 0)),
+        adult(ch(911, "24/7 | ADULT A HD", 1)),
+    ]);
+    let ids = |c: &CatalogStore| {
+        c.guide_channels()
+            .iter()
+            .map(|g| g.archive_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&catalog), [601]);
+    catalog.set_adult_unlocked(true);
+    assert_eq!(ids(&catalog), [601, 911]);
+    assert!(catalog.guide_channels()[1].adult);
+}
+
+#[test]
+fn an_unloaded_catalog_has_no_guide_channels() {
+    assert!(CatalogStore::new(portal()).guide_channels().is_empty());
+}

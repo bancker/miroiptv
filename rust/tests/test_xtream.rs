@@ -50,6 +50,23 @@ async fn fetch_catalog_combines_all_three_lists() {
 }
 
 #[tokio::test]
+async fn the_live_list_carries_the_logo_url() {
+    let server = MockServer::start().await;
+    mount_action(&server, "get_live_streams", fixtures("xtream_live")).await;
+    mount_action(&server, "get_vod_streams", fixtures("xtream_vod")).await;
+    mount_action(&server, "get_series", fixtures("xtream_series")).await;
+    let cat = XtreamPortal::new(creds_for(&server))
+        .fetch_catalog()
+        .await
+        .unwrap();
+    assert_eq!(
+        cat.live[0].stream_icon.as_deref(),
+        Some("http://logos.example/npo1.png")
+    );
+    assert_eq!(cat.live[1].stream_icon.as_deref(), Some(""));
+}
+
+#[tokio::test]
 async fn fetch_epg_returns_parsed_entries() {
     let server = MockServer::start().await;
     mount_action(&server, "get_short_epg", fixtures("xtream_epg")).await;

@@ -48,6 +48,86 @@ fn adult_series(s: &Series) -> bool {
     s.is_adult
 }
 
+/// One column of the guide: a channel that has a catch-up (archive) variant,
+/// all its variants merged. On this portal only the catch-up variants carry
+/// EPG, so these are the channels the guide can fill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuideChannel {
+    /// The name the column shows: the live variant's, else the catch-up one's.
+    pub name: String,
+    /// What plays live: the live variant zapping would pick, else `archive_id`.
+    pub live_id: i64,
+    /// Where the EPG and catch-up come from.
+    pub archive_id: i64,
+    /// How many days back catch-up reaches; 0 when the portal does not say.
+    pub archive_days: u32,
+    /// The logo URL, if the portal has one.
+    pub logo: Option<String>,
+    /// A variant of the channel carries the portal's adult flag.
+    pub adult: bool,
+}
+
+/// The guide's channels in `live`: one per channel ([`normalize_channel_name`])
+/// that has a catch-up variant (`tv_archive == 1`), in the order the channels
+/// first appear. Of several live or catch-up variants the one zapping would
+/// pick wins ([`zap_preference`]); on a tie, the first.
+pub fn guide_channels_of(live: &[LiveChannel]) -> Vec<GuideChannel> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<&LiveChannel>> = HashMap::new();
+    for ch in live {
+        let key = normalize_channel_name(&ch.name);
+        if key.is_empty() {
+            continue;
+        }
+        groups
+            .entry(key)
+            .or_insert_with_key(|k| {
+                order.push(k.clone());
+                Vec::new()
+            })
+            .push(ch);
+    }
+    order
+        .iter()
+        .filter_map(|key| {
+            let group = groups.get(key)?;
+            let best = |archive: bool| {
+                group
+                    .iter()
+                    .copied()
+                    .filter(|c| (c.tv_archive == 1) == archive)
+                    .fold(None::<&LiveChannel>, |best, c| match best {
+                        Some(b)
+                            if zap_preference(quality_rank(&b.name))
+                                >= zap_preference(quality_rank(&c.name)) =>
+                        {
+                            Some(b)
+                        }
+                        _ => Some(c),
+                    })
+            };
+            let archive = best(true)?;
+            let live_variant = best(false);
+            let shown = live_variant.unwrap_or(archive);
+            let logo = live_variant
+                .into_iter()
+                .chain(Some(archive))
+                .filter_map(|c| c.stream_icon.as_deref())
+                .map(str::trim)
+                .find(|s| !s.is_empty())
+                .map(str::to_owned);
+            Some(GuideChannel {
+                name: shown.name.clone(),
+                live_id: shown.stream_id,
+                archive_id: archive.stream_id,
+                archive_days: u32::try_from(archive.tv_archive_duration).unwrap_or(0),
+                logo,
+                adult: group.iter().any(|c| adult_live(c)),
+            })
+        })
+        .collect()
+}
+
 /// A loaded catalog plus what the app asks of it while it draws, worked out once
 /// where the catalog is stored: a lookup by stream id is one probe of a set, not
 /// a scan of ~13,000 channels. Reads as the catalog itself (`Deref`).
@@ -55,6 +135,8 @@ struct StoredCatalog {
     catalog: PortalCatalog,
     /// Stream ids of the adult live channels (see `adult_live`).
     adult_live_ids: HashSet<i64>,
+    /// The guide's columns (see `guide_channels_of`), adult ones included.
+    guide: Vec<GuideChannel>,
 }
 
 impl StoredCatalog {
@@ -67,9 +149,11 @@ impl StoredCatalog {
             .filter(|c| adult_live(c))
             .map(|c| c.stream_id)
             .collect();
+        let guide = guide_channels_of(&catalog.live);
         Self {
             catalog,
             adult_live_ids,
+            guide,
         }
     }
 }
@@ -198,6 +282,7 @@ mod quality_tests {
             tv_archive,
             tv_archive_duration: 0,
             is_adult: false,
+            stream_icon: None,
         }
     }
 
@@ -366,6 +451,7 @@ mod zap_tests {
             tv_archive,
             tv_archive_duration: 0,
             is_adult: false,
+            stream_icon: None,
         }
     }
 
@@ -649,6 +735,24 @@ impl CatalogStore {
             .unwrap_or_default()
     }
 
+    /// The guide's columns ([`guide_channels_of`]), without the adult ones while
+    /// locked. Worked out when the catalog was stored; this clones the ~200
+    /// entries, so the app asks again only when the catalog or the lock changes.
+    pub fn guide_channels(&self) -> Vec<GuideChannel> {
+        let unlocked = self.adult_unlocked();
+        self.inner
+            .read()
+            .as_ref()
+            .map(|c| {
+                c.guide
+                    .iter()
+                    .filter(|g| unlocked || !g.adult)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Quality ladder for the channel currently playing `sid`, plus the index
     /// within it — for the +/- quality switcher. One read-lock, no full-catalog
     /// clone (only this channel's handful of variants are cloned). Empty ladder
@@ -840,6 +944,7 @@ mod news_tests {
             tv_archive: 0,
             tv_archive_duration: 0,
             is_adult,
+            stream_icon: None,
         }
     }
 
