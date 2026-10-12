@@ -2953,10 +2953,22 @@ impl TvApp {
         } else {
             1
         };
+        // The columns on screen first (under a filter they are not next to one
+        // another), then the rest from the leftmost one on. A channel named twice
+        // costs nothing: the fetcher skips what is in flight or fresh. The guide
+        // list may have changed since the last frame, hence `get`.
         let (start, count) = self.guide_view.visible_window();
         let channels = &self.guide_channels;
-        let order = fetch_order(start..start + count.max(1), channels.len())
-            .map(|i| channels[i].archive_id);
+        let on_screen = self
+            .guide_view
+            .visible_columns()
+            .iter()
+            .filter_map(|&i| channels.get(i))
+            .map(|c| c.archive_id);
+        let order = on_screen.chain(
+            fetch_order(start..start + count.max(1), channels.len())
+                .map(|i| channels[i].archive_id),
+        );
         self.epg_fetcher
             .tick(&self.epg_store, order, limit, now, chrono::Utc::now());
     }
@@ -4351,6 +4363,76 @@ mod tests {
         open_guide(&mut h, false);
         let fetching: Vec<i64> = h.app.epg_fetcher.in_flight().iter().copied().collect();
         assert_eq!(fetching, [13], "TEST 03's catch-up twin, not the adult 911");
+    }
+
+    /// An app on a catalog of ten channels with catch-up (ids 601 to 610) whose
+    /// guide is open and filtered on "zebra", which is in the names of the third
+    /// and the ninth. No EPG fetch has started yet: the test lets it start.
+    fn zebra_app(root: &std::path::Path) -> Harness {
+        let names = [
+            "ALFA",
+            "BRAVO",
+            "CHARLIE ZEBRA",
+            "DELTA",
+            "ECHO",
+            "FOXTROT",
+            "GOLF",
+            "HOTEL",
+            "INDIA ZEBRA",
+            "JULIET",
+        ];
+        let live: Vec<LiveChannel> = (601..)
+            .zip(names)
+            .map(|(id, name)| archive_channel(id, &format!("NL | {name}")))
+            .collect();
+        let portal = FakePortal::new(live.clone(), Vec::new());
+        let catalog = crate::portal::Catalog {
+            live,
+            ..Default::default()
+        };
+        let catalog = Arc::new(CatalogStore::from_catalog(portal, catalog));
+        let mut h = Harness::start(root, catalog, PortalState::Configured, None);
+        h.app.refresh_guide_channels();
+        h.app.guide_open = true;
+        h.frame(&[]);
+        h.press(&[Key::F]);
+        h.type_text("zebra");
+        h.frame(&[]);
+        assert_eq!(h.app.guide_view.visible_columns(), [2, 8], "the two shown");
+        assert!(h.app.epg_fetcher.in_flight().is_empty());
+        h
+    }
+
+    fn fetching_now(h: &Harness) -> Vec<i64> {
+        let mut ids: Vec<i64> = h.app.epg_fetcher.in_flight().iter().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn under_a_filter_the_epg_of_the_columns_on_screen_is_fetched_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = zebra_app(dir.path());
+        // The fetching starts: the two columns on screen go first, not the
+        // channel beside the leftmost one.
+        h.app.guide_fetching = true;
+        h.frame(&[]);
+        assert_eq!(fetching_now(&h), [603, 609]);
+    }
+
+    #[tokio::test]
+    async fn a_guide_list_that_shrank_since_the_last_frame_does_not_break_the_fetch_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = zebra_app(dir.path());
+        // The lock took channels out of the list after the last frame drew.
+        h.app.guide_channels.truncate(4);
+        h.app.guide_fetching = true;
+        h.frame(&[]);
+        assert_eq!(
+            fetching_now(&h),
+            [603, 604],
+            "the one left on screen, then on"
+        );
     }
 
     #[tokio::test]

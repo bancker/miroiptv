@@ -213,7 +213,7 @@ texts! {
     GuideStartsAt => ["begint om {0}", "starts at {0}", "beginnt um {0}"],
     GuideNotReplayable => ["niet terug te kijken", "not available to watch back", "nicht als Wiederholung verfügbar"],
     GuideLiveToast => ["[LIVE] {0} · {1}", "[LIVE] {0} · {1}", "[LIVE] {0} · {1}"],
-    GuideKeysFooter => ["pijlen = navigeren   /   PgUp/PgDn = andere zenders   /   Enter = afspelen   /   n / p = nu / primetime   /   d = datum   /   f = filter   /   Esc of g = sluiten", "arrows = navigate   /   PgUp/PgDn = other channels   /   Enter = play   /   n / p = now / primetime   /   d = date   /   f = filter   /   Esc or g = close", "Pfeile = navigieren   /   PgUp/PgDn = andere Sender   /   Enter = abspielen   /   n / p = jetzt / Primetime   /   d = Datum   /   f = Filter   /   Esc oder g = schließen"],
+    GuideKeysFooter => ["Esc of g = sluiten   /   pijlen = navigeren   /   PgUp/PgDn = andere zenders   /   Enter = afspelen   /   n / p = nu / primetime   /   d = datum   /   f = filter", "Esc or g = close   /   arrows = navigate   /   PgUp/PgDn = other channels   /   Enter = play   /   n / p = now / primetime   /   d = date   /   f = filter", "Esc oder g = schließen   /   Pfeile = navigieren   /   PgUp/PgDn = andere Sender   /   Enter = abspielen   /   n / p = jetzt / Primetime   /   d = Datum   /   f = Filter"],
     // Days in the guide
     DayYesterday => ["Gisteren", "Yesterday", "Gestern"],
     DayToday => ["Vandaag", "Today", "Heute"],

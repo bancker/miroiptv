@@ -131,9 +131,16 @@ pub struct GuideView {
     /// The keyboard went into the filter box by `f` or a click. It gets there
     /// no other way: a Tab that puts it there is undone.
     filter_wanted: bool,
+    /// How often `realign` ran: a frame in which it did, or the page moved, asks
+    /// for the next frame at once (see `show`).
+    realigns: u64,
     /// Index into the guide's channel list of the leftmost column, and how many
     /// columns show: where the fetcher starts.
     visible: (usize, usize),
+    /// The guide-list index of every column on screen, in order: under a filter
+    /// they are not next to one another. Refilled by each frame in the room it
+    /// has.
+    visible_cols: Vec<usize>,
     /// Texts that change now and then, made when they do.
     labels: Labels,
 }
@@ -162,7 +169,9 @@ impl GuideView {
             days_for: None,
             filter_had_focus: false,
             filter_wanted: false,
+            realigns: 0,
             visible: (0, 0),
+            visible_cols: Vec::new(),
             labels: Labels::default(),
         };
         view.set_day(today);
@@ -201,6 +210,7 @@ impl GuideView {
     pub fn realign(&mut self) {
         self.aligned.clear();
         self.moved.clear();
+        self.realigns = self.realigns.wrapping_add(1);
     }
 
     /// `n`, or a click on "Nu & straks": today, lined up on now.
@@ -740,7 +750,7 @@ impl TopBar {
         let y = bar.center().y - h / 2.0;
         let at = |x: f32, w: f32| Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h));
         let (date_w, modes_w, filter_w) = if narrow {
-            (120.0, 190.0, 150.0)
+            (120.0, 190.0, 176.0)
         } else {
             (160.0, 250.0, 240.0)
         };
@@ -771,6 +781,13 @@ impl GuideView {
         self.visible
     }
 
+    /// The guide-list index of every column on screen, in order, as of the last
+    /// frame drawn: the fetcher puts these first, also under a filter, where
+    /// the shown channels are not next to one another.
+    pub fn visible_columns(&self) -> &[usize] {
+        &self.visible_cols
+    }
+
     /// One frame of the guide over the whole window. Per frame it works only on
     /// the visible rows of the visible columns.
     pub fn show(
@@ -793,6 +810,7 @@ impl GuideView {
             Vec2::new(screen.width(), TOP_BAR_H),
         ));
 
+        let started = (self.realigns, self.page_start);
         self.follow_today(data.today);
         if self.all_for != Some(data.channels_revision) || self.all.len() != data.channels.len() {
             self.all = (0..data.channels.len()).collect();
@@ -819,8 +837,7 @@ impl GuideView {
         self.clamp(&page);
         // Before the keys: `refresh_filter` has just made the day, the mode and
         // the matches agree, and a key steps from rows that match the copy of
-        // the EPG the store holds now. A key that changes the day or the mode
-        // calls `realign`, and the next frame lines the columns up on it.
+        // the EPG the store holds now.
         self.align(&page, matches);
 
         let mut action = None;
@@ -832,11 +849,26 @@ impl GuideView {
             ctx.memory_mut(|m| m.surrender_focus(filter_id()));
         }
         self.clamp(&page);
+        // And after them, for what they changed: the columns a key paged in, and
+        // the day or mode it picked (`realign` cleared what was lined up). Not
+        // when the matches in hand were worked out for another day or text than
+        // the keys left (the day picked from the date list, Esc wiping the
+        // filter): the next frame works them out again and lines up on those.
+        let matches_fit = filtered
+            .as_ref()
+            .is_none_or(|(key, _)| key.day == self.day && key.text == self.filter);
+        if matches_fit {
+            self.align(&page, matches);
+        }
         let on_page = page.shown.len().saturating_sub(self.page_start).min(cols);
         self.visible = (
             page.shown.get(self.page_start).copied().unwrap_or(0),
             on_page,
         );
+        self.visible_cols.clear();
+        let on_screen = page.shown.get(self.page_start..self.page_start + on_page);
+        self.visible_cols
+            .extend_from_slice(on_screen.unwrap_or_default());
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(BG))
@@ -872,6 +904,12 @@ impl GuideView {
         self.filter_had_focus = ctx.memory(|m| m.has_focus(filter_id()));
         self.filtered = filtered;
         self.all = all;
+        // Lining up ran again, or the page moved, in this frame (a key, a click,
+        // the clock passing midnight): whatever it could not settle yet settles
+        // in the next frame, which should not wait for the app's 33 ms.
+        if (self.realigns, self.page_start) != started {
+            ctx.request_repaint();
+        }
         action
     }
 
@@ -1028,7 +1066,10 @@ impl GuideView {
         let response = ui
             .allocate_ui_at_rect(bar.filter, |ui| ui.add_enabled(data.keys, edit))
             .inner;
-        if response.clicked() {
+        // egui gives the box the keyboard on the press: that counts as wanted,
+        // or the guard below takes it back and the box flashes (and a drag that
+        // selects text would end without the keyboard).
+        if response.clicked() || response.is_pointer_button_down_on() {
             self.filter_wanted = true;
         }
         if response.gained_focus() && !self.filter_wanted {
@@ -1093,9 +1134,14 @@ impl GuideView {
             }
             return None;
         }
-        let (hover, wheel) = ui
-            .ctx()
-            .input(|i| (i.pointer.hover_pos(), i.raw_scroll_delta.y));
+        let ctx = ui.ctx();
+        let (hover, wheel) = ctx.input(|i| (i.pointer.hover_pos(), i.raw_scroll_delta.y));
+        // The wheel turns what is under the pointer: the guide's own panel. Not
+        // a column that lies under the date list (or any other window over the
+        // guide), and not while the help has the keyboard.
+        let wheel_at = hover
+            .filter(|_| wheel != 0.0 && data.keys)
+            .filter(|&p| ctx.layer_id_at(p) == Some(ui.layer_id()));
         let live_label = i18n::t(data.lang, T::GuideLiveBadge);
         let mut action = None;
         for col in 0..page.cols {
@@ -1111,7 +1157,7 @@ impl GuideView {
                 || ch.logo.as_deref().is_some_and(|url| logos.is_loading(url));
             paint_header(ui, logos, ch, column, loading);
             let rows = Rect::from_min_max(Pos2::new(left, area.top() + HEADER_H), column.max);
-            if wheel != 0.0 && hover.is_some_and(|p| rows.contains(p)) {
+            if wheel_at.is_some_and(|p| rows.contains(p)) {
                 self.scroll(page, col, -wheel / ROW_H);
             }
             if let Some(a) = self.rows(ui, page, matches, col, ch, rows, live_label) {
@@ -2214,6 +2260,8 @@ mod tests {
         logos: LogoStore,
         width: f32,
         height: f32,
+        /// When the last frame asked to be drawn again (zero: at once).
+        repaint_in: std::time::Duration,
         _dir: tempfile::TempDir,
     }
 
@@ -2229,6 +2277,7 @@ mod tests {
                 logos: LogoStore::new(dir.path().to_path_buf()),
                 width,
                 height,
+                repaint_in: std::time::Duration::MAX,
                 _dir: dir,
             }
         }
@@ -2259,6 +2308,10 @@ mod tests {
                 _ => None,
             });
             assert_eq!(clash, None, "two widgets share an id");
+            self.repaint_in = output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map_or(std::time::Duration::MAX, |v| v.repaint_delay);
             (action, output.shapes)
         }
 
@@ -2918,5 +2971,356 @@ mod tests {
         assert!(painted
             .iter()
             .any(|t| t == "no channels with programme information"));
+    }
+
+    // --- Fix round 1 (R19) ---
+
+    /// Ten channels from 601 on; "Special" runs now on the third (603) and the
+    /// ninth (609) and nowhere else: a filter on it shows two columns that lie
+    /// six places apart in the guide's list.
+    fn two_specials_far_apart() -> Fixture {
+        let mut f = Fixture::new(10, &[603, 609]);
+        for id in [603, 609] {
+            let mut entries = hourly().entries().to_vec();
+            entries[36].title = "Special".into();
+            f.store
+                .insert(id, ChannelEpg::new(Epg::new(entries), now()));
+        }
+        f
+    }
+
+    #[test]
+    fn the_columns_on_screen_are_reported_by_their_place_in_the_guides_list() {
+        let f = two_specials_far_apart();
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        assert_eq!(v.visible_columns(), [0, 1, 2, 3, 4], "a page of the list");
+        s.frame(&mut v, &d, vec![key(Key::PageDown)]);
+        assert_eq!(v.visible_columns(), [5, 6, 7, 8, 9]);
+        // Under a filter the shown channels are not next to one another.
+        v.filter = "special".into();
+        s.frame(&mut v, &d, vec![]);
+        assert_eq!(v.visible_columns(), [2, 8], "the two that match");
+        assert_eq!(v.visible_window(), (2, 2), "as before");
+        // A frame fills the list again without a new allocation.
+        let kept = v.visible_columns().as_ptr();
+        s.frame(&mut v, &d, vec![]);
+        s.frame(&mut v, &d, vec![]);
+        assert_eq!(v.visible_columns().as_ptr(), kept);
+        // Nothing found, nothing on screen.
+        v.filter = "voetbal".into();
+        s.frame(&mut v, &d, vec![]);
+        assert!(v.visible_columns().is_empty());
+    }
+
+    // The one-frame settle: what a key changes is lined up in the same frame.
+
+    #[test]
+    fn a_page_turned_with_a_key_shows_its_columns_lined_up_in_the_same_frame() {
+        let f = Fixture::new(12, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        s.frame(&mut v, &d, vec![key(Key::PageDown)]);
+        assert_eq!(v.visible_window(), (5, 5));
+        let (_, line) = rows_and_line();
+        for id in 606..=610 {
+            assert_eq!(
+                v.cursor.get(&id).copied(),
+                Some(f.live(id)),
+                "{id} is on what runs now"
+            );
+            assert_eq!(
+                v.top.get(&id).copied(),
+                Some(f.live(id) as f32 - line as f32),
+                "{id} has its live row on the now-line"
+            );
+        }
+    }
+
+    #[test]
+    fn a_day_picked_without_a_filter_lines_the_columns_up_on_its_primetime_in_the_same_frame() {
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        s.frame(&mut v, &d, vec![key(Key::D)]);
+        s.frame(&mut v, &d, vec![key(Key::ArrowUp)]);
+        s.frame(&mut v, &d, vec![key(Key::Enter)]);
+        let yesterday = time::day_of(now()).pred_opt().unwrap();
+        assert_eq!(v.day, yesterday);
+        let seven = time::at_hour(yesterday, time::PRIMETIME_HOUR);
+        for id in [601, 602, 603] {
+            let e = &f.store.get(id).unwrap().entries()[v.cursor[&id]];
+            assert!(
+                e.start <= seven && seven < e.end,
+                "{id}: {} runs at 19:00 yesterday",
+                e.title
+            );
+        }
+    }
+
+    #[test]
+    fn a_mode_changed_with_a_filter_lines_the_matches_up_in_the_same_frame() {
+        // "Special" runs now and at 19:00: the match that counts depends on the mode.
+        let mut f = Fixture::new(1, &[601]);
+        let seven = time::at_hour(time::day_of(now()), time::PRIMETIME_HOUR);
+        let mut entries = hourly().entries().to_vec();
+        let evening = entries
+            .iter()
+            .position(|e| e.start <= seven && seven < e.end)
+            .unwrap();
+        entries[36].title = "Special".into();
+        entries[evening].title = "Special".into();
+        f.store
+            .insert(601, ChannelEpg::new(Epg::new(entries), now()));
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        v.filter = "special".into();
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        assert_eq!(v.cursor[&601], 36, "the one on now");
+        s.frame(&mut v, &d, vec![key(Key::P)]);
+        assert_eq!(
+            v.cursor[&601], evening,
+            "the one at 19:00, in the frame of p"
+        );
+        s.frame(&mut v, &d, vec![key(Key::N)]);
+        assert_eq!(v.cursor[&601], 36, "and back on now, in the frame of n");
+    }
+
+    #[test]
+    fn a_frame_without_input_that_realigns_asks_for_the_next_one_at_once() {
+        // egui asks for the next frame after any frame with input; this one has
+        // none. The clock passes midnight with the guide open in Nu & straks: the
+        // day moves on and the columns line up on it.
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let today = time::day_of(now());
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(today));
+        let quiet = |s: &mut Screen, v: &mut GuideView, d: &GuideData| {
+            for _ in 0..4 {
+                s.frame(v, d, vec![]);
+            }
+            assert_ne!(
+                s.repaint_in,
+                std::time::Duration::ZERO,
+                "a settled guide asks for nothing"
+            );
+        };
+        quiet(&mut s, &mut v, &data(&f, &none, true));
+        let tomorrow = GuideData {
+            today: today.succ_opt().unwrap(),
+            ..data(&f, &none, true)
+        };
+        s.frame(&mut v, &tomorrow, vec![]);
+        assert_eq!(v.day, tomorrow.today, "the day moved on");
+        assert_eq!(s.repaint_in, std::time::Duration::ZERO);
+        quiet(&mut s, &mut v, &tomorrow);
+    }
+
+    // The filter box takes the keyboard on the press.
+
+    fn pointer_button(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn the_filter_box_has_the_keyboard_from_the_press_on() {
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        let bar = TopBar::new(Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(1280.0, TOP_BAR_H),
+        ));
+        let pos = bar.filter.center();
+        s.frame(&mut v, &d, vec![egui::Event::PointerMoved(pos)]);
+        assert!(!s.focused(), "a pointer over the box is no click");
+        s.frame(&mut v, &d, vec![pointer_button(pos, true)]);
+        assert!(s.focused(), "pressed: the box does not flash");
+        s.frame(&mut v, &d, vec![]);
+        assert!(s.focused(), "held down");
+        s.frame(&mut v, &d, vec![pointer_button(pos, false)]);
+        assert!(s.focused(), "released");
+    }
+
+    #[test]
+    fn a_press_on_the_filter_box_under_the_help_gives_it_nothing() {
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, false);
+        s.frame(&mut v, &d, vec![]);
+        let bar = TopBar::new(Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(1280.0, TOP_BAR_H),
+        ));
+        let pos = bar.filter.center();
+        s.frame(&mut v, &d, vec![egui::Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            s.frame(&mut v, &d, vec![pointer_button(pos, pressed)]);
+            assert!(!s.focused(), "keys are off, pressed: {pressed}");
+        }
+        assert!(!v.filter_wanted);
+    }
+
+    #[test]
+    fn a_tab_still_cannot_put_the_keyboard_in_the_box_after_a_click_elsewhere() {
+        // `filter_wanted` follows the press and the release; it must not outlive them.
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        let bar = TopBar::new(Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(1280.0, TOP_BAR_H),
+        ));
+        // Click in the box, then on the page arrow: the box lets go.
+        s.click(&mut v, &d, bar.filter.center());
+        assert!(s.focused());
+        s.click(&mut v, &d, bar.next.center());
+        s.frame(&mut v, &d, vec![]);
+        assert!(!s.focused(), "a click elsewhere takes the keyboard back");
+        assert!(!v.filter_wanted);
+        s.frame(&mut v, &d, vec![key(Key::Tab)]);
+        s.frame(&mut v, &d, vec![]);
+        assert!(!s.focused(), "and a Tab does not give it back");
+    }
+
+    // The wheel turns what is under the pointer.
+
+    /// One frame in which the pointer is at `pos` and the wheel turns two rows.
+    fn wheel_at(
+        s: &mut Screen,
+        v: &mut GuideView,
+        d: &GuideData,
+        pos: Pos2,
+    ) -> Option<GuideAction> {
+        let events = vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::Scroll(Vec2::new(0.0, 2.0 * ROW_H)),
+        ];
+        s.frame(v, d, events).0
+    }
+
+    #[test]
+    fn the_wheel_does_not_scroll_the_column_under_the_open_date_list() {
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        s.frame(&mut v, &d, vec![key(Key::D)]);
+        assert!(v.date_pick.is_some());
+        // The list shows from its second frame on; it lies over the first column.
+        s.frame(&mut v, &d, vec![]);
+        s.frame(&mut v, &d, vec![]);
+        let (before, first_col) = (v.top[&601], v.top[&602]);
+        wheel_at(&mut s, &mut v, &d, Pos2::new(60.0, 200.0));
+        assert_eq!(v.top[&601], before, "the column under the list stays");
+        assert!(v.date_pick.is_some(), "and the list is still open");
+        // Beside the list the wheel still turns a column.
+        let beside = Pos2::new(MARGIN + COLUMN_W + COLUMN_GAP + 50.0, 300.0);
+        wheel_at(&mut s, &mut v, &d, beside);
+        assert_eq!(v.top[&602], first_col - 2.0, "the one that is not covered");
+    }
+
+    #[test]
+    fn the_wheel_does_not_scroll_under_the_help() {
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        s.frame(&mut v, &data(&f, &none, true), vec![]);
+        let before = v.top[&602];
+        let over_second = Pos2::new(MARGIN + COLUMN_W + COLUMN_GAP + 50.0, 300.0);
+        let help_is_up = data(&f, &none, false);
+        wheel_at(&mut s, &mut v, &help_is_up, over_second);
+        assert_eq!(v.top[&602], before, "the keys are off, so is the wheel");
+        wheel_at(&mut s, &mut v, &data(&f, &none, true), over_second);
+        assert_eq!(v.top[&602], before - 2.0, "and back on without the help");
+    }
+
+    // 640 px: the narrowest window.
+
+    /// The shapes of the guide's second frame on a window `width` wide, in `lang`.
+    fn drawn(width: f32, lang: Lang) -> Vec<egui::epaint::ClippedShape> {
+        let f = Fixture::new(5, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(width), GuideView::new(time::day_of(now())));
+        let d = GuideData {
+            lang,
+            ..data(&f, &none, true)
+        };
+        s.run(&mut v, &d, vec![]);
+        s.run(&mut v, &d, vec![]).1
+    }
+
+    /// The text of the shape that draws `what`, as drawn: cut off and ending in
+    /// "…" when it did not fit.
+    fn as_drawn(shapes: &[egui::epaint::ClippedShape], what: &str) -> String {
+        shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == what => Some(t.galley.rows[0].text()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{what:?} is not drawn"))
+    }
+
+    #[test]
+    fn the_footer_of_the_narrowest_window_still_says_how_to_close_the_guide() {
+        let closing = [
+            (Lang::Nl, "Esc of g = sluiten"),
+            (Lang::En, "Esc or g = close"),
+            (Lang::De, "Esc oder g = schließen"),
+        ];
+        for (lang, closing) in closing {
+            let footer = i18n::t(lang, T::GuideKeysFooter);
+            let narrow = as_drawn(&drawn(640.0, lang), footer);
+            assert!(
+                narrow.starts_with(closing),
+                "{lang:?}: the 640 px footer reads {narrow:?}"
+            );
+            assert!(
+                narrow.ends_with('…'),
+                "{lang:?}: it is cut off, and says so"
+            );
+            let wide = as_drawn(&drawn(1280.0, lang), footer);
+            assert_eq!(wide, footer, "{lang:?}: 1280 px holds all of it");
+        }
+    }
+
+    #[test]
+    fn the_hint_of_the_filter_box_fits_it_in_the_narrowest_window() {
+        for lang in Lang::ALL {
+            let hint = i18n::t(lang, T::GuideFilterHint);
+            let shapes = drawn(640.0, lang);
+            let (width, room) = shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == hint => {
+                        Some((t.galley.rect.width(), s.clip_rect.width() - 2.0))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{hint:?} is not drawn"));
+            assert!(
+                width <= room + 0.01,
+                "{lang:?}: {hint:?} is {width} px wide in a box with {room} px of room"
+            );
+        }
     }
 }
