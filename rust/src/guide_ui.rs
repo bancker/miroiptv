@@ -2212,16 +2212,22 @@ mod tests {
         ctx: egui::Context,
         logos: LogoStore,
         width: f32,
+        height: f32,
         _dir: tempfile::TempDir,
     }
 
     impl Screen {
         fn new(width: f32) -> Self {
+            Self::sized(width, 720.0)
+        }
+
+        fn sized(width: f32, height: f32) -> Self {
             let dir = tempfile::tempdir().unwrap();
             Self {
                 ctx: egui::Context::default(),
                 logos: LogoStore::new(dir.path().to_path_buf()),
                 width,
+                height,
                 _dir: dir,
             }
         }
@@ -2236,7 +2242,7 @@ mod tests {
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     Pos2::ZERO,
-                    Vec2::new(self.width, 720.0),
+                    Vec2::new(self.width, self.height),
                 )),
                 events,
                 ..Default::default()
@@ -2729,6 +2735,66 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Fixture channel 602 with "Special" on programme 40 (four hours from now).
+    fn with_a_special() -> Fixture {
+        let mut f = Fixture::new(3, &[602]);
+        let mut entries = hourly().entries().to_vec();
+        entries[40].title = "Special".into();
+        f.store
+            .insert(602, ChannelEpg::new(Epg::new(entries), now()));
+        f
+    }
+
+    #[test]
+    fn typing_a_filter_shows_the_channels_that_match_lined_up_on_the_match() {
+        let f = with_a_special();
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        s.frame(&mut v, &d, vec![key(Key::F), text("f")]);
+        s.frame(&mut v, &d, vec![text("special")]);
+        let (_, painted) = s.frame(&mut v, &d, vec![]);
+        assert_eq!(v.filter, "special");
+        assert_eq!(v.visible_window(), (1, 1), "602 is the one channel left");
+        assert_eq!(v.cursor[&602], 40, "lined up on the match");
+        assert!(painted.iter().any(|t| t == "channels 1-1 of 1"));
+    }
+
+    #[test]
+    fn wiping_the_filter_lines_the_columns_up_on_now_again() {
+        let f = with_a_special();
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        v.filter = "special".into();
+        s.frame(&mut v, &d, vec![]);
+        assert_eq!(v.cursor[&602], 40, "on the match");
+        // The box does not have the keyboard: Esc wipes the filter.
+        s.frame(&mut v, &d, vec![key(Key::Escape)]);
+        assert!(v.filter.is_empty());
+        s.frame(&mut v, &d, vec![]);
+        assert_eq!(v.cursor[&602], f.live(602), "back on what runs now");
+        assert_eq!(v.visible_window(), (0, 3), "and all channels are back");
+    }
+
+    #[test]
+    fn a_degenerate_window_does_not_break_the_guide() {
+        // A panic ends the player: a minimised window is 0 x 0.
+        let f = Fixture::new(5, &[]);
+        let none = HashSet::new();
+        let sizes = [(0.0, 0.0), (1.0, 1.0), (10.0, 700.0), (640.0, 10.0)];
+        for (w, h) in sizes.into_iter().chain([(30.0, 30.0), (100.0, 100.0)]) {
+            let (mut s, mut v) = (Screen::sized(w, h), GuideView::new(time::day_of(now())));
+            let d = data(&f, &none, true);
+            for k in [Key::ArrowDown, Key::PageDown, Key::End, Key::ArrowRight] {
+                s.run(&mut v, &d, vec![key(k)]);
+            }
+            s.run(&mut v, &d, vec![key(Key::D)]);
+            s.run(&mut v, &d, vec![egui::Event::Scroll(Vec2::new(0.0, 99.0))]);
         }
     }
 
