@@ -4679,6 +4679,7 @@ mod tests {
                 title: "Journaal".into(),
                 start: now - chrono::Duration::minutes(10),
                 end: now + chrono::Duration::minutes(20),
+                has_archive: None,
             }]
         } else {
             Vec::new()
@@ -5205,6 +5206,7 @@ mod tests {
             title: "NOS Journaal".into(),
             start: now - chrono::Duration::hours(2),
             end: now - chrono::Duration::minutes(110),
+            has_archive: None,
         };
         let live = vec![archive_channel(601, "NL | NPO1 HD")];
         let portal = FakePortal::new(live.clone(), vec![bulletin]);

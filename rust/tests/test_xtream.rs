@@ -365,3 +365,32 @@ async fn an_answer_that_is_no_xtream_login_is_still_invalid_not_unreachable() {
     let r = XtreamPortal::new(creds_for(&server)).check().await;
     assert_eq!(r, ConnCheck::Invalid);
 }
+
+#[tokio::test]
+async fn a_busy_day_table_is_an_error_not_an_empty_guide() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/player_api.php"))
+        .and(query_param("action", "get_simple_data_table"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("<html>busy</html>"))
+        .mount(&server)
+        .await;
+    let portal = XtreamPortal::new(creds_for(&server));
+    let err = portal.fetch_day_epg(601).await.unwrap_err();
+    assert!(
+        matches!(err, bongo_player::portal::PortalError::Status(503)),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_day_table_is_read_with_its_archive_flags() {
+    let server = MockServer::start().await;
+    let body = r#"{"epg_listings":[{"title":"Tk9T","start_timestamp":"1781021400","stop_timestamp":"1781024700","has_archive":"1"}]}"#;
+    mount_action(&server, "get_simple_data_table", body.to_string()).await;
+    let portal = XtreamPortal::new(creds_for(&server));
+    let epg = portal.fetch_day_epg(601).await.unwrap();
+    assert_eq!(epg.entries().len(), 1);
+    assert_eq!(epg.entries()[0].title, "NOS");
+    assert_eq!(epg.entries()[0].has_archive, Some(true));
+}

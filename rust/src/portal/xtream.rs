@@ -192,6 +192,10 @@ struct EpgRaw {
     end: Option<String>,
     #[serde(default)]
     stop: Option<String>,
+    // 1 when the portal keeps the programme for catch-up
+    // (get_simple_data_table); a number, a numeric string or a bool.
+    #[serde(default)]
+    has_archive: serde_json::Value,
 }
 
 fn as_i64(v: &serde_json::Value) -> Option<i64> {
@@ -200,6 +204,25 @@ fn as_i64(v: &serde_json::Value) -> Option<i64> {
         serde_json::Value::String(s) => s.parse::<i64>().ok(),
         _ => None,
     }
+}
+
+/// `has_archive` as the portal sends it; `None` when it is missing or odd.
+fn archive_flag(v: &serde_json::Value) -> Option<bool> {
+    match v {
+        serde_json::Value::Bool(b) => Some(*b),
+        other => as_i64(other).map(|n| n != 0),
+    }
+}
+
+/// How many programmes say `has_archive` 1, 0, or nothing.
+fn archive_counts(entries: &[EpgEntry]) -> (usize, usize, usize) {
+    entries
+        .iter()
+        .fold((0, 0, 0), |(yes, no, unknown), e| match e.has_archive {
+            Some(true) => (yes + 1, no, unknown),
+            Some(false) => (yes, no + 1, unknown),
+            None => (yes, no, unknown + 1),
+        })
 }
 
 fn b64_decode(s: &str) -> String {
@@ -261,6 +284,7 @@ fn parse_epg_body(txt: &str) -> Epg {
                 title: b64_decode(&r.title),
                 start: epoch_or_dt(&r.start_timestamp, r.start.as_deref())?,
                 end: epoch_or_dt(&r.stop_timestamp, r.end.as_deref().or(r.stop.as_deref()))?,
+                has_archive: archive_flag(&r.has_archive),
             })
         })
         .collect();
@@ -319,6 +343,22 @@ mod epg_tests {
             r#"[{"title":"VGVzdA==","start_timestamp":"1781021400","stop_timestamp":"1781024700"}]"#;
         assert_eq!(parse_epg_body(body).entries().len(), 1);
     }
+
+    #[test]
+    fn reads_has_archive_in_every_form() {
+        let body = r#"{"epg_listings":[
+            {"title":"QQ==","start_timestamp":"1781021400","stop_timestamp":"1781024700","has_archive":1},
+            {"title":"Qg==","start_timestamp":"1781024700","stop_timestamp":"1781028300","has_archive":"0"},
+            {"title":"Qw==","start_timestamp":"1781028300","stop_timestamp":"1781031900","has_archive":true},
+            {"title":"RA==","start_timestamp":"1781031900","stop_timestamp":"1781035500"}
+        ]}"#;
+        let flags: Vec<Option<bool>> = parse_epg_body(body)
+            .entries()
+            .iter()
+            .map(|e| e.has_archive)
+            .collect();
+        assert_eq!(flags, [Some(true), Some(false), Some(true), None]);
+    }
 }
 
 #[async_trait::async_trait]
@@ -365,7 +405,26 @@ impl Portal for XtreamPortal {
     async fn fetch_day_epg(&self, stream_id: i64) -> Result<Epg, PortalError> {
         let sid = stream_id.to_string();
         let url = self.api_url(&[("action", "get_simple_data_table"), ("stream_id", &sid)]);
-        self.parse_epg(&url).await
+        let resp = self.client.get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // A busy portal (503, 509) answers with an error page. That is not
+            // "no programmes": the guide must wait before it asks again.
+            return Err(PortalError::Status(status.as_u16()));
+        }
+        let txt = resp.text().await?;
+        let epg = parse_epg_body(&txt);
+        let (yes, no, unknown) = archive_counts(epg.entries());
+        tracing::info!(
+            "epg: day table for sid={} - {} KB, {} programmes, has_archive 1/0/-: {}/{}/{}",
+            stream_id,
+            txt.len() / 1024,
+            epg.entries().len(),
+            yes,
+            no,
+            unknown
+        );
+        Ok(epg)
     }
 
     async fn fetch_series_episodes(&self, series_id: i64) -> Result<Vec<Episode>, PortalError> {

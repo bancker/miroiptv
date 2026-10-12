@@ -13,6 +13,10 @@ pub enum PortalError {
     Json(#[from] serde_json::Error),
     #[error("portal returned unexpected shape: {0}")]
     Shape(String),
+    /// The portal answered with this HTTP status instead of data (503 and 509
+    /// mean it is busy).
+    #[error("http status {0}")]
+    Status(u16),
 }
 
 #[async_trait::async_trait]
