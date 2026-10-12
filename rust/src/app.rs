@@ -13,7 +13,10 @@ use crate::portal::xtream::ConnCheck;
 use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};
 use crate::search::{self, ItemKind, SearchItem};
 use crate::settings::Settings;
-use crate::settings_ui::{conn_rich_text, ConnState, SettingsAction, SettingsUi, SettingsView};
+use crate::settings_ui::{
+    conn_rich_text, marker_scroll_area, paint_scroll_marker, ConnState, SettingsAction, SettingsUi,
+    SettingsView,
+};
 use crate::shortcuts;
 use crate::storage::Storage;
 use crate::zap::ZapPacer;
@@ -496,6 +499,23 @@ impl NewsLookup {
     }
 }
 
+/// How many day-EPG fetches the news picker keeps in flight. The portal
+/// throttles bursts, so a long rule list must not fire them all at once; the 7
+/// default rules are all concurrent.
+const NEWS_FETCHES_IN_FLIGHT: usize = 8;
+
+/// Runs `work` once the semaphore has a permit free, and holds the permit until
+/// the work is done.
+async fn within_limit<T>(
+    permits: &tokio::sync::Semaphore,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    // Only a closed semaphore refuses, and nothing closes this one: then the work
+    // just runs.
+    let _permit = permits.acquire().await;
+    work.await
+}
+
 /// Modal "latest news" chooser opened with `n` (RTL + NOS combined).
 struct NewsPicker {
     items: Vec<NewsItem>,
@@ -621,8 +641,8 @@ pub struct TvApp {
     /// After a stop, the stopped stream's frames must not show again.
     frame_fence: FrameFence,
     /// The channel each news rule points at ("gevonden: ..."), for the
-    /// settings; worked out again only when `news_found_for` says it is stale,
-    /// never per frame.
+    /// settings; worked out again only when `news_found_for` says it is stale
+    /// and the News section shows, never per frame.
     news_found: Vec<Option<String>>,
     news_found_for: Option<NewsLookup>,
     /// Settings changed in memory and not written yet: the news rules change
@@ -959,16 +979,25 @@ impl TvApp {
         }
     }
 
-    /// The channel each news rule points at, for the settings. A pass over every
-    /// channel, so it runs when the rules' channel names, the catalog or the
-    /// adult lock changed, not per frame.
-    fn refresh_news_found(&mut self) {
+    /// Whether `news_found` answers for the rules and the catalog as they are now.
+    fn news_found_is_fresh(&self) -> bool {
         let rules = self.settings.news_rules();
         let (loaded, unlocked) = (self.catalog.is_loaded(), self.catalog.adult_unlocked());
         let fresh = |key: &NewsLookup| !key.is_stale(rules, loaded, unlocked);
-        if self.news_found_for.as_ref().is_some_and(fresh) {
+        self.news_found_for.as_ref().is_some_and(fresh)
+    }
+
+    /// The channel each news rule points at, for the settings. A pass over every
+    /// channel, so it runs when the rules' channel names, the catalog or the
+    /// adult lock changed, not per frame (and `paint_settings` asks for it only
+    /// while the News section shows).
+    fn refresh_news_found(&mut self) {
+        if self.news_found_is_fresh() {
             return;
         }
+        let rules = self.settings.news_rules();
+        let (loaded, unlocked) = (self.catalog.is_loaded(), self.catalog.adult_unlocked());
+        tracing::debug!("settings: news lookup ({} rules)", rules.len());
         self.news_found = self
             .catalog
             .resolve_news(rules)
@@ -979,12 +1008,24 @@ impl TvApp {
     }
 
     fn paint_settings(&mut self, ctx: &egui::Context) {
-        if self.settings_ui.is_none() {
+        let Some(overlay) = self.settings_ui.as_ref() else {
             return;
+        };
+        // The lookup is a pass over every channel: made while its result is on
+        // show, not for the other sections.
+        if overlay.shows_news() {
+            self.refresh_news_found();
         }
-        self.refresh_news_found();
+        // What the lookup last found is of no use after the rules, the catalog or
+        // the lock changed, and the section shows nothing for it then.
+        let found_is_fresh = self.news_found_is_fresh();
         let Some(overlay) = self.settings_ui.as_mut() else {
             return;
+        };
+        let news_found: &[Option<String>] = if found_is_fresh {
+            &self.news_found
+        } else {
+            &[]
         };
         let view = SettingsView {
             lang: self.lang,
@@ -999,7 +1040,7 @@ impl TvApp {
                 .map(|d| d.as_secs().max(1)),
             adult_note: self.adult_note,
             news_rules: self.settings.news_rules(),
-            news_found: &self.news_found,
+            news_found,
         };
         let actions = overlay.show(ctx, &view);
         for a in actions {
@@ -1577,15 +1618,18 @@ impl TvApp {
         let slot = self.news_picker_slot.clone();
         tokio::spawn(async move {
             let now = chrono::Utc::now();
+            let permits = Arc::new(tokio::sync::Semaphore::new(NEWS_FETCHES_IN_FLIGHT));
             let handles: Vec<_> = sources
                 .into_iter()
                 .map(|(sid, is_archive, rule)| {
-                    let p = portal.clone();
+                    let (p, permits) = (portal.clone(), permits.clone());
                     (
                         sid,
                         is_archive,
                         rule,
-                        tokio::spawn(async move { p.fetch_day_epg(sid).await.ok() }),
+                        tokio::spawn(async move {
+                            within_limit(&permits, async { p.fetch_day_epg(sid).await.ok() }).await
+                        }),
                     )
                 })
                 .collect();
@@ -1630,12 +1674,12 @@ impl TvApp {
                             live: false,
                         })
                         .collect();
-                    found.sort_by(|a, b| b.start.cmp(&a.start));
+                    found.sort_by_key(|i| std::cmp::Reverse(i.start));
                     found.truncate(3);
                     items.extend(found);
                 }
             }
-            items.sort_by(|a, b| b.start.cmp(&a.start)); // newest first across sources
+            items.sort_by_key(|i| std::cmp::Reverse(i.start)); // newest first across sources
             items.truncate(10);
             tracing::info!(
                 "news picker {} items: {:?}",
@@ -2572,8 +2616,6 @@ impl TvApp {
                     .inner_margin(egui::Margin::symmetric(16.0, HELP_FRAME_MARGIN))
                     .show(ui, |ui| {
                         ui.set_max_width(720.0);
-                        // Visible whenever the rows do not all fit.
-                        ui.spacing_mut().scroll = egui::style::ScrollStyle::thin();
                         let title =
                             self.tr(T::HelpTitle, &[crate::APP_NAME, env!("CARGO_PKG_VERSION")]);
                         ui.label(egui::RichText::new(title).color(Color32::WHITE).heading());
@@ -2588,11 +2630,11 @@ impl TvApp {
                             - above
                             - HELP_FOOTER_HEIGHT)
                             .max(HELP_MIN_ROWS_HEIGHT);
-                        let scrolled = egui::ScrollArea::vertical()
-                            .id_source("__help_rows__")
+                        // No scroll bar and no drag area: each is a Tab stop, and the
+                        // settings row is to be the one. The marker shows where the
+                        // rows are scrolled to.
+                        let scrolled = marker_scroll_area("__help_rows__")
                             .max_height(rows_height)
-                            // Dragging the rows would be one more Tab stop.
-                            .drag_to_scroll(false)
                             .show(ui, |ui| {
                                 for (si, (section, rows)) in sections.into_iter().enumerate() {
                                     ui.label(
@@ -2614,6 +2656,7 @@ impl TvApp {
                                     ui.add_space(10.0);
                                 }
                             });
+                        paint_scroll_marker(ui, &scrolled);
                         // Up/Down and PageUp/PageDown scroll the rows, wherever
                         // the pointer is (the wheel needs it over them). The
                         // viewer's and the guide's keys are all swallowed while
@@ -4146,6 +4189,43 @@ mod tests {
             assert_eq!(others(&normal), others(&swapped), "{lang:?}");
             assert_eq!(normal[1], swapped[1], "{lang:?}");
         }
+    }
+
+    /// Starts `tasks` fetches that each take a moment, all through one semaphore
+    /// of `limit` permits, and returns the most that were in flight at once.
+    async fn most_in_flight(limit: usize, tasks: usize) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let permits = Arc::new(tokio::sync::Semaphore::new(limit));
+        let (now, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let handles: Vec<_> = (0..tasks)
+            .map(|_| {
+                let (permits, now, most) = (permits.clone(), now.clone(), most.clone());
+                tokio::spawn(async move {
+                    within_limit(&permits, async {
+                        let in_flight = now.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(in_flight, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        now.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .await
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.await.expect("a fetch task panicked");
+        }
+        most.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_long_rule_list_cannot_burst_the_portal() {
+        // 20 fetches wanted: 8 at a time ...
+        assert_eq!(
+            most_in_flight(NEWS_FETCHES_IN_FLIGHT, 20).await,
+            NEWS_FETCHES_IN_FLIGHT
+        );
+        // ... while the 7 default rules all run at once.
+        assert_eq!(most_in_flight(NEWS_FETCHES_IN_FLIGHT, 7).await, 7);
     }
 
     fn news_rule(channel: &str) -> NewsRule {

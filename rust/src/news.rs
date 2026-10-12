@@ -383,8 +383,35 @@ mod tests {
         }
     }
 
+    /// The first version of `resolve_channel`, kept as the oracle for the batch:
+    /// one rule, up to four scans of the list, every name normalized again for
+    /// each scan. Slow, and simple enough to be right.
+    fn naive_resolve(
+        live: &[crate::portal::LiveChannel],
+        rule: &NewsRule,
+    ) -> Option<(i64, bool, String)> {
+        use crate::catalog::normalize_channel_name;
+        let key = normalize_channel_name(&rule.channel);
+        if key.is_empty() {
+            return None;
+        }
+        let pick = |archive: bool| {
+            let kind = |c: &&crate::portal::LiveChannel| (c.tv_archive == 1) == archive;
+            live.iter()
+                .filter(kind)
+                .find(|c| normalize_channel_name(&c.name) == key)
+                .or_else(|| {
+                    live.iter()
+                        .filter(kind)
+                        .find(|c| normalize_channel_name(&c.name).contains(&key))
+                })
+                .map(|c| (c.stream_id, archive, c.name.clone()))
+        };
+        pick(true).or_else(|| pick(false))
+    }
+
     #[test]
-    fn one_pass_over_several_rules_gives_what_each_rule_gives_alone() {
+    fn one_pass_over_several_rules_gives_what_the_original_gives_for_each() {
         let live = trap_catalog();
         let rules = vec![
             rule("CNN"),
@@ -399,7 +426,9 @@ mod tests {
         let batch = resolve_channels(&live, &rules);
         assert_eq!(batch.len(), rules.len());
         for (rule, found) in rules.iter().zip(&batch) {
-            assert_eq!(found, &resolve_channel(&live, rule), "{:?}", rule.channel);
+            let original = naive_resolve(&live, rule);
+            assert_eq!(found, &original, "{:?}", rule.channel);
+            assert_eq!(resolve_channel(&live, rule), original, "{:?}", rule.channel);
         }
         // The cases above are not all the same answer.
         assert_eq!(batch[1], Some((4, true, "NL | NPO1 HD".into())));
@@ -407,6 +436,75 @@ mod tests {
         assert_eq!(batch[1], batch[7]);
         assert_eq!(batch[4], None);
         assert_eq!(batch[5], None);
+    }
+
+    /// A small deterministic dice (xorshift64): the same catalog on every run.
+    struct Dice(u64);
+
+    impl Dice {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    /// Channels from a small vocabulary, so that names repeat, contain one
+    /// another and differ only in kind or in quality marker.
+    fn generated_catalog(dice: &mut Dice, size: i64) -> Vec<crate::portal::LiveChannel> {
+        const COUNTRIES: [&str; 3] = ["", "NL | ", "BE | "];
+        const WORDS: [&str; 8] = ["NPO", "RTL", "CNN", "BBC", "News", "1", "4", "Plus"];
+        const MARKERS: [&str; 6] = ["", "", " HD", " FHD", " UHD", " SD"];
+        (0..size)
+            .map(|id| {
+                let mut name = COUNTRIES[dice.below(COUNTRIES.len())].to_string();
+                for word in 0..=dice.below(3) {
+                    if word > 0 && dice.below(2) == 0 {
+                        name.push(' ');
+                    }
+                    name.push_str(WORDS[dice.below(WORDS.len())]);
+                }
+                name.push_str(MARKERS[dice.below(MARKERS.len())]);
+                // 0 live, 1 catch-up, 2 neither: that counts as live.
+                lc(id, &name, dice.below(3) as i32)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_batch_agrees_with_the_original_on_a_generated_catalog() {
+        use crate::catalog::normalize_channel_name;
+        let mut dice = Dice(0x9E37_79B9_7F4A_7C15);
+        let live = generated_catalog(&mut dice, 150);
+        let mut rules = vec![rule(""), rule("  "), rule("no such channel")];
+        for _ in 0..100 {
+            let name = live[dice.below(live.len())].name.clone();
+            // A channel's own name, and a stretch of it: exact and containing matches.
+            let key = normalize_channel_name(&name);
+            let from = dice.below(key.len());
+            let to = from + 1 + dice.below(key.len() - from);
+            rules.push(rule(&key[from..to]));
+            rules.push(rule(&name));
+        }
+        let batch = resolve_channels(&live, &rules);
+        for (rule, found) in rules.iter().zip(&batch) {
+            assert_eq!(found, &naive_resolve(&live, rule), "{:?}", rule.channel);
+        }
+        // Not a comparison of nothings: most rules find a channel, of both kinds.
+        let found = |archive: bool| {
+            batch
+                .iter()
+                .flatten()
+                .filter(|(_, is_archive, _)| *is_archive == archive)
+                .count()
+        };
+        assert!(
+            found(true) > 20 && found(false) > 20,
+            "{} / {}",
+            found(true),
+            found(false)
+        );
     }
 
     #[test]

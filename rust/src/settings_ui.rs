@@ -48,6 +48,9 @@ const AREA_ID: &str = "__settings__";
 const OVERLAY_SCREEN_MARGIN: f32 = 12.0;
 /// Space between the overlay's frame and what is in it.
 const OVERLAY_FRAME_MARGIN: f32 = 16.0;
+/// The gap above the key hints at the bottom of the overlay: the layout leaves
+/// it and the height cap reserves it.
+const OVERLAY_HINT_GAP: f32 = 8.0;
 
 // The columns of the news rules, in points. The patterns box takes what is left
 // of the row.
@@ -56,13 +59,24 @@ const NEWS_LABEL_WIDTH: f32 = 50.0;
 const NEWS_REMOVE_WIDTH: f32 = 20.0;
 /// The patterns box is never narrower than this, whatever the window.
 const NEWS_PATTERNS_MIN_WIDTH: f32 = 60.0;
+/// The lines the patterns hint may take under the rules: one, or two when a
+/// narrow pane wraps it. The rules leave room for both.
+const NEWS_HINT_LINES: f32 = 2.0;
+/// The gaps in that tail: before the buttons, before the hint and after it.
+const NEWS_TAIL_GAPS: f32 = 3.0;
 /// The rules never get less height than this, whatever the window.
 const NEWS_MIN_ROWS_HEIGHT: f32 = 60.0;
-/// The scroll marker's width, the room it takes beside the rules, and the least
-/// it is long.
-const NEWS_MARKER_WIDTH: f32 = 3.0;
-const NEWS_MARKER_ROOM: f32 = 6.0;
-const NEWS_MARKER_MIN_LENGTH: f32 = 12.0;
+/// The scroll marker's width, the room it takes beside the view it belongs to
+/// (the marker lies at the far end of it), and the least it is long.
+const SCROLL_MARKER_WIDTH: f32 = 3.0;
+const SCROLL_MARKER_ROOM: f32 = 6.0;
+const SCROLL_MARKER_MIN_LENGTH: f32 = 12.0;
+
+/// The overlay's width in a window this wide: the window less 20 pt on each
+/// side, between 480 and 760.
+fn overlay_width(window_width: f32) -> f32 {
+    (window_width - 40.0).clamp(480.0, 760.0)
+}
 
 /// The overlay's own layer: the Area is built from it, and a focused widget
 /// counts as the overlay's only when it lies on it.
@@ -246,6 +260,12 @@ impl SettingsUi {
         Self::default()
     }
 
+    /// The News section is the one shown. Whatever the app works out only for
+    /// it (which channel each rule found) can wait until then.
+    pub fn shows_news(&self) -> bool {
+        Section::ALL[self.section] == Section::News
+    }
+
     pub fn show(&mut self, ctx: &egui::Context, view: &SettingsView) -> Vec<SettingsAction> {
         let mut actions = Vec::new();
         let lang = view.lang;
@@ -305,7 +325,7 @@ impl SettingsUi {
                 self.focus_first = true;
             }
         });
-        let width = (ctx.screen_rect().width() - 40.0).clamp(480.0, 760.0);
+        let width = overlay_width(ctx.screen_rect().width());
         let layer = overlay_layer();
         egui::Area::new(layer.id)
             .order(layer.order)
@@ -330,7 +350,7 @@ impl SettingsUi {
                         // frame's margins, the title above and the key hints below,
                         // and scrolls what does not fit in it.
                         let above = ui.cursor().min.y - ui.min_rect().min.y;
-                        let hints = 8.0
+                        let hints = OVERLAY_HINT_GAP
                             + 2.0 * ui.spacing().item_spacing.y
                             + ui.text_style_height(&egui::TextStyle::Small);
                         let section_height = ctx.screen_rect().height()
@@ -387,7 +407,7 @@ impl SettingsUi {
                             row.response.rect.y_range(),
                             ui.visuals().widgets.noninteractive.bg_stroke,
                         );
-                        ui.add_space(8.0);
+                        ui.add_space(OVERLAY_HINT_GAP);
                         ui.label(
                             egui::RichText::new(t(lang, T::SettingsNav))
                                 .small()
@@ -670,12 +690,16 @@ impl SettingsUi {
         let focus_row = self.news_focus.take().or(focus_first.then_some(0));
         let last = rules.len().saturating_sub(1);
         let (mut changed, mut remove) = (false, None);
+        // The app looks the channels up once this section is shown, so a frame
+        // can come before the lines: they stay blank, in their room, rather than
+        // say "not found" for a lookup that has not been made.
+        let found_in = view.news_found.len() == rules.len();
 
         let (gap, row_height) = (ui.spacing().item_spacing.x, ui.spacing().interact_size.y);
         let skip_width = ui.spacing().interact_size.x;
         // The rows leave room for the marker that shows where the rules are
         // scrolled to, whether it shows or not: the columns do not shift.
-        let row_width = ui.available_width() - NEWS_MARKER_ROOM;
+        let row_width = ui.available_width() - SCROLL_MARKER_ROOM;
         let fixed = NEWS_CHANNEL_WIDTH + NEWS_LABEL_WIDTH + skip_width + NEWS_REMOVE_WIDTH;
         let patterns_width = (row_width - fixed - 4.0 * gap).max(NEWS_PATTERNS_MIN_WIDTH);
 
@@ -686,20 +710,16 @@ impl SettingsUi {
             let skip_and_remove = skip_width + gap + NEWS_REMOVE_WIDTH;
             news_header(ui, skip_and_remove, t(lang, T::NewsColSkip));
         });
-        // What is left for the rules: the buttons and the hint (a second line of
-        // it, should it wrap) stay in view below them.
+        // What is left for the rules: the buttons and the hint stay in view below
+        // them (see NEWS_HINT_LINES and NEWS_TAIL_GAPS).
         let above = ui.cursor().min.y - ui.min_rect().min.y;
         let below = ui.spacing().interact_size.y
-            + 2.0 * ui.text_style_height(&egui::TextStyle::Small)
-            + 3.0 * ui.spacing().item_spacing.y;
-        let scrolled = egui::ScrollArea::vertical()
-            .id_source("__news_rules__")
+            + NEWS_HINT_LINES * ui.text_style_height(&egui::TextStyle::Small)
+            + NEWS_TAIL_GAPS * ui.spacing().item_spacing.y;
+        let scrolled = marker_scroll_area("__news_rules__")
             .max_height((max_height - above - below).max(NEWS_MIN_ROWS_HEIGHT))
+            .max_width(row_width)
             .auto_shrink([false, true])
-            // Dragging the rules would be one more Tab stop, and so is a scroll
-            // bar: the wheel scrolls, and the marker below only shows where.
-            .drag_to_scroll(false)
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             // Tab jumps to a rule; no gliding there.
             .animated(false)
             .show(ui, |ui| {
@@ -737,10 +757,13 @@ impl SettingsUi {
                             | label.changed()
                             | skip.changed();
                         if x.clicked() {
-                            remove = Some(i);
+                            // Whether the keyboard pressed it, for the focus below.
+                            remove = Some((i, x.has_focus()));
                         }
                     });
+                    // A space is a line of the same height as the words it stands in for.
                     let found = match view.news_found.get(i) {
+                        _ if !found_in => " ".to_string(),
                         Some(Some(name)) => tr(lang, T::NewsFound, &[name.as_str()]),
                         _ => t(lang, T::NewsNotFound).to_string(),
                     };
@@ -755,10 +778,14 @@ impl SettingsUi {
                 }
             });
         paint_scroll_marker(ui, &scrolled);
-        if let Some(i) = remove {
+        if let Some((i, by_keyboard)) = remove {
             rules.remove(i);
             changed = true;
-            self.news_focus = Some(i);
+            // A click leaves the focus as egui has it, nowhere: a key typed next
+            // must not edit a rule the user did not pick.
+            if by_keyboard {
+                self.news_focus = Some(i);
+            }
         }
         ui.horizontal(|ui| {
             let add = ui.button(t(lang, T::NewsAddRule));
@@ -813,23 +840,41 @@ fn reveal_on_focus(response: &egui::Response) {
     }
 }
 
-/// A thin bar along the right edge of a scroll area that does not fit its
-/// content, showing which part of it is in view. It senses nothing: egui's own
-/// scroll bar is a Tab stop.
-fn paint_scroll_marker<R>(ui: &egui::Ui, scrolled: &egui::scroll_area::ScrollAreaOutput<R>) {
-    let (view, total) = (scrolled.inner_rect, scrolled.content_size.y);
-    if total <= view.height() {
+/// A vertical scroll area for a list the keyboard walks through: no scroll bar
+/// and no area to drag, since each is a Tab stop in egui (the list's own
+/// widgets are the stops, and `reveal_on_focus` scrolls to the one that has the
+/// focus). The wheel still scrolls; `paint_scroll_marker` shows where the view is.
+pub fn marker_scroll_area(id_source: impl std::hash::Hash) -> egui::ScrollArea {
+    egui::ScrollArea::vertical()
+        .id_source(id_source)
+        .drag_to_scroll(false)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+}
+
+/// A thin bar in the room beside the right edge of a scroll area's view, shown
+/// when the content does not fit it, to tell which part is in view. It senses
+/// nothing (egui's own scroll bar is a Tab stop, see `marker_scroll_area`).
+pub fn paint_scroll_marker<R>(ui: &egui::Ui, scrolled: &egui::scroll_area::ScrollAreaOutput<R>) {
+    // `inner_rect` is the room the area was offered. It ends up as wide as its
+    // content when it shrinks to fit it, and as tall as the room when the
+    // content does not fit.
+    let (offered, content) = (scrolled.inner_rect, scrolled.content_size);
+    if content.y <= offered.height() {
         return;
     }
-    let handle = (view.height() * view.height() / total).max(NEWS_MARKER_MIN_LENGTH);
-    let passed = (scrolled.state.offset.y / (total - view.height())).clamp(0.0, 1.0);
-    let top = view.top() + (view.height() - handle) * passed;
+    let right = offered.left() + offered.width().min(content.x);
+    let handle = (offered.height() * offered.height() / content.y).max(SCROLL_MARKER_MIN_LENGTH);
+    let passed = (scrolled.state.offset.y / (content.y - offered.height())).clamp(0.0, 1.0);
+    let top = offered.top() + (offered.height() - handle) * passed;
     let bar = egui::Rect::from_min_size(
-        egui::pos2(view.right() - NEWS_MARKER_WIDTH, top),
-        egui::vec2(NEWS_MARKER_WIDTH, handle),
+        egui::pos2(right + SCROLL_MARKER_ROOM - SCROLL_MARKER_WIDTH, top),
+        egui::vec2(SCROLL_MARKER_WIDTH, handle),
     );
-    ui.painter()
-        .rect_filled(bar, NEWS_MARKER_WIDTH / 2.0, Color32::from_white_alpha(90));
+    ui.painter().rect_filled(
+        bar,
+        SCROLL_MARKER_WIDTH / 2.0,
+        Color32::from_white_alpha(90),
+    );
 }
 
 /// A masked PIN field: anything but digits is dropped as it is typed, and it
@@ -1025,6 +1070,18 @@ mod tests {
         ctx.run(raw, draw)
     }
 
+    /// The scroll markers a frame painted (see `paint_scroll_marker`).
+    fn painted_markers(output: &egui::FullOutput) -> Vec<egui::Rect> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(bar) if bar.rect.width() == SCROLL_MARKER_WIDTH => Some(bar.rect),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every text a frame painted.
     fn painted_texts(output: &egui::FullOutput) -> Vec<String> {
         output
@@ -1081,6 +1138,8 @@ mod tests {
         news_found: Vec<Option<String>>,
         /// Every text the last frame painted.
         painted: Vec<String>,
+        /// The scroll markers it painted.
+        markers: Vec<egui::Rect>,
     }
 
     impl Overlay {
@@ -1112,6 +1171,7 @@ mod tests {
                 lang: Lang::En,
                 news_found: Vec::new(),
                 painted: Vec::new(),
+                markers: Vec::new(),
             };
             // Two empty frames first, so the widgets exist before the first key.
             overlay.frame(&[]);
@@ -1153,7 +1213,39 @@ mod tests {
                 actions = self.ui.show(ctx, &view)
             });
             self.painted = painted_texts(&output);
+            self.markers = painted_markers(&output);
             actions
+        }
+
+        /// A click with the primary mouse button at `pos`: the pointer moves
+        /// there, presses and releases, one frame each; what the overlay reports
+        /// over the three.
+        fn click_at(&mut self, pos: egui::Pos2) -> Vec<SettingsAction> {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            let mut actions = self.frame_with(vec![egui::Event::PointerMoved(pos)]);
+            actions.extend(self.frame_with(vec![button(true)]));
+            actions.extend(self.frame_with(vec![button(false)]));
+            actions
+        }
+
+        /// The widget with the keyboard focus is in sight: not cut off by the
+        /// edge of the scrolling rules, inside the overlay, inside the window.
+        fn assert_focus_in_view(&self, what: &str) {
+            let field = self.focused_response();
+            assert_eq!(
+                field.interact_rect, field.rect,
+                "{what}: cut off by the list's edge"
+            );
+            assert!(self.overlay_rect().contains_rect(field.rect), "{what}");
+            assert!(
+                self.screen_rect().contains_rect(self.overlay_rect()),
+                "{what}"
+            );
         }
 
         /// Into the News section: its first control has the focus, the first
@@ -2031,6 +2123,39 @@ mod tests {
     }
 
     #[test]
+    fn the_overlay_says_when_the_news_section_is_the_one_shown() {
+        let mut o = Overlay::new();
+        assert!(!o.ui.shows_news());
+        o.press(Key::ArrowDown, 3); // Adult
+        assert!(!o.ui.shows_news());
+        o.press(Key::ArrowDown, 1); // News
+        assert!(o.ui.shows_news());
+        o.press(Key::ArrowUp, 1);
+        assert!(!o.ui.shows_news());
+    }
+
+    #[test]
+    fn the_found_lines_stay_blank_until_the_lookup_has_come_in() {
+        let mut o = Overlay::new();
+        o.settings.news_rules = Some(vec![news_rule("NPO 1"), news_rule("CNN")]);
+        // The app looks the channels up only once the section is shown, so the
+        // first frame has no lines: it must not say "not found" for them.
+        o.open_news_pane();
+        let says = |o: &Overlay, text: &str| o.painted.iter().any(|p| p == text);
+        assert!(!says(&o, "not found"), "{:?}", o.painted);
+        let blank = o.overlay_rect().height();
+        // A different number of lines than rules is no answer either.
+        o.news_found = vec![None];
+        assert_eq!(o.frame(&[]), vec![]);
+        assert!(!says(&o, "not found"), "{:?}", o.painted);
+        // The lookup comes in: the lines show, in the room that was kept for them.
+        o.news_found = vec![Some("NL | NPO1 HD".into()), None];
+        assert_eq!(o.frame(&[]), vec![]);
+        assert!(says(&o, "found: NL | NPO1 HD") && says(&o, "not found"));
+        assert_eq!(o.overlay_rect().height(), blank);
+    }
+
+    #[test]
     fn with_no_saved_rules_the_news_section_starts_from_the_defaults() {
         let mut o = Overlay::new();
         assert_eq!(o.settings.news_rules, None);
@@ -2075,6 +2200,24 @@ mod tests {
         assert_eq!(o.frame(&[]), vec![]);
         let rules = one_set_news_rules(o.type_char(Key::Z, 'z'));
         assert_eq!(channels(&rules), ["A", "Cz"]);
+    }
+
+    #[test]
+    fn a_click_on_remove_leaves_the_keyboard_alone() {
+        let mut o = Overlay::new();
+        o.settings.news_rules = Some(vec![news_rule("A"), news_rule("B"), news_rule("C")]);
+        o.open_news_pane();
+        o.press(Key::Tab, 9); // B's remove button ...
+        let remove = o.focused_response().rect;
+        o.press(Key::Tab, 1); // ... and on to C's channel field, so Remove has no focus
+        let rules = one_set_news_rules(o.click_at(remove.center()));
+        assert_eq!(channels(&rules), ["A", "C"]);
+        assert_eq!(o.frame(&[]), vec![]);
+        // The mouse took the focus away from C's field (a click elsewhere does
+        // that) and did not hand it to the rule that moved up: a key typed next
+        // goes nowhere, `o` being a letter and not the key that closes.
+        assert_eq!(o.ctx.memory(|m| m.focused()), None);
+        assert_eq!(o.type_char(Key::O, 'o'), vec![]);
     }
 
     #[test]
@@ -2124,6 +2267,14 @@ mod tests {
     }
 
     #[test]
+    fn the_overlay_is_as_wide_as_its_window_less_a_margin_within_limits() {
+        assert_eq!(overlay_width(640.0), 600.0); // the smallest window the app allows
+        assert_eq!(overlay_width(700.0), 660.0);
+        assert_eq!(overlay_width(300.0), 480.0); // never narrower than 480
+        assert_eq!(overlay_width(1920.0), 760.0); // never wider than 760
+    }
+
+    #[test]
     fn the_news_section_never_makes_the_overlay_bigger_than_its_window() {
         // The smallest window the app allows, and some bigger ones; German has
         // the longest texts.
@@ -2141,7 +2292,7 @@ mod tests {
                     "{name}: {overlay:?} is not inside {screen:?}"
                 );
                 // The rules fit the pane: they do not widen the overlay.
-                let designed = (width - 40.0).clamp(480.0, 760.0) + 32.0;
+                let designed = overlay_width(width) + 2.0 * OVERLAY_FRAME_MARGIN;
                 assert!(
                     overlay.width() <= designed + 0.5,
                     "{name}: {} wide, designed for {designed}",
@@ -2160,16 +2311,158 @@ mod tests {
         // five controls each.
         o.press(Key::Tab, 55);
         assert_eq!(o.frame(&[]), vec![]); // the scroll shows in the frame after the Tab
-        let field = o.focused_response();
-        assert_eq!(
-            field.interact_rect, field.rect,
-            "cut off by the list's edge"
-        );
-        assert!(o.overlay_rect().contains_rect(field.rect));
-        assert!(o.screen_rect().contains_rect(o.overlay_rect()));
+        o.assert_focus_in_view("the last rule's channel field");
         // And it is the last rule's channel field.
         let rules = one_set_news_rules(o.type_char(Key::X, 'x'));
         assert_eq!(rules[11].channel, "Channel 12x");
+    }
+
+    #[test]
+    fn a_rule_added_below_the_fold_is_brought_into_view() {
+        let mut o = Overlay::in_window(640.0, 360.0);
+        o.settings.news_rules = Some(twelve_rules());
+        o.open_news_pane();
+        o.press(Key::Tab, 60); // the Add button, below all 12 rules
+        let rules = one_set_news_rules(o.frame(&[Key::Space]));
+        assert_eq!(rules.len(), 13);
+        assert_eq!(o.frame(&[]), vec![]); // the new rule is drawn and takes the focus
+        assert_eq!(o.frame(&[]), vec![]); // the list scrolls to it
+        o.assert_focus_in_view("the new rule's channel field");
+        let rules = one_set_news_rules(o.type_char(Key::X, 'x'));
+        assert_eq!(rules[12].channel, "x");
+    }
+
+    #[test]
+    fn a_rule_removed_with_the_keyboard_below_the_fold_leaves_the_focus_in_view() {
+        let mut o = Overlay::in_window(640.0, 360.0);
+        o.settings.news_rules = Some(twelve_rules());
+        o.open_news_pane();
+        o.press(Key::Tab, 59); // the last rule's remove button
+        let rules = one_set_news_rules(o.frame(&[Key::Space]));
+        assert_eq!(rules.len(), 11);
+        assert_eq!(o.frame(&[]), vec![]);
+        assert_eq!(o.frame(&[]), vec![]);
+        o.assert_focus_in_view("the channel field that took the place");
+        let rules = one_set_news_rules(o.type_char(Key::X, 'x'));
+        assert_eq!(rules[10].channel, "Channel 11x");
+    }
+
+    /// What a headless frame draws with `marker_scroll_area`: a button, a scroll
+    /// area 100 tall holding `content_height` of stuff scrolled to `offset` (or
+    /// ten buttons if `buttons`), its marker, and a button; `keys` are pressed in
+    /// it. Returns the view and the rects the marker painted.
+    fn marker_frame(
+        ctx: &egui::Context,
+        content_height: f32,
+        offset: f32,
+        buttons: bool,
+        keys: &[Key],
+    ) -> (egui::Rect, Vec<egui::Rect>) {
+        let mut view = egui::Rect::NOTHING;
+        let events = keys.iter().map(|&key| key_event(key, true)).collect();
+        let output = run_events_in(ctx, SCREEN, events, |ctx| {
+            egui::Area::new(egui::Id::new("__marker__"))
+                .sense(egui::Sense::hover())
+                .fixed_pos(egui::pos2(50.0, 50.0))
+                .show(ctx, |ui| {
+                    let _ = ui.button("before");
+                    let scrolled = marker_scroll_area("__marker_rows__")
+                        .max_height(100.0)
+                        .vertical_scroll_offset(offset)
+                        .show(ui, |ui| {
+                            if buttons {
+                                for i in 0..10 {
+                                    let _ = ui.button(format!("row {i}"));
+                                }
+                            } else {
+                                ui.allocate_space(egui::vec2(80.0, content_height));
+                            }
+                        });
+                    view = scrolled.inner_rect;
+                    paint_scroll_marker(ui, &scrolled);
+                    let _ = ui.button("after");
+                });
+        });
+        (view, painted_markers(&output))
+    }
+
+    #[test]
+    fn a_scroll_area_with_a_marker_has_no_tab_stops_of_its_own() {
+        // 12 buttons, ten of them in a scroll area that cannot show them all: a
+        // scroll bar or a drag area would be a 13th stop.
+        let ctx = egui::Context::default();
+        marker_frame(&ctx, 0.0, 0.0, true, &[]);
+        marker_frame(&ctx, 0.0, 0.0, true, &[]);
+        let mut stops = std::collections::HashSet::new();
+        for _ in 0..30 {
+            marker_frame(&ctx, 0.0, 0.0, true, &[Key::Tab]);
+            marker_frame(&ctx, 0.0, 0.0, true, &[]); // the focus moves a frame later
+            stops.extend(ctx.memory(|m| m.focused()));
+        }
+        assert_eq!(stops.len(), 12);
+    }
+
+    #[test]
+    fn the_scroll_marker_shows_which_part_of_the_content_is_in_view() {
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        // 300 of content in a view 100 tall: the handle is a third of the view ...
+        for (offset, passed) in [(0.0, 0.0), (100.0, 0.5), (200.0, 1.0), (999.0, 1.0)] {
+            let ctx = egui::Context::default();
+            marker_frame(&ctx, 300.0, offset, false, &[]);
+            let (view, bars) = marker_frame(&ctx, 300.0, offset, false, &[]);
+            assert_eq!(bars.len(), 1, "offset {offset}");
+            let bar = bars[0];
+            let length = 100.0 / 3.0;
+            assert!(near(bar.height(), length), "offset {offset}: {bar:?}");
+            // ... that moves down the view as the content moves up ...
+            let top = view.top() + (view.height() - length) * passed;
+            assert!(near(bar.top(), top), "offset {offset}: {bar:?} in {view:?}");
+            // ... in the room beside the content (80 wide), which is as wide as
+            // the view: the area shrinks to fit it, though it was offered more.
+            assert!(view.width() > 1000.0);
+            assert!(near(bar.right(), view.left() + 80.0 + SCROLL_MARKER_ROOM));
+        }
+        // Never shorter than a thumb, however much content there is.
+        let ctx = egui::Context::default();
+        marker_frame(&ctx, 100_000.0, 0.0, false, &[]);
+        let (_, bars) = marker_frame(&ctx, 100_000.0, 0.0, false, &[]);
+        assert!(near(bars[0].height(), SCROLL_MARKER_MIN_LENGTH), "{bars:?}");
+    }
+
+    #[test]
+    fn the_scroll_marker_stays_away_when_everything_fits() {
+        let ctx = egui::Context::default();
+        marker_frame(&ctx, 80.0, 0.0, false, &[]);
+        let (_, bars) = marker_frame(&ctx, 80.0, 0.0, false, &[]);
+        assert_eq!(bars, []);
+    }
+
+    #[test]
+    fn the_news_rules_show_where_they_are_scrolled_to() {
+        let mut o = Overlay::in_window(640.0, 360.0);
+        o.settings.news_rules = Some(twelve_rules());
+        o.open_news_pane();
+        assert_eq!(o.frame(&[]), vec![]);
+        // One marker, in the pane and not over the rules, at the top of the list.
+        assert_eq!(o.markers.len(), 1, "{:?}", o.markers);
+        let at_top = o.markers[0];
+        let pane_right = o.overlay_rect().right() - OVERLAY_FRAME_MARGIN;
+        assert!(
+            at_top.right() <= pane_right + 0.5,
+            "{at_top:?} in {pane_right}"
+        );
+        let rules_right = o.focused_response().rect.right();
+        assert!(at_top.left() > rules_right, "{at_top:?} over the rules");
+        // Tab to the last rule: the list scrolls, and the marker with it.
+        o.press(Key::Tab, 55);
+        assert_eq!(o.frame(&[]), vec![]);
+        assert_eq!(o.markers.len(), 1);
+        assert!(o.markers[0].top() > at_top.top() + 50.0, "{:?}", o.markers);
+        // Few rules fit: nothing to show.
+        let mut o = Overlay::in_window(640.0, 360.0);
+        o.settings.news_rules = Some(vec![news_rule("A")]);
+        o.open_news_pane();
+        assert_eq!(o.markers, []);
     }
 
     #[test]
