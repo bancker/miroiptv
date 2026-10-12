@@ -65,7 +65,12 @@ public static void Key(IntPtr hwnd, int vk, bool extended) {
     PostMessage(hwnd, 0x0101, (IntPtr)vk, (IntPtr)unchecked((int)up));
 }
 // A character key: down, the character itself (what TranslateMessage makes of
-// a real key press - winit needs it), up.
+// a real key press - winit needs it), up. winit's message loop also calls
+// TranslateMessage on the posted down, which queues a WM_CHAR of its own.
+// Normally the posted up is queued by then and winit drops that second character;
+// when it takes the down before the up (or the character) is posted, it adds both
+// characters to the key's text and one arrives doubled ("ss", about 1 in 100).
+// Nothing here can prevent that: a typing scenario that fails may need one more run.
 public static void Char(IntPtr hwnd, char c) {
     int vk = VkKeyScanW(c) & 0xFF;
     uint scan = MapVirtualKeyW((uint)vk, 0);
