@@ -75,7 +75,10 @@ pub fn day_start_in<Tz: TimeZone>(day: NaiveDate, tz: &Tz) -> DateTime<Utc> {
     at_hour_in(day, 0, tz)
 }
 
-/// The day `t` falls on in `tz`.
+/// The day `t` falls on in `tz`. Monotone: a later moment is never on an
+/// earlier day, so of several moments the latest is on the latest day, and a
+/// caller with many of them converts only that one (a local-time conversion is
+/// an OS call; see `EpgStore::last_day`).
 pub fn day_of_in<Tz: TimeZone>(t: DateTime<Utc>, tz: &Tz) -> NaiveDate {
     t.with_timezone(tz).date_naive()
 }

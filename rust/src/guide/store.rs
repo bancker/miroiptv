@@ -16,10 +16,10 @@ pub struct ChannelEpg {
     pub epg: Arc<Epg>,
     pub fetched_at: DateTime<Utc>,
     /// The portal sends `has_archive = 1` for some programme of this channel,
-    /// so its 0 means "not kept" (see `time::playable`). For a given programme
-    /// use [`ChannelEpg::trusts_flag_for`], which also looks at when the EPG
-    /// was fetched.
-    pub trusts_archive_flag: bool,
+    /// so its 0 means "not kept" (see `time::playable`). Private: outside this
+    /// module it is read through [`ChannelEpg::trusts_flag_for`], which also
+    /// looks at when the EPG was fetched.
+    trusts_archive_flag: bool,
 }
 
 impl ChannelEpg {
@@ -105,32 +105,27 @@ impl EpgStore {
         let ahead = c
             .entries()
             .last()
-            .is_some_and(|e| e.end > now + Duration::hours(24));
+            .is_some_and(|e| e.end >= now + Duration::hours(24));
         !ahead && age >= Duration::hours(1)
     }
 
     /// The last day on which any channel has a programme (`day_of` names the
-    /// day of a moment).
+    /// day of a moment). `day_of` is asked once, for the latest start of all: a
+    /// later moment is never on an earlier day (see `time::day_of_in`), and a
+    /// local-time conversion is an OS call, so not one per channel.
     pub fn last_day(&self, day_of: impl Fn(DateTime<Utc>) -> NaiveDate) -> Option<NaiveDate> {
         self.channels
             .values()
             .filter_map(|c| c.entries().last())
-            .map(|e| day_of(e.start))
+            .map(|e| e.start)
             .max()
+            .map(day_of)
     }
 
     /// Forgets everything: another portal's catalog took over.
     pub fn clear(&mut self) {
         self.channels.clear();
         self.revision += 1;
-    }
-
-    /// Handles to every channel's EPG, for the cache file.
-    pub fn snapshot(&self) -> Vec<(i64, ChannelEpg)> {
-        self.channels
-            .iter()
-            .map(|(id, c)| (*id, c.clone()))
-            .collect()
     }
 }
 
@@ -155,6 +150,8 @@ pub struct FilterResult {
 
 /// The channels whose name holds `text` (trimmed, any case), or that have a
 /// programme within `range_of(entries)` (the chosen day) whose title holds it.
+/// A range that reaches past the entries is cut to them and an inverted one is
+/// empty, so a wrong `range_of` cannot panic here (a panic ends the player).
 /// Run when the text, the day or the store changes, never per frame.
 pub fn filter_channels(
     channels: &[GuideChannel],
@@ -174,7 +171,9 @@ pub fn filter_channels(
             .get(ch.archive_id)
             .map(|c| {
                 let entries = c.entries();
-                range_of(entries)
+                let len = entries.len();
+                let range = range_of(entries);
+                (range.start.min(len)..range.end.min(len))
                     .filter(|&j| entries[j].title.to_lowercase().contains(&needle))
                     .collect()
             })
@@ -243,6 +242,11 @@ mod tests {
             store.needs_fetch(602, now + Duration::minutes(31)),
             "less than a day ahead and an hour old"
         );
+        store.insert(603, ChannelEpg::new(epg_until(12, 24), t(11)));
+        assert!(
+            !store.needs_fetch(603, now),
+            "exactly a day ahead is not less than a day, an hour old"
+        );
     }
 
     #[test]
@@ -260,6 +264,30 @@ mod tests {
         assert_eq!(store.get(601).unwrap().entries()[0].title, "Nieuw");
         assert_eq!(store.revision(), revision, "nothing changed");
         assert_eq!((store.len(), store.programmes()), (1, 1));
+    }
+
+    #[test]
+    fn the_revision_rises_on_a_first_insert_a_newer_copy_and_a_clear() {
+        let mut store = EpgStore::default();
+        let at_start = store.revision();
+        store.insert(
+            601,
+            ChannelEpg::new(Epg::new(vec![entry("Eerst", 10, 11)]), t(2)),
+        );
+        let first = store.revision();
+        assert!(first > at_start, "a first insert is a change");
+        store.insert(
+            601,
+            ChannelEpg::new(Epg::new(vec![entry("Later", 10, 11)]), t(12)),
+        );
+        let newer = store.revision();
+        assert!(newer > first, "a newer copy replaces the one kept");
+        assert_eq!(store.get(601).unwrap().entries()[0].title, "Later");
+        store.clear();
+        assert!(
+            store.revision() > newer,
+            "forgetting everything is a change"
+        );
     }
 
     #[test]
@@ -341,13 +369,16 @@ mod tests {
         let r = filter_channels(&channels, &store, "journaal", all);
         assert_eq!(r.channels, [1]);
         assert_eq!(r.matches[&602], [0, 2]);
-        let r = filter_channels(&channels, &store, " NPO ", all);
+        let r = filter_channels(&channels, &store, "  NPO  ", all);
         assert_eq!(r.channels, [0, 1], "by name, in any case, trimmed");
         assert!(r.matches.is_empty());
         assert_eq!(
             filter_channels(&channels, &store, "", all).channels,
             [0, 1, 2]
         );
+        let blank = filter_channels(&channels, &store, "   ", all);
+        assert_eq!(blank.channels, [0, 1, 2], "blank text is no filter");
+        assert!(blank.matches.is_empty());
         assert!(filter_channels(&channels, &store, "voetbal", all)
             .channels
             .is_empty());
@@ -368,6 +399,45 @@ mod tests {
     }
 
     #[test]
+    fn a_range_outside_the_entries_is_cut_to_them() {
+        let channels = vec![channel(602, "NL | NPO 2")];
+        let mut store = EpgStore::default();
+        let listing = vec![
+            entry("Journaal", 8, 9),
+            entry("Sport", 9, 10),
+            entry("Journaal", 10, 11),
+            entry("Weer", 11, 12),
+        ];
+        store.insert(602, ChannelEpg::new(Epg::new(listing), t(1)));
+        let inside = |r: &FilterResult| {
+            r.matches.iter().all(|(id, hits)| {
+                let len = store.get(*id).unwrap().entries().len();
+                hits.iter().all(|&j| j < len)
+            })
+        };
+
+        let past_the_end = |e: &[EpgEntry]| 0..e.len() + 5;
+        let r = filter_channels(&channels, &store, "journaal", past_the_end);
+        assert_eq!(r.matches[&602], [0, 2], "cut to the entries there are");
+        assert!(inside(&r));
+
+        let beyond = |e: &[EpgEntry]| (e.len() + 2)..(e.len() + 9);
+        let r = filter_channels(&channels, &store, "journaal", beyond);
+        assert!(
+            r.channels.is_empty() && r.matches.is_empty(),
+            "wholly outside"
+        );
+        assert!(inside(&r));
+
+        // Reversed on purpose: it is the input under test.
+        #[allow(clippy::reversed_empty_ranges)]
+        let inverted = |_: &[EpgEntry]| 3..1;
+        let r = filter_channels(&channels, &store, "journaal", inverted);
+        assert!(r.channels.is_empty() && r.matches.is_empty(), "inverted");
+        assert!(inside(&r));
+    }
+
+    #[test]
     fn the_last_day_is_that_of_the_last_programme_anywhere() {
         let mut store = EpgStore::default();
         assert_eq!(store.last_day(|t| t.date_naive()), None);
@@ -379,5 +449,27 @@ mod tests {
         assert_eq!(store.last_day(|t| t.date_naive()), Some(t(50).date_naive()));
         store.clear();
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn the_last_day_is_worked_out_once_however_many_channels_there_are() {
+        let asked = std::cell::Cell::new(0);
+        let day_of = |moment: DateTime<Utc>| {
+            asked.set(asked.get() + 1);
+            moment.date_naive()
+        };
+        let mut store = EpgStore::default();
+        assert_eq!(store.last_day(day_of), None);
+        assert_eq!(asked.get(), 0, "no programme, nothing to convert");
+        for (id, from) in [(601, 5), (602, 50), (603, 20), (604, 30)] {
+            let epg = Epg::new(vec![entry("A", from, from + 1)]);
+            store.insert(id, ChannelEpg::new(epg, t(1)));
+        }
+        assert_eq!(store.last_day(day_of), Some(t(50).date_naive()));
+        assert_eq!(
+            asked.get(),
+            1,
+            "once: a local-time conversion is an OS call"
+        );
     }
 }
