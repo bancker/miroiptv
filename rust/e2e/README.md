@@ -16,7 +16,8 @@ See the parameter block in `run-scenario.ps1` and the docstring in
 Ctrl, Alt, Enter, Esc, Space or an arrow key is held down (`held-keys.ps1`):
 winit turns a key that Windows reports as down into a key press when the window
 gets the focus, which would make a run depend on the keyboard's state. Press and
-release the key once and run again.
+release the key once and run again. `test-held-keys.ps1` checks that guard against
+a fake keyboard (nothing is pressed or sent).
 
 Before committing: `bash check-staged.sh` (fails if the staged diff holds the
 real portal credentials).

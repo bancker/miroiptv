@@ -768,7 +768,9 @@ impl SettingsUi {
         if actions.len() > pushed_before {
             self.local_note = None;
         }
-        self.pin_sent = sent.or(self.pin_sent);
+        if sent.is_some() {
+            self.pin_sent = sent;
+        }
         if let Some(secs) = view.pin_wait_secs {
             ui.label(tr(lang, T::PinBlocked, &[&secs.to_string()]));
         }
