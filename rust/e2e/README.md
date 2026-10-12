@@ -20,15 +20,17 @@ release the key once and run again. `test-held-keys.ps1` checks that guard again
 a fake keyboard (nothing is pressed or sent).
 
 Keys are posted to the window as messages (key down, the character, key up),
-never injected, and winit takes them like real ones, with two quirks. A `TEXT:`
+never injected, and winit takes them like real ones. Two things follow. A `TEXT:`
 step ends with a 300 ms pause, because egui handles the events of one frame
 together and a Tab moves the focus first: a character typed in the frame of the
-next Tab lands in the next field. And about one posted character in a hundred
-arrives doubled: winit's message loop calls `TranslateMessage` on the posted key
+next Tab lands in the next field. Real keys obey that rule too, but a person's
+gap before a Tab is far longer than a frame, while the harness types about one
+character per frame. And about one posted character in a hundred gains a second
+one: winit's message loop calls `TranslateMessage` on the posted key
 down, which queues a `WM_CHAR` of its own, and when winit takes the down before
 the posted up is queued it adds both characters to that key's text
 (`text: Some("ss")` in a log made with `RUST_LOG=eframe=trace`). It only hurts
-scenarios that type into a field, the setup prompt's login above all (a doubled
+scenarios that type into a field, the setup prompt's login above all (an extra
 character is a `BadLogin` or an unreachable host), so run such a scenario once
 more before looking for a bug in the app.
 

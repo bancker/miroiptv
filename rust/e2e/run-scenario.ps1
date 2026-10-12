@@ -6,7 +6,8 @@ keys to its window and checks its log. Example:
 
 -Keys: steps separated by ';' - a key (UP DOWN LEFT RIGHT ENTER ESC TAB
 BACKSPACE SPACE, or one character such as o f n 1), TEXT:<text> (followed by a
-300 ms pause, so that its last character and the next key never share a frame),
+300 ms pause, so that its last character and the next key share no frame unless
+the app stalls that long),
 SLEEP:<ms>, MARK:<label>. Keys are posted to the app's window, so nothing
 reaches other windows and no focus is needed. Exit code 1 when an -Expect is
 missing or a -Forbid matches, and also when the run proves nothing: no log (or
@@ -152,7 +153,7 @@ try {
                         foreach ($c in $arg.ToCharArray()) { [E2E.Win]::Char($hwnd, $c); Start-Sleep -Milliseconds 40 }
                         # egui handles the events of one frame together, and a Tab moves the focus before
                         # the frame's typed text is applied: a character and a Tab that land in the same
-                        # frame put that character in the NEXT field. The app draws a frame about every
+                        # frame put that character in the NEXT field. In the e2e runs a frame took about
                         # 45 ms, so the key after a TEXT step must come well after its last character.
                         Start-Sleep -Milliseconds 300
                     }
