@@ -29,6 +29,10 @@ Environment:
   MOCK_DENY=105,...  streams refused to the account (HTTP 407)
   MOCK_BUSY_UNTIL=S  live requests answer 503 for the first S seconds
   MOCK_LATENCY=1     answer about as slowly as the real portal
+  MOCK_LOGIN_STATUS=N  the login (player_api.php without an action) answers HTTP N,
+                     e.g. 503 or 509, the real portal's busy answers
+  MOCK_EPG_DELAY=S   day-EPG requests (the news fetch) answer after S seconds, so
+                     a test can press n again while a fetch is in flight
 """
 import base64
 import http.server
@@ -128,12 +132,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(p).query))
             action = q.get("action")
             if action is None:
+                if ENV("MOCK_LOGIN_STATUS"):
+                    return self.reply(int(ENV("MOCK_LOGIN_STATUS")), b"busy")
                 ok = q.get("username") == "tester" and q.get("password") == "secret"
                 return self.json({"user_info": {"auth": 1 if ok else 0, "status": "Active"}, "server_info": {}})
             if action == "get_live_streams":
                 return self.json(live_streams())
             if action == "get_vod_streams":
                 return self.json(vod_streams())
+            if action == "get_simple_data_table" and ENV("MOCK_EPG_DELAY"):
+                time.sleep(float(ENV("MOCK_EPG_DELAY")))
             if action in ("get_simple_data_table", "get_short_epg"):
                 if q.get("stream_id") == "601" and ENV("MOCK_NEWS") == "1":
                     return self.json({"epg_listings": news_epg()})

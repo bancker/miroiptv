@@ -12,6 +12,11 @@ windows and no focus is needed. Exit code 1 when an -Expect is missing or a
 line), no window to post the keys to (waits up to 10 s for it), the app exited
 by itself before the run ended, or it left a panic-*.log. Exit code 0 otherwise.
 
+It refuses to start (exit code 1, naming the key) while Tab, Shift, Ctrl, Alt,
+Enter, Esc, Space or an arrow key is held down: winit turns a key Windows reports
+as down into a key press when the window gets the focus, so the result would
+depend on the keyboard's state (see held-keys.ps1).
+
 -Settings replaces settings.json; without it a folder that has none gets
 {"language":"nl"}, so the first-start language screen stays away unless
 -FirstStart asks for it. -ConfigDir reuses a folder across runs (restarts); its
@@ -44,6 +49,8 @@ param(
     [switch]$MpvVerbose
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'held-keys.ps1')
+Assert-KeysUp
 Add-Type -Namespace E2E -Name Win -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 [DllImport("user32.dll")] public static extern short VkKeyScanW(char ch);

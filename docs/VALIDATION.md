@@ -12,8 +12,8 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] Catalog loads (debug HUD with `d` shows "catalog: loaded" after ~2s)
 
 ## Zap
-- [ ] Press `1` → tunes to NPO 1 within 1 second, toast appears
-- [ ] Press `2`, `3` → tunes to NPO 2, NPO 3
+- [ ] Digits `0`-`9` are car-radio presets and start empty: tapping an empty one says "sneltoets N is leeg - houd N ingedrukt om op te slaan"
+- [ ] Hold a digit (about half a second) on a channel → toast "sneltoets N opgeslagen: <zender>"; tap it later → tunes to that channel within 1 second, toast appears; it survives a restart
 - [ ] Mouse wheel up/down: cycles channels
 - [ ] Arrow up/down: cycles channels
 - [ ] Each zap shows a toast with channel name immediately
@@ -58,7 +58,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] A bare adult stream URL on the command line (`BongoPlayer.exe <url>`) → the next plain start does not resume it
 
 ## News rules
-- [ ] Settings → News lists the 7 default rules, each with "gevonden: …"
+- [ ] Settings → News lists the 7 default rules, each with "gevonden: …" or "niet gevonden"
 - [ ] Change a pattern; N follows the new rule; "Standaard herstellen" brings the defaults back
 - [ ] With many rules the list scrolls and Tab brings each rule into view
 - [ ] Removing a rule with the mouse leaves the keyboard where it was (typing afterwards edits no rule)
