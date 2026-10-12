@@ -225,6 +225,10 @@ texts! {
     GuideEpgFailed => ["gids ophalen mislukt", "guide fetch failed", "Programmabruf fehlgeschlagen"],
     GuideNoEpg => ["portal heeft geen gids voor deze zender", "the portal has no guide for this channel", "das Portal hat kein Programm für diesen Sender"],
     GuideFooter => ["typen = filter   /   pijlen = navigeren   /   PgUp/PgDn = sneller   /   Enter = afspelen   /   Esc of g = sluiten", "type = filter   /   arrows = navigate   /   PgUp/PgDn = faster   /   Enter = play   /   Esc or g = close", "tippen = Filter   /   Pfeile = navigieren   /   PgUp/PgDn = schneller   /   Enter = abspielen   /   Esc oder g = schließen"],
+    // Days in the guide
+    DayYesterday => ["Gisteren", "Yesterday", "Gestern"],
+    DayToday => ["Vandaag", "Today", "Heute"],
+    DayTomorrow => ["Morgen", "Tomorrow", "Morgen"],
     // Debug HUD
     DebugBuffering => ["afspelen: BUFFEREN  {0}s", "playback: BUFFERING  {0}s", "Wiedergabe: PUFFERN  {0}s"],
     DebugBufferingStartup => ["afspelen: bufferen (start)", "playback: buffering (startup)", "Wiedergabe: puffern (Start)"],
@@ -347,6 +351,48 @@ pub fn tr(lang: Lang, key: T, args: &[&str]) -> String {
     result
 }
 
+/// Weekdays (Monday first) and months, short, per language (NL, EN, DE).
+const WEEKDAYS: [[&str; 7]; 3] = [
+    ["ma", "di", "wo", "do", "vr", "za", "zo"],
+    ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+    ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"],
+];
+const MONTHS: [[&str; 12]; 3] = [
+    [
+        "jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec",
+    ],
+    [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ],
+    [
+        "Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez",
+    ],
+];
+
+/// How the guide names `day`: "Gisteren", "Vandaag", "Morgen", else weekday,
+/// day and month ("do 8 okt", "Thu 8 Oct", "Do. 8. Okt.").
+pub fn day_label(lang: Lang, day: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    match (day - today).num_days() {
+        -1 => t(lang, T::DayYesterday).to_string(),
+        0 => t(lang, T::DayToday).to_string(),
+        1 => t(lang, T::DayTomorrow).to_string(),
+        _ => {
+            let row = match lang {
+                Lang::Nl => 0,
+                Lang::En => 1,
+                Lang::De => 2,
+            };
+            let weekday = WEEKDAYS[row][day.weekday().num_days_from_monday() as usize];
+            let month = MONTHS[row][day.month0() as usize];
+            match lang {
+                Lang::De => format!("{weekday}. {}. {month}.", day.day()),
+                _ => format!("{weekday} {} {month}", day.day()),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +483,19 @@ mod tests {
         assert_eq!(lang_from_langid(0x0C07), Lang::De); // de-AT
         assert_eq!(lang_from_langid(0x0409), Lang::En); // en-US
         assert_eq!(lang_from_langid(0x040C), Lang::En); // fr-FR
+    }
+
+    #[test]
+    fn days_are_named_like_a_tv_guide() {
+        // 12 October 2026 is a Monday.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        let d = |n: i64| today + chrono::Duration::days(n);
+        assert_eq!(day_label(Lang::Nl, d(-1), today), "Gisteren");
+        assert_eq!(day_label(Lang::En, d(0), today), "Today");
+        assert_eq!(day_label(Lang::De, d(1), today), "Morgen");
+        assert_eq!(day_label(Lang::Nl, d(-4), today), "do 8 okt");
+        assert_eq!(day_label(Lang::En, d(-4), today), "Thu 8 Oct");
+        assert_eq!(day_label(Lang::De, d(-4), today), "Do. 8. Okt.");
+        assert_eq!(day_label(Lang::Nl, d(3), today), "do 15 okt");
     }
 }
