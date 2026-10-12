@@ -36,3 +36,12 @@ more before looking for a bug in the app.
 
 Before committing: `bash check-staged.sh` (fails if the staged diff holds the
 real portal credentials).
+
+## Regression set
+
+`regression.ps1` runs the keyboard-only scenarios of 0.6.0 part 1 (and, from part 2 on, the guide's
+group `G`) through `run-scenario.ps1`, one JSON line per scenario in `%TEMP%\bongo-regression`.
+`-Group` picks groups, `-Only` scenario ids (wildcards), `-DryRun` prints the commands, `-Summary`
+sums up the last results. A scenario that fails is run once more; one that the held-key guard
+refuses waits 10 s and tries again (up to 3 times). Typing scenarios can fail once on a doubled
+character (see above), so a pass on the re-run counts.
