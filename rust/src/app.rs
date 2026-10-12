@@ -867,6 +867,9 @@ impl TvApp {
                 if crate::pin::portal_password_ok(&password, actual) {
                     self.settings.pin = None;
                     self.save_settings();
+                    // Whoever proved the portal password need not wait out an
+                    // earlier block before choosing the new PIN.
+                    self.pin_gate = PinGate::new();
                     self.adult_note = Some(T::PinCleared);
                     tracing::info!("adult: PIN cleared with the portal password");
                 } else {
@@ -1960,6 +1963,12 @@ impl TvApp {
             return Err(ConnState::WriteFailed { path, error });
         }
         tracing::info!("settings: portal saved to {} - connecting", path.display());
+        // The new catalog starts locked, so a save locks like Lock does: asked of
+        // the old catalog, the only one that knows this stream, before it goes.
+        let playing_adult = self
+            .current_url
+            .as_deref()
+            .is_some_and(|u| self.catalog.is_adult_url(u));
         self.creds = Some(creds.clone());
         let portal: Arc<dyn Portal> = Arc::new(XtreamPortal::new(creds));
         self.catalog = Arc::new(CatalogStore::new(portal));
@@ -1969,6 +1978,9 @@ impl TvApp {
         self.forget_list_positions();
         self.guide.forget_portal();
         self.adult_note = None;
+        if playing_adult {
+            self.stop_playback();
+        }
         self.catalog.spawn_fetch();
         self.portal_state = PortalState::Configured;
         self.set_toast(self.t(T::ConnectingPortal));

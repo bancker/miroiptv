@@ -234,7 +234,13 @@ impl SettingsUi {
         // belong to the overlay, not to a focused control.
         ctx.input_mut(|i| {
             if i.consume_key(Modifiers::NONE, Key::Escape) {
-                if self.in_pane {
+                if self.pin_dialog_open() {
+                    // Esc backs out one level at a time: an open PIN dialog
+                    // first, with what was typed in it, then the section.
+                    self.adult = AdultDialog::Idle;
+                    self.local_note = None;
+                    self.focus_first = true;
+                } else if self.in_pane {
                     self.in_pane = false;
                 } else {
                     actions.push(SettingsAction::Close);
@@ -406,6 +412,13 @@ impl SettingsUi {
         }
     }
 
+    /// A PIN dialog is open and the keyboard is in the adult section that shows it.
+    fn pin_dialog_open(&self) -> bool {
+        self.in_pane
+            && Section::ALL[self.section] == Section::Adult
+            && !matches!(self.adult, AdultDialog::Idle)
+    }
+
     /// Whether adult content shows, with the buttons that change it or the PIN
     /// dialog one of them opened, then why the last PIN was turned down.
     fn adult_pane(
@@ -431,6 +444,9 @@ impl SettingsUi {
         let mut open = None;
         let done = match &mut dialog {
             AdultDialog::Idle => {
+                // The first focus goes to the first button that works: Lock,
+                // Unlock or, while PIN input is blocked, Forgot PIN. A disabled
+                // button keeps no focus, and the keyboard would be left with none.
                 ui.horizontal(|ui| {
                     if view.adult_unlocked {
                         let r = ui.button(t(lang, T::Lock));
@@ -442,7 +458,7 @@ impl SettingsUi {
                         }
                     } else {
                         let r = ui.add_enabled(!blocked, egui::Button::new(t(lang, T::Unlock)));
-                        if focus_first {
+                        if focus_first && !blocked {
                             r.request_focus();
                         }
                         if r.clicked() {
@@ -468,13 +484,16 @@ impl SettingsUi {
                             second: String::new(),
                         });
                     }
-                    if view.has_pin
-                        && !view.adult_unlocked
-                        && ui.button(t(lang, T::ForgotPin)).clicked()
-                    {
-                        open = Some(AdultDialog::Forgot {
-                            password: String::new(),
-                        });
+                    if view.has_pin && !view.adult_unlocked {
+                        let r = ui.button(t(lang, T::ForgotPin));
+                        if focus_first && blocked {
+                            r.request_focus();
+                        }
+                        if r.clicked() {
+                            open = Some(AdultDialog::Forgot {
+                                password: String::new(),
+                            });
+                        }
                     }
                 });
                 false
@@ -492,8 +511,12 @@ impl SettingsUi {
                 ok || cancel
             }
             AdultDialog::SetPin { first, second } => {
-                pin_field(ui, t(lang, T::ChoosePin), first, focus);
+                let r1 = pin_field(ui, t(lang, T::ChoosePin), first, focus);
                 let r = pin_field(ui, t(lang, T::RepeatPin), second, false);
+                // Enter in a field that is not the last goes on to the next one.
+                if entered(ui, &r1) {
+                    r.request_focus();
+                }
                 let (ok, cancel) = ok_cancel(ui, lang, &r, true);
                 if ok {
                     if !valid_pin(first) {
@@ -507,9 +530,15 @@ impl SettingsUi {
                 ok || cancel
             }
             AdultDialog::Change { old, first, second } => {
-                pin_field(ui, t(lang, T::CurrentPin), old, focus);
-                pin_field(ui, t(lang, T::NewPin), first, false);
+                let r_old = pin_field(ui, t(lang, T::CurrentPin), old, focus);
+                let r_new = pin_field(ui, t(lang, T::NewPin), first, false);
                 let r = pin_field(ui, t(lang, T::RepeatPin), second, false);
+                if entered(ui, &r_old) {
+                    r_new.request_focus();
+                }
+                if entered(ui, &r_new) {
+                    r.request_focus();
+                }
                 let (ok, cancel) = ok_cancel(ui, lang, &r, !blocked);
                 if ok {
                     if !valid_pin(old) || !valid_pin(first) {
@@ -579,10 +608,15 @@ fn pin_field(ui: &mut egui::Ui, label: &str, value: &mut String, focus: bool) ->
     r
 }
 
+/// Enter was pressed in this single-line field (egui takes its focus away then).
+fn entered(ui: &egui::Ui, field: &egui::Response) -> bool {
+    field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
+}
+
 /// OK and Cancel under a dialog; Enter in its last field counts as OK.
 /// Returns (OK, Cancel); OK is only given while `enabled`.
 fn ok_cancel(ui: &mut egui::Ui, lang: Lang, last: &egui::Response, enabled: bool) -> (bool, bool) {
-    let enter = last.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+    let enter = entered(ui, last);
     let (mut ok, mut cancel) = (false, false);
     ui.horizontal(|ui| {
         ok = ui
@@ -698,6 +732,17 @@ mod tests {
             pressed,
             repeat: false,
             modifiers: Modifiers::NONE,
+        }
+    }
+
+    /// Shift+Tab as egui gets it: the focus goes to the previous widget.
+    fn shift_tab() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
         }
     }
 
@@ -1269,20 +1314,25 @@ mod tests {
             }
             // Letters and the space are dropped; four digits are all it keeps.
             assert_eq!(first_field(&o.ui), "1234", "has_pin: {has_pin}");
-            // The overlay is still there: Esc leaves the field, the next one closes.
+            // The overlay is still there: Esc cancels the dialog, the next one
+            // leaves the section, only the third closes.
+            assert_eq!(o.frame(&[Key::Escape]), vec![]);
             assert_eq!(o.frame(&[Key::Escape]), vec![]);
             assert_eq!(o.frame(&[Key::Escape]), vec![SettingsAction::Close]);
         }
     }
 
     #[test]
-    fn coming_back_to_an_open_dialog_puts_the_focus_in_its_first_field() {
+    fn coming_back_to_a_dialog_left_open_puts_the_focus_in_its_first_field() {
         let mut o = Overlay::new();
         o.has_pin = true;
         o.open_adult_dialog();
         o.type_text("12");
-        assert_eq!(o.frame(&[Key::Escape]), vec![]); // back to the list
-        o.press(Key::Enter, 1); // into the section again
+        // Shift+Tab walks back over the list rows: News, then Adult. Enter on
+        // the Adult row enters the section again, with the dialog still open.
+        o.frame_with(vec![shift_tab()]);
+        o.frame_with(vec![shift_tab()]);
+        o.press(Key::Enter, 1);
         o.type_text("34");
         assert_eq!(first_field(&o.ui), "1234");
     }
@@ -1358,16 +1408,128 @@ mod tests {
     }
 
     #[test]
-    fn no_dialog_opens_while_pin_input_is_blocked() {
+    fn while_pin_input_is_blocked_the_focus_goes_to_the_one_button_that_works() {
         let mut o = Overlay::new();
         o.has_pin = true;
         o.pin_wait_secs = Some(30);
         o.press(Key::ArrowDown, 3); // Adult
-        o.press(Key::Enter, 1); // into it
-        o.press(Key::Enter, 1); // Unlock is disabled
-        o.press(Key::Tab, 1);
-        o.press(Key::Enter, 1); // so is Change PIN
+        o.press(Key::Enter, 1); // into it: Unlock and Change PIN are disabled
+        o.press(Key::Enter, 1); // Forgot PIN has the focus and opens its dialog
+        assert!(
+            matches!(o.ui.adult, AdultDialog::Forgot { .. }),
+            "{:?}",
+            o.ui.adult
+        );
+        assert_eq!(o.frame(&[]), vec![]);
+        o.type_text("secret");
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::ResetPin("secret".into())]
+        );
+    }
+
+    #[test]
+    fn unlock_and_change_pin_cannot_be_reached_while_pin_input_is_blocked() {
+        // Shift+Tab from Forgot PIN skips what is disabled: back to the list rows.
+        // Enter there opens a section, never a dialog.
+        for steps in 1..=2 {
+            let mut o = Overlay::new();
+            o.has_pin = true;
+            o.pin_wait_secs = Some(30);
+            o.press(Key::ArrowDown, 3); // Adult
+            o.press(Key::Enter, 1); // into it: Forgot PIN has the focus
+            for _ in 0..steps {
+                o.frame_with(vec![shift_tab()]);
+            }
+            o.press(Key::Enter, 1);
+            assert!(
+                matches!(o.ui.adult, AdultDialog::Idle),
+                "{steps} step(s) back: {:?}",
+                o.ui.adult
+            );
+        }
+    }
+
+    #[test]
+    fn enter_in_the_first_pin_field_moves_on_to_the_repeat() {
+        let mut o = Overlay::new();
+        o.open_adult_dialog(); // no PIN yet: the dialog chooses one
+        o.type_text("1234");
+        o.press(Key::Enter, 1); // on to the repeat
+        o.type_text("1234");
+        assert_eq!(
+            o.frame(&[Key::Enter]), // in the last field Enter is OK
+            vec![SettingsAction::SetPin("1234".into())]
+        );
+    }
+
+    #[test]
+    fn enter_walks_through_the_three_fields_of_changing_the_pin() {
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.press(Key::ArrowDown, 3); // Adult
+        o.press(Key::Enter, 1); // into it: Unlock has the focus
+        o.press(Key::Tab, 1); // Change PIN
+        o.press(Key::Enter, 1);
+        assert_eq!(o.frame(&[]), vec![]);
+        o.type_text("1234");
+        o.press(Key::Enter, 1); // the new PIN
+        o.type_text("5678");
+        o.press(Key::Enter, 1); // its repeat
+        o.type_text("5678");
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::ChangePin {
+                old: "1234".into(),
+                new: "5678".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn esc_cancels_an_open_pin_dialog_and_what_was_typed_does_not_come_back() {
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.open_adult_dialog();
+        o.type_text("12");
+        // No action, and the keyboard stays in the section.
+        assert_eq!(o.frame(&[Key::Escape]), vec![]);
         assert!(matches!(o.ui.adult, AdultDialog::Idle), "{:?}", o.ui.adult);
+        // The first button has the focus: Enter opens a fresh dialog.
+        o.press(Key::Enter, 1);
+        assert_eq!(first_field(&o.ui), "");
+        assert_eq!(o.frame(&[]), vec![]);
+        o.type_text("1234");
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::Unlock("1234".into())]
+        );
+    }
+
+    #[test]
+    fn esc_backs_out_one_level_at_a_time_from_an_open_dialog() {
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.open_adult_dialog();
+        o.type_text("12");
+        assert_eq!(o.frame(&[Key::Escape]), vec![]); // the dialog
+        assert!(matches!(o.ui.adult, AdultDialog::Idle), "{:?}", o.ui.adult);
+        assert_eq!(o.frame(&[Key::Escape]), vec![]); // the section, back to the list
+        assert_eq!(o.frame(&[Key::Escape]), vec![SettingsAction::Close]);
+    }
+
+    #[test]
+    fn esc_in_another_section_leaves_a_dialog_hidden_behind_it_alone() {
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.open_adult_dialog();
+        o.type_text("12");
+        o.frame_with(vec![shift_tab()]); // back to the last list row: News
+        o.press(Key::Enter, 1); // its section opens, the dialog stays open behind it
+        assert!(matches!(o.ui.adult, AdultDialog::Unlock { .. }));
+        // Esc is the News section's: back to the list, where `o` closes the overlay.
+        assert_eq!(o.frame(&[Key::Escape]), vec![]);
+        assert_eq!(o.frame(&[Key::O]), vec![SettingsAction::Close]);
     }
 
     #[test]
