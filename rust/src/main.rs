@@ -3,7 +3,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use bongo_player::app::{PortalState, TvApp};
-use bongo_player::args::{ini_path, read_ini_creds, resolve_creds, Cli, CredsSource, XtreamCreds};
+use bongo_player::args::{
+    ini_path, read_ini_creds, resolve_creds, Cli, CredsOrigin, CredsSource, XtreamCreds,
+};
 use bongo_player::catalog::CatalogStore;
 use bongo_player::legacy;
 use bongo_player::player;
@@ -205,10 +207,22 @@ fn main() -> anyhow::Result<()> {
             port: 1,
         }))
     };
+    let resolved = resolve_creds(cli.xtream.as_deref(), ini_creds.as_deref());
+    // The settings tell the user that what they save there does not count
+    // while this --xtream is given.
+    let creds_from_cli = matches!(
+        resolved,
+        CredsSource::Configured(_, CredsOrigin::CommandLine)
+    );
     let (portal, portal_state, creds): (Arc<dyn Portal>, PortalState, Option<XtreamCreds>) =
-        match resolve_creds(cli.xtream.as_deref(), ini_creds.as_deref()) {
-            CredsSource::Configured(c) => {
+        match resolved {
+            CredsSource::Configured(c, _) => {
                 tracing::info!("portal: xtream <user>@{}:{}", c.host, c.port);
+                if creds_from_cli {
+                    tracing::info!(
+                        "portal: from --xtream, which beats {APP_ID}.ini on every start"
+                    );
+                }
                 (Arc::new(XtreamPortal::new(c.clone())), PortalState::Configured, Some(c))
             }
             CredsSource::Placeholder => {
@@ -261,6 +275,7 @@ fn main() -> anyhow::Result<()> {
                 cli.url,
                 relay,
                 creds,
+                creds_from_cli,
                 settings,
             ))
         }),

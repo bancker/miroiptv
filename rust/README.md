@@ -33,7 +33,12 @@ extraction.
 
 ## Where the app keeps its data
 
-- Portal login: `BongoPlayer.ini` next to the exe.
+- Portal login: `BongoPlayer.ini` next to the exe. The first-start prompt and
+  Save in the settings (`o`, Portal) write it. A real `--xtream` on the command
+  line beats it on every start, and the Portal settings say so when it does.
+- Preferences: `settings.json` in `%APPDATA%\BongoPlayer\config\`. It holds the
+  language, reversed zapping, the adult-content PIN (a salted hash, never the
+  PIN) and the news rules; a file that is missing or broken gives the defaults.
 - Favorites, resume points, presets and logs: `%APPDATA%\BongoPlayer\config\`.
 
 On the first start after the rename, data from the old `tvplayer`

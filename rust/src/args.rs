@@ -46,9 +46,18 @@ pub enum CredsError {
 
 /// Path to `BongoPlayer.ini` next to the executable (falls back to CWD if the
 /// exe path can't be resolved). This is the app's "root folder" config file.
+///
+/// `BONGO_INI` points it elsewhere. So does `BONGO_CONFIG_DIR` (the test
+/// override, see `Storage::standard`) when `BONGO_INI` is not set: the ini is
+/// then `BongoPlayer.ini` in that folder, never the file next to the exe, which
+/// may hold the developer's real portal and which a Save in the settings
+/// overwrites.
 pub fn ini_path() -> std::path::PathBuf {
     if let Some(p) = std::env::var_os("BONGO_INI") {
         return std::path::PathBuf::from(p);
+    }
+    if let Some(dir) = std::env::var_os("BONGO_CONFIG_DIR") {
+        return std::path::PathBuf::from(dir).join(format!("{}.ini", crate::APP_ID));
     }
     std::env::current_exe()
         .ok()
@@ -99,6 +108,33 @@ pub fn write_ini_creds(path: &std::path::Path, creds: &str) -> std::io::Result<(
     saved
 }
 
+/// `text` without CR and LF. egui keeps the ones that come with a paste in a
+/// single-line field, where they would end up inside a user name, a password or
+/// a server.
+pub fn without_newlines(text: &str) -> String {
+    text.chars().filter(|c| !matches!(c, '\r' | '\n')).collect()
+}
+
+/// The `user:pass@server` line that the settings and the setup prompt hand to
+/// the connection test and the ini, made of what was typed or pasted. CR and LF
+/// go from all three. The user name and the server lose the spaces around them,
+/// and the server a leading `http://` or `https://` and its trailing `/` (a
+/// pasted address). The password stays as typed, spaces included.
+pub fn credentials_line(user: &str, password: &str, server: &str) -> String {
+    let (user, server) = (without_newlines(user), without_newlines(server));
+    let server = server.trim();
+    let server = ["https://", "http://"]
+        .iter()
+        .find_map(|scheme| {
+            let head = server.get(..scheme.len())?;
+            head.eq_ignore_ascii_case(scheme)
+                .then(|| &server[scheme.len()..])
+        })
+        .unwrap_or(server);
+    let server = server.trim_end_matches('/');
+    format!("{}:{}@{}", user.trim(), without_newlines(password), server)
+}
+
 pub fn parse_xtream_creds(s: &str) -> Result<XtreamCreds, CredsError> {
     // The LAST '@' separates the server: a password may contain '@', a host
     // never does.
@@ -126,11 +162,21 @@ pub fn is_placeholder_creds(creds: &XtreamCreds) -> bool {
         || (creds.username == "user" && creds.password == "pass")
 }
 
+/// Which of the two places usable credentials were read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredsOrigin {
+    /// `--xtream`, which wins over the ini on every start.
+    CommandLine,
+    /// `BongoPlayer.ini`.
+    Ini,
+}
+
 /// Where the portal credentials come from at startup.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CredsSource {
-    /// Usable credentials: `--xtream` if it has real values, else the ini.
-    Configured(XtreamCreds),
+    /// Usable credentials, and which place they came from: `--xtream` if it has
+    /// real values, else the ini.
+    Configured(XtreamCreds, CredsOrigin),
     /// Only placeholder values (the zip's run.bat): show the setup prompt.
     Placeholder,
     /// None at all: show the setup prompt.
@@ -144,9 +190,10 @@ pub enum CredsSource {
 pub fn resolve_creds(cli: Option<&str>, ini: Option<&str>) -> CredsSource {
     let mut placeholder = false;
     let mut invalid = None;
-    for s in [cli, ini].into_iter().flatten() {
+    let places = [(cli, CredsOrigin::CommandLine), (ini, CredsOrigin::Ini)];
+    for (s, origin) in places.into_iter().filter_map(|(s, o)| Some((s?, o))) {
         match parse_xtream_creds(s) {
-            Ok(c) if !is_placeholder_creds(&c) => return CredsSource::Configured(c),
+            Ok(c) if !is_placeholder_creds(&c) => return CredsSource::Configured(c, origin),
             Ok(_) => placeholder = true,
             Err(e) => invalid = invalid.or(Some(e.to_string())),
         }

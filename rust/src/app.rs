@@ -1,4 +1,4 @@
-use crate::args::{parse_xtream_creds, CredsError, XtreamCreds};
+use crate::args::{credentials_line, parse_xtream_creds, CredsError, XtreamCreds};
 use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, quality_rank, zap_position, CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::{Entry as FavoriteEntry, Favorites};
@@ -586,6 +586,9 @@ pub struct TvApp {
     /// Portal credentials in use: the settings screen shows them and the PIN
     /// reset checks the password against them.
     creds: Option<XtreamCreds>,
+    /// They came from `--xtream`, which beats the ini on every start: the
+    /// settings say that what is saved there only counts without it.
+    creds_from_command_line: bool,
 
     video_tex: Option<TextureHandle>,
     last_frame_version: u64,
@@ -731,6 +734,7 @@ impl TvApp {
         initial_url: Option<String>,
         relay: Option<Relay>,
         creds: Option<XtreamCreds>,
+        creds_from_command_line: bool,
         settings: Settings,
     ) -> Self {
         // Whenever a new mpv frame is ready, ask egui to redraw.
@@ -753,6 +757,7 @@ impl TvApp {
             initial_url,
             relay,
             creds,
+            creds_from_command_line,
             settings,
         )
     }
@@ -767,6 +772,7 @@ impl TvApp {
         initial_url: Option<String>,
         relay: Option<Relay>,
         creds: Option<XtreamCreds>,
+        creds_from_command_line: bool,
         settings: Settings,
     ) -> Self {
         let favorites = Favorites::load(&storage.favorites_path()).unwrap_or_default();
@@ -781,6 +787,7 @@ impl TvApp {
             storage,
             portal_state,
             creds,
+            creds_from_command_line,
             video_tex: None,
             last_frame_version: 0,
             current_idx: None,
@@ -1165,6 +1172,7 @@ impl TvApp {
             lang: self.lang,
             settings: &self.settings,
             creds: self.creds.as_ref(),
+            creds_from_command_line: self.creds_from_command_line,
             conn: &self.conn_state,
             adult_unlocked: self.catalog.adult_unlocked(),
             has_pin: self.settings.pin.is_some(),
@@ -2176,12 +2184,7 @@ impl TvApp {
                         }
                         let entered = ready && ctx.input(|i| i.key_pressed(Key::Enter));
                         if clicked || entered {
-                            submit = Some(format!(
-                                "{}:{}@{}",
-                                self.cfg_user.trim(),
-                                self.cfg_pass,
-                                self.cfg_host.trim()
-                            ));
+                            submit = Some(self.prompt_credentials());
                         }
                     });
             });
@@ -2189,6 +2192,12 @@ impl TvApp {
             // Saving tests first: only credentials that log in are kept.
             self.start_conn_check(s, true);
         }
+    }
+
+    /// The `user:pass@server` line the setup prompt tests and saves, made of its
+    /// three fields as they were typed or pasted (see `credentials_line`).
+    fn prompt_credentials(&self) -> String {
+        credentials_line(&self.cfg_user, &self.cfg_pass, &self.cfg_host)
     }
 
     /// Test credentials in the background; with `save`, store and connect
@@ -2246,6 +2255,7 @@ impl TvApp {
         // the old catalog, the only one that knows this stream, before it goes.
         let playing_adult = self.playing_adult();
         self.creds = Some(creds.clone());
+        self.creds_from_command_line = false;
         let portal: Arc<dyn Portal> = Arc::new(XtreamPortal::new(creds));
         self.catalog = Arc::new(CatalogStore::new(portal));
         self.catalog_generation += 1;
@@ -4545,6 +4555,7 @@ mod tests {
                 initial_url.map(str::to_owned),
                 None,
                 creds,
+                false,
                 settings,
             );
             let mut harness = Harness {
@@ -5289,5 +5300,54 @@ mod tests {
         assert!(h.app.settings_ui.is_some());
         assert!(!finish_news_fetch(&portal, &mut h).await);
         assert!(h.app.settings_ui.is_some(), "the overlay stays up");
+    }
+
+    // ---- the portal fields ----
+
+    #[test]
+    fn the_setup_prompt_cleans_what_was_pasted_before_it_tests_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(CatalogStore::new(idle_portal()));
+        let mut h = Harness::start(dir.path(), catalog, PortalState::Missing, None);
+        let paste = |text: &str| egui::Event::Paste(text.into());
+        h.press(&[Key::Tab]); // the server field
+        h.frame_with(vec![paste("https://srv.example.net:8080/\r\n")]);
+        h.press(&[Key::Tab]);
+        h.frame_with(vec![paste(" bob\n")]);
+        h.press(&[Key::Tab]);
+        h.frame_with(vec![paste("se cret\r\n")]);
+        assert_eq!(
+            h.app.prompt_credentials(),
+            "bob:se cret@srv.example.net:8080"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_portal_section_shows_the_command_line_note_until_a_save_replaces_the_portal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        h.app.creds_from_command_line = true;
+        let note = crate::i18n::t(Lang::En, T::PortalFromCommandLine);
+        let says_note = |h: &Harness| h.painted.iter().any(|p| p == note);
+        // o, Down, Enter: the Portal section.
+        h.press(&[Key::O, Key::ArrowDown, Key::Enter]);
+        h.frame(&[]);
+        assert!(says_note(&h), "{:?}", h.painted);
+        {
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+            let creds = XtreamCreds {
+                username: "u2".into(),
+                password: "p2".into(),
+                host: "127.0.0.1".into(),
+                port: 1,
+            };
+            let saved = h.app.apply_creds(creds, "u2:p2@127.0.0.1:1");
+            std::env::remove_var("BONGO_INI");
+            assert!(saved.is_ok());
+        }
+        // The portal in use is the saved one now, no longer the command line's.
+        h.frame(&[]);
+        assert!(!says_note(&h), "{:?}", h.painted);
     }
 }

@@ -149,6 +149,7 @@ texts! {
     ConnBadLogin => ["Gebruiker of wachtwoord onjuist", "Wrong username or password", "Benutzer oder Passwort falsch"],
     ConnUnreachable => ["Server niet bereikbaar", "Server not reachable", "Server nicht erreichbar"],
     ConnInvalid => ["Geen geldige portal", "Not a valid portal", "Kein gültiges Portal"],
+    PortalFromCommandLine => ["Deze portal komt uit de opdrachtregel (--xtream); wat je hier opslaat geldt pas als je zonder die optie start.", "This portal comes from the command line (--xtream); what you save here only applies when you start without that option.", "Dieses Portal stammt aus der Befehlszeile (--xtream); was du hier speicherst, gilt erst, wenn du ohne diese Option startest."],
     // Empty state and catalog status
     Preparing => ["voorbereiden...", "preparing...", "wird vorbereitet..."],
     Connecting => ["verbinden...", "connecting...", "Verbindung wird hergestellt..."],

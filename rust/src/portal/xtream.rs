@@ -85,7 +85,8 @@ pub enum ConnCheck {
     Ok { channels: Option<usize> },
     /// The portal refuses the user name or the password.
     BadLogin,
-    /// No answer from the server within the time allowed.
+    /// No answer from the server within the time allowed, or none that says
+    /// anything about the login: this portal answers 503 or 509 when it is busy.
     Unreachable,
     /// The login got an answer that no Xtream portal gives.
     Invalid,
@@ -127,6 +128,11 @@ impl XtreamPortal {
             .map_err(|_| ConnCheck::Unreachable)?;
         if matches!(answer.status().as_u16(), 401 | 403) {
             return Err(ConnCheck::BadLogin);
+        }
+        // Any other refusal (503 and 509 are this portal's normal busy answers)
+        // says nothing about the credentials: the server gave no usable answer.
+        if !answer.status().is_success() {
+            return Err(ConnCheck::Unreachable);
         }
         let body: serde_json::Value = answer.json().await.map_err(|_| ConnCheck::Invalid)?;
         let auth = body

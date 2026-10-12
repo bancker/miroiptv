@@ -36,14 +36,11 @@ if (Test-Path (Join-Path $mpvDir 'LICENSE.txt')) {
 
 $runBat = @'
 @echo off
-REM =====================================================================
-REM  !!  EDIT THE LINE BELOW WITH YOUR REAL XTREAM PORTAL CREDENTIALS  !!
-REM  Format: user:pass@host:port
-REM  Without a real portal the app shows a "no portal configured" screen.
-REM =====================================================================
-set XTREAM_CREDS=user:pass@host.example.com:8080
-
-"%~dp0BongoPlayer.exe" --xtream %XTREAM_CREDS% %*
+REM Starts Bongo Player. Nothing to edit here: on the first start the app asks
+REM for your language and then for your portal (server, user, password), and
+REM keeps the portal in BongoPlayer.ini next to the exe. Change it later in the
+REM settings (press o). Anything typed after run.bat goes on to the app.
+"%~dp0BongoPlayer.exe" %*
 '@
 Set-Content -Path (Join-Path $staging 'run.bat') -Value $runBat -Encoding ASCII
 
@@ -52,12 +49,16 @@ Bongo Player v$ver - portable
 
 USAGE
 -----
-1. Edit run.bat: replace the XTREAM_CREDS line with your portal
-   user:pass@host:port
-2. Double-click run.bat
+1. Double-click run.bat (or BongoPlayer.exe).
+2. First start: choose your language, then enter your Xtream portal (server,
+   user, password) when asked. The app tests it and keeps it in
+   BongoPlayer.ini next to the exe.
+3. Change the language, the portal and more later in the settings (press o).
 
 OR from the command line:
-  BongoPlayer.exe --xtream user:pass@host:port
+  BongoPlayer.exe --xtream user:pass@host:port      (beats the saved portal for
+                                                      as long as it is given;
+                                                      the settings say so)
   BongoPlayer.exe https://example.com/some.m3u8      (bare URL, no portal)
   BongoPlayer.exe --selftest                          (smoke check)
 
@@ -70,21 +71,26 @@ BongoPlayer.exe.
 
 KEYS
 ----
-  arrow up/down, mouse wheel        zap previous/next channel
-  1 / 2 / 3                          NPO 1 / 2 / 3
-  n                                  news shortcut (NPO)
-  r                                  news shortcut (RTL)
-  f                                  cross-catalog search
-  e                                  EPG strip (now + next)
-  Shift+E                            EPG grid
+  arrow up/down, mouse wheel        previous / next channel
+  0-9 (tap)                          recall a preset channel
+  0-9 (hold)                         store the current channel as a preset
+  n                                  latest news (choose a bulletin)
+  f                                  search (live, movies, series)
   Shift+F                            favorites list
-  *                                  toggle favorite for current channel
-  a / s                              cycle audio / subtitle track
+  *                                  toggle favorite for the current channel
+  e / Shift+E                        guide strip (now + next) / guide overview
+  g                                  TV guide
+  a / s                              next audio track / subtitles
   + / -                              higher / lower quality (live)
-  left / right arrow                 seek -30s / +30s (VOD)
+  left / right arrow                 seek -30s / +30s (movies, catch-up)
+  space                              pause / play (movies, series, catch-up)
+  o                                  settings (language, portal, adult content, news)
+  ?                                  all keys
   F11                                fullscreen
-  d                                  debug HUD
-  Esc                                dismiss overlays
+  t                                  borderless + always on top
+  F5                                 retry the portal fetch
+  d                                  debug info
+  Esc                                close overlays
 
 LICENSE
 -------

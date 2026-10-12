@@ -146,8 +146,22 @@ in `storage.rs` vervalt):
   (`user:pass@host:port`).
 - Splitsen gebeurt op de **laatste** `@`, zodat een wachtwoord een `@` mag
   bevatten. Een gebruikersnaam mag geen `:` bevatten (zoals nu).
-- Een `--xtream` met placeholder-waarden (de `run.bat` in de zip) telt niet: dan
-  geldt de ini. Een `--xtream` met echte waarden gaat, zoals nu, voor de ini.
+- Een `--xtream` met placeholder-waarden telt niet: dan geldt de ini. Een
+  `--xtream` met echte waarden gaat, zoals nu, voor de ini, bij elke start. Komt
+  de portal in gebruik daaruit, dan zegt het portaldeel van de instellingen dat
+  onder de velden ("Deze portal komt uit de opdrachtregel (--xtream); wat je
+  hier opslaat geldt pas als je zonder die optie start."); na een Save is de
+  opgeslagen portal die in gebruik is en verdwijnt de melding.
+- De `run.bat` in de zip vraagt niet meer om inloggegevens: hij start alleen de
+  app. De portal wordt bij de eerste start gevraagd (na de taalkeuze) of later
+  ingesteld met `o`.
+- Wat in het portaldeel of in het portalscherm van de eerste start wordt
+  geplakt of getypt, wordt eerst opgeschoond: regeleinden (CR/LF) weg uit alle
+  velden, spaties rond server en gebruiker weg, bij de server ook een
+  voorafgaande `http://` of `https://` en een afsluitende `/`; het wachtwoord blijft
+  zoals getypt. Een antwoord op het inloggen dat geen 2xx is (behalve 401/403:
+  onjuist) leest als "Server niet bereikbaar": 503 en 509 zijn de gewone
+  drukte-antwoorden van deze portal.
 
 ### Catalogus en portal
 

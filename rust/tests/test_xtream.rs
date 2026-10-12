@@ -335,3 +335,33 @@ async fn the_budget_is_one_for_the_whole_test() {
         .await;
     assert_eq!(r, ConnCheck::Ok { channels: None });
 }
+
+#[tokio::test]
+async fn check_tells_a_busy_portal_from_a_wrong_login() {
+    // This portal answers 503 or 509 when it is busy: the credentials are not at
+    // fault, the server gave no usable answer.
+    for status in [404u16, 500, 502, 503, 509] {
+        let server = MockServer::start().await;
+        login_answering(&server, ResponseTemplate::new(status)).await;
+        let r = XtreamPortal::new(creds_for(&server)).check().await;
+        assert_eq!(r, ConnCheck::Unreachable, "status {status}");
+    }
+}
+
+#[tokio::test]
+async fn a_busy_answer_with_a_login_body_is_still_not_a_login() {
+    // Only a 2xx answer is read; the body of a refusal says nothing.
+    let server = MockServer::start().await;
+    let busy = ResponseTemplate::new(503).set_body_string(GOOD_LOGIN);
+    login_answering(&server, busy).await;
+    let r = XtreamPortal::new(creds_for(&server)).check().await;
+    assert_eq!(r, ConnCheck::Unreachable);
+}
+
+#[tokio::test]
+async fn an_answer_that_is_no_xtream_login_is_still_invalid_not_unreachable() {
+    let server = MockServer::start().await;
+    login(&server, "{\"hello\": 1}").await;
+    let r = XtreamPortal::new(creds_for(&server)).check().await;
+    assert_eq!(r, ConnCheck::Invalid);
+}

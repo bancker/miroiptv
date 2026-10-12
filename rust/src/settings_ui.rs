@@ -3,7 +3,7 @@
 //! right. Both draw themselves and report what the user did as actions;
 //! app.rs carries those out.
 
-use crate::args::XtreamCreds;
+use crate::args::{credentials_line, without_newlines, XtreamCreds};
 use crate::i18n::{t, tr, Lang, T};
 use crate::news::{default_rules, NewsRule};
 use crate::pin::valid_pin;
@@ -118,6 +118,9 @@ pub struct SettingsView<'a> {
     pub settings: &'a Settings,
     /// The portal credentials in use, if any: the portal form starts from them.
     pub creds: Option<&'a XtreamCreds>,
+    /// They came from `--xtream`, which beats the ini on every start: the portal
+    /// section says that a Save only counts when the app starts without it.
+    pub creds_from_command_line: bool,
     /// How the connection test stands.
     pub conn: &'a ConnState,
     /// Adult content shows now (the catalog's state; the section keeps no copy).
@@ -182,6 +185,9 @@ pub fn conn_text(lang: Lang, conn: &ConnState) -> Option<String> {
 
 /// What a failed test is shown in: the setup prompt's old error red.
 const FAILURE_RED: Color32 = Color32::from_rgb(240, 130, 110);
+
+/// A note the user should not miss, in the colour the help gives its keys.
+const NOTE_AMBER: Color32 = Color32::from_rgb(230, 220, 110);
 
 /// The status line as label text: red when the test did not go through, else
 /// the normal colour.
@@ -457,12 +463,20 @@ impl SettingsUi {
                 .password(true)
                 .desired_width(320.0),
         );
+        if view.creds_from_command_line {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(t(lang, T::PortalFromCommandLine))
+                    .small()
+                    .color(NOTE_AMBER),
+            );
+        }
         let ready = !form.host.trim().is_empty()
             && !form.user.trim().is_empty()
             && !form.pass.is_empty()
             && *view.conn != ConnState::Testing;
         // Built when a button is pressed, not every frame.
-        let creds = || format!("{}:{}@{}", form.user.trim(), form.pass, form.host.trim());
+        let creds = || credentials_line(&form.user, &form.pass, &form.host);
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui
@@ -642,7 +656,7 @@ impl SettingsUi {
                 }
                 let (ok, cancel) = ok_cancel(ui, lang, &r, !password.is_empty());
                 if ok {
-                    actions.push(SettingsAction::ResetPin(password.clone()));
+                    actions.push(SettingsAction::ResetPin(without_newlines(password)));
                 }
                 ok || cancel
             }
@@ -1003,6 +1017,7 @@ mod tests {
             settings,
             creds: None,
             conn: &ConnState::Idle,
+            creds_from_command_line: false,
             adult_unlocked: false,
             has_pin: false,
             pin_wait_secs: None,
@@ -1126,6 +1141,8 @@ mod tests {
         settings: Settings,
         /// Draw another default Area before the overlay in every frame.
         other_panel: bool,
+        /// What app.rs would tell the portal section.
+        creds_from_command_line: bool,
         /// What app.rs would tell the adult section.
         adult_unlocked: bool,
         has_pin: bool,
@@ -1164,6 +1181,7 @@ mod tests {
                 ui: SettingsUi::new(),
                 settings: Settings::default(),
                 other_panel,
+                creds_from_command_line: false,
                 adult_unlocked: false,
                 has_pin: false,
                 pin_wait_secs: None,
@@ -1199,6 +1217,7 @@ mod tests {
             let mut actions = Vec::new();
             let view = SettingsView {
                 lang: self.lang,
+                creds_from_command_line: self.creds_from_command_line,
                 adult_unlocked: self.adult_unlocked,
                 has_pin: self.has_pin,
                 pin_wait_secs: self.pin_wait_secs,
@@ -1683,6 +1702,69 @@ mod tests {
         assert_eq!(crate::args::parse_xtream_creds(one_string).unwrap(), creds);
     }
 
+    #[test]
+    fn test_and_save_hand_over_what_was_pasted_cleaned() {
+        // egui keeps the CR/LF of a paste in a single-line field.
+        let pasted = PortalForm {
+            host: " https://srv.example.net:8080/\r\n".into(),
+            user: "bob\n".into(),
+            pass: "se cret\r\n".into(),
+        };
+        let one_string = "bob:se cret@srv.example.net:8080".to_string();
+        assert_eq!(
+            press_test_and_save(pasted, &ConnState::Idle),
+            vec![
+                SettingsAction::TestConnection(one_string.clone()),
+                SettingsAction::SavePortal(one_string)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_portal_section_says_when_the_portal_comes_from_the_command_line() {
+        for lang in Lang::ALL {
+            let note = t(lang, T::PortalFromCommandLine);
+            for from_cli in [false, true] {
+                let mut o = Overlay::new();
+                o.lang = lang;
+                o.creds_from_command_line = from_cli;
+                o.press(Key::ArrowDown, 1); // Portal
+                assert_eq!(o.frame(&[]), vec![]);
+                let shown = o.painted.iter().any(|p| p == note);
+                assert_eq!(shown, from_cli, "{lang:?}, --xtream given: {from_cli}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_note_on_the_command_line_portal_adds_no_tab_stop() {
+        // Server, user, password, Test and Save are the section's five stops, with
+        // the note or without it: one Tab past Save is back on the list.
+        for from_cli in [false, true] {
+            let mut o = Overlay::new();
+            o.creds_from_command_line = from_cli;
+            o.ui.portal = Some(PortalForm {
+                host: "srv.example.net:8080".into(),
+                user: "bob".into(),
+                pass: "secret".into(),
+            });
+            o.press(Key::ArrowDown, 1);
+            o.press(Key::Enter, 1); // into the section: the server field
+            o.press(Key::Tab, 4); // user, password, Test, Save
+            o.press(Key::Tab, 1); // past Save
+            assert_eq!(o.frame(&[]), vec![]);
+            let row = o
+                .ctx
+                .memory(|m| m.focused())
+                .expect("a widget has the focus");
+            assert_eq!(
+                o.ui.list_ids.first(),
+                Some(&row),
+                "--xtream given: {from_cli}"
+            );
+        }
+    }
+
     /// The text in the open dialog's first field.
     fn first_field(ui: &SettingsUi) -> &str {
         match &ui.adult {
@@ -2037,6 +2119,22 @@ mod tests {
         assert_eq!(
             o.frame(&[Key::Enter]),
             vec![SettingsAction::ResetPin("foo bar".into())]
+        );
+    }
+
+    #[test]
+    fn the_line_breaks_of_a_pasted_portal_password_do_not_reach_the_pin_reset() {
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.press(Key::ArrowDown, 3); // Adult
+        o.press(Key::Enter, 1); // into it: Unlock has the focus
+        o.press(Key::Tab, 2); // Change PIN, then Forgot PIN?
+        o.press(Key::Enter, 1);
+        assert_eq!(o.frame(&[]), vec![]);
+        o.frame_with(vec![egui::Event::Paste("se\r\ncret\n".into())]);
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::ResetPin("secret".into())]
         );
     }
 

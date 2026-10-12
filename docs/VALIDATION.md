@@ -4,8 +4,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 
 ## Setup
 - [ ] Extract `rust\dist\BongoPlayer-v*.zip` to a fresh folder
-- [ ] Edit `run.bat`: set `XTREAM_CREDS=user:pass@host:port`
-- [ ] Double-click `run.bat`
+- [ ] Double-click `run.bat`: the first start asks for the language and then for the portal (server, user, password); `BongoPlayer.ini` appears next to the exe
 
 ## Smoke
 - [ ] Window opens within 3 seconds
@@ -38,6 +37,8 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] `o` opens the settings; Up/Down choose a section, Enter opens it, Esc goes back; Esc or `o` in the list closes
 - [ ] Switch the language: every text changes at once (help, toasts, guide, settings)
 - [ ] Portal: Test with a wrong password → "Gebruiker of wachtwoord onjuist"; Save with the right one → "Verbonden: N zenders", or just "Verbonden" when the channel list is slow to arrive; `BongoPlayer.ini` then holds the line `portal=<user>:<password>@<server>:<port>`
+- [ ] Portal: a pasted server such as `http://host:8080/` (with a line break after it) connects like `host:8080`; a busy portal (HTTP 503 or 509) reads "Server niet bereikbaar", not "Geen geldige portal"
+- [ ] Started with `--xtream user:pass@host:port`: Settings → Portal shows a note under the fields that the portal comes from the command line and that what is saved there only counts without that option; after a Save the note is gone
 - [ ] Controls: reverse zapping → arrow up and wheel up go to the next channel; the help shows it
 - [ ] `?` opens the help; its `o` row is underlined and a click on it opens the settings; in a small window the help scrolls with the wheel, a thin marker shows the position, and Tab stops only on the `o` row
 
