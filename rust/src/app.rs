@@ -546,6 +546,29 @@ struct NewsPicker {
     selected: usize,
 }
 
+/// What a news list was made for: the catalog it was fetched through (counted
+/// from the start, a new one with every portal save) and whether adult content
+/// showed then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NewsStamp {
+    generation: u64,
+    unlocked: bool,
+}
+
+/// A finished news list, on its way from its background task to the UI.
+struct NewsResult {
+    items: Vec<NewsItem>,
+    stamp: NewsStamp,
+}
+
+/// Whether a news list fetched under `fetched` may still be shown under `now`.
+/// A list fetched while adult content showed must not pop up after a Lock, and
+/// one fetched through the old portal's catalog holds stream ids that mean
+/// other channels (or none) in the new one.
+fn keep_news_result(fetched: NewsStamp, now: NewsStamp) -> bool {
+    fetched == now
+}
+
 /// A finished credentials test, on its way from its background task to the UI.
 struct ConnResult {
     check: ConnCheck,
@@ -575,7 +598,14 @@ pub struct TvApp {
     epg_slot: Arc<Mutex<Option<(i64, Epg)>>>,
     epg_fetch_pending_for: Option<i64>,
     /// Combined NOS/RTL news list built async for the `n` picker.
-    news_picker_slot: Arc<Mutex<Option<Vec<NewsItem>>>>,
+    news_picker_slot: Arc<Mutex<Option<NewsResult>>>,
+    /// A news fetch is under way. Its result clears this; `n` does nothing until
+    /// then, since a held key repeats and each press would start a batch of EPG
+    /// fetches, the burst the portal throttles.
+    news_fetching: bool,
+    /// Which catalog this is, counted from the start; a portal save makes it a
+    /// new one.
+    catalog_generation: u64,
     /// Open `n` news chooser (modal overlay), if any.
     news_picker: Option<NewsPicker>,
 
@@ -759,6 +789,8 @@ impl TvApp {
             current_epg: None,
             epg_slot: Arc::new(Mutex::new(None)),
             news_picker_slot: Arc::new(Mutex::new(None)),
+            news_fetching: false,
+            catalog_generation: 0,
             news_picker: None,
             epg_fetch_pending_for: None,
             toast: None,
@@ -1696,6 +1728,9 @@ impl TvApp {
     /// matching past programmes (3 per rule, 10 in total, newest first), then
     /// pop the modal picker. Fully async - the current channel keeps playing.
     fn open_news_picker(&mut self) {
+        if self.news_fetching {
+            return;
+        }
         let rules = self.settings.news_rules_or_default();
         if rules.is_empty() {
             tracing::info!("news picker: no rules");
@@ -1720,6 +1755,8 @@ impl TvApp {
             return;
         }
         self.set_toast(self.t(T::FetchingNews));
+        self.news_fetching = true;
+        let stamp = self.news_stamp();
         let portal = self.catalog.portal().clone();
         let slot = self.news_picker_slot.clone();
         tokio::spawn(async move {
@@ -1800,15 +1837,38 @@ impl TvApp {
                     ))
                     .collect::<Vec<_>>()
             );
-            *slot.lock() = Some(items);
+            *slot.lock() = Some(NewsResult { items, stamp });
         });
+    }
+
+    /// What a news list fetched now would be made for.
+    fn news_stamp(&self) -> NewsStamp {
+        NewsStamp {
+            generation: self.catalog_generation,
+            unlocked: self.catalog.adult_unlocked(),
+        }
     }
 
     /// When the async news list lands, pop the picker (newest pre-selected).
     fn drain_news_picker(&mut self) {
-        if let Some(items) = self.news_picker_slot.lock().take() {
-            self.news_picker = Some(NewsPicker { items, selected: 0 });
+        let Some(result) = self.news_picker_slot.lock().take() else {
+            return;
+        };
+        self.news_fetching = false;
+        // Not under the settings overlay either: a panel with a Tab stop of its own
+        // must not appear beneath it (see close_panels_under_settings).
+        if self.settings_ui.is_some() {
+            tracing::info!("news picker: list dropped, the settings are open");
+            return;
         }
+        if !keep_news_result(result.stamp, self.news_stamp()) {
+            tracing::info!("news picker: list dropped, the catalog or the lock changed since");
+            return;
+        }
+        self.news_picker = Some(NewsPicker {
+            items: result.items,
+            selected: 0,
+        });
     }
 
     /// Arrow keys / Enter / Esc for the open news picker.
@@ -2188,6 +2248,7 @@ impl TvApp {
         self.creds = Some(creds.clone());
         let portal: Arc<dyn Portal> = Arc::new(XtreamPortal::new(creds));
         self.catalog = Arc::new(CatalogStore::new(portal));
+        self.catalog_generation += 1;
         // Another portal: its stream ids mean other channels, so the old lists'
         // positions and the guide's per-channel data are of no use. The new
         // catalog starts locked, so the last PIN outcome no longer applies.
@@ -4702,13 +4763,16 @@ mod tests {
 
     // ---- a portal that answers from memory ----
 
-    /// Answers from memory. Its catalog arrives only after `release_catalog`, so
-    /// a test decides when the app learns what is in it.
+    /// Answers from memory. Its catalog arrives only after `release_catalog`,
+    /// its day EPGs only after `release_epg`, so a test decides when the app
+    /// learns what; `epg_fetches` counts the day-EPG requests.
     struct FakePortal {
         urls: XtreamPortal,
         live: Vec<LiveChannel>,
         day_epg: Vec<EpgEntry>,
         catalog_gate: tokio::sync::Semaphore,
+        epg_gate: tokio::sync::Semaphore,
+        epg_fetches: std::sync::atomic::AtomicUsize,
     }
 
     impl FakePortal {
@@ -4723,11 +4787,21 @@ mod tests {
                 live,
                 day_epg,
                 catalog_gate: tokio::sync::Semaphore::new(0),
+                epg_gate: tokio::sync::Semaphore::new(0),
+                epg_fetches: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
         fn release_catalog(&self) {
             self.catalog_gate.add_permits(1 << 20);
+        }
+
+        fn release_epg(&self) {
+            self.epg_gate.add_permits(1 << 20);
+        }
+
+        fn epg_fetches(&self) -> usize {
+            self.epg_fetches.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -4746,6 +4820,9 @@ mod tests {
             Ok(Epg::new(Vec::new()))
         }
         async fn fetch_day_epg(&self, _: i64) -> Result<Epg, crate::portal::PortalError> {
+            self.epg_fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _wait = self.epg_gate.acquire().await;
             Ok(Epg::new(self.day_epg.clone()))
         }
         async fn fetch_series_episodes(
@@ -5079,5 +5156,138 @@ mod tests {
         );
         assert_eq!(h.app.current_stream_id, None);
         assert!(!h.app.playing_resumed);
+    }
+
+    // ---- the news picker ----
+
+    fn archive_channel(stream_id: i64, name: &str) -> LiveChannel {
+        LiveChannel {
+            stream_id,
+            name: name.into(),
+            category_id: None,
+            epg_channel_id: None,
+            tv_archive: 1,
+            tv_archive_duration: 0,
+            is_adult: false,
+        }
+    }
+
+    /// An app whose catalog holds "NL | NPO1 HD", a catch-up channel the first
+    /// default news rule finds, and a portal whose day EPG holds one bulletin
+    /// and arrives on `release_epg`.
+    fn news_app(root: &std::path::Path) -> (Arc<FakePortal>, Arc<CatalogStore>, Harness) {
+        let now = chrono::Utc::now();
+        let bulletin = EpgEntry {
+            title: "NOS Journaal".into(),
+            start: now - chrono::Duration::hours(2),
+            end: now - chrono::Duration::minutes(110),
+        };
+        let live = vec![archive_channel(601, "NL | NPO1 HD")];
+        let portal = FakePortal::new(live.clone(), vec![bulletin]);
+        let catalog = Arc::new(CatalogStore::from_catalog(
+            portal.clone(),
+            crate::portal::Catalog {
+                live,
+                ..Default::default()
+            },
+        ));
+        let h = Harness::start(root, catalog.clone(), PortalState::Configured, None);
+        (portal, catalog, h)
+    }
+
+    /// Lets the news fetch finish and the app notice: whether its list came up.
+    async fn finish_news_fetch(portal: &FakePortal, h: &mut Harness) -> bool {
+        portal.release_epg();
+        let slot = h.app.news_picker_slot.clone();
+        wait_until("the news list", || slot.lock().is_some()).await;
+        h.frame(&[]);
+        h.app.news_picker.is_some()
+    }
+
+    #[test]
+    fn a_news_list_is_kept_only_for_the_catalog_and_the_lock_it_was_made_for() {
+        let stamp = |generation, unlocked| NewsStamp {
+            generation,
+            unlocked,
+        };
+        assert!(keep_news_result(stamp(0, false), stamp(0, false)));
+        assert!(keep_news_result(stamp(3, true), stamp(3, true)));
+        // A Lock (or an unlock) since, or another catalog since: dropped.
+        assert!(!keep_news_result(stamp(0, true), stamp(0, false)));
+        assert!(!keep_news_result(stamp(0, false), stamp(0, true)));
+        assert!(!keep_news_result(stamp(0, false), stamp(1, false)));
+        assert!(!keep_news_result(stamp(2, true), stamp(3, false)));
+    }
+
+    #[tokio::test]
+    async fn a_held_n_starts_one_news_fetch_and_the_next_n_waits_for_its_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let (portal, _catalog, mut h) = news_app(dir.path());
+        // A held key repeats: three presses in a row ...
+        h.press(&[Key::N, Key::N, Key::N]);
+        wait_until("the fetch", || portal.epg_fetches() >= 1).await;
+        // ... and more while the portal is still thinking.
+        h.press(&[Key::N, Key::N]);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(portal.epg_fetches(), 1, "one batch, not one per press");
+        assert!(finish_news_fetch(&portal, &mut h).await);
+        let picker = h.app.news_picker.as_ref().expect("the list popped up");
+        assert_eq!(picker.items.len(), 1);
+        assert!(!h.app.news_fetching);
+        // Closed again, the next `n` fetches anew.
+        h.press(&[Key::Escape, Key::N]);
+        wait_until("the second fetch", || portal.epg_fetches() == 2).await;
+    }
+
+    #[tokio::test]
+    async fn a_news_list_fetched_under_another_lock_never_pops_up() {
+        for unlocked_at_fetch in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (portal, catalog, mut h) = news_app(dir.path());
+            catalog.set_adult_unlocked(unlocked_at_fetch);
+            h.press(&[Key::N]);
+            wait_until("the fetch", || portal.epg_fetches() == 1).await;
+            // Lock (or unlock) while the portal is still thinking.
+            h.app.set_adult_visible(!unlocked_at_fetch);
+            let shown = finish_news_fetch(&portal, &mut h).await;
+            assert!(!shown, "unlocked when fetched: {unlocked_at_fetch}");
+            // The fetch is over all the same: `n` works again.
+            assert!(!h.app.news_fetching);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_news_list_fetched_through_the_old_portal_is_dropped_after_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let (portal, _catalog, mut h) = news_app(dir.path());
+        h.press(&[Key::N]);
+        wait_until("the fetch", || portal.epg_fetches() == 1).await;
+        {
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+            let creds = XtreamCreds {
+                username: "u2".into(),
+                password: "p2".into(),
+                host: "127.0.0.1".into(),
+                port: 1,
+            };
+            let saved = h.app.apply_creds(creds, "u2:p2@127.0.0.1:1");
+            std::env::remove_var("BONGO_INI");
+            assert!(saved.is_ok());
+        }
+        assert!(!finish_news_fetch(&portal, &mut h).await);
+        assert!(!h.app.news_fetching);
+    }
+
+    #[tokio::test]
+    async fn a_news_list_that_lands_under_the_settings_overlay_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (portal, _catalog, mut h) = news_app(dir.path());
+        h.press(&[Key::N]);
+        wait_until("the fetch", || portal.epg_fetches() == 1).await;
+        h.press(&[Key::O]);
+        assert!(h.app.settings_ui.is_some());
+        assert!(!finish_news_fetch(&portal, &mut h).await);
+        assert!(h.app.settings_ui.is_some(), "the overlay stays up");
     }
 }

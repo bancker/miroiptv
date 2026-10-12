@@ -23,6 +23,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 
 ## News
 - [ ] `n` → a "Laatste nieuws" list of recent bulletins opens (channels and title patterns come from the news rules, see "News rules"); arrows choose, Enter plays one (catch-up; a 24 h news channel plays live), Esc closes
+- [ ] Hold `n`: one list comes up and the log shows one `news picker N items` line, not one per key repeat; a list still on its way when Lock, a portal save or the settings come first does not pop up
 
 ## Search
 - [ ] Press `f` → search box appears top-center
