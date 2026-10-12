@@ -225,6 +225,14 @@ texts! {
     GuideEpgFailed => ["gids ophalen mislukt", "guide fetch failed", "Programmabruf fehlgeschlagen"],
     GuideNoEpg => ["portal heeft geen gids voor deze zender", "the portal has no guide for this channel", "das Portal hat kein Programm für diesen Sender"],
     GuideFooter => ["typen = filter   /   pijlen = navigeren   /   PgUp/PgDn = sneller   /   Enter = afspelen   /   Esc of g = sluiten", "type = filter   /   arrows = navigate   /   PgUp/PgDn = faster   /   Enter = play   /   Esc or g = close", "tippen = Filter   /   Pfeile = navigieren   /   PgUp/PgDn = schneller   /   Enter = abspielen   /   Esc oder g = schließen"],
+    // The guide of 0.6.0 (part 2)
+    GuideNow => ["Nu & straks", "Now & next", "Jetzt & gleich"],
+    GuidePrime => ["Primetime", "Primetime", "Primetime"],
+    GuideFilterHint => ["zender of programma", "channel or programme", "Sender oder Sendung"],
+    GuideNoChannels => ["geen zenders met programma-informatie", "no channels with programme information", "keine Sender mit Programminformationen"],
+    GuideNothingFound => ["niets gevonden voor '{0}'", "nothing found for '{0}'", "nichts gefunden für '{0}'"],
+    GuideLiveBadge => ["LIVE", "LIVE", "LIVE"],
+    GuideKeysFooter => ["pijlen = navigeren   /   PgUp/PgDn = andere zenders   /   Enter = afspelen   /   n / p = nu / primetime   /   d = datum   /   f = filter   /   Esc of g = sluiten", "arrows = navigate   /   PgUp/PgDn = other channels   /   Enter = play   /   n / p = now / primetime   /   d = date   /   f = filter   /   Esc or g = close", "Pfeile = navigieren   /   PgUp/PgDn = andere Sender   /   Enter = abspielen   /   n / p = jetzt / Primetime   /   d = Datum   /   f = Filter   /   Esc oder g = schließen"],
     // Days in the guide
     DayYesterday => ["Gisteren", "Yesterday", "Gestern"],
     DayToday => ["Vandaag", "Today", "Heute"],

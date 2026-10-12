@@ -2,6 +2,7 @@ use crate::args::{credentials_line, parse_xtream_creds, CredsError, XtreamCreds}
 use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, quality_rank, zap_position, CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::{Entry as FavoriteEntry, Favorites};
+use crate::guide_ui::{channel_accent_color, channel_badge_label};
 use crate::i18n::{Lang, T};
 use crate::news::NewsRule;
 use crate::pin::{PinGate, PinHash};
@@ -320,72 +321,6 @@ enum ChannelMode {
     Live,
     /// Only tv_archive=1 - the catch-up archive channels.
     Catchup,
-}
-
-/// Pick a recognisable accent color for a channel based on common Dutch
-/// pattern matches. Purely visual - lets the user spot a channel category
-/// at a glance without us shipping logos. Falls back to neutral grey.
-fn channel_accent_color(name: &str) -> Color32 {
-    let n = name.to_uppercase();
-    if n.contains("NPO 1") || n.contains("NPO1") {
-        Color32::from_rgb(245, 130, 32)
-    } else if n.contains("NPO 2") || n.contains("NPO2") {
-        Color32::from_rgb(40, 165, 220)
-    } else if n.contains("NPO 3") || n.contains("NPO3") {
-        Color32::from_rgb(120, 200, 70)
-    } else if n.contains("NPO") {
-        Color32::from_rgb(220, 110, 30)
-    } else if n.contains("RTL 4") || n.contains("RTL4") {
-        Color32::from_rgb(220, 30, 30)
-    } else if n.contains("RTL 5") || n.contains("RTL5") {
-        Color32::from_rgb(180, 50, 50)
-    } else if n.contains("RTL Z") || n.contains("RTLZ") {
-        Color32::from_rgb(160, 30, 30)
-    } else if n.contains("RTL") {
-        Color32::from_rgb(200, 40, 40)
-    } else if n.contains("SBS") {
-        Color32::from_rgb(255, 160, 0)
-    } else if n.contains("NET 5") || n.contains("NET5") {
-        Color32::from_rgb(180, 90, 180)
-    } else if n.contains("VERONICA") {
-        Color32::from_rgb(200, 50, 100)
-    } else if n.contains("SPORT") || n.contains("ESPN") || n.contains("ZIGGO SPORT") || n.contains("FOX SPORTS") {
-        Color32::from_rgb(50, 170, 90)
-    } else if n.contains("DISCOVERY") || n.contains("NATIONAL GEOGRAPHIC") || n.contains("HISTORY") || n.contains("ANIMAL PLANET") {
-        Color32::from_rgb(40, 140, 140)
-    } else if n.contains("FILM") || n.contains("CINEMA") || n.contains("MOVIE") {
-        Color32::from_rgb(140, 70, 200)
-    } else if n.contains("KIDS") || n.contains("DISNEY") || n.contains("NICKELODEON") || n.contains("CARTOON") {
-        Color32::from_rgb(230, 90, 160)
-    } else if n.contains("NIEUWS") || n.contains("NEWS") || n.contains("BNR") || n.contains("NOS") {
-        Color32::from_rgb(70, 130, 220)
-    } else {
-        Color32::from_rgb(110, 110, 120)
-    }
-}
-
-/// Extract a 1-3 character "badge" label from a channel name. For Dutch
-/// patterns we prefer the channel number ("NPO 1" -> "1", "RTL 4" -> "4");
-/// for others we fall back to the first letter.
-fn channel_badge_label(name: &str) -> String {
-    let up = name.to_uppercase();
-    for prefix in ["NPO ", "NPO", "RTL ", "RTL", "SBS ", "SBS", "NET ", "NET"] {
-        if let Some(idx) = up.find(prefix) {
-            let rest = &up[idx + prefix.len()..];
-            let digits: String = rest
-                .chars()
-                .skip_while(|c| !c.is_ascii_digit() && *c != 'Z')
-                .take_while(|c| c.is_ascii_digit() || *c == 'Z')
-                .collect();
-            if !digits.is_empty() {
-                return digits;
-            }
-        }
-    }
-    name.chars()
-        .find(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "?".into())
 }
 
 /// NLZIET-style column EPG guide opened with `g`.
