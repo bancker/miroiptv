@@ -51,6 +51,21 @@ where
     })
 }
 
+/// Tolerant optional string: a JSON string gives `Some`; null, a missing field
+/// or anything else (`false`, a number) gives `None`. Portals type fields
+/// loosely (see `deser_flag`), and one odd value must not fail the whole list.
+fn deser_opt_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let v = Option::<serde_json::Value>::deserialize(d).unwrap_or(None);
+    Ok(match v {
+        Some(serde_json::Value::String(s)) => Some(s),
+        _ => None,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveChannel {
     #[serde(deserialize_with = "deser_id")]
@@ -76,8 +91,9 @@ pub struct LiveChannel {
     /// content (see `catalog::adult_live`).
     #[serde(default, deserialize_with = "deser_flag")]
     pub is_adult: bool,
-    /// The channel's logo URL, if the portal has one (often empty).
-    #[serde(default)]
+    /// The channel's logo URL, if the portal has one (often empty). Only the
+    /// guide's list keeps logos (`GuideChannel::logo`); the stored list drops them.
+    #[serde(default, deserialize_with = "deser_opt_string")]
     pub stream_icon: Option<String>,
 }
 

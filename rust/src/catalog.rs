@@ -142,7 +142,7 @@ struct StoredCatalog {
 impl StoredCatalog {
     /// The one way a catalog gets stored: the fetch and `from_catalog` both come
     /// through here, so what is worked out cannot differ between them.
-    fn new(catalog: PortalCatalog) -> Self {
+    fn new(mut catalog: PortalCatalog) -> Self {
         let adult_live_ids = catalog
             .live
             .iter()
@@ -150,6 +150,10 @@ impl StoredCatalog {
             .map(|c| c.stream_id)
             .collect();
         let guide = guide_channels_of(&catalog.live);
+        // Only GuideChannel::logo keeps logos: ~13,000 stored URLs cost memory and a clone each.
+        for c in &mut catalog.live {
+            c.stream_icon = None;
+        }
         Self {
             catalog,
             adult_live_ids,

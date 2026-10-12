@@ -184,6 +184,23 @@ fn reads_the_adult_flag_in_every_form_the_portal_uses() {
 }
 
 #[test]
+fn a_logo_field_that_is_no_string_is_none_not_a_failed_catalog() {
+    use bongo_player::portal::LiveChannel;
+    let live: Vec<LiveChannel> = serde_json::from_str(
+        r#"[
+            {"stream_id": 1, "name": "A", "stream_icon": false},
+            {"stream_id": 2, "name": "B", "stream_icon": 7},
+            {"stream_id": 3, "name": "C", "stream_icon": null},
+            {"stream_id": 4, "name": "D"},
+            {"stream_id": 5, "name": "E", "stream_icon": "http://x/e.png"}
+        ]"#,
+    )
+    .unwrap();
+    let logos: Vec<Option<&str>> = live.iter().map(|c| c.stream_icon.as_deref()).collect();
+    assert_eq!(logos, [None, None, None, None, Some("http://x/e.png")]);
+}
+
+#[test]
 fn stream_ref_reads_kind_and_id_from_portal_urls() {
     use bongo_player::portal::xtream::{stream_ref, StreamKind};
     assert_eq!(stream_ref("http://h:8080/live/u/p/42.m3u8"), Some((StreamKind::Live, 42)));

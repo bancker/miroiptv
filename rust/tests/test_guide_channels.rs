@@ -116,6 +116,25 @@ fn the_logo_comes_from_the_live_variant_else_the_catch_up_one() {
 }
 
 #[test]
+fn the_stored_list_keeps_no_logos() {
+    let catalog = store(vec![
+        with_icon(ch(501, "NL | NPO 1", 0), "http://logos/live.png"),
+        with_icon(ch(601, "NL | NPO1 HD", 1), "http://logos/tk.png"),
+    ]);
+    let live = catalog.live_channels();
+    assert_eq!(live.len(), 2);
+    assert!(live.iter().all(|c| c.stream_icon.is_none()), "{live:?}");
+    let zap = catalog.zap_channels();
+    assert_eq!(zap.len(), 1);
+    assert!(zap.iter().all(|c| c.stream_icon.is_none()), "{zap:?}");
+    assert_eq!(
+        catalog.guide_channels()[0].logo.as_deref(),
+        Some("http://logos/live.png"),
+        "the guide's own list still has the logo"
+    );
+}
+
+#[test]
 fn the_catalog_leaves_adult_columns_out_while_locked() {
     let catalog = store(vec![
         ch(501, "NL | NPO 1", 0),
@@ -133,6 +152,34 @@ fn the_catalog_leaves_adult_columns_out_while_locked() {
     catalog.set_adult_unlocked(true);
     assert_eq!(ids(&catalog), [601, 911]);
     assert!(catalog.guide_channels()[1].adult);
+}
+
+/// `live` holds the variants of one channel: its column is adult, left out of
+/// the catalog's list while locked and there once unlocked.
+fn assert_one_adult_column(live: Vec<LiveChannel>) {
+    let g = guide_channels_of(&live);
+    assert_eq!(g.len(), 1);
+    assert!(g[0].adult);
+    let catalog = store(live);
+    assert!(catalog.guide_channels().is_empty(), "locked: left out");
+    catalog.set_adult_unlocked(true);
+    assert_eq!(catalog.guide_channels().len(), 1, "unlocked: there");
+}
+
+#[test]
+fn a_column_is_adult_when_only_its_live_variant_is_flagged() {
+    assert_one_adult_column(vec![
+        adult(ch(901, "24/7 | ADULT B", 0)),
+        ch(911, "24/7 | ADULT B HD", 1),
+    ]);
+}
+
+#[test]
+fn a_column_is_adult_when_only_its_catch_up_variant_is_flagged() {
+    assert_one_adult_column(vec![
+        ch(901, "24/7 | ADULT B", 0),
+        adult(ch(911, "24/7 | ADULT B HD", 1)),
+    ]);
 }
 
 #[test]
