@@ -95,12 +95,21 @@ pub struct GuideView {
     selected: usize,
     /// Per catch-up id: the programme the cursor is on (an index into its EPG).
     cursor: HashMap<i64, usize>,
+    /// Per catch-up id: when that programme starts. A new copy of the EPG moves
+    /// the indexes; the start finds the programme again.
+    cursor_at: HashMap<i64, DateTime<Utc>>,
     /// Per catch-up id: the entry in the top row, fractional while the wheel
     /// turns; before the day's first programme the rows stay empty.
     top: HashMap<i64, f32>,
-    /// Columns lined up since the last `realign`; the others line up as soon
-    /// as they show with programmes on the day.
-    aligned: HashSet<i64>,
+    /// Per catch-up id: when the copy of its EPG was fetched that `cursor` and
+    /// `top` were worked out on. A column without an entry lines up as soon as
+    /// it shows with programmes on the day (after `realign`, or when its EPG
+    /// comes late); one whose entry is not the store's copy any more has to
+    /// line up again, or keep its place (see `moved`).
+    aligned: HashMap<i64, DateTime<Utc>>,
+    /// Columns the user moved or scrolled in since they were lined up: on a new
+    /// copy of their EPG they keep their programme instead of lining up again.
+    moved: HashSet<i64>,
     filter: String,
     filtered: Option<(FilterKey, FilterResult)>,
     /// The date list while it is open: the day it highlights.
@@ -118,8 +127,10 @@ impl GuideView {
             page_start: 0,
             selected: 0,
             cursor: HashMap::new(),
+            cursor_at: HashMap::new(),
             top: HashMap::new(),
-            aligned: HashSet::new(),
+            aligned: HashMap::new(),
+            moved: HashSet::new(),
             filter: String::new(),
             filtered: None,
             date_pick: None,
@@ -156,6 +167,7 @@ impl GuideView {
     /// Every column lines up again as soon as it shows with programmes.
     pub fn realign(&mut self) {
         self.aligned.clear();
+        self.moved.clear();
     }
 
     /// `n`, or a click on "Nu & straks": today, lined up on now.
@@ -258,10 +270,14 @@ impl GuideView {
         self.filtered.as_ref().map(|(_, result)| result)
     }
 
-    /// Lines up every column of the page that has programmes on the day and
-    /// was not lined up since the last `realign`: its cursor goes to the target
-    /// (now, 19:00, or the filter's next match) and that row to the now-line. A
-    /// column whose EPG comes later lines up when it comes.
+    /// Lines up every column of the page that has programmes on the day and is
+    /// not lined up on the copy of its EPG the store holds: its cursor goes to
+    /// the target (now, 19:00, or the filter's next match) and that row to the
+    /// now-line. Those are the columns not lined up since the last `realign`,
+    /// the ones whose EPG comes late, and the ones whose EPG a newer copy
+    /// replaced, because the old copy's indexes mean nothing in the new one. A
+    /// column the user moved in is the exception to the last: it keeps its
+    /// programme, on the same row of the screen.
     pub fn align(&mut self, page: &Page, matches: Option<&HashMap<i64, Vec<usize>>>) {
         let t = self.target_time(page.now);
         for col in 0..page.cols {
@@ -269,23 +285,116 @@ impl GuideView {
                 break;
             };
             let id = ch.archive_id;
-            if self.aligned.contains(&id) {
-                continue;
-            }
             let Some(epg) = page.store.get(id) else {
                 continue;
             };
-            let entries = epg.entries();
-            let target = match matches.and_then(|m| m.get(&id)) {
-                Some(hits) => time::match_target(entries, hits, t),
-                None => time::target_index(entries, self.day_range(entries), t),
-            };
-            let Some(target) = target else {
+            let seen = self.aligned.get(&id).copied();
+            if seen == Some(epg.fetched_at) {
                 continue;
-            };
-            self.cursor.insert(id, target);
-            self.top.insert(id, target as f32 - page.line() as f32);
-            self.aligned.insert(id);
+            }
+            let entries = epg.entries();
+            let range = self.day_range(entries);
+            let kept = seen.is_some()
+                && self.moved.contains(&id)
+                && self.keep_place(id, entries, &range, page);
+            if !kept {
+                let target = match matches.and_then(|m| m.get(&id)) {
+                    Some(hits) => time::match_target(entries, hits, t),
+                    None => time::target_index(entries, range, t),
+                };
+                if !self.line_up(id, entries, target, page.line()) {
+                    // The new copy has no programme on the day to stand on.
+                    if seen.is_some() {
+                        self.forget(id);
+                    }
+                    continue;
+                }
+            }
+            self.aligned.insert(id, epg.fetched_at);
+        }
+    }
+
+    /// Puts column `id` on `target`, an index into `entries`, and that row on
+    /// the now-line (`line` rows from the top). False, and nothing changed,
+    /// when there is no such programme.
+    fn line_up(
+        &mut self,
+        id: i64,
+        entries: &[EpgEntry],
+        target: Option<usize>,
+        line: usize,
+    ) -> bool {
+        let Some(target) = target else {
+            return false;
+        };
+        if !self.set_cursor(id, entries, target) {
+            return false;
+        }
+        self.top.insert(id, target as f32 - line as f32);
+        self.moved.remove(&id);
+        true
+    }
+
+    /// A newer copy of the EPG of a column the user moved in: the cursor goes
+    /// to the programme running at the start it was on, else the first one
+    /// after it, and the column scrolls by as many rows as the cursor moved, so
+    /// the cursor stays on the same row of the screen. False when the new copy
+    /// has nothing on the day to keep a place in.
+    fn keep_place(
+        &mut self,
+        id: i64,
+        entries: &[EpgEntry],
+        range: &Range<usize>,
+        page: &Page,
+    ) -> bool {
+        let (Some(&old), Some(&at), Some(&top)) = (
+            self.cursor.get(&id),
+            self.cursor_at.get(&id),
+            self.top.get(&id),
+        ) else {
+            return false;
+        };
+        if range.is_empty() {
+            return false;
+        }
+        let new = entries
+            .partition_point(|e| e.end <= at)
+            .clamp(range.start, range.end - 1);
+        if !self.set_cursor(id, entries, new) {
+            return false;
+        }
+        let top = top + (new as f32 - old as f32);
+        self.top.insert(id, clamp_top(top, range, page));
+        true
+    }
+
+    /// Drops what a column kept for a copy of its EPG that is gone.
+    fn forget(&mut self, id: i64) {
+        self.cursor.remove(&id);
+        self.cursor_at.remove(&id);
+        self.top.remove(&id);
+        self.aligned.remove(&id);
+        self.moved.remove(&id);
+    }
+
+    /// Puts the cursor of column `id` on programme `i` of `entries` and
+    /// remembers when it starts. False, and nothing changed, when `entries` has
+    /// no programme `i` (a list of matches worked out on an older copy).
+    fn set_cursor(&mut self, id: i64, entries: &[EpgEntry], i: usize) -> bool {
+        let Some(entry) = entries.get(i) else {
+            return false;
+        };
+        self.cursor.insert(id, i);
+        self.cursor_at.insert(id, entry.start);
+        true
+    }
+
+    /// The user put the cursor on programme `i` of `entries`: a key (see
+    /// `move_row`) or a click on it. The column counts as moved in, so a newer
+    /// copy of its EPG keeps the programme instead of lining the column up.
+    fn put_cursor(&mut self, id: i64, entries: &[EpgEntry], i: usize) {
+        if self.set_cursor(id, entries, i) {
+            self.moved.insert(id);
         }
     }
 
@@ -334,7 +443,8 @@ impl GuideView {
         let Some(epg) = page.store.get(id) else {
             return;
         };
-        let range = self.day_range(epg.entries());
+        let entries = epg.entries();
+        let range = self.day_range(entries);
         if range.is_empty() {
             return;
         }
@@ -351,7 +461,7 @@ impl GuideView {
             RowStep::First => range.start,
             RowStep::Last => last,
         };
-        self.cursor.insert(id, next);
+        self.put_cursor(id, entries, next);
         let rows = page.rows.max(1) as f32;
         let top = self.top_of(id, &range, page);
         let wanted = if (next as f32) < top {
@@ -379,6 +489,7 @@ impl GuideView {
         }
         let top = self.top_of(id, &range, page) + rows;
         self.top.insert(id, clamp_top(top, &range, page));
+        self.moved.insert(id);
     }
 
     /// A column's top row: as kept, else the day's first programme on the
@@ -480,6 +591,17 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    /// `hourly` as a later fetch gives it: the first six programmes are over
+    /// and gone from the portal's listing, so every index moves by six.
+    fn without_first_six() -> Epg {
+        Epg::new(hourly().entries()[6..].to_vec())
+    }
+
+    /// That listing as a copy fetched five minutes after the fixture's.
+    fn later_copy() -> ChannelEpg {
+        ChannelEpg::new(without_first_six(), now() + Duration::minutes(5))
     }
 
     struct Fixture {
@@ -818,5 +940,245 @@ mod tests {
         assert_eq!(v.day_range(entries), c, "past midnight");
         v.opened(today);
         assert_eq!(v.day_range(entries), b, "the guide opens");
+    }
+
+    #[test]
+    fn a_new_copy_of_a_columns_epg_lines_it_up_again() {
+        let mut f = Fixture::new(1, &[]);
+        let mut v = GuideView::new(time::day_of(now()));
+        v.align(&f.page(), None);
+        assert_eq!(v.cursor[&601], f.live(601));
+        // A fetch lands: the first six programmes are gone, every index moves.
+        f.store.insert(601, later_copy());
+        let page = f.page();
+        v.align(&page, None);
+        let live = f.live(601);
+        assert_eq!(v.cursor[&601], live, "the live row of the new copy");
+        assert_eq!(
+            v.top[&601],
+            live as f32 - page.line() as f32,
+            "on the now-line"
+        );
+    }
+
+    #[test]
+    fn a_column_the_user_moved_in_keeps_its_programme_on_a_new_copy() {
+        let mut f = Fixture::new(1, &[]);
+        let mut v = GuideView::new(time::day_of(now()));
+        v.align(&f.page(), None);
+        v.move_row(&f.page(), RowStep::Down);
+        v.move_row(&f.page(), RowStep::Down);
+        let old = v.cursor[&601];
+        let title = f.store.get(601).unwrap().entries()[old].title.clone();
+        let row = old as f32 - v.top[&601];
+        f.store.insert(601, later_copy());
+        v.align(&f.page(), None);
+        let entries = f.store.get(601).unwrap().entries();
+        assert_eq!(entries[v.cursor[&601]].title, title, "the same programme");
+        assert_eq!(v.cursor[&601], old - 6, "six programmes fewer before it");
+        assert_eq!(
+            v.cursor[&601] as f32 - v.top[&601],
+            row,
+            "on the same row of the screen"
+        );
+        assert_ne!(v.cursor[&601], f.live(601), "not lined up on now again");
+    }
+
+    #[test]
+    fn a_scrolled_column_keeps_its_place_and_another_columns_copy_leaves_it_alone() {
+        let mut f = Fixture::new(2, &[]);
+        let mut v = GuideView::new(time::day_of(now()));
+        v.align(&f.page(), None);
+        v.scroll(&f.page(), 0, -2.0);
+        let (cursor, top) = (v.cursor[&601], v.top[&601]);
+        // 602 gets a newer copy, 601 still has the one it was lined up on.
+        f.store.insert(602, later_copy());
+        v.align(&f.page(), None);
+        assert_eq!(
+            (v.cursor[&601], v.top[&601]),
+            (cursor, top),
+            "the other column's copy does not touch this one"
+        );
+        assert_eq!(
+            v.cursor[&602],
+            f.live(602),
+            "602, not moved in, lines up again"
+        );
+        // Now 601 gets one: the wheel moved it in, so the same programmes
+        // stay on the same rows.
+        f.store.insert(601, later_copy());
+        v.align(&f.page(), None);
+        assert_eq!(v.cursor[&601], cursor - 6);
+        assert_eq!(v.top[&601], top - 6.0);
+    }
+
+    #[test]
+    fn a_shorter_or_empty_new_copy_leaves_no_stale_index_behind() {
+        let mut f = Fixture::new(1, &[]);
+        let mut v = GuideView::new(time::day_of(now()));
+        v.align(&f.page(), None);
+        v.move_row(&f.page(), RowStep::Last);
+        let at = now() + Duration::minutes(5);
+        // A copy that ends long before the programme the cursor was on.
+        let short = hourly().entries()[30..40].to_vec();
+        f.store.insert(601, ChannelEpg::new(Epg::new(short), at));
+        v.align(&f.page(), None);
+        let entries = f.store.get(601).unwrap().entries();
+        let range = v.day_range(entries);
+        assert!(range.end <= entries.len());
+        assert_eq!(
+            v.cursor[&601],
+            range.end - 1,
+            "the last programme of the day the new copy has"
+        );
+        // A copy without programmes: nothing of the old one is kept.
+        let empty = ChannelEpg::new(Epg::new(Vec::new()), at + Duration::minutes(5));
+        f.store.insert(601, empty);
+        v.align(&f.page(), None);
+        assert!(!v.cursor.contains_key(&601) && !v.top.contains_key(&601));
+        assert_eq!(v.play_selected(&f.page()), None);
+        v.move_row(&f.page(), RowStep::Down);
+        // The programmes come back: the column lines up as on a first copy.
+        let back = ChannelEpg::new(hourly(), at + Duration::minutes(10));
+        f.store.insert(601, back);
+        v.align(&f.page(), None);
+        assert_eq!(v.cursor[&601], f.live(601));
+    }
+
+    #[test]
+    fn a_new_copy_without_the_programme_the_cursor_was_on_moves_it_to_the_next_one_of_the_day() {
+        let mut f = Fixture::new(1, &[]);
+        let mut v = GuideView::new(time::day_of(now()));
+        v.align(&f.page(), None);
+        v.move_row(&f.page(), RowStep::Down);
+        v.move_row(&f.page(), RowStep::Down);
+        // A copy fetched `minutes` after the fixture's: the first six
+        // programmes are gone, and so are those named in `gone`.
+        let without = |gone: &[&str], minutes: i64| {
+            let kept = without_first_six()
+                .entries()
+                .iter()
+                .filter(|e| !gone.contains(&e.title.as_str()))
+                .cloned()
+                .collect();
+            ChannelEpg::new(Epg::new(kept), now() + Duration::minutes(minutes))
+        };
+        let title = |f: &Fixture, v: &GuideView| {
+            f.store.get(601).unwrap().entries()[v.cursor[&601]]
+                .title
+                .clone()
+        };
+        assert_eq!(title(&f, &v), "P2");
+        f.store.insert(601, without(&["P2"], 5));
+        v.align(&f.page(), None);
+        assert_eq!(title(&f, &v), "P3", "the first one after it");
+        // On the day's last programme the first one after it is tomorrow's:
+        // the cursor stays on the day.
+        v.move_row(&f.page(), RowStep::Last);
+        let last = title(&f, &v);
+        f.store.insert(601, without(&["P2", last.as_str()], 10));
+        v.align(&f.page(), None);
+        let entries = f.store.get(601).unwrap().entries();
+        let range = v.day_range(entries);
+        assert_eq!(
+            v.cursor[&601],
+            range.end - 1,
+            "the last programme of the day that is left"
+        );
+        assert_ne!(entries[v.cursor[&601]].title, last);
+    }
+
+    #[test]
+    fn a_match_list_from_an_older_copy_cannot_put_the_cursor_outside_the_listing() {
+        let f = Fixture::new(1, &[]);
+        let page = f.page();
+        let mut v = GuideView::new(page.today);
+        // Matches worked out on a longer copy: programme 500 is not there.
+        let mut matches = HashMap::new();
+        matches.insert(601, vec![500]);
+        v.align(&page, Some(&matches));
+        assert!(
+            !v.cursor.contains_key(&601),
+            "no such programme: nothing to stand on"
+        );
+        v.align(&page, None);
+        assert_eq!(
+            v.cursor[&601],
+            f.live(601),
+            "lined up once it is asked right"
+        );
+    }
+
+    #[test]
+    fn the_filter_result_is_worked_out_again_when_any_part_of_its_key_changes() {
+        let mut f = Fixture::new(3, &[]);
+        let today = time::day_of(now());
+        let mut v = GuideView::new(today);
+        v.filter = "special".into();
+        v.refresh_filter(&f.channels, &f.store, 1);
+        assert!(v.filtered().unwrap().channels.is_empty());
+        // The store: 602 gets a newer copy with "Special" on now.
+        let mut entries = hourly().entries().to_vec();
+        entries[36].title = "Special".into();
+        let copy = ChannelEpg::new(Epg::new(entries), now() + Duration::minutes(5));
+        f.store.insert(602, copy);
+        v.refresh_filter(&f.channels, &f.store, 1);
+        let found = v.filtered().unwrap();
+        assert_eq!(found.channels, [1], "the store changed");
+        assert_eq!(found.matches[&602], [36]);
+        // The text.
+        v.filter = "zender 601".into();
+        v.refresh_filter(&f.channels, &f.store, 1);
+        assert_eq!(v.filtered().unwrap().channels, [0], "the text changed");
+        // The day: "Special" is on today, not on yesterday.
+        v.filter = "special".into();
+        v.refresh_filter(&f.channels, &f.store, 1);
+        assert_eq!(v.filtered().unwrap().channels, [1]);
+        v.pick_day(today.pred_opt().unwrap());
+        v.refresh_filter(&f.channels, &f.store, 1);
+        assert!(v.filtered().unwrap().channels.is_empty(), "the day changed");
+        // The channel list: its revision moves when it changes.
+        v.filter = "zender".into();
+        v.refresh_filter(&f.channels, &f.store, 1);
+        assert_eq!(v.filtered().unwrap().channels, [0, 1, 2]);
+        v.refresh_filter(&f.channels[..2], &f.store, 2);
+        assert_eq!(
+            v.filtered().unwrap().channels,
+            [0, 1],
+            "the channels changed"
+        );
+    }
+
+    #[test]
+    fn play_trusts_a_zero_for_has_archive_only_for_a_programme_over_at_the_fetch() {
+        let mut f = Fixture::new(1, &[601]);
+        let at = |hours: i64| now() + Duration::hours(hours);
+        let entry = |title: &str, from: i64, to: i64, has_archive: Option<bool>| EpgEntry {
+            title: title.into(),
+            start: at(from),
+            end: at(to),
+            has_archive,
+        };
+        // The portal says 1 for the first, 0 for the others. The copy was
+        // fetched three hours ago: the third was still running then.
+        let epg = Epg::new(vec![
+            entry("Kept", -6, -5, Some(true)),
+            entry("Gone", -5, -4, Some(false)),
+            entry("Running at the fetch", -4, -1, Some(false)),
+        ]);
+        f.store.insert(601, ChannelEpg::new(epg, at(-3)));
+        let page = f.page();
+        let v = GuideView::new(page.today);
+        let playable = |i: usize| match v.play(&page, &f.channels[0], i) {
+            Some(GuideAction::Play { playable, .. }) => playable,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(playable(0), Playable::Replay);
+        assert_eq!(playable(1), Playable::Unavailable, "a 0 over at the fetch");
+        assert_eq!(
+            playable(2),
+            Playable::Replay,
+            "a 0 for a programme that was still running says nothing"
+        );
     }
 }
