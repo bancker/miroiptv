@@ -70,7 +70,14 @@ impl XtreamPortal {
     }
 
     async fn parse_epg(&self, url: &str) -> Result<Epg, PortalError> {
-        let txt = self.client.get(url).send().await?.text().await?;
+        let resp = self.client.get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // A busy portal (503, 509) answers with an error page. That is not
+            // "no programmes": whoever asked must know it failed.
+            return Err(PortalError::Status(status.as_u16()));
+        }
+        let txt = resp.text().await?;
         Ok(parse_epg_body(&txt))
     }
 }
