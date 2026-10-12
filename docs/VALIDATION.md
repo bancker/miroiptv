@@ -22,8 +22,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] Tap arrow down 3× quickly → tunes once, to the third channel
 
 ## News
-- [ ] `n` → tunes to an NPO channel
-- [ ] `r` → tunes to an RTL channel
+- [ ] `n` → a "Laatste nieuws" list of recent bulletins opens (channels and title patterns come from the news rules, see "News rules"); arrows choose, Enter plays one (catch-up; a 24 h news channel plays live), Esc closes
 
 ## Search
 - [ ] Press `f` → search box appears top-center
@@ -32,6 +31,32 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] Arrow down / up → moves the highlighted result; Enter plays the highlighted one (film or channel)
 - [ ] After the arrows, keep typing → the letters land at the end of the query
 - [ ] Esc dismisses search
+
+## Settings (o) and language
+- [ ] First start (no `settings.json`): a language screen in three languages, the Windows language preselected; Enter picks it and the last channel then plays
+- [ ] `o` opens the settings; Up/Down choose a section, Enter opens it, Esc goes back; Esc or `o` in the list closes
+- [ ] Switch the language: every text changes at once (help, toasts, guide, settings)
+- [ ] Portal: Test with a wrong password → "Gebruiker of wachtwoord onjuist"; Save with the right one → "Verbonden: N zenders", or just "Verbonden" when the channel list is slow to arrive; `BongoPlayer.ini` then holds the line `portal=<user>:<password>@<server>:<port>`
+- [ ] Controls: reverse zapping → arrow up and wheel up go to the next channel; the help shows it
+- [ ] `?` opens the help; its `o` row is underlined and a click on it opens the settings; in a small window the help scrolls with the wheel, a thin marker shows the position, and Tab stops only on the `o` row
+
+## Adult content
+- [ ] Locked (after every start): zapping, search, guide, favorites and presets show no adult channels or films
+- [ ] Unlock: the first time asks to choose a PIN (twice); later it asks for the PIN; then adult content is visible until the app closes
+- [ ] 3 wrong PINs → wait 30 s
+- [ ] Lock while adult content plays → playback stops, the picture goes black, "Vergrendeld"
+- [ ] Close the app while adult content plays → the next start does not resume it
+- [ ] Forgot PIN: the portal password clears it
+- [ ] Saving another portal (Settings → Portal) while adult content plays stops playback
+- [ ] In the PIN dialogs Enter moves to the next field and Esc cancels the open dialog first
+- [ ] After 3 wrong PINs and Forgot PIN the 30 s wait is gone (a new PIN can be chosen at once)
+- [ ] A bare adult stream URL on the command line (`BongoPlayer.exe <url>`) → the next plain start does not resume it
+
+## News rules
+- [ ] Settings → News lists the 7 default rules, each with "gevonden: …"
+- [ ] Change a pattern; N follows the new rule; "Standaard herstellen" brings the defaults back
+- [ ] With many rules the list scrolls and Tab brings each rule into view
+- [ ] Removing a rule with the mouse leaves the keyboard where it was (typing afterwards edits no rule)
 
 ## EPG
 - [ ] After tuning, press `e` → current programme strip appears bottom
