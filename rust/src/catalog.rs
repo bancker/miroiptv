@@ -4,7 +4,7 @@ use crate::portal::{Catalog as PortalCatalog, LiveChannel, Movie, Portal, Series
 use crate::search::{rank, ItemKind, SearchItem};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -593,6 +593,15 @@ pub struct CatalogStore {
     status: Arc<RwLock<CatalogStatus>>,
     /// Adult content shows only after the PIN unlocked it; never persisted.
     adult_unlocked: AtomicBool,
+    /// How many times `inner` was replaced (see [`CatalogStore::revision`]).
+    revision: Arc<AtomicU64>,
+}
+
+/// Puts a catalog in its slot and counts it. The count moves after the catalog
+/// is in, so whoever sees the new count finds the new catalog.
+fn put_catalog(slot: &RwLock<Option<StoredCatalog>>, revision: &AtomicU64, stored: StoredCatalog) {
+    *slot.write() = Some(stored);
+    revision.fetch_add(1, Ordering::Release);
 }
 
 impl CatalogStore {
@@ -602,15 +611,26 @@ impl CatalogStore {
             portal,
             status: Arc::new(RwLock::new(CatalogStatus::Idle)),
             adult_unlocked: AtomicBool::new(false),
+            revision: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// A store with a catalog already loaded (tests, tools).
     pub fn from_catalog(portal: Arc<dyn Portal>, catalog: PortalCatalog) -> Self {
         let store = Self::new(portal);
-        *store.inner.write() = Some(StoredCatalog::new(catalog));
+        put_catalog(&store.inner, &store.revision, StoredCatalog::new(catalog));
         *store.status.write() = CatalogStatus::Loaded;
         store
+    }
+
+    /// How many catalogs this store has held: 0 until the first loads, then one
+    /// more with every load, re-fetch and `from_catalog`. F5 replaces the catalog
+    /// in place and `is_loaded` stays true, so whatever the app works out from
+    /// the catalog (the guide's columns) compares this per frame, an atomic
+    /// load. Read it before the catalog itself: one that lands in between is
+    /// then noticed next time, not missed.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
     }
 
     pub fn set_adult_unlocked(&self, on: bool) {
@@ -661,6 +681,7 @@ impl CatalogStore {
     /// Safe to call repeatedly: subsequent calls trigger a re-fetch.
     pub fn spawn_fetch(self: &Arc<Self>) {
         let inner = self.inner.clone();
+        let revision = self.revision.clone();
         let portal = self.portal.clone();
         let status = self.status.clone();
         *status.write() = CatalogStatus::Connecting;
@@ -695,7 +716,7 @@ impl CatalogStore {
                     }
                     // Worked out before the lock is taken: readers never wait for it.
                     let stored = StoredCatalog::new(c);
-                    *inner.write() = Some(stored);
+                    put_catalog(&inner, &revision, stored);
                     *status.write() = CatalogStatus::Loaded;
                 }
                 Err(e) => {
@@ -828,7 +849,7 @@ impl CatalogStore {
         })
     }
 
-    /// Reverse of live_id_by_name. Used by the guide / zap-toast EPG fetch
+    /// Reverse of live_id_by_name. Used by the zap toast's EPG fetch
     /// path: some Xtream portals (hnlol et al.) only populate EPG against
     /// the tv_archive=1 stream_ids - the live variants return empty even
     /// though they share a programme schedule with their archive twin.

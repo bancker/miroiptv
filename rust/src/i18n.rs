@@ -193,7 +193,7 @@ texts! {
     HelpGuideFilter => ["filter: zender of programma", "filter: channel or programme", "Filter: Sender oder Sendung"],
     HelpGuideRows => ["programma kiezen in de kolom", "programme cursor in the column", "Sendung in der Spalte wählen"],
     HelpGuideColumns => ["andere kolom", "switch column", "Spalte wechseln"],
-    HelpGuidePages => ["vorige / volgende pagina zenders", "previous / next page of channels", "vorige / nächste Seite Sender"],
+    HelpGuidePages => ["vorige / volgende pagina zenders", "previous / next page of channels", "vorherige / nächste Seite der Sender"],
     HelpGuideDate => ["datum kiezen", "choose the date", "Datum wählen"],
     HelpGuideEsc => ["filter wissen, anders gids sluiten", "clear the filter, else close the guide", "Filter löschen, sonst Programm schließen"],
     HelpGuideHomeEnd => ["eerste / laatste programma", "first / last programme", "erste / letzte Sendung"],

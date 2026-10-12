@@ -439,9 +439,9 @@ pub struct TvApp {
     guide_view: GuideView,
     /// The guide's columns, the catalog's channels with catch-up, as the
     /// catalog and the lock stood at `guide_channels_for` (catalog generation,
-    /// loaded, unlocked).
+    /// the catalog's revision, unlocked).
     guide_channels: Vec<GuideChannel>,
-    guide_channels_for: Option<(u64, bool, bool)>,
+    guide_channels_for: Option<(u64, u64, bool)>,
     /// Counts every new `guide_channels`: what the guide works out from the
     /// list is worked out again when it moves.
     guide_channels_revision: u64,
@@ -2883,12 +2883,14 @@ impl TvApp {
     // draws it and hands back what the user did.
     // ------------------------------------------------------------------
 
-    /// The guide's columns again when the catalog, its loading or the lock
-    /// changed; three comparisons otherwise.
+    /// The guide's columns again when the catalog (another portal's, or this
+    /// one's loaded or fetched again by F5) or the lock changed; three
+    /// comparisons otherwise. The key is read before the list: a catalog that
+    /// lands in between is noticed next frame.
     fn refresh_guide_channels(&mut self) {
         let key = (
             self.catalog_generation,
-            self.catalog.is_loaded(),
+            self.catalog.revision(),
             self.catalog.adult_unlocked(),
         );
         if self.guide_channels_for == Some(key) {
@@ -2933,6 +2935,12 @@ impl TvApp {
                     .insert(fetched.archive_id, ChannelEpg::new(epg, chrono::Utc::now()));
             }
         }
+        if self.guide_fetching {
+            self.start_epg_fetches(now);
+        }
+        // After the start, so a fetch that is followed by the next one does not
+        // count: this line marks the end of a round (or a rest after a failure),
+        // one for all the fetches of it.
         if any && self.epg_fetcher.in_flight().is_empty() {
             tracing::info!(
                 "guide: epg store {} channels, {} programmes",
@@ -2940,9 +2948,10 @@ impl TvApp {
                 self.epg_store.programmes()
             );
         }
-        if !self.guide_fetching {
-            return;
-        }
+    }
+
+    /// Starts EPG fetches while fewer run than the limit allows.
+    fn start_epg_fetches(&mut self, now: Instant) {
         let starting = self
             .stream_starting_since
             .is_some_and(|t| t.elapsed() < Duration::from_secs(10));
@@ -3794,6 +3803,10 @@ mod tests {
         );
         assert!(!h.app.guide_open, "the guide closes");
         assert_eq!(h.app.current_stream_id, Some(3));
+        // Live plays as live, never straight to mpv: through the relay, with the
+        // stall watchdog watching.
+        assert!(h.app.current_live);
+        assert!(h.app.stall_watchdog_armed);
     }
 
     #[tokio::test]
@@ -3801,14 +3814,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
         open_guide(&mut h, true);
+        // The programme before the one on now, as the EPG holds it, and the URL
+        // that plays it from its start for as long as it ran.
+        let picked = h
+            .app
+            .epg_store
+            .get(13)
+            .and_then(|c| c.entries().iter().find(|e| e.title == "Journaal -1"))
+            .cloned()
+            .expect("the programme before the one on now");
+        let minutes = (picked.end - picked.start).num_minutes().max(1) as u32;
+        let from_its_start = h
+            .app
+            .catalog
+            .portal()
+            .catchup_url(13, picked.start, minutes);
         h.sent();
         h.press(&[Key::ArrowUp, Key::Enter]);
         let sent = h.sent();
-        let is_catch_up = |c: &Cmd| match c {
-            Cmd::LoadUrl(u) => u.contains("/timeshift/") && u.ends_with("/13.m3u8"),
-            _ => false,
-        };
-        assert!(sent.iter().any(is_catch_up), "{sent:?}");
+        assert!(
+            sent.iter()
+                .any(|c| matches!(c, Cmd::LoadUrl(u) if *u == from_its_start)),
+            "{sent:?} should hold {from_its_start}"
+        );
+        // Catch-up plays as video on demand: not as live, no stall watchdog.
+        assert!(!h.app.current_live);
+        assert!(!h.app.stall_watchdog_armed);
     }
 
     #[tokio::test]
@@ -3851,6 +3882,59 @@ mod tests {
         assert!(zapped(&h.sent()), "the cursor is back on TEST 03");
     }
 
+    #[tokio::test]
+    async fn unlocking_with_the_guide_open_adds_the_adult_column_within_a_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, true);
+        assert_eq!(h.app.guide_channels.len(), 1, "locked: no adult column");
+        assert!(
+            !h.painted.iter().any(|t| t.contains("ADULT")),
+            "{:?}",
+            h.painted
+        );
+        h.app.set_adult_visible(true);
+        h.frame(&[]);
+        assert_eq!(h.app.guide_channels.len(), 2, "unlocked: the adult column");
+        assert!(
+            h.painted.iter().any(|t| t.contains("ADULT")),
+            "and it is drawn: {:?}",
+            h.painted
+        );
+    }
+
+    #[tokio::test]
+    async fn the_guide_follows_a_catalog_that_f5_fetches_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let portal = FakePortal::new(vec![archive_channel(601, "NL | NPO1 HD")], Vec::new());
+        portal.release_catalog();
+        let catalog = Arc::new(CatalogStore::new(portal.clone()));
+        catalog.spawn_fetch();
+        wait_until("the catalog loads", || catalog.is_loaded()).await;
+        let mut h = Harness::start(dir.path(), catalog.clone(), PortalState::Configured, None);
+        assert_eq!(h.app.guide_channels.len(), 1);
+        // The portal lists another channel now. F5 fetches the catalog again into
+        // the same store, which stays loaded all the while.
+        portal.set_live(vec![
+            archive_channel(601, "NL | NPO1 HD"),
+            archive_channel(602, "NL | NPO2 HD"),
+        ]);
+        h.press(&[Key::F5]);
+        wait_until("the re-fetch lands", || catalog.live_channels().len() == 2).await;
+        h.frame(&[]);
+        assert_eq!(
+            h.app.guide_channels.len(),
+            2,
+            "the columns follow the new catalog"
+        );
+        open_guide(&mut h, false);
+        assert!(
+            h.painted.iter().any(|t| t.contains("NPO2")),
+            "and the new column is drawn: {:?}",
+            h.painted
+        );
+    }
+
     #[test]
     fn enter_on_the_help_row_opens_the_settings_in_their_list_not_in_a_section() {
         let dir = tempfile::tempdir().unwrap();
@@ -3885,7 +3969,8 @@ mod tests {
     /// learns what; `epg_fetches` counts the day-EPG requests.
     struct FakePortal {
         urls: XtreamPortal,
-        live: Vec<LiveChannel>,
+        /// What the catalog lists; `set_live` changes it for the next fetch.
+        live: Mutex<Vec<LiveChannel>>,
         day_epg: Vec<EpgEntry>,
         catalog_gate: tokio::sync::Semaphore,
         epg_gate: tokio::sync::Semaphore,
@@ -3901,12 +3986,17 @@ mod tests {
                     host: "h".into(),
                     port: 80,
                 }),
-                live,
+                live: Mutex::new(live),
                 day_epg,
                 catalog_gate: tokio::sync::Semaphore::new(0),
                 epg_gate: tokio::sync::Semaphore::new(0),
                 epg_fetches: std::sync::atomic::AtomicUsize::new(0),
             })
+        }
+
+        /// The portal lists these channels from the next catalog fetch on.
+        fn set_live(&self, live: Vec<LiveChannel>) {
+            *self.live.lock() = live;
         }
 
         fn release_catalog(&self) {
@@ -3929,7 +4019,7 @@ mod tests {
         ) -> Result<crate::portal::Catalog, crate::portal::PortalError> {
             let _wait = self.catalog_gate.acquire().await;
             Ok(crate::portal::Catalog {
-                live: self.live.clone(),
+                live: self.live.lock().clone(),
                 ..Default::default()
             })
         }
@@ -4363,6 +4453,62 @@ mod tests {
         open_guide(&mut h, false);
         let fetching: Vec<i64> = h.app.epg_fetcher.in_flight().iter().copied().collect();
         assert_eq!(fetching, [13], "TEST 03's catch-up twin, not the adult 911");
+    }
+
+    /// A log sink the test can read back.
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogBuffer {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock()).into_owned()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_epg_store_is_logged_once_per_round_not_once_per_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let live: Vec<LiveChannel> = (601..=604)
+            .map(|id| archive_channel(id, &format!("NL | NPO{} HD", id - 600)))
+            .collect();
+        let portal = FakePortal::new(live.clone(), Vec::new());
+        portal.release_epg();
+        let catalog = crate::portal::Catalog {
+            live,
+            ..Default::default()
+        };
+        let catalog = Arc::new(CatalogStore::from_catalog(portal, catalog));
+        let mut h = Harness::start(dir.path(), catalog, PortalState::Configured, None);
+        let log = LogBuffer::default();
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+        // The guide was opened and is closed again: one fetch at a time, four
+        // fetches in a row.
+        h.app.open_guide();
+        h.app.close_guide();
+        wait_until("every channel has its EPG", || {
+            h.frame(&[]);
+            h.app.epg_store.len() == 4 && h.app.epg_fetcher.in_flight().is_empty()
+        })
+        .await;
+        let text = log.text();
+        let lines = text.lines().filter(|l| l.contains("guide: epg store"));
+        assert_eq!(lines.count(), 1, "one line for the round:\n{text}");
     }
 
     /// An app on a catalog of ten channels with catch-up (ids 601 to 610) whose

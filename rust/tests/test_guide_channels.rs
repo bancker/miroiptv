@@ -186,3 +186,13 @@ fn a_column_is_adult_when_only_its_catch_up_variant_is_flagged() {
 fn an_unloaded_catalog_has_no_guide_channels() {
     assert!(CatalogStore::new(portal()).guide_channels().is_empty());
 }
+
+#[test]
+fn the_catalog_counts_every_load_and_not_the_lock() {
+    assert_eq!(CatalogStore::new(portal()).revision(), 0, "nothing loaded");
+    let s = store(vec![ch(601, "NL | NPO1 HD", 1)]);
+    assert_eq!(s.revision(), 1, "the catalog in the store is the first");
+    s.set_adult_unlocked(true);
+    s.set_adult_unlocked(false);
+    assert_eq!(s.revision(), 1, "the lock is no new catalog");
+}
