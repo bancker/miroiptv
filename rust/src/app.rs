@@ -1034,6 +1034,18 @@ impl TvApp {
     }
 
     fn apply_settings_action(&mut self, action: SettingsAction) {
+        // The dialog that sent a PIN reads the app's answer from the note next
+        // frame: the note of an earlier attempt must not stand in for it, also
+        // when this one is not answered at all (PIN input is blocked).
+        if matches!(
+            action,
+            SettingsAction::Unlock(_)
+                | SettingsAction::SetPin(_)
+                | SettingsAction::ChangePin { .. }
+                | SettingsAction::ResetPin(_)
+        ) {
+            self.adult_note = None;
+        }
         match action {
             SettingsAction::Close => {
                 // A write that fails here is tried again when the app closes.
@@ -5349,5 +5361,134 @@ mod tests {
         // The portal in use is the saved one now, no longer the command line's.
         h.frame(&[]);
         assert!(!says_note(&h), "{:?}", h.painted);
+    }
+
+    // ---- the PIN dialogs, end to end through the app ----
+
+    /// A locked app with the PIN 1234 and the Adult section of the settings
+    /// open on its first button.
+    fn app_in_the_adult_section(root: &std::path::Path) -> Harness {
+        let mut h = Harness::start(root, loaded_catalog(), PortalState::Configured, None);
+        h.app.settings.pin = Some(PinHash::new("1234").unwrap());
+        // o, then Down to Adult, then Enter into the section: Unlock has the focus.
+        h.press(&[
+            Key::O,
+            Key::ArrowDown,
+            Key::ArrowDown,
+            Key::ArrowDown,
+            Key::Enter,
+        ]);
+        h
+    }
+
+    fn says(h: &Harness, text: &str) -> bool {
+        h.painted.iter().any(|p| p == text)
+    }
+
+    #[test]
+    fn a_wrong_pin_stays_in_the_dialog_with_the_apps_note_and_the_right_one_unlocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = app_in_the_adult_section(dir.path());
+        h.press(&[Key::Enter]); // Unlock opens its dialog
+        h.type_text("0000");
+        h.press(&[Key::Enter]);
+        assert!(!h.app.catalog.adult_unlocked());
+        assert!(says(&h, "Wrong PIN"), "{:?}", h.painted);
+        // The dialog is still there, empty, with the keyboard in it.
+        h.type_text("1234");
+        h.press(&[Key::Enter]);
+        assert!(h.app.catalog.adult_unlocked());
+        assert!(says(&h, "Unlocked until you quit"), "{:?}", h.painted);
+        // The dialog went: Lock is the keyboard's button.
+        h.press(&[Key::Enter]);
+        assert!(!h.app.catalog.adult_unlocked());
+    }
+
+    #[test]
+    fn three_wrong_pins_block_input_and_the_dialog_stays_with_its_ok_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = app_in_the_adult_section(dir.path());
+        h.press(&[Key::Enter]);
+        for _ in 0..3 {
+            h.type_text("0000");
+            h.press(&[Key::Enter]);
+        }
+        assert!(h
+            .painted
+            .iter()
+            .any(|p| p.starts_with("Too many attempts - wait ")));
+        // The right PIN does nothing while the block lasts.
+        h.type_text("1234");
+        h.press(&[Key::Enter]);
+        assert!(!h.app.catalog.adult_unlocked());
+    }
+
+    #[test]
+    fn a_pin_changed_twice_shows_each_attempts_own_answer_not_the_one_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = app_in_the_adult_section(dir.path());
+        h.press(&[Key::Enter]);
+        h.type_text("1234");
+        h.press(&[Key::Enter]); // unlocked: the Adult section shows Lock first
+        let change = |h: &mut Harness, old: &str, new: &str| {
+            // Tab to Change PIN and open it: the current PIN, the new one, its repeat.
+            h.press(&[Key::Tab, Key::Enter]);
+            h.type_text(old);
+            h.press(&[Key::Enter]);
+            h.type_text(new);
+            h.press(&[Key::Enter]);
+            h.type_text(new);
+            h.press(&[Key::Enter]);
+        };
+        change(&mut h, "1234", "5678");
+        assert!(says(&h, "PIN changed"), "{:?}", h.painted);
+        assert!(h.app.settings.pin.as_ref().unwrap().verify("5678"));
+        // The old PIN is wrong now: the note must be the app's new answer, and the
+        // dialog stays open for another try.
+        change(&mut h, "1234", "4321");
+        assert!(says(&h, "Wrong PIN"), "{:?}", h.painted);
+        assert!(!says(&h, "PIN changed"), "{:?}", h.painted);
+        assert!(h.app.settings.pin.as_ref().unwrap().verify("5678"));
+    }
+
+    #[test]
+    fn the_note_of_an_earlier_pin_is_never_the_answer_to_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        h.app.settings.pin = Some(PinHash::new("1234").unwrap());
+        for _ in 0..3 {
+            h.app
+                .apply_settings_action(SettingsAction::Unlock("0000".into()));
+        }
+        // Blocked now. A note left from before must not stand for an answer the
+        // blocked app never gave.
+        h.app.adult_note = Some(T::PinChanged);
+        h.app.apply_settings_action(SettingsAction::ChangePin {
+            old: "1234".into(),
+            new: "5678".into(),
+        });
+        assert_eq!(h.app.adult_note, None);
+        assert!(h.app.settings.pin.as_ref().unwrap().verify("1234"));
+    }
+
+    #[test]
+    fn a_wrong_portal_password_stays_in_the_forgot_pin_dialog_and_the_right_one_clears_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = app_in_the_adult_section(dir.path());
+        // Unlock, Change PIN, then Forgot PIN?
+        h.press(&[Key::Tab, Key::Tab, Key::Enter]);
+        h.type_text("nope");
+        h.press(&[Key::Enter]);
+        assert!(h.app.settings.pin.is_some());
+        assert!(says(&h, "Wrong portal password"), "{:?}", h.painted);
+        // The portal password of the test app is "p".
+        h.type_text("p");
+        h.press(&[Key::Enter]);
+        assert!(h.app.settings.pin.is_none());
+        assert!(
+            says(&h, "PIN cleared - choose a new one when unlocking"),
+            "{:?}",
+            h.painted
+        );
     }
 }

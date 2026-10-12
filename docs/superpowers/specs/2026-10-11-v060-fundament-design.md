@@ -241,6 +241,16 @@ wijziging geldt meteen, behalve de portal.
    - **Pincode wijzigen** vraagt de oude code en daarna de nieuwe 2×.
    - **Pincode vergeten?** vraagt het portal-wachtwoord (zoals in de ini). Juist →
      de pincode is gewist; bij de volgende keer ontgrendelen kies je een nieuwe.
+   - **Een dialoog sluit alleen bij succes of Annuleren (Esc).** Een pincode van de
+     verkeerde vorm (geen 4 cijfers; twee die verschillen) of een die de app
+     afwijst (verkeerde pincode, verkeerde oude pincode, verkeerd
+     portal-wachtwoord) laat de dialoog open, met de melding, de foute velden
+     leeg en het toetsenbord in het eerste daarvan; bij een afgewezen poging
+     zijn alle velden leeg en staat het toetsenbord in het eerste. De app
+     antwoordt in hetzelfde beeld waarin hij de actie kreeg; het scherm leest
+     dat antwoord in het volgende beeld uit de toestand (ontgrendeld, pincode
+     aanwezig, de melding "Pincode gewijzigd"). Na de derde foute pincode
+     blijft de dialoog open met OK uitgeschakeld tot de 30 s om zijn.
 5. **Nieuws (N):**
    - Een lijst regels met de kolommen zender, titelpatroon(en), label en
      "begin later (s)".

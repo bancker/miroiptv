@@ -47,6 +47,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] Only the portal's adult flag counts, never a name: while locked a film such as xXx (2002), or a channel whose name starts with XXX but carries no flag, still shows in search and zapping
 - [ ] Unlock: the first time asks to choose a PIN (twice); later it asks for the PIN; then adult content is visible until the app closes
 - [ ] 3 wrong PINs → wait 30 s
+- [ ] A wrong PIN, or one that is not 4 digits, or two new PINs that differ: the dialog stays open with the note, its fields empty and the cursor in the first; the right PIN closes it; Esc cancels. After the 3rd wrong PIN the dialog stays, with OK disabled, until the 30 s are over
 - [ ] Lock while adult content plays → playback stops, the picture goes black, "Vergrendeld"
 - [ ] Close the app while adult content plays → the next start does not resume it
 - [ ] A channel the portal flagged adult since it was last watched (its `last_watched.json` still says not adult): the start resumes it, and when the catalog has loaded it stops with "Vergrendeld"; the next start does not resume it
