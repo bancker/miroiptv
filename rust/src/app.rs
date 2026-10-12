@@ -919,12 +919,13 @@ impl TvApp {
         }
     }
 
-    /// Closes every panel that has a widget the keyboard could reach. They are
-    /// drawn before the settings overlay, so Tab with nothing focused, and the
-    /// Enter or Space after it, would go to them first (a favorite to zap or
-    /// delete, a guide cell to play) instead of to the overlay on top. Panels
-    /// that only show something (the toast, the guide strip, the debug HUD)
-    /// stay.
+    /// Closes every panel the settings overlay would sit on top of. They are
+    /// drawn before it, so Tab with nothing focused, and the Enter or Space
+    /// after it, would go to a widget there first (a favorite to zap or
+    /// delete) instead of to the overlay, and a click beside the overlay would
+    /// play a guide cell (egui 0.27 never lets a guide cell keep the keyboard
+    /// focus, so the guide's hazard is the mouse). Panels that only show
+    /// something (the toast, the guide strip, the debug HUD) stay.
     fn close_panels_under_settings(&mut self) {
         self.show_favs = false;
         self.show_search = false;
