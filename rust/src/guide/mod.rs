@@ -4,6 +4,7 @@
 
 pub mod cache;
 pub mod fetch;
+pub mod logos;
 pub mod store;
 pub mod time;
 
