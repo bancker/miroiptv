@@ -4,13 +4,15 @@ use bongo_player::catalog::{fallback_variant, CatalogStore, QualityNav};
 use bongo_player::epg::Epg;
 use bongo_player::portal::{Catalog, Episode, LiveChannel, Movie, Portal, PortalError, Series};
 use std::sync::Arc;
+use std::time::Duration;
 
+/// Has nothing to say, except for the catalog it is asked to fetch: `catalog()`.
 struct NullPortal;
 
 #[async_trait::async_trait]
 impl Portal for NullPortal {
     async fn fetch_catalog(&self) -> Result<Catalog, PortalError> {
-        Ok(Catalog::default())
+        Ok(catalog())
     }
     async fn fetch_epg(&self, _: i64) -> Result<Epg, PortalError> {
         Ok(Epg::new(Vec::new()))
@@ -59,22 +61,23 @@ fn movie(id: i64, name: &str, adult: bool) -> Movie {
     }
 }
 
+fn catalog() -> Catalog {
+    Catalog {
+        live: vec![
+            live(1, "NL | NPO 1", false),
+            live(2, "24/7 | SHOPLYFTER 1", true),
+            live(3, "XXX | MEIDEN VAN HOLLAND", false), // the name rule
+        ],
+        movies: vec![
+            movie(10, "Gewone film", false),
+            movie(11, "Adult film", true),
+        ],
+        series: Vec::new(),
+    }
+}
+
 fn store() -> CatalogStore {
-    CatalogStore::from_catalog(
-        Arc::new(NullPortal),
-        Catalog {
-            live: vec![
-                live(1, "NL | NPO 1", false),
-                live(2, "24/7 | SHOPLYFTER 1", true),
-                live(3, "XXX | MEIDEN VAN HOLLAND", false), // the name rule
-            ],
-            movies: vec![
-                movie(10, "Gewone film", false),
-                movie(11, "Adult film", true),
-            ],
-            series: Vec::new(),
-        },
-    )
+    CatalogStore::from_catalog(Arc::new(NullPortal), catalog())
 }
 
 fn ids(v: Vec<LiveChannel>) -> Vec<i64> {
@@ -262,4 +265,50 @@ fn the_ladder_position_counts_only_the_rungs_that_show() {
     let nav = s.quality_nav(1);
     assert_eq!(rungs(&nav), [2, 1, 3]);
     assert_eq!(nav.pos, Some(1));
+}
+
+#[test]
+fn a_saved_favorite_hides_by_what_the_catalog_knows_whatever_name_it_was_saved_under() {
+    // 2 is adult by the portal's flag alone, 3 by the name rule alone: no name
+    // below says so, only the catalog does.
+    let s = store();
+    assert!(s.is_hidden_live(2, "Shoplyfter"));
+    assert!(s.is_hidden_live(3, "Meiden van Holland"));
+    assert!(!s.is_hidden_live(1, "NPO 1"));
+    assert!(
+        !s.is_hidden_live(4, "Niet in de catalogus"),
+        "an unknown id with an innocent name stays"
+    );
+    s.set_adult_unlocked(true);
+    assert!(!s.is_hidden_live(2, "Shoplyfter"));
+    assert!(!s.is_hidden_live(3, "Meiden van Holland"));
+}
+
+#[test]
+fn a_catch_up_url_of_a_channel_adult_by_its_name_alone_is_adult() {
+    let s = store();
+    assert!(s.is_adult_url("http://h/timeshift/u/p/30/x/3.m3u8"));
+    assert!(s.is_adult_url("http://h/live/u/p/3.m3u8"));
+}
+
+#[tokio::test]
+async fn a_fetched_catalog_knows_its_adult_channels_like_one_handed_over_whole() {
+    // The fetch stores its catalog its own way; the lookups must not differ.
+    let s = Arc::new(CatalogStore::new(Arc::new(NullPortal)));
+    assert!(!s.is_hidden_live(2, "Shoplyfter"), "nothing is known yet");
+    s.spawn_fetch();
+    for _ in 0..100 {
+        if s.is_loaded() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(s.is_loaded(), "the fetch did not finish");
+    assert!(s.is_hidden_live(2, "Shoplyfter"), "the portal's flag");
+    assert!(s.is_hidden_live(3, "Meiden van Holland"), "the name rule");
+    assert!(!s.is_hidden_live(1, "NPO 1"));
+    assert!(s.is_adult_url("http://h/live/u/p/2.m3u8"));
+    assert!(s.is_adult_url("http://h/timeshift/u/p/30/x/3.m3u8"));
+    assert!(!s.is_adult_url("http://h/live/u/p/1.m3u8"));
+    assert_eq!(ids(s.zap_channels()), [1]);
 }

@@ -5,6 +5,7 @@
 
 use crate::args::XtreamCreds;
 use crate::i18n::{t, tr, Lang, T};
+use crate::pin::valid_pin;
 use crate::portal::xtream::ConnCheck;
 use crate::settings::Settings;
 use egui::{Color32, Key, Modifiers};
@@ -59,6 +60,18 @@ pub enum SettingsAction {
     /// Try these credentials (`user:pass@host:port`); keep and use them if
     /// they work.
     SavePortal(String),
+    /// Show adult content if this is the PIN.
+    Unlock(String),
+    /// Choose the very first PIN (and unlock with it).
+    SetPin(String),
+    ChangePin {
+        old: String,
+        new: String,
+    },
+    /// Clear the PIN if this is the portal password.
+    ResetPin(String),
+    /// Hide adult content again.
+    Lock,
 }
 
 /// What the overlay shows but app.rs owns.
@@ -69,6 +82,13 @@ pub struct SettingsView<'a> {
     pub creds: Option<&'a XtreamCreds>,
     /// How the connection test stands.
     pub conn: &'a ConnState,
+    /// Adult content shows now (the catalog's state; the section keeps no copy).
+    pub adult_unlocked: bool,
+    pub has_pin: bool,
+    /// Seconds left while PIN input is blocked after too many wrong tries.
+    pub pin_wait_secs: Option<u64>,
+    /// The last PIN outcome (wrong PIN, PIN changed, ...).
+    pub adult_note: Option<T>,
 }
 
 /// The connection test's state, shown under the portal buttons.
@@ -140,6 +160,28 @@ struct PortalForm {
     pass: String,
 }
 
+/// The PIN dialog that is open in the adult section, with its fields.
+#[derive(Debug, Clone, Default)]
+enum AdultDialog {
+    #[default]
+    Idle,
+    Unlock {
+        pin: String,
+    },
+    SetPin {
+        first: String,
+        second: String,
+    },
+    Change {
+        old: String,
+        first: String,
+        second: String,
+    },
+    Forgot {
+        password: String,
+    },
+}
+
 /// The overlay's own state while it is open.
 #[derive(Default)]
 pub struct SettingsUi {
@@ -156,6 +198,13 @@ pub struct SettingsUi {
     /// The portal form: made when the section is first shown, from the
     /// credentials in use, and kept while the overlay is open.
     portal: Option<PortalForm>,
+    /// The PIN dialog of the adult section, if one is open.
+    adult: AdultDialog,
+    /// Focus the dialog's first field on the next frame (it was just opened).
+    focus_dialog: bool,
+    /// Why a PIN was turned down before it left the dialog (not 4 digits, not
+    /// the same twice); what the app says about a PIN comes with the view.
+    local_note: Option<T>,
 }
 
 impl SettingsUi {
@@ -267,8 +316,11 @@ impl SettingsUi {
                                     Section::Controls => {
                                         controls_pane(ui, view, focus_first, &mut actions)
                                     }
-                                    // Filled in by Tasks 16-17.
-                                    Section::Adult | Section::News => {}
+                                    Section::Adult => {
+                                        self.adult_pane(ui, view, focus_first, &mut actions)
+                                    }
+                                    // Filled in by Task 17.
+                                    Section::News => {}
                                 }
                             });
                             list.response.rect.right() + 11.0
@@ -353,6 +405,192 @@ impl SettingsUi {
             ui.label(text);
         }
     }
+
+    /// Whether adult content shows, with the buttons that change it or the PIN
+    /// dialog one of them opened, then why the last PIN was turned down.
+    fn adult_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: &SettingsView,
+        focus_first: bool,
+        actions: &mut Vec<SettingsAction>,
+    ) {
+        let lang = view.lang;
+        let status = if view.adult_unlocked {
+            T::AdultVisible
+        } else {
+            T::AdultHidden
+        };
+        ui.label(egui::RichText::new(t(lang, status)).strong());
+        ui.add_space(6.0);
+        let blocked = view.pin_wait_secs.is_some();
+        // A dialog just opened, or the section entered again with one open:
+        // its first field takes the focus.
+        let focus = std::mem::take(&mut self.focus_dialog) || focus_first;
+        let mut dialog = std::mem::take(&mut self.adult);
+        let mut open = None;
+        let done = match &mut dialog {
+            AdultDialog::Idle => {
+                ui.horizontal(|ui| {
+                    if view.adult_unlocked {
+                        let r = ui.button(t(lang, T::Lock));
+                        if focus_first {
+                            r.request_focus();
+                        }
+                        if r.clicked() {
+                            actions.push(SettingsAction::Lock);
+                        }
+                    } else {
+                        let r = ui.add_enabled(!blocked, egui::Button::new(t(lang, T::Unlock)));
+                        if focus_first {
+                            r.request_focus();
+                        }
+                        if r.clicked() {
+                            // The very first PIN is chosen, not entered.
+                            open = Some(if view.has_pin {
+                                AdultDialog::Unlock { pin: String::new() }
+                            } else {
+                                AdultDialog::SetPin {
+                                    first: String::new(),
+                                    second: String::new(),
+                                }
+                            });
+                        }
+                    }
+                    if view.has_pin
+                        && ui
+                            .add_enabled(!blocked, egui::Button::new(t(lang, T::ChangePin)))
+                            .clicked()
+                    {
+                        open = Some(AdultDialog::Change {
+                            old: String::new(),
+                            first: String::new(),
+                            second: String::new(),
+                        });
+                    }
+                    if view.has_pin
+                        && !view.adult_unlocked
+                        && ui.button(t(lang, T::ForgotPin)).clicked()
+                    {
+                        open = Some(AdultDialog::Forgot {
+                            password: String::new(),
+                        });
+                    }
+                });
+                false
+            }
+            AdultDialog::Unlock { pin } => {
+                let r = pin_field(ui, t(lang, T::EnterPin), pin, focus);
+                let (ok, cancel) = ok_cancel(ui, lang, &r, !blocked);
+                if ok {
+                    if valid_pin(pin) {
+                        actions.push(SettingsAction::Unlock(pin.clone()));
+                    } else {
+                        self.local_note = Some(T::PinFormat);
+                    }
+                }
+                ok || cancel
+            }
+            AdultDialog::SetPin { first, second } => {
+                pin_field(ui, t(lang, T::ChoosePin), first, focus);
+                let r = pin_field(ui, t(lang, T::RepeatPin), second, false);
+                let (ok, cancel) = ok_cancel(ui, lang, &r, true);
+                if ok {
+                    if !valid_pin(first) {
+                        self.local_note = Some(T::PinFormat);
+                    } else if first != second {
+                        self.local_note = Some(T::PinMismatch);
+                    } else {
+                        actions.push(SettingsAction::SetPin(first.clone()));
+                    }
+                }
+                ok || cancel
+            }
+            AdultDialog::Change { old, first, second } => {
+                pin_field(ui, t(lang, T::CurrentPin), old, focus);
+                pin_field(ui, t(lang, T::NewPin), first, false);
+                let r = pin_field(ui, t(lang, T::RepeatPin), second, false);
+                let (ok, cancel) = ok_cancel(ui, lang, &r, !blocked);
+                if ok {
+                    if !valid_pin(old) || !valid_pin(first) {
+                        self.local_note = Some(T::PinFormat);
+                    } else if first != second {
+                        self.local_note = Some(T::PinMismatch);
+                    } else {
+                        actions.push(SettingsAction::ChangePin {
+                            old: old.clone(),
+                            new: first.clone(),
+                        });
+                    }
+                }
+                ok || cancel
+            }
+            AdultDialog::Forgot { password } => {
+                ui.label(t(lang, T::PortalPassword));
+                let r = ui.add(
+                    egui::TextEdit::singleline(password)
+                        .password(true)
+                        .desired_width(220.0),
+                );
+                if focus {
+                    r.request_focus();
+                }
+                let (ok, cancel) = ok_cancel(ui, lang, &r, !password.is_empty());
+                if ok {
+                    actions.push(SettingsAction::ResetPin(password.clone()));
+                }
+                ok || cancel
+            }
+        };
+        if let Some(next) = open {
+            self.adult = next;
+            self.focus_dialog = true;
+            self.local_note = None;
+        } else if done {
+            self.adult = AdultDialog::Idle;
+            // Back on the buttons, so the keyboard can carry on.
+            self.focus_first = true;
+        } else {
+            self.adult = dialog;
+        }
+        if let Some(secs) = view.pin_wait_secs {
+            ui.label(tr(lang, T::PinBlocked, &[&secs.to_string()]));
+        }
+        if let Some(note) = self.local_note.or(view.adult_note) {
+            ui.label(t(lang, note));
+        }
+    }
+}
+
+/// A masked PIN field: anything but digits is dropped as it is typed, and it
+/// holds 4 at most.
+fn pin_field(ui: &mut egui::Ui, label: &str, value: &mut String, focus: bool) -> egui::Response {
+    ui.label(label);
+    let r = ui.add(
+        egui::TextEdit::singleline(value)
+            .password(true)
+            .desired_width(90.0),
+    );
+    value.retain(|c| c.is_ascii_digit());
+    value.truncate(4);
+    if focus {
+        r.request_focus();
+    }
+    r
+}
+
+/// OK and Cancel under a dialog; Enter in its last field counts as OK.
+/// Returns (OK, Cancel); OK is only given while `enabled`.
+fn ok_cancel(ui: &mut egui::Ui, lang: Lang, last: &egui::Response, enabled: bool) -> (bool, bool) {
+    let enter = last.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+    let (mut ok, mut cancel) = (false, false);
+    ui.horizontal(|ui| {
+        ok = ui
+            .add_enabled(enabled, egui::Button::new(t(lang, T::Ok)))
+            .clicked();
+        cancel = ui.button(t(lang, T::Cancel)).clicked();
+    });
+    (enabled && (ok || enter), cancel)
 }
 
 fn language_pane(
@@ -445,6 +683,10 @@ mod tests {
             settings,
             creds: None,
             conn: &ConnState::Idle,
+            adult_unlocked: false,
+            has_pin: false,
+            pin_wait_secs: None,
+            adult_note: None,
         }
     }
 
@@ -517,6 +759,10 @@ mod tests {
         settings: Settings,
         /// Draw another default Area before the overlay in every frame.
         other_panel: bool,
+        /// What app.rs would tell the adult section.
+        adult_unlocked: bool,
+        has_pin: bool,
+        pin_wait_secs: Option<u64>,
     }
 
     impl Overlay {
@@ -536,6 +782,9 @@ mod tests {
                 ui: SettingsUi::new(),
                 settings: Settings::default(),
                 other_panel,
+                adult_unlocked: false,
+                has_pin: false,
+                pin_wait_secs: None,
             };
             // Two empty frames first, so the widgets exist before the first key.
             overlay.frame(&[]);
@@ -561,7 +810,12 @@ mod tests {
         /// One frame with these events; what the overlay reports.
         fn frame_with(&mut self, events: Vec<egui::Event>) -> Vec<SettingsAction> {
             let mut actions = Vec::new();
-            let view = make_view(&self.settings);
+            let view = SettingsView {
+                adult_unlocked: self.adult_unlocked,
+                has_pin: self.has_pin,
+                pin_wait_secs: self.pin_wait_secs,
+                ..make_view(&self.settings)
+            };
             let other_panel = self.other_panel;
             run_events(&self.ctx, events, |ctx| {
                 if other_panel {
@@ -578,6 +832,25 @@ mod tests {
                 let actions = self.frame(&[key]);
                 assert!(actions.is_empty(), "{key:?} reported {actions:?}");
             }
+        }
+
+        /// `text` typed one character at a time, as a keyboard does; none of it
+        /// may report anything.
+        fn type_text(&mut self, text: &str) {
+            for c in text.chars() {
+                let key = Key::from_name(&c.to_string()).expect("a key for every character");
+                let actions = self.type_char(key, c);
+                assert!(actions.is_empty(), "typing {c:?} reported {actions:?}");
+            }
+        }
+
+        /// Into the adult section and its first dialog: its first button opens
+        /// it, and one more frame lets the dialog's first field take the focus.
+        fn open_adult_dialog(&mut self) {
+            self.press(Key::ArrowDown, 3); // Adult
+            self.press(Key::Enter, 1); // into it: the first button has the focus
+            self.press(Key::Enter, 1); // the button opens the dialog
+            assert_eq!(self.frame(&[]), vec![]);
         }
     }
 
@@ -958,5 +1231,182 @@ mod tests {
             vec![SettingsAction::SavePortal(one_string.into())]
         );
         assert_eq!(crate::args::parse_xtream_creds(one_string).unwrap(), creds);
+    }
+
+    /// The text in the open dialog's first field.
+    fn first_field(ui: &SettingsUi) -> &str {
+        match &ui.adult {
+            AdultDialog::Unlock { pin } => pin,
+            AdultDialog::SetPin { first, .. } => first,
+            AdultDialog::Change { old, .. } => old,
+            AdultDialog::Forgot { password } => password,
+            AdultDialog::Idle => panic!("no dialog is open"),
+        }
+    }
+
+    #[test]
+    fn keys_typed_into_the_pin_fields_stay_in_the_fields() {
+        // Both dialogs that take a PIN: choosing the first one, and entering it.
+        for has_pin in [false, true] {
+            let mut o = Overlay::new();
+            o.has_pin = has_pin;
+            o.open_adult_dialog();
+            for (key, c) in [
+                (Key::Num1, '1'),
+                (Key::O, 'o'),
+                (Key::Num2, '2'),
+                (Key::Space, ' '),
+                (Key::F, 'f'),
+                (Key::Num3, '3'),
+                (Key::Num4, '4'),
+                (Key::Num5, '5'),
+            ] {
+                let actions = o.type_char(key, c);
+                assert!(
+                    actions.is_empty(),
+                    "typing {c:?} reported {actions:?}, has_pin: {has_pin}"
+                );
+            }
+            // Letters and the space are dropped; four digits are all it keeps.
+            assert_eq!(first_field(&o.ui), "1234", "has_pin: {has_pin}");
+            // The overlay is still there: Esc leaves the field, the next one closes.
+            assert_eq!(o.frame(&[Key::Escape]), vec![]);
+            assert_eq!(o.frame(&[Key::Escape]), vec![SettingsAction::Close]);
+        }
+    }
+
+    #[test]
+    fn coming_back_to_an_open_dialog_puts_the_focus_in_its_first_field() {
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.open_adult_dialog();
+        o.type_text("12");
+        assert_eq!(o.frame(&[Key::Escape]), vec![]); // back to the list
+        o.press(Key::Enter, 1); // into the section again
+        o.type_text("34");
+        assert_eq!(first_field(&o.ui), "1234");
+    }
+
+    #[test]
+    fn the_unlock_dialog_hands_over_four_digits_and_nothing_else() {
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.open_adult_dialog();
+        o.type_text("123");
+        // Too short: nothing leaves the dialog and the user is told why.
+        assert_eq!(o.frame(&[Key::Enter]), vec![]);
+        assert_eq!(o.ui.local_note, Some(T::PinFormat));
+        // Once more, with four digits.
+        assert_eq!(o.frame(&[]), vec![]); // the first button has the focus again
+        o.press(Key::Enter, 1); // it opens the dialog
+        assert_eq!(o.frame(&[]), vec![]);
+        o.type_text("1234");
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::Unlock("1234".into())]
+        );
+        assert_eq!(o.ui.local_note, None);
+    }
+
+    #[test]
+    fn a_pin_typed_and_confirmed_within_one_frame_is_handed_over() {
+        // A fast typist on a slow frame: the digits and the Enter arrive together.
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.open_adult_dialog();
+        let mut events: Vec<egui::Event> = "4321"
+            .chars()
+            .map(|c| egui::Event::Text(c.to_string()))
+            .collect();
+        events.push(key_event(Key::Enter, true));
+        assert_eq!(
+            o.frame_with(events),
+            vec![SettingsAction::Unlock("4321".into())]
+        );
+    }
+
+    #[test]
+    fn choosing_the_first_pin_asks_for_it_twice() {
+        let mut o = Overlay::new();
+        o.open_adult_dialog(); // no PIN yet: the dialog chooses one
+        o.type_text("1234");
+        o.press(Key::Tab, 1); // the repeat
+        o.type_text("1235");
+        assert_eq!(o.frame(&[Key::Enter]), vec![]);
+        assert_eq!(o.ui.local_note, Some(T::PinMismatch));
+        // Again, and this time twice the same.
+        assert_eq!(o.frame(&[]), vec![]);
+        o.press(Key::Enter, 1);
+        assert_eq!(o.frame(&[]), vec![]);
+        o.type_text("1234");
+        o.press(Key::Tab, 1);
+        o.type_text("1234");
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::SetPin("1234".into())]
+        );
+    }
+
+    #[test]
+    fn while_unlocked_the_first_button_locks() {
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.adult_unlocked = true;
+        o.press(Key::ArrowDown, 3); // Adult
+        o.press(Key::Enter, 1); // into it: Lock has the focus
+        assert_eq!(o.frame(&[Key::Enter]), vec![SettingsAction::Lock]);
+    }
+
+    #[test]
+    fn no_dialog_opens_while_pin_input_is_blocked() {
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.pin_wait_secs = Some(30);
+        o.press(Key::ArrowDown, 3); // Adult
+        o.press(Key::Enter, 1); // into it
+        o.press(Key::Enter, 1); // Unlock is disabled
+        o.press(Key::Tab, 1);
+        o.press(Key::Enter, 1); // so is Change PIN
+        assert!(matches!(o.ui.adult, AdultDialog::Idle), "{:?}", o.ui.adult);
+    }
+
+    #[test]
+    fn changing_the_pin_hands_over_the_old_and_the_new_one() {
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.press(Key::ArrowDown, 3); // Adult
+        o.press(Key::Enter, 1); // into it: Unlock has the focus
+        o.press(Key::Tab, 1); // Change PIN
+        o.press(Key::Enter, 1);
+        assert_eq!(o.frame(&[]), vec![]);
+        o.type_text("1234");
+        o.press(Key::Tab, 1);
+        o.type_text("5678");
+        o.press(Key::Tab, 1);
+        o.type_text("5678");
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::ChangePin {
+                old: "1234".into(),
+                new: "5678".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_forgotten_pin_is_reset_with_the_portal_password() {
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.press(Key::ArrowDown, 3); // Adult
+        o.press(Key::Enter, 1); // into it: Unlock has the focus
+        o.press(Key::Tab, 2); // Change PIN, then Forgot PIN?
+        o.press(Key::Enter, 1);
+        assert_eq!(o.frame(&[]), vec![]);
+        // A password takes any character, `o` and the space included.
+        o.type_text("foo bar");
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::ResetPin("foo bar".into())]
+        );
     }
 }

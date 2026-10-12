@@ -3,6 +3,7 @@ use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, qu
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::Favorites;
 use crate::i18n::{Lang, T};
+use crate::pin::{PinGate, PinHash};
 use crate::playback_health::{PlaybackHealth, ReloadBudget};
 use crate::relay::Relay;
 use crate::player::{Cmd, Event, PlayerHandle, RgbaFrame};
@@ -28,6 +29,10 @@ use tracing::warn;
 struct LastWatched {
     url: String,
     live: bool,
+    /// Adult content never resumes (every start is locked). `None`: a file
+    /// from 0.5, written before this flag existed.
+    #[serde(default)]
+    adult: Option<bool>,
 }
 
 impl LastWatched {
@@ -75,6 +80,56 @@ fn programme_status(
 /// watchdog armed and resumed as live. Catch-up plays as VOD.
 fn plays_as_live(status: ProgrammeStatus) -> bool {
     matches!(status, ProgrammeStatus::Live)
+}
+
+/// Which frames on the frame bus may show. A stopped stream's frames must not
+/// come back, and the newest of them can still be on their way when the stop is
+/// ordered: mpv renders one more while the command travels to its thread. So
+/// from the stop on nothing shows, until the next load narrows the fence to
+/// what is on the bus by then (the stopped stream's last frames); the first
+/// newer frame lifts it.
+#[derive(Debug, Default)]
+struct FrameFence(Option<u64>);
+
+impl FrameFence {
+    fn stop(&mut self) {
+        self.0 = Some(u64::MAX);
+    }
+
+    /// A stream loads; `latest` is the version of the newest frame on the bus.
+    /// Without a stop there is no fence to narrow.
+    fn load(&mut self, latest: u64) {
+        if self.0.is_some() {
+            self.0 = Some(latest);
+        }
+    }
+
+    /// Whether the frame with this version may show.
+    fn admit(&mut self, version: u64) -> bool {
+        if self.0.is_some_and(|fence| version <= fence) {
+            return false;
+        }
+        self.0 = None;
+        true
+    }
+}
+
+/// What to do with the last-watched stream at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeDecision {
+    Play,
+    Skip,
+    WaitForCatalog,
+}
+
+/// `flag`: the file's adult flag; `catalog_says_adult`: the catalog's answer,
+/// `None` while it is not loaded yet.
+fn resume_decision(flag: Option<bool>, catalog_says_adult: Option<bool>) -> ResumeDecision {
+    match flag.or(catalog_says_adult) {
+        Some(true) => ResumeDecision::Skip,
+        Some(false) => ResumeDecision::Play,
+        None => ResumeDecision::WaitForCatalog,
+    }
 }
 
 /// One line of the help overlay: the key(s) and what they do. Both are static
@@ -354,6 +409,18 @@ impl Default for GuideState {
     }
 }
 
+impl GuideState {
+    /// Another portal's catalog took over: everything kept per stream id means
+    /// other channels now. Fetches of the old portal still in flight finish into
+    /// the old maps, which they alone still hold.
+    fn forget_portal(&mut self) {
+        self.row_per_channel.clear();
+        self.epg_cache = Arc::new(Mutex::new(HashMap::new()));
+        self.epg_pending = Arc::new(Mutex::new(HashSet::new()));
+        self.epg_failed = Arc::new(Mutex::new(HashSet::new()));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortalState {
     /// `--xtream user:pass@host:port` was given with non-placeholder values.
@@ -507,6 +574,12 @@ pub struct TvApp {
     /// The portal credentials test (settings screen and setup prompt).
     conn_state: ConnState,
     conn_slot: Arc<Mutex<Option<ConnResult>>>,
+    /// Wrong PIN attempts; blocks PIN input for 30 s after 3 in a row.
+    pin_gate: PinGate,
+    /// The last PIN outcome, shown in the adult section.
+    adult_note: Option<T>,
+    /// After a stop, the stopped stream's frames must not show again.
+    frame_fence: FrameFence,
 }
 
 /// The translated text for a credentials error.
@@ -603,6 +676,9 @@ impl TvApp {
             settings_ui: None,
             conn_state: ConnState::Idle,
             conn_slot: Arc::new(Mutex::new(None)),
+            pin_gate: PinGate::new(),
+            adult_note: None,
+            frame_fence: FrameFence::default(),
         };
         // Initial stream: an explicit --url / bare URL wins; otherwise resume
         // whatever we were watching last session (persisted by load_url).
@@ -623,8 +699,24 @@ impl TvApp {
         app
     }
 
-    /// Play what was playing when the app last closed.
+    /// Play what was playing when the app last closed, unless that was adult
+    /// content (every start is locked).
     fn resume(&mut self, lw: LastWatched) {
+        let catalog_says = self
+            .catalog
+            .is_loaded()
+            .then(|| self.catalog.is_adult_url(&lw.url));
+        match resume_decision(lw.adult, catalog_says) {
+            ResumeDecision::Play => {}
+            ResumeDecision::Skip => {
+                tracing::info!("resume: last watched was adult content - not resumed");
+                return;
+            }
+            ResumeDecision::WaitForCatalog => {
+                self.pending_resume = Some(lw);
+                return;
+            }
+        }
         tracing::info!("resuming last watched ({})", crate::redact::redact(&lw.url));
         self.set_toast(self.t(T::ResumingLast));
         // Up/down then continues from this channel (see zap_delta).
@@ -638,6 +730,7 @@ impl TvApp {
         if self.conn_state != ConnState::Testing {
             self.conn_state = ConnState::Idle;
         }
+        self.adult_note = None;
         tracing::info!("settings: opened");
     }
 
@@ -660,6 +753,60 @@ impl TvApp {
         }
     }
 
+    /// Check a PIN against the saved hash, counting wrong attempts.
+    fn pin_attempt(&mut self, pin: &str) -> bool {
+        let now = Instant::now();
+        if self.pin_gate.wait_left(now).is_some() {
+            return false;
+        }
+        let ok = self.settings.pin.as_ref().is_some_and(|h| h.verify(pin));
+        self.pin_gate.record(ok, now);
+        if !ok {
+            self.adult_note = Some(T::PinWrong);
+            tracing::info!("adult: wrong PIN");
+            if self.pin_gate.wait_left(now).is_some() {
+                tracing::info!("adult: PIN input blocked for 30 s");
+            }
+        }
+        ok
+    }
+
+    /// The channel lists changed under whatever points into them: adult content
+    /// shown or hidden, or another portal's catalog. The playing channel is
+    /// found in the zap list again on the next arrow press, search results are
+    /// searched again, and the guide rebuilds its cached channel indices.
+    fn forget_list_positions(&mut self) {
+        self.current_idx = None;
+        self.search_hits_for = None;
+        self.guide.visible_filter_snapshot.clear();
+    }
+
+    fn set_adult_visible(&mut self, on: bool) {
+        self.catalog.set_adult_unlocked(on);
+        // The lists changed length: find the playing channel again, search again.
+        self.forget_list_positions();
+        let note = if on { T::Unlocked } else { T::LockedToast };
+        self.adult_note = Some(note);
+        self.set_toast(self.t(note));
+        tracing::info!("adult: {}", if on { "unlocked" } else { "locked" });
+    }
+
+    /// Stop playing: mpv stops, its last picture goes, nothing is current.
+    fn stop_playback(&mut self) {
+        let _ = self.player.cmd_tx.send(Cmd::Stop);
+        self.zap_pacer.cancel();
+        self.current_url = None;
+        self.current_live = false;
+        self.current_idx = None;
+        self.current_name = None;
+        self.current_stream_id = None;
+        self.current_epg = None;
+        self.stall_watchdog_armed = false;
+        self.frame_fence.stop();
+        self.video_tex = None;
+        tracing::info!("player: stop");
+    }
+
     fn apply_settings_action(&mut self, action: SettingsAction) {
         match action {
             SettingsAction::Close => {
@@ -679,6 +826,64 @@ impl TvApp {
             }
             SettingsAction::TestConnection(s) => self.start_conn_check(s, false),
             SettingsAction::SavePortal(s) => self.start_conn_check(s, true),
+            SettingsAction::Unlock(pin) => {
+                if self.pin_attempt(&pin) {
+                    self.set_adult_visible(true);
+                }
+            }
+            SettingsAction::SetPin(pin) => {
+                // Only for the very first PIN: otherwise this would bypass it.
+                if self.settings.pin.is_none() {
+                    match PinHash::new(&pin) {
+                        Ok(h) => {
+                            self.settings.pin = Some(h);
+                            self.set_adult_visible(true);
+                            // After the toast above: a failed write must show its own.
+                            self.save_settings();
+                        }
+                        Err(_) => self.adult_note = Some(T::PinFormat),
+                    }
+                }
+            }
+            SettingsAction::ChangePin { old, new } => {
+                if self.pin_attempt(&old) {
+                    match PinHash::new(&new) {
+                        Ok(h) => {
+                            self.settings.pin = Some(h);
+                            self.save_settings();
+                            self.adult_note = Some(T::PinChanged);
+                            tracing::info!("adult: PIN changed");
+                        }
+                        Err(_) => self.adult_note = Some(T::PinFormat),
+                    }
+                }
+            }
+            SettingsAction::ResetPin(password) => {
+                let actual = self
+                    .creds
+                    .as_ref()
+                    .map(|c| c.password.as_str())
+                    .unwrap_or("");
+                if crate::pin::portal_password_ok(&password, actual) {
+                    self.settings.pin = None;
+                    self.save_settings();
+                    self.adult_note = Some(T::PinCleared);
+                    tracing::info!("adult: PIN cleared with the portal password");
+                } else {
+                    self.adult_note = Some(T::WrongPortalPassword);
+                }
+            }
+            SettingsAction::Lock => {
+                self.set_adult_visible(false);
+                // Adult content playing now stops, and its picture goes.
+                let playing_adult = self
+                    .current_url
+                    .as_deref()
+                    .is_some_and(|u| self.catalog.is_adult_url(u));
+                if playing_adult {
+                    self.stop_playback();
+                }
+            }
         }
     }
 
@@ -691,6 +896,13 @@ impl TvApp {
             settings: &self.settings,
             creds: self.creds.as_ref(),
             conn: &self.conn_state,
+            adult_unlocked: self.catalog.adult_unlocked(),
+            has_pin: self.settings.pin.is_some(),
+            pin_wait_secs: self
+                .pin_gate
+                .wait_left(Instant::now())
+                .map(|d| d.as_secs().max(1)),
+            adult_note: self.adult_note,
         };
         let actions = overlay.show(ctx, &view);
         for a in actions {
@@ -745,11 +957,18 @@ impl TvApp {
             Some(relay) if hls => relay.vod_url(&url),
             _ => url.clone(),
         };
+        // After a stop: what is on the bus now is the stopped stream's. Read
+        // before the load goes out, so no frame of the new stream is counted.
+        self.frame_fence.load(self.player.frames.version());
         let _ = self.player.cmd_tx.send(Cmd::LoadUrl(play));
-        // Remember as last-watched so the next launch resumes it.
+        // Remember as last-watched so the next launch resumes it, unless it is
+        // adult content. The catalog knows that whenever it is loaded; the
+        // loads before that are the resume (already checked) and a URL given
+        // on the command line.
         LastWatched {
             url: url.clone(),
             live: watchdog,
+            adult: Some(self.catalog.is_adult_url(&url)),
         }
         .save(&self.storage.last_watched_path());
         self.current_url = Some(url);
@@ -1598,10 +1817,13 @@ impl TvApp {
     }
 
     fn recall_preset(&mut self, digit: u8) {
-        let target = self.presets.get(digit).map(|p| p.stream_id);
+        let target = self
+            .presets
+            .get(digit)
+            .map(|p| (p.stream_id, p.name.clone()));
         match target {
-            Some(sid) => self.zap_by_id(sid),
-            None => self.set_toast(self.tr(T::PresetEmpty, &[&digit.to_string()])),
+            Some((sid, name)) if !self.catalog.is_hidden_live(sid, &name) => self.zap_by_id(sid),
+            _ => self.set_toast(self.tr(T::PresetEmpty, &[&digit.to_string()])),
         }
     }
 
@@ -1741,6 +1963,12 @@ impl TvApp {
         self.creds = Some(creds.clone());
         let portal: Arc<dyn Portal> = Arc::new(XtreamPortal::new(creds));
         self.catalog = Arc::new(CatalogStore::new(portal));
+        // Another portal: its stream ids mean other channels, so the old lists'
+        // positions and the guide's per-channel data are of no use. The new
+        // catalog starts locked, so the last PIN outcome no longer applies.
+        self.forget_list_positions();
+        self.guide.forget_portal();
+        self.adult_note = None;
         self.catalog.spawn_fetch();
         self.portal_state = PortalState::Configured;
         self.set_toast(self.t(T::ConnectingPortal));
@@ -1986,6 +2214,10 @@ impl TvApp {
         if frame.w == 0 || frame.h == 0 {
             return;
         }
+        // After a stop the last picture must not come back.
+        if !self.frame_fence.admit(frame.version) {
+            return;
+        }
         if frame.version == self.last_frame_version && self.video_tex.is_some() {
             return;
         }
@@ -2128,7 +2360,13 @@ impl TvApp {
         }
         let mut zap_id: Option<i64> = None;
         let mut remove_id: Option<i64> = None;
-        let entries: Vec<_> = self.favorites.iter().cloned().collect();
+        // Adult favorites act as if they were not there while locked.
+        let entries: Vec<_> = self
+            .favorites
+            .iter()
+            .filter(|e| !self.catalog.is_hidden_live(e.stream_id, &e.name))
+            .cloned()
+            .collect();
         let lang = self.lang;
 
         egui::Area::new(egui::Id::new("__favs__"))
@@ -2495,11 +2733,12 @@ impl TvApp {
     fn refresh_visible_if_stale(&mut self, channels: &[LiveChannel]) {
         let f = self.guide.filter.trim().to_lowercase();
         let mode = self.guide.channel_mode;
-        // Encode mode + filter into snapshot string; both must trigger rebuild.
+        // Mode, filter and list length: unlocking or locking adult content
+        // (or a new portal) changes the list under the cached indices.
         let snapshot = match mode {
-            ChannelMode::All => format!("A|{}", f),
-            ChannelMode::Live => format!("L|{}", f),
-            ChannelMode::Catchup => format!("C|{}", f),
+            ChannelMode::All => format!("A|{}|{}", channels.len(), f),
+            ChannelMode::Live => format!("L|{}|{}", channels.len(), f),
+            ChannelMode::Catchup => format!("C|{}|{}", channels.len(), f),
         };
         if self.guide.visible_filter_snapshot == snapshot && !self.guide.visible.is_empty() {
             return;
@@ -2827,6 +3066,8 @@ impl TvApp {
             entry.end.with_timezone(&chrono::Local).format("%H:%M")
         );
         self.load_url(url, plays_as_live(status));
+        // Up/down continues from this channel, not from the one zapped to before.
+        self.current_idx = None;
         self.current_name = Some(format!("{} - {}", channel.name, entry.title));
         self.current_stream_id = Some(channel.stream_id);
         self.current_epg = None;
@@ -3536,6 +3777,15 @@ impl eframe::App for TvApp {
             ctx.request_repaint_after(Duration::from_millis(33));
             return;
         }
+        // A resume waiting for the catalog (a 0.5 last_watched.json).
+        if self.choosing_language.is_none()
+            && self.pending_resume.is_some()
+            && self.catalog.is_loaded()
+        {
+            if let Some(lw) = self.pending_resume.take() {
+                self.resume(lw);
+            }
+        }
         // The channel the user stopped flipping on.
         if let Some((sid, name, idx)) = self.zap_pacer.due(Instant::now()) {
             self.zap_to(sid, &name, Some(idx));
@@ -3617,6 +3867,55 @@ mod tests {
     fn a_live_guide_pick_plays_through_the_relay() {
         assert!(plays_as_live(ProgrammeStatus::Live));
         assert!(!plays_as_live(ProgrammeStatus::Catchup));
+    }
+
+    #[test]
+    fn an_old_last_watched_file_has_an_unknown_adult_flag() {
+        let old: LastWatched =
+            serde_json::from_str(r#"{"url":"http://h/live/u/p/1.m3u8","live":true}"#).unwrap();
+        assert_eq!(old.adult, None);
+        let new: LastWatched =
+            serde_json::from_str(r#"{"url":"http://h/live/u/p/1.m3u8","live":true,"adult":false}"#)
+                .unwrap();
+        assert_eq!(new.adult, Some(false));
+    }
+
+    #[test]
+    fn a_stopped_streams_frames_never_come_back() {
+        let mut fence = FrameFence::default();
+        assert!(fence.admit(5), "no stop: every frame shows");
+        fence.stop();
+        // A frame mpv rendered while the stop was on its way is as stale as the
+        // older ones, though it is newer than the bus was when the stop was ordered.
+        assert!(!fence.admit(5));
+        assert!(!fence.admit(6));
+        // The next stream loads; what is on the bus then is the stopped one's.
+        fence.load(6);
+        assert!(!fence.admit(6));
+        // Its first frame lifts the fence for good.
+        assert!(fence.admit(7));
+        assert!(fence.admit(7));
+        assert!(fence.admit(8));
+    }
+
+    #[test]
+    fn a_load_without_a_stop_leaves_the_frames_alone() {
+        let mut fence = FrameFence::default();
+        fence.load(10);
+        assert!(fence.admit(10));
+        assert!(fence.admit(11));
+    }
+
+    #[test]
+    fn adult_content_never_resumes() {
+        use ResumeDecision::*;
+        assert_eq!(resume_decision(Some(false), None), Play);
+        assert_eq!(resume_decision(Some(true), None), Skip);
+        assert_eq!(resume_decision(Some(true), Some(false)), Skip);
+        // A file from 0.5: only the catalog can tell.
+        assert_eq!(resume_decision(None, None), WaitForCatalog);
+        assert_eq!(resume_decision(None, Some(true)), Skip);
+        assert_eq!(resume_decision(None, Some(false)), Play);
     }
 
     #[test]

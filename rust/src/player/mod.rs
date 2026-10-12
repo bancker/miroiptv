@@ -16,6 +16,8 @@ use tracing::{debug, error, info, warn};
 pub enum Cmd {
     LoadUrl(String),
     Pause(bool),
+    /// Stop playing; nothing is loaded afterwards.
+    Stop,
     SeekRelative(f64),
     CycleAudio,
     CycleSubtitle,
@@ -90,6 +92,10 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                         }
                         Ok(Cmd::Pause(p)) => {
                             let _ = mpv.set_property("pause", if p { "yes" } else { "no" });
+                        }
+                        Ok(Cmd::Stop) => {
+                            info!("stop");
+                            let _ = mpv.command(&["stop"]);
                         }
                         Ok(Cmd::SeekRelative(s)) => {
                             let _ = mpv.command(&["seek", &s.to_string(), "relative"]);
