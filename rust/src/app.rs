@@ -679,14 +679,38 @@ impl TvApp {
             .frames
             .set_new_frame_callback(move || ctx.request_repaint());
 
-        let favorites = Favorites::load(&storage.favorites_path()).unwrap_or_default();
-        let presets = Presets::load(&storage.presets_path()).unwrap_or_default();
         // Only kick off a fetch if we actually have a real portal — otherwise the
         // request would hang on a placeholder/missing host until the network timeout
         // and the user would see "loading..." for ~45s before any error appears.
         if portal_state == PortalState::Configured {
             catalog.spawn_fetch();
         }
+        Self::start(
+            player,
+            catalog,
+            storage,
+            portal_state,
+            initial_url,
+            relay,
+            creds,
+            settings,
+        )
+    }
+
+    /// The rest of `new`, which needs no window: the tests start the app with it.
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        player: PlayerHandle,
+        catalog: Arc<CatalogStore>,
+        storage: Storage,
+        portal_state: PortalState,
+        initial_url: Option<String>,
+        relay: Option<Relay>,
+        creds: Option<XtreamCreds>,
+        settings: Settings,
+    ) -> Self {
+        let favorites = Favorites::load(&storage.favorites_path()).unwrap_or_default();
+        let presets = Presets::load(&storage.presets_path()).unwrap_or_default();
 
         let lang = settings.lang().unwrap_or_else(crate::i18n::system_lang);
         let choosing_language = settings.lang().is_none().then_some(lang);
@@ -795,7 +819,23 @@ impl TvApp {
         self.load_url_with(lw.url, lw.live, lw.adult);
     }
 
+    /// Closes every panel that has a widget the keyboard could reach. They are
+    /// drawn before the settings overlay, so Tab with nothing focused, and the
+    /// Enter or Space after it, would go to them first (a favorite to zap or
+    /// delete, a guide cell to play) instead of to the overlay on top. Panels
+    /// that only show something (the toast, the guide strip, the debug HUD)
+    /// stay.
+    fn close_panels_under_settings(&mut self) {
+        self.show_favs = false;
+        self.show_search = false;
+        self.search_query.clear();
+        self.show_epg_grid = false;
+        self.guide.open = false;
+        self.news_picker = None;
+    }
+
     fn open_settings(&mut self) {
+        self.close_panels_under_settings();
         self.settings_ui = Some(SettingsUi::new());
         // An earlier visit's verdict is stale; a test still running is not.
         if self.conn_state != ConnState::Testing {
@@ -1947,6 +1987,9 @@ impl TvApp {
         let mut submit: Option<String> = None;
         let lang = self.lang;
         egui::Area::new(egui::Id::new("__portal_prompt__"))
+            // Its default click sense makes the frame a Tab stop that shows
+            // nothing (see paint_toast): the first Tab goes to the Server field.
+            .sense(egui::Sense::hover())
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 egui::Frame::popup(&ctx.style())
@@ -3882,6 +3925,14 @@ impl eframe::App for TvApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_ui(ctx);
+    }
+}
+
+impl TvApp {
+    /// One frame of the app: what `update` does, minus the window's `Frame`,
+    /// which the tests do not have.
+    fn update_ui(&mut self, ctx: &egui::Context) {
         self.drain_events();
         self.drain_epg();
         self.drain_news_picker();
@@ -3969,6 +4020,12 @@ impl eframe::App for TvApp {
         if self.paint_help(ctx) {
             self.show_help = false;
             self.open_settings();
+            // The Enter or Space that clicked the row is spent. The overlay, drawn
+            // later in this frame, would take that Enter for "open the section".
+            ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                i.consume_key(egui::Modifiers::NONE, Key::Space);
+            });
         }
         self.paint_settings(ctx);
 
@@ -4287,5 +4344,268 @@ mod tests {
                 assert_eq!(links[0].action, crate::i18n::t(lang, T::HelpSettings));
             }
         }
+    }
+
+    // ---- the app on a headless egui context ----
+
+    /// A key press as egui gets it from the window.
+    fn key_press(key: Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// The app on a headless egui context, with no window and no mpv behind it.
+    /// Frames run through `update_ui`; what the app tells the player arrives in
+    /// `cmds`.
+    struct Harness {
+        app: TvApp,
+        ctx: egui::Context,
+        cmds: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+    }
+
+    impl Harness {
+        /// The app as `main` starts it, with `root` as its config folder and
+        /// two quiet frames drawn, so the widgets exist before the first key.
+        fn start(
+            root: &std::path::Path,
+            catalog: Arc<CatalogStore>,
+            state: PortalState,
+            initial_url: Option<&str>,
+        ) -> Self {
+            let (cmd_tx, cmds) = tokio::sync::mpsc::unbounded_channel();
+            let (_events, evt_rx) = tokio::sync::mpsc::unbounded_channel();
+            let player = PlayerHandle {
+                cmd_tx,
+                evt_rx: Mutex::new(evt_rx),
+                frames: Arc::new(crate::player::FrameBus::new()),
+            };
+            let settings = Settings {
+                language: Some("en".into()),
+                ..Settings::default()
+            };
+            let creds = (state == PortalState::Configured).then(|| XtreamCreds {
+                username: "u".into(),
+                password: "p".into(),
+                host: "h".into(),
+                port: 80,
+            });
+            let app = TvApp::start(
+                player,
+                catalog,
+                Storage::with_root(root.to_path_buf()),
+                state,
+                initial_url.map(str::to_owned),
+                None,
+                creds,
+                settings,
+            );
+            let mut harness = Harness {
+                app,
+                ctx: egui::Context::default(),
+                cmds,
+            };
+            harness.frame(&[]);
+            harness.frame(&[]);
+            harness
+        }
+
+        /// One frame in which these events arrive.
+        fn frame_with(&mut self, events: Vec<egui::Event>) {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 720.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let app = &mut self.app;
+            let _ = self.ctx.run(raw, |ctx| app.update_ui(ctx));
+        }
+
+        /// One frame in which these keys are pressed.
+        fn frame(&mut self, keys: &[Key]) {
+            self.frame_with(keys.iter().map(|&k| key_press(k)).collect());
+        }
+
+        /// One frame per key, each followed by a quiet one: the focus egui moves
+        /// on a Tab shows in it.
+        fn press(&mut self, keys: &[Key]) {
+            for &k in keys {
+                self.frame(&[k]);
+                self.frame(&[]);
+            }
+        }
+
+        /// Text typed, as the keyboard makes it.
+        fn type_text(&mut self, text: &str) {
+            for c in text.chars() {
+                self.frame_with(vec![egui::Event::Text(c.to_string())]);
+            }
+        }
+
+        /// What the app told the player since the last call.
+        fn sent(&mut self) -> Vec<Cmd> {
+            let mut sent = Vec::new();
+            while let Ok(cmd) = self.cmds.try_recv() {
+                sent.push(cmd);
+            }
+            sent
+        }
+
+        /// Presses Tab until the keyboard is on the widget with this id: whether
+        /// it got there within `limit` presses.
+        fn tab_to(&mut self, id: egui::Id, limit: usize) -> bool {
+            for _ in 0..limit {
+                if self.ctx.memory(|m| m.focused()) == Some(id) {
+                    return true;
+                }
+                self.press(&[Key::Tab]);
+            }
+            self.ctx.memory(|m| m.focused()) == Some(id)
+        }
+    }
+
+    fn loaded_catalog() -> Arc<CatalogStore> {
+        Arc::new(CatalogStore::from_catalog(idle_portal(), adult_catalog()))
+    }
+
+    fn zapped(sent: &[Cmd]) -> bool {
+        sent.iter().any(|c| matches!(c, Cmd::LoadUrl(_)))
+    }
+
+    #[tokio::test]
+    async fn the_settings_overlay_owns_tab_and_enter_even_when_the_favorites_list_was_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        h.app.favorites.toggle(3, "TEST 03");
+        h.app.show_favs = true;
+        h.frame(&[]);
+        // o, Tab, Tab, Enter used to zap to the favorite under the overlay.
+        h.press(&[Key::O, Key::Tab, Key::Tab, Key::Enter]);
+        assert!(h.app.settings_ui.is_some(), "the overlay is up");
+        assert!(!h.app.show_favs, "the favorites list is closed");
+        assert!(!zapped(&h.sent()), "nothing was zapped");
+        assert!(h.app.favorites.contains(3), "and nothing deleted");
+    }
+
+    /// A guide on `h` with one programme airing now on the channel TEST 03, so the
+    /// guide has a cell to click; or, without `programme`, an empty guide.
+    fn open_guide(h: &mut Harness, programme: bool) {
+        let now = chrono::Utc::now();
+        let entries = if programme {
+            vec![EpgEntry {
+                title: "Journaal".into(),
+                start: now - chrono::Duration::minutes(10),
+                end: now + chrono::Duration::minutes(20),
+            }]
+        } else {
+            Vec::new()
+        };
+        h.app.guide.epg_cache.lock().insert(3, Epg::new(entries));
+        h.app.guide.open = true;
+        h.frame(&[]);
+        h.frame(&[]);
+    }
+
+    /// A click with the primary mouse button at `pos`, one frame per step.
+    fn click_at(h: &mut Harness, pos: egui::Pos2) {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        h.frame_with(vec![egui::Event::PointerMoved(pos)]);
+        h.frame_with(vec![button(true)]);
+        h.frame_with(vec![button(false)]);
+    }
+
+    #[tokio::test]
+    async fn the_help_link_closes_the_guide() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, false);
+        h.app.show_help = true;
+        h.frame(&[]);
+        let help_row = egui::Id::new("__help_settings__");
+        assert!(
+            h.tab_to(help_row, 6),
+            "the help's settings row can be reached"
+        );
+        h.frame(&[Key::Enter]);
+        assert!(h.app.settings_ui.is_some(), "the settings opened");
+        assert!(!h.app.guide.open, "the guide closed");
+    }
+
+    #[tokio::test]
+    async fn no_guide_cell_lies_under_the_settings_overlay_for_the_mouse_either() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, true);
+        h.app.open_settings();
+        h.frame(&[]);
+        // The overlay is a window in the middle; a guide cell spans the whole width,
+        // so a click beside the overlay used to play the programme in it.
+        click_at(&mut h, egui::pos2(60.0, 350.0));
+        assert!(!zapped(&h.sent()), "no guide programme was played");
+        assert!(h.app.settings_ui.is_some(), "the overlay is still up");
+    }
+
+    #[test]
+    fn opening_the_settings_closes_every_panel_a_key_could_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        let app = &mut h.app;
+        app.show_favs = true;
+        app.show_search = true;
+        app.search_query = "ab".into();
+        app.show_epg_grid = true;
+        app.guide.open = true;
+        app.news_picker = Some(NewsPicker {
+            items: Vec::new(),
+            selected: 0,
+        });
+        // These only show something, nothing in them takes a key.
+        app.show_epg_strip = true;
+        app.show_debug = true;
+        app.open_settings();
+        assert!(app.settings_ui.is_some());
+        assert!(!app.show_favs && !app.show_search && !app.show_epg_grid);
+        assert!(!app.guide.open && app.news_picker.is_none());
+        assert!(app.search_query.is_empty());
+        assert!(app.show_epg_strip && app.show_debug);
+    }
+
+    #[test]
+    fn enter_on_the_help_row_opens_the_settings_in_their_list_not_in_a_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        h.frame_with(vec![egui::Event::Text("?".into())]);
+        h.frame(&[]);
+        assert!(h.app.show_help);
+        // The `o` row is the help's one Tab stop.
+        h.press(&[Key::Tab]);
+        h.frame(&[Key::Enter]);
+        assert!(h.app.settings_ui.is_some() && !h.app.show_help);
+        // In the list `o` closes the overlay. Had the same Enter opened the Language
+        // pane, `o` would be a letter there and the overlay would stay.
+        h.press(&[Key::O]);
+        assert!(h.app.settings_ui.is_none());
+    }
+
+    #[test]
+    fn the_first_tab_in_the_setup_prompt_lands_in_the_server_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(CatalogStore::new(idle_portal()));
+        let mut h = Harness::start(dir.path(), catalog, PortalState::Missing, None);
+        h.press(&[Key::Tab]);
+        h.type_text("host");
+        assert_eq!(h.app.cfg_host, "host");
     }
 }
