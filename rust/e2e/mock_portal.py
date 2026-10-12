@@ -17,8 +17,12 @@ Environment:
   MOCK_CHANNELS=N    live channels "TEST 01" .. "TEST NN" (default 40)
   MOCK_VARIANTS=1    channel 05 also as "TEST 05 UHD" (105) and "TEST 05 FHD" (205)
   MOCK_ADULT=1       after TEST 02: "24/7 | ADULT A" (901, is_adult=1) and
-                     "XXX | ADULT B" (902, is_adult=0, caught by the name rule);
-                     VOD "Adult Film" (9001, is_adult=1) and "Gewone Film" (9002)
+                     "XXX | ADULT B" (902, is_adult=1; the XXX in its name means
+                     nothing, the flag does); VOD "Adult Film" (9001, is_adult=1)
+                     and "Gewone Film" (9002)
+  MOCK_XXX=1         names that start with XXX but carry no flag, so they are
+                     ordinary content: the live channel "XXX Something" (903, last)
+                     and the VOD film "xXx: State of the Union" (9003)
   MOCK_NEWS=1        "NL | NPO 1" (501) with archive twin "NL | NPO1 HD" (601,
                      tv_archive=1); the twin's EPG holds three past programmes:
                      NOS Journaal, NOS Jeugdjournaal, Tussen Kunst en Kitsch
@@ -67,19 +71,25 @@ def live_streams():
     for i in range(1, n + 1):
         out.append(ch(i, f"TEST {i:02d}"))
         if i == 2 and ENV("MOCK_ADULT") == "1":
-            out += [ch(901, "24/7 | ADULT A", adult=1), ch(902, "XXX | ADULT B")]
+            out += [ch(901, "24/7 | ADULT A", adult=1), ch(902, "XXX | ADULT B", adult=1)]
     if ENV("MOCK_VARIANTS") == "1":
         out += [ch(105, "TEST 05 UHD"), ch(205, "TEST 05 FHD")]
     if ENV("MOCK_NEWS") == "1":
         out += [ch(501, "NL | NPO 1"), ch(601, "NL | NPO1 HD", archive=1)]
+    if ENV("MOCK_XXX") == "1":
+        out += [ch(903, "XXX Something")]
     return out
 
 
 def vod_streams():
-    if ENV("MOCK_ADULT") != "1":
-        return []
-    return [{"stream_id": 9001, "name": "Adult Film", "container_extension": "mp4", "is_adult": "1"},
-            {"stream_id": 9002, "name": "Gewone Film", "container_extension": "mp4", "is_adult": "0"}]
+    films = []
+    if ENV("MOCK_ADULT") == "1":
+        films += [{"stream_id": 9001, "name": "Adult Film", "container_extension": "mp4", "is_adult": "1"},
+                  {"stream_id": 9002, "name": "Gewone Film", "container_extension": "mp4", "is_adult": "0"}]
+    if ENV("MOCK_XXX") == "1":
+        films += [{"stream_id": 9003, "name": "xXx: State of the Union", "container_extension": "mp4",
+                   "is_adult": "0"}]
+    return films
 
 
 def news_epg():

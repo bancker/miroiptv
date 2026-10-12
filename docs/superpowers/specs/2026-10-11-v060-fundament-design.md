@@ -153,8 +153,11 @@ in `storage.rs` vervalt):
 
 - `LiveChannel`, `Movie` en `Series` krijgen `is_adult: bool`. Het inlezen is
   tolerant: `"1"`, `1` en `true` betekenen ja; ontbreekt het veld, dan nee.
-- Adult = `is_adult`, **of** de naam begint met `XXX` (na het weglaten van
-  voorloopspaties, hoofdletterongevoelig).
+- Adult = `is_adult`, en niets anders. Een naamregel (de naam begint met `XXX`)
+  hoorde er eerst ook bij; die is op besluit van de gebruiker van 2026-10-12
+  vervallen: hij verborg ook de gewone film *xXx* (2002) en de vervolgen zolang
+  de app vergrendeld was, en de vlag is op deze portal betrouwbaar (197 van de
+  198 adult-zenders en alle 3.937 adult-films hebben hem).
 - `CatalogStore` krijgt `set_adult_unlocked(bool)` (alleen in het geheugen,
   standaard `false`). Alle lijsten die de app gebruikt (`zap_channels`,
   `live_channels`, `search_items`/`search`, het opzoeken van een zender of film

@@ -42,6 +42,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 
 ## Adult content
 - [ ] Locked (after every start): zapping, search, guide, favorites and presets show no adult channels or films
+- [ ] Only the portal's adult flag counts, never a name: while locked a film such as xXx (2002), or a channel whose name starts with XXX but carries no flag, still shows in search and zapping
 - [ ] Unlock: the first time asks to choose a PIN (twice); later it asks for the PIN; then adult content is visible until the app closes
 - [ ] 3 wrong PINs → wait 30 s
 - [ ] Lock while adult content plays → playback stops, the picture goes black, "Vergrendeld"

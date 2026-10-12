@@ -32,24 +32,20 @@ pub fn normalize_channel_name(name: &str) -> String {
         .collect()
 }
 
-/// A name that marks adult content by itself: it starts with "XXX" (after
-/// leading spaces, any case). Backs up the portal's `is_adult` flag.
-pub fn is_adult_name(name: &str) -> bool {
-    name.trim_start()
-        .get(..3)
-        .is_some_and(|p| p.eq_ignore_ascii_case("xxx"))
-}
-
+/// Adult content is what the portal flags with `is_adult`, and nothing else. A
+/// name rule ("starts with XXX") was dropped on the user's decision of
+/// 2026-10-12: it hid the ordinary film xXx (2002) and its sequels while
+/// locked, and on this portal the flag is reliable.
 fn adult_live(c: &LiveChannel) -> bool {
-    c.is_adult || is_adult_name(&c.name)
+    c.is_adult
 }
 
 fn adult_movie(m: &Movie) -> bool {
-    m.is_adult || is_adult_name(&m.name)
+    m.is_adult
 }
 
 fn adult_series(s: &Series) -> bool {
-    s.is_adult || is_adult_name(&s.name)
+    s.is_adult
 }
 
 /// A loaded catalog plus what the app asks of it while it draws, worked out once
@@ -466,32 +462,27 @@ mod zap_tests {
     }
 
     #[test]
-    fn xxx_names_count_as_adult() {
-        assert!(is_adult_name("XXX | PLAYBOY TV"));
-        assert!(is_adult_name("  xxx Hot"));
-        assert!(!is_adult_name("NL | XXL Nostalgie"));
-        assert!(!is_adult_name("Né"));
-        assert!(!is_adult_name(""));
-    }
-
-    #[test]
-    fn a_stored_catalog_knows_its_adult_channels_by_flag_and_by_name() {
+    fn a_stored_catalog_knows_its_adult_channels_by_the_portals_flag_alone() {
         let stored = StoredCatalog::new(PortalCatalog {
             live: vec![
                 ch(1, "NL | NPO 1", 0),
                 LiveChannel {
                     is_adult: true,
-                    ..ch(2, "24/7 | SHOPLYFTER 1", 0) // the flag alone
+                    ..ch(2, "24/7 | SHOPLYFTER 1", 0) // flagged
                 },
-                ch(3, "XXX | MEIDEN VAN HOLLAND", 0), // the name rule alone
+                ch(3, "XXX | MEIDEN VAN HOLLAND", 0), // a name says nothing
+                LiveChannel {
+                    is_adult: true,
+                    ..ch(4, "XXX | FLAGGED TOO", 0)
+                },
             ],
             ..PortalCatalog::default()
         });
         let mut adult: Vec<i64> = stored.adult_live_ids.iter().copied().collect();
         adult.sort();
-        assert_eq!(adult, [2, 3]);
+        assert_eq!(adult, [2, 4]);
         // The rest of the catalog reads through it.
-        assert_eq!(stored.live.len(), 3);
+        assert_eq!(stored.live.len(), 4);
     }
 }
 
@@ -562,14 +553,13 @@ impl CatalogStore {
         }
     }
 
-    /// Whether a saved favorite or preset must stay hidden now: adult and
-    /// locked. While the catalog is still loading only the name rule applies.
-    pub fn is_hidden_live(&self, sid: i64, name: &str) -> bool {
+    /// Whether a saved favorite or preset must stay hidden now: a channel the
+    /// portal flags as adult, while locked. Until the catalog has loaded
+    /// nothing is known, so nothing is hidden: whoever shows saved names waits
+    /// for `is_loaded`.
+    pub fn is_hidden_live(&self, sid: i64) -> bool {
         if self.adult_unlocked() {
             return false;
-        }
-        if is_adult_name(name) {
-            return true;
         }
         self.inner
             .read()
@@ -870,7 +860,7 @@ mod news_tests {
                 live: vec![
                     ch(1, "NL | NPO 1", false),
                     ch(2, "24/7 | NIGHT NEWS", true), // adult by the portal's flag
-                    ch(3, "XXX | AFTER DARK", false), // adult by its name
+                    ch(3, "XXX | AFTER DARK", true),  // adult by the flag, whatever the name
                 ],
                 ..PortalCatalog::default()
             },

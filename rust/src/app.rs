@@ -142,7 +142,7 @@ fn last_watched_record(
 fn shown_favorites(favorites: &Favorites, catalog: &CatalogStore) -> Vec<FavoriteEntry> {
     favorites
         .iter()
-        .filter(|e| !catalog.is_hidden_live(e.stream_id, &e.name))
+        .filter(|e| !catalog.is_hidden_live(e.stream_id))
         .cloned()
         .collect()
 }
@@ -152,7 +152,7 @@ fn shown_favorites(favorites: &Favorites, catalog: &CatalogStore) -> Vec<Favorit
 fn preset_target(presets: &Presets, digit: u8, catalog: &CatalogStore) -> Option<i64> {
     presets
         .get(digit)
-        .filter(|p| !catalog.is_hidden_live(p.stream_id, &p.name))
+        .filter(|p| !catalog.is_hidden_live(p.stream_id))
         .map(|p| p.stream_id)
 }
 
@@ -4007,7 +4007,8 @@ mod tests {
         }))
     }
 
-    /// 3 is a normal channel, 901 is adult by the portal's flag, 902 by its name.
+    /// 3 is a normal channel, 901 and 902 carry the portal's adult flag (the
+    /// name of 902 starts with XXX, which means nothing by itself).
     fn adult_catalog() -> crate::portal::Catalog {
         let live = |stream_id: i64, name: &str, is_adult: bool| LiveChannel {
             stream_id,
@@ -4022,7 +4023,7 @@ mod tests {
             live: vec![
                 live(3, "TEST 03", false),
                 live(901, "24/7 | ADULT A", true),
-                live(902, "XXX | ADULT B", false),
+                live(902, "XXX | ADULT B", true),
             ],
             ..Default::default()
         }
@@ -4081,8 +4082,8 @@ mod tests {
         let mut favorites = Favorites::default();
         favorites.toggle(3, "TEST 03");
         favorites.toggle(901, "24/7 | ADULT A"); // adult by the portal's flag
-        favorites.toggle(902, "Renamed"); // adult by its name in the catalog
-        favorites.toggle(77, "XXX | Gone"); // not in the catalog: the name says it
+        favorites.toggle(902, "Renamed"); // flagged in the catalog, saved under another name
+        favorites.toggle(77, "XXX | Gone"); // not in the catalog: nothing says it is adult
         let mut presets = Presets::default();
         presets.set(1, 901, "24/7 | ADULT A");
         presets.set(2, 902, "Renamed");
@@ -4097,9 +4098,13 @@ mod tests {
                 .map(|digit| preset_target(&presets, digit, catalog))
                 .collect::<Vec<_>>()
         };
-        // Locked: only the normal channel is listed or recalled; empty slots stay empty.
-        assert_eq!(listed(&catalog), [3]);
-        assert_eq!(recalled(&catalog), [None, None, None, Some(3), None, None]);
+        // Locked: the flagged channels are left out of the list and act empty when
+        // recalled; empty slots stay empty. A name starting with XXX decides nothing.
+        assert_eq!(listed(&catalog), [3, 77]);
+        assert_eq!(
+            recalled(&catalog),
+            [None, None, None, Some(3), Some(77), None]
+        );
         // Unlocked: all of them.
         catalog.set_adult_unlocked(true);
         assert_eq!(listed(&catalog), [3, 901, 902, 77]);

@@ -72,8 +72,8 @@ pub struct LiveChannel {
     /// Days of catch-up history available on this archive channel.
     #[serde(default, deserialize_with = "deser_int_or_zero")]
     pub tv_archive_duration: i32,
-    /// The portal's adult flag (`is_adult`); see `catalog::is_adult_name` for
-    /// the name rule that backs it up.
+    /// The portal's adult flag (`is_adult`): the only thing that marks adult
+    /// content (see `catalog::adult_live`).
     #[serde(default, deserialize_with = "deser_flag")]
     pub is_adult: bool,
 }
@@ -85,8 +85,8 @@ pub struct Movie {
     pub name: String,
     #[serde(default)]
     pub container_extension: Option<String>,
-    /// The portal's adult flag (`is_adult`); see `catalog::is_adult_name` for
-    /// the name rule that backs it up.
+    /// The portal's adult flag (`is_adult`): the only thing that marks adult
+    /// content (see `catalog::adult_live`).
     #[serde(default, deserialize_with = "deser_flag")]
     pub is_adult: bool,
 }
@@ -96,8 +96,8 @@ pub struct Series {
     #[serde(deserialize_with = "deser_id")]
     pub series_id: i64,
     pub name: String,
-    /// The portal's adult flag (`is_adult`); see `catalog::is_adult_name` for
-    /// the name rule that backs it up.
+    /// The portal's adult flag (`is_adult`): the only thing that marks adult
+    /// content (see `catalog::adult_live`).
     #[serde(default, deserialize_with = "deser_flag")]
     pub is_adult: bool,
 }
