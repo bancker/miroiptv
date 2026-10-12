@@ -5,12 +5,14 @@ keys to its window and checks its log. Example:
   .\run-scenario.ps1 -Resume 10 -Keys 'UP' -Expect 'zap: -> TEST 09'
 
 -Keys: steps separated by ';' - a key (UP DOWN LEFT RIGHT ENTER ESC TAB
-BACKSPACE SPACE, or one character such as o f n 1), TEXT:<text>, SLEEP:<ms>,
-MARK:<label>. Keys are posted to the app's window, so nothing reaches other
-windows and no focus is needed. Exit code 1 when an -Expect is missing or a
--Forbid matches, and also when the run proves nothing: no log (or no "starting"
-line), no window to post the keys to (waits up to 10 s for it), the app exited
-by itself before the run ended, or it left a panic-*.log. Exit code 0 otherwise.
+BACKSPACE SPACE, or one character such as o f n 1), TEXT:<text> (followed by a
+300 ms pause, so that its last character and the next key never share a frame),
+SLEEP:<ms>, MARK:<label>. Keys are posted to the app's window, so nothing
+reaches other windows and no focus is needed. Exit code 1 when an -Expect is
+missing or a -Forbid matches, and also when the run proves nothing: no log (or
+no "starting" line), no window to post the keys to (waits up to 10 s for it),
+the app exited by itself before the run ended, or it left a panic-*.log. Exit
+code 0 otherwise.
 
 It refuses to start (exit code 1, naming the key) while Tab, Shift, Ctrl, Alt,
 Enter, Esc, Space or an arrow key is held down: winit turns a key Windows reports
@@ -141,7 +143,14 @@ try {
                 $kind, $arg = $step -split ':', 2
                 if ($null -eq $arg) { $arg = '' }
                 switch ($kind) {
-                    'TEXT' { foreach ($c in $arg.ToCharArray()) { [E2E.Win]::Char($hwnd, $c); Start-Sleep -Milliseconds 40 } }
+                    'TEXT' {
+                        foreach ($c in $arg.ToCharArray()) { [E2E.Win]::Char($hwnd, $c); Start-Sleep -Milliseconds 40 }
+                        # egui handles the events of one frame together, and a Tab moves the focus before
+                        # the frame's typed text is applied: a character and a Tab that land in the same
+                        # frame put that character in the NEXT field. The app draws a frame about every
+                        # 45 ms, so the key after a TEXT step must come well after its last character.
+                        Start-Sleep -Milliseconds 300
+                    }
                     'SLEEP' { Start-Sleep -Milliseconds ([int]$arg) }
                     'MARK' { "  --- $arg at {0:HH:mm:ss.fff}" -f (Get-Date).ToUniversalTime() }
                     default {
