@@ -47,6 +47,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] 3 wrong PINs → wait 30 s
 - [ ] Lock while adult content plays → playback stops, the picture goes black, "Vergrendeld"
 - [ ] Close the app while adult content plays → the next start does not resume it
+- [ ] A channel the portal flagged adult since it was last watched (its `last_watched.json` still says not adult): the start resumes it, and when the catalog has loaded it stops with "Vergrendeld"; the next start does not resume it
 - [ ] Forgot PIN: the portal password clears it
 - [ ] Saving another portal (Settings → Portal) while adult content plays stops playback
 - [ ] In the PIN dialogs Enter moves to the next field and Esc cancels the open dialog first
@@ -68,6 +69,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 ## Favorites
 - [ ] On a channel, press `*` → toast "added: <name>"
 - [ ] Press Shift+F → panel shows favorite
+- [ ] Shift+F right after the start, before the catalog has loaded → "catalogus laden...", no favorite names (adult ones included); once loaded, the favorites show
 - [ ] Click the favorite → tunes to it
 - [ ] Press `*` again on that channel → toast "removed"
 - [ ] Restart app → favorites persist (still in Shift+F list)

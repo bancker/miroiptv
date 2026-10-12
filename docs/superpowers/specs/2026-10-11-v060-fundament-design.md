@@ -241,10 +241,16 @@ wijziging geldt meteen, behalve de portal.
 - **Favorieten en sneltoetsen:** een verwijzing naar adult gedraagt zich als leeg.
   De favoriet staat niet in de lijst; de sneltoets meldt "sneltoets 5 is leeg".
   Er verschijnt geen pincodevraag, want die zou verraden dat er iets is. Opslaan
-  als favoriet of sneltoets kan alleen als de app ontgrendeld is.
+  als favoriet of sneltoets kan alleen als de app ontgrendeld is. Zolang de
+  catalogus nog niet geladen is, toont de favorietenlijst niets maar "catalogus
+  laden...": alleen de catalogus weet welke favorieten adult zijn.
 - **Hervatten bij de start:** wijst `last_watched` naar adult (een live- of
   film-URL met een adult-id), dan speelt de app niets af en toont de lege
-  toestand.
+  toestand; zegt de geladen catalogus het, dan onthoudt het bestand het. Stond
+  het bestand op niet-adult en zegt de catalogus pas na het laden dat de
+  hervatte stream adult is, dan stopt die zoals bij Vergrendelen (en het
+  bestand onthoudt het). Een URL van de opdrachtregel of een eigen keuze blijft
+  spelen; het bestand krijgt wel het woord van de catalogus.
 - **Nieuwsregels:** een regel waarvan de zender adult is, wordt overgeslagen.
 - **Vergrendelen terwijl er adult speelt:** het afspelen stopt (nieuw commando
   `Cmd::Stop`) en de melding "Vergrendeld" verschijnt.

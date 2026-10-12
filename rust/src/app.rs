@@ -137,9 +137,33 @@ fn last_watched_record(
     })
 }
 
-/// The favorites that show: adult ones act as if they were not there while
-/// locked.
+/// What a resume that skips leaves in last_watched.json. When the loaded
+/// catalog is the one that calls the stream adult, and the file did not say so
+/// already, the file learns it: the next start then skips at once, without
+/// waiting for the catalog. `None`: the file stays as it is.
+fn skipped_record(lw: &LastWatched, catalog_says: Option<bool>) -> Option<LastWatched> {
+    (catalog_says == Some(true) && lw.adult != Some(true)).then(|| LastWatched {
+        adult: Some(true),
+        ..lw.clone()
+    })
+}
+
+/// Whether the catalog's first word on the stream that plays must stop it: the
+/// stream came from the resume at start (not from the command line, not picked
+/// by the user), the catalog calls it adult, and the app is locked. The file
+/// can be older than the portal's flag, and the resume went by the file while
+/// the catalog was still loading.
+fn stop_resumed_adult(from_resume: bool, adult: bool, unlocked: bool) -> bool {
+    from_resume && adult && !unlocked
+}
+
+/// The favorites that show: none until the catalog has loaded (until then
+/// nothing says which of them are adult, and none could play anyway), then all
+/// but the adult ones, which act as if they were not there while locked.
 fn shown_favorites(favorites: &Favorites, catalog: &CatalogStore) -> Vec<FavoriteEntry> {
+    if !catalog.is_loaded() {
+        return Vec::new();
+    }
     favorites
         .iter()
         .filter(|e| !catalog.is_hidden_live(e.stream_id))
@@ -629,6 +653,12 @@ pub struct TvApp {
     choosing_language: Option<Lang>,
     /// A resume held back until the language is chosen (first start).
     pending_resume: Option<LastWatched>,
+    /// What plays came from the resume at start, and nothing was picked since
+    /// (a reload of it counts as the same): the catalog's first word can still
+    /// stop it, see `on_catalog_loaded`.
+    playing_resumed: bool,
+    /// The catalog's first word on the stream that played at start is dealt with.
+    catalog_noted: bool,
     /// The settings overlay (`o`) while it is open.
     settings_ui: Option<SettingsUi>,
     /// The portal credentials test (settings screen and setup prompt).
@@ -766,6 +796,8 @@ impl TvApp {
             lang,
             choosing_language,
             pending_resume: None,
+            playing_resumed: false,
+            catalog_noted: false,
             settings_ui: None,
             conn_state: ConnState::Idle,
             conn_slot: Arc::new(Mutex::new(None)),
@@ -803,6 +835,9 @@ impl TvApp {
             ResumeDecision::Play => {}
             ResumeDecision::Skip => {
                 tracing::info!("resume: last watched was adult content - not resumed");
+                if let Some(record) = skipped_record(&lw, catalog_says) {
+                    record.save(&self.storage.last_watched_path());
+                }
                 return;
             }
             ResumeDecision::WaitForCatalog => {
@@ -817,6 +852,32 @@ impl TvApp {
         // The file's flag goes on as the hint: the catalog is mostly not loaded
         // yet, and a normal start must not record "unknown" for the next one.
         self.load_url_with(lw.url, lw.live, lw.adult);
+        self.playing_resumed = true;
+    }
+
+    /// The catalog has loaded, which until now could not say whether the stream
+    /// that plays is adult. last_watched.json holds an old word of the file (a
+    /// resume) or none (a URL from the command line): it gets the catalog's, once.
+    /// A stream the resume played on a file that had it wrong is stopped the way
+    /// Lock stops adult playback.
+    fn on_catalog_loaded(&mut self) {
+        let Some(url) = self.current_url.clone() else {
+            return;
+        };
+        let adult = self.catalog.is_adult_url(&url);
+        let record = LastWatched {
+            url,
+            live: self.current_live,
+            adult: Some(adult),
+        };
+        record.save(&self.storage.last_watched_path());
+        if stop_resumed_adult(self.playing_resumed, adult, self.catalog.adult_unlocked()) {
+            tracing::info!(
+                "resume: the catalog says the resumed stream is adult content - stopped"
+            );
+            self.stop_playback();
+            self.set_toast(self.t(T::LockedToast));
+        }
     }
 
     /// Closes every panel that has a widget the keyboard could reach. They are
@@ -919,6 +980,7 @@ impl TvApp {
         self.current_name = None;
         self.current_stream_id = None;
         self.current_epg = None;
+        self.playing_resumed = false;
         self.stall_watchdog_armed = false;
         self.frame_fence.stop();
         self.video_tex = None;
@@ -1135,6 +1197,10 @@ impl TvApp {
         let reload =
             self.current_url.as_deref() == Some(url.as_str()) && self.current_live == watchdog;
         self.current_live = watchdog;
+        // Another stream is a pick, which the catalog's first word leaves alone.
+        if !reload {
+            self.playing_resumed = false;
+        }
         // Live goes through the local relay: one continuous stream for mpv
         // that rides out portal refusals instead of dying on them. The portal
         // URL stays the current/last-watched one (the relay port changes
@@ -2128,6 +2194,13 @@ impl TvApp {
         self.forget_list_positions();
         self.guide.forget_portal();
         self.adult_note = None;
+        // Whatever waited for the old portal's catalog, or was told by it, means
+        // nothing to the new one: a 0.5 resume would play the old portal's URL
+        // through it, an old stream id would be another channel.
+        self.pending_resume = None;
+        self.current_stream_id = None;
+        self.playing_resumed = false;
+        self.catalog_noted = true;
         if playing_adult {
             self.stop_playback();
         }
@@ -2523,6 +2596,7 @@ impl TvApp {
         let mut zap_id: Option<i64> = None;
         let mut remove_id: Option<i64> = None;
         let entries = shown_favorites(&self.favorites, &self.catalog);
+        let loaded = self.catalog.is_loaded();
         let lang = self.lang;
 
         egui::Area::new(egui::Id::new("__favs__"))
@@ -2535,10 +2609,12 @@ impl TvApp {
                         ui.heading(crate::i18n::t(lang, T::FavoritesTitle));
                         ui.separator();
                         if entries.is_empty() {
-                            ui.label(
-                                egui::RichText::new(crate::i18n::t(lang, T::FavoritesEmpty))
-                                    .italics(),
-                            );
+                            let text = if loaded {
+                                T::FavoritesEmpty
+                            } else {
+                                T::CatalogLoading
+                            };
+                            ui.label(egui::RichText::new(crate::i18n::t(lang, text)).italics());
                         }
                         for entry in entries {
                             ui.horizontal(|ui| {
@@ -3954,6 +4030,10 @@ impl TvApp {
                 self.resume(lw);
             }
         }
+        if !self.catalog_noted && self.catalog.is_loaded() {
+            self.catalog_noted = true;
+            self.on_catalog_loaded();
+        }
         // The channel the user stopped flipping on.
         if let Some((sid, name, idx)) = self.zap_pacer.due(Instant::now()) {
             self.zap_to(sid, &name, Some(idx));
@@ -4366,6 +4446,8 @@ mod tests {
         app: TvApp,
         ctx: egui::Context,
         cmds: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+        /// Every text the last frame painted.
+        painted: Vec<String>,
     }
 
     impl Harness {
@@ -4408,6 +4490,7 @@ mod tests {
                 app,
                 ctx: egui::Context::default(),
                 cmds,
+                painted: Vec::new(),
             };
             harness.frame(&[]);
             harness.frame(&[]);
@@ -4425,7 +4508,15 @@ mod tests {
                 ..Default::default()
             };
             let app = &mut self.app;
-            let _ = self.ctx.run(raw, |ctx| app.update_ui(ctx));
+            let output = self.ctx.run(raw, |ctx| app.update_ui(ctx));
+            self.painted = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
         }
 
         /// One frame in which these keys are pressed.
@@ -4607,5 +4698,386 @@ mod tests {
         h.press(&[Key::Tab]);
         h.type_text("host");
         assert_eq!(h.app.cfg_host, "host");
+    }
+
+    // ---- a portal that answers from memory ----
+
+    /// Answers from memory. Its catalog arrives only after `release_catalog`, so
+    /// a test decides when the app learns what is in it.
+    struct FakePortal {
+        urls: XtreamPortal,
+        live: Vec<LiveChannel>,
+        day_epg: Vec<EpgEntry>,
+        catalog_gate: tokio::sync::Semaphore,
+    }
+
+    impl FakePortal {
+        fn new(live: Vec<LiveChannel>, day_epg: Vec<EpgEntry>) -> Arc<Self> {
+            Arc::new(FakePortal {
+                urls: XtreamPortal::new(XtreamCreds {
+                    username: "u".into(),
+                    password: "p".into(),
+                    host: "h".into(),
+                    port: 80,
+                }),
+                live,
+                day_epg,
+                catalog_gate: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        fn release_catalog(&self) {
+            self.catalog_gate.add_permits(1 << 20);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Portal for FakePortal {
+        async fn fetch_catalog(
+            &self,
+        ) -> Result<crate::portal::Catalog, crate::portal::PortalError> {
+            let _wait = self.catalog_gate.acquire().await;
+            Ok(crate::portal::Catalog {
+                live: self.live.clone(),
+                ..Default::default()
+            })
+        }
+        async fn fetch_epg(&self, _: i64) -> Result<Epg, crate::portal::PortalError> {
+            Ok(Epg::new(Vec::new()))
+        }
+        async fn fetch_day_epg(&self, _: i64) -> Result<Epg, crate::portal::PortalError> {
+            Ok(Epg::new(self.day_epg.clone()))
+        }
+        async fn fetch_series_episodes(
+            &self,
+            _: i64,
+        ) -> Result<Vec<crate::portal::Episode>, crate::portal::PortalError> {
+            Ok(Vec::new())
+        }
+        fn live_stream_url(&self, id: i64) -> String {
+            self.urls.live_stream_url(id)
+        }
+        fn live_stream_id(&self, url: &str) -> Option<i64> {
+            self.urls.live_stream_id(url)
+        }
+        fn movie_stream_url(&self, id: i64, ext: &str) -> String {
+            self.urls.movie_stream_url(id, ext)
+        }
+        fn series_stream_url(&self, id: &str, ext: &str) -> String {
+            self.urls.series_stream_url(id, ext)
+        }
+        fn catchup_url(&self, id: i64, start: chrono::DateTime<chrono::Utc>, min: u32) -> String {
+            self.urls.catchup_url(id, start, min)
+        }
+    }
+
+    /// Waits (for 2 s at most) until `done` holds: the tests wait for tasks that
+    /// run in the background.
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn live_url(id: i64) -> String {
+        format!("http://h:80/live/u/p/{id}.m3u8")
+    }
+
+    fn write_last_watched(root: &std::path::Path, url: &str, live: bool, adult: Option<bool>) {
+        let record = LastWatched {
+            url: url.into(),
+            live,
+            adult,
+        };
+        record.save(&Storage::with_root(root.to_path_buf()).last_watched_path());
+    }
+
+    fn read_last_watched(root: &std::path::Path) -> LastWatched {
+        LastWatched::load(&Storage::with_root(root.to_path_buf()).last_watched_path())
+            .expect("last_watched.json was written")
+    }
+
+    // ---- the favorites wait for the catalog ----
+
+    #[test]
+    fn the_favorites_list_shows_nothing_until_the_catalog_has_loaded() {
+        let mut favorites = Favorites::default();
+        favorites.toggle(3, "TEST 03");
+        favorites.toggle(901, "Adult A"); // flagged, whatever the name says
+        let unloaded = CatalogStore::new(idle_portal());
+        // Until then nothing says which favorites are adult: none shows.
+        assert!(shown_favorites(&favorites, &unloaded).is_empty());
+        // Loaded: the normal ones, and the flagged one only when unlocked.
+        let loaded = CatalogStore::from_catalog(idle_portal(), adult_catalog());
+        let ids = |catalog: &CatalogStore| {
+            let shown = shown_favorites(&favorites, catalog);
+            shown.iter().map(|e| e.stream_id).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&loaded), [3]);
+        loaded.set_adult_unlocked(true);
+        assert_eq!(ids(&loaded), [3, 901]);
+    }
+
+    #[tokio::test]
+    async fn the_favorites_panel_says_the_catalog_is_loading_and_names_nothing_until_it_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let portal = FakePortal::new(adult_catalog().live, Vec::new());
+        let catalog = Arc::new(CatalogStore::new(portal.clone()));
+        let mut h = Harness::start(dir.path(), catalog.clone(), PortalState::Configured, None);
+        h.app.favorites.toggle(3, "TEST 03");
+        h.app.favorites.toggle(901, "Adult A");
+        h.app.show_favs = true;
+        // An area shows from its second frame on.
+        h.frame(&[]);
+        h.frame(&[]);
+        let says = |h: &Harness, text: &str| h.painted.iter().any(|p| p == text);
+        assert!(says(&h, "loading catalog..."), "{:?}", h.painted);
+        assert!(
+            !says(&h, "TEST 03") && !says(&h, "Adult A"),
+            "{:?}",
+            h.painted
+        );
+        catalog.spawn_fetch();
+        portal.release_catalog();
+        wait_until("the catalog", || catalog.is_loaded()).await;
+        h.frame(&[]);
+        h.frame(&[]);
+        assert!(says(&h, "TEST 03"), "{:?}", h.painted);
+        assert!(!says(&h, "Adult A") && !says(&h, "loading catalog..."));
+    }
+
+    // ---- the catalog's first word on what was resumed ----
+
+    #[test]
+    fn a_resume_that_skips_on_the_catalogs_word_teaches_the_file() {
+        let lw = |adult| LastWatched {
+            url: live_url(901),
+            live: true,
+            adult,
+        };
+        let learned = |adult, says| skipped_record(&lw(adult), says).map(|r| r.adult);
+        // The catalog calls it adult and the file did not know: the file learns it.
+        assert_eq!(learned(Some(false), Some(true)), Some(Some(true)));
+        assert_eq!(learned(None, Some(true)), Some(Some(true)));
+        // Nothing to write when the file said so already, or the catalog did not.
+        assert_eq!(learned(Some(true), Some(true)), None);
+        assert_eq!(learned(Some(true), None), None);
+        assert_eq!(learned(Some(false), Some(false)), None);
+        assert_eq!(learned(None, None), None);
+        // The rest of the record stays as it was.
+        let record = skipped_record(&lw(Some(false)), Some(true)).unwrap();
+        assert_eq!(
+            (record.url.as_str(), record.live),
+            (live_url(901).as_str(), true)
+        );
+    }
+
+    #[test]
+    fn only_a_resumed_adult_stream_on_a_locked_app_is_stopped_by_the_catalogs_word() {
+        // (from the resume, adult, unlocked) -> stop?
+        let cases = [
+            (true, true, false, true),
+            // A URL from the command line, or a pick of the user: left playing.
+            (false, true, false, false),
+            // The PIN opened adult content for this session.
+            (true, true, true, false),
+            // Not adult: nothing to stop.
+            (true, false, false, false),
+            (false, false, false, false),
+            (true, false, true, false),
+            (false, true, true, false),
+        ];
+        for (from_resume, adult, unlocked, stop) in cases {
+            assert_eq!(
+                stop_resumed_adult(from_resume, adult, unlocked),
+                stop,
+                "resumed {from_resume}, adult {adult}, unlocked {unlocked}"
+            );
+        }
+    }
+
+    /// An app started on a resume of channel 901 (flagged in the catalog) from a
+    /// last_watched.json that says `file_says`, with its catalog still to come:
+    /// the catalog, the portal that releases it, and the app.
+    fn resumed_901(
+        root: &std::path::Path,
+        file_says: Option<bool>,
+    ) -> (Arc<CatalogStore>, Arc<FakePortal>, Harness) {
+        write_last_watched(root, &live_url(901), true, file_says);
+        let portal = FakePortal::new(adult_catalog().live, Vec::new());
+        let catalog = Arc::new(CatalogStore::new(portal.clone()));
+        let mut h = Harness::start(root, catalog.clone(), PortalState::Configured, None);
+        assert!(
+            zapped(&h.sent()),
+            "the resume plays: the file says {file_says:?}"
+        );
+        (catalog, portal, h)
+    }
+
+    /// The catalog arrives and the app draws a frame in which it notices.
+    async fn load_catalog(catalog: &Arc<CatalogStore>, portal: &FakePortal, h: &mut Harness) {
+        catalog.spawn_fetch();
+        portal.release_catalog();
+        wait_until("the catalog", || catalog.is_loaded()).await;
+        h.frame(&[]);
+    }
+
+    fn stopped(sent: &[Cmd]) -> bool {
+        sent.iter().any(|c| matches!(c, Cmd::Stop))
+    }
+
+    #[tokio::test]
+    async fn a_resumed_stream_the_catalog_calls_adult_stops_and_the_next_start_skips_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // The file, from an earlier session, says "not adult": the portal has
+        // flagged the channel since.
+        let (catalog, portal, mut h) = resumed_901(dir.path(), Some(false));
+        load_catalog(&catalog, &portal, &mut h).await;
+        // Stopped as Lock stops adult playback, with its toast ...
+        assert!(stopped(&h.sent()));
+        assert_eq!(h.app.current_url, None);
+        assert_eq!(h.app.toast.as_ref().map(|t| t.0.as_str()), Some("Locked"));
+        // ... and the file knows now, so the next start does not resume it.
+        assert_eq!(read_last_watched(dir.path()).adult, Some(true));
+        let next_catalog = Arc::new(CatalogStore::new(idle_portal()));
+        let mut next = Harness::start(dir.path(), next_catalog, PortalState::Configured, None);
+        assert!(!zapped(&next.sent()));
+        assert_eq!(next.app.current_url, None);
+    }
+
+    #[tokio::test]
+    async fn a_stale_file_that_says_nothing_either_way_is_healed_and_stopped_too() {
+        let dir = tempfile::tempdir().unwrap();
+        // A 0.5 file with no flag waits for the catalog and then skips; nothing plays.
+        write_last_watched(dir.path(), &live_url(901), true, None);
+        let portal = FakePortal::new(adult_catalog().live, Vec::new());
+        let catalog = Arc::new(CatalogStore::new(portal.clone()));
+        let mut h = Harness::start(dir.path(), catalog.clone(), PortalState::Configured, None);
+        assert!(!zapped(&h.sent()));
+        load_catalog(&catalog, &portal, &mut h).await;
+        h.frame(&[]);
+        assert!(!zapped(&h.sent()), "still not resumed");
+        assert_eq!(read_last_watched(dir.path()).adult, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_url_from_the_command_line_keeps_playing_and_its_flag_is_healed() {
+        let dir = tempfile::tempdir().unwrap();
+        let portal = FakePortal::new(adult_catalog().live, Vec::new());
+        let catalog = Arc::new(CatalogStore::new(portal.clone()));
+        let url = live_url(901);
+        let mut h = Harness::start(
+            dir.path(),
+            catalog.clone(),
+            PortalState::Configured,
+            Some(&url),
+        );
+        // Before the catalog the file can only say "unknown".
+        assert_eq!(read_last_watched(dir.path()).adult, None);
+        load_catalog(&catalog, &portal, &mut h).await;
+        assert!(!stopped(&h.sent()), "the user's own URL keeps playing");
+        assert_eq!(h.app.current_url.as_deref(), Some(url.as_str()));
+        // But the next plain start must not resume it without the PIN.
+        assert_eq!(read_last_watched(dir.path()).adult, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_resumed_stream_keeps_playing_when_the_app_is_unlocked_by_then() {
+        let dir = tempfile::tempdir().unwrap();
+        let (catalog, portal, mut h) = resumed_901(dir.path(), Some(false));
+        catalog.set_adult_unlocked(true);
+        load_catalog(&catalog, &portal, &mut h).await;
+        assert!(!stopped(&h.sent()));
+        assert!(h.app.current_url.is_some());
+        assert_eq!(read_last_watched(dir.path()).adult, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_pick_since_the_start_is_left_playing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (catalog, portal, mut h) = resumed_901(dir.path(), Some(false));
+        // The user picked another stream before the catalog came in.
+        h.app.load_url(live_url(902), true);
+        h.sent();
+        load_catalog(&catalog, &portal, &mut h).await;
+        assert!(!stopped(&h.sent()));
+        assert_eq!(h.app.current_url, Some(live_url(902)));
+    }
+
+    #[tokio::test]
+    async fn a_reload_of_the_resumed_stream_is_still_the_resumed_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let (catalog, portal, mut h) = resumed_901(dir.path(), Some(false));
+        // The stall watchdog (or an eof) loads the same stream again.
+        h.app.load_url(live_url(901), true);
+        h.sent();
+        load_catalog(&catalog, &portal, &mut h).await;
+        assert!(stopped(&h.sent()));
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_skips_on_the_loaded_catalogs_word_writes_that_into_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_last_watched(dir.path(), &live_url(901), true, Some(false));
+        let loaded = Arc::new(CatalogStore::from_catalog(idle_portal(), adult_catalog()));
+        let mut h = Harness::start(dir.path(), loaded, PortalState::Configured, None);
+        assert!(!zapped(&h.sent()));
+        assert_eq!(read_last_watched(dir.path()).adult, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_normal_resume_is_not_touched_by_the_catalogs_word() {
+        let dir = tempfile::tempdir().unwrap();
+        write_last_watched(dir.path(), &live_url(3), true, Some(false));
+        let portal = FakePortal::new(adult_catalog().live, Vec::new());
+        let catalog = Arc::new(CatalogStore::new(portal.clone()));
+        let mut h = Harness::start(dir.path(), catalog.clone(), PortalState::Configured, None);
+        assert!(zapped(&h.sent()));
+        load_catalog(&catalog, &portal, &mut h).await;
+        assert!(!stopped(&h.sent()));
+        assert_eq!(h.app.current_url, Some(live_url(3)));
+        assert_eq!(read_last_watched(dir.path()).adult, Some(false));
+    }
+
+    // ---- a portal save forgets the old portal ----
+
+    /// Tests that point `BONGO_INI` somewhere hold this: the variable is the
+    /// whole process's.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn a_portal_save_forgets_what_waited_for_or_came_from_the_old_portal() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        // A 0.5 resume still waiting for the catalog; a stream of the old portal
+        // that came from a resume; the old portal's id of the channel it plays.
+        h.app.pending_resume = Some(LastWatched {
+            url: live_url(3),
+            live: true,
+            adult: None,
+        });
+        h.app.current_stream_id = Some(3);
+        h.app.playing_resumed = true;
+        let creds = XtreamCreds {
+            username: "u2".into(),
+            password: "p2".into(),
+            host: "127.0.0.1".into(),
+            port: 1,
+        };
+        let saved = h.app.apply_creds(creds, "u2:p2@127.0.0.1:1");
+        std::env::remove_var("BONGO_INI");
+        assert!(saved.is_ok());
+        assert!(
+            h.app.pending_resume.is_none(),
+            "the old portal's URL must not play"
+        );
+        assert_eq!(h.app.current_stream_id, None);
+        assert!(!h.app.playing_resumed);
     }
 }
