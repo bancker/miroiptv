@@ -1,12 +1,12 @@
 use crate::args::{parse_xtream_creds, CredsError, XtreamCreds};
 use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, quality_rank, zap_position, CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
-use crate::favorites::Favorites;
+use crate::favorites::{Entry as FavoriteEntry, Favorites};
 use crate::i18n::{Lang, T};
 use crate::pin::{PinGate, PinHash};
 use crate::playback_health::{PlaybackHealth, ReloadBudget};
 use crate::relay::Relay;
-use crate::player::{Cmd, Event, PlayerHandle, RgbaFrame};
+use crate::player::{Cmd, Event, FrameFence, PlayerHandle, RgbaFrame};
 use crate::presets::Presets;
 use crate::portal::xtream::ConnCheck;
 use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};
@@ -82,38 +82,6 @@ fn plays_as_live(status: ProgrammeStatus) -> bool {
     matches!(status, ProgrammeStatus::Live)
 }
 
-/// Which frames on the frame bus may show. A stopped stream's frames must not
-/// come back, and the newest of them can still be on their way when the stop is
-/// ordered: mpv renders one more while the command travels to its thread. So
-/// from the stop on nothing shows, until the next load narrows the fence to
-/// what is on the bus by then (the stopped stream's last frames); the first
-/// newer frame lifts it.
-#[derive(Debug, Default)]
-struct FrameFence(Option<u64>);
-
-impl FrameFence {
-    fn stop(&mut self) {
-        self.0 = Some(u64::MAX);
-    }
-
-    /// A stream loads; `latest` is the version of the newest frame on the bus.
-    /// Without a stop there is no fence to narrow.
-    fn load(&mut self, latest: u64) {
-        if self.0.is_some() {
-            self.0 = Some(latest);
-        }
-    }
-
-    /// Whether the frame with this version may show.
-    fn admit(&mut self, version: u64) -> bool {
-        if self.0.is_some_and(|fence| version <= fence) {
-            return false;
-        }
-        self.0 = None;
-        true
-    }
-}
-
 /// What to do with the last-watched stream at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResumeDecision {
@@ -123,13 +91,65 @@ enum ResumeDecision {
 }
 
 /// `flag`: the file's adult flag; `catalog_says_adult`: the catalog's answer,
-/// `None` while it is not loaded yet.
+/// `None` while it is not loaded yet. Either one saying adult is enough (the
+/// file can be older than the portal's word); with neither knowing, the resume
+/// waits for the catalog.
 fn resume_decision(flag: Option<bool>, catalog_says_adult: Option<bool>) -> ResumeDecision {
-    match flag.or(catalog_says_adult) {
-        Some(true) => ResumeDecision::Skip,
-        Some(false) => ResumeDecision::Play,
-        None => ResumeDecision::WaitForCatalog,
+    match (flag, catalog_says_adult) {
+        (Some(true), _) | (_, Some(true)) => ResumeDecision::Skip,
+        (None, None) => ResumeDecision::WaitForCatalog,
+        _ => ResumeDecision::Play,
     }
+}
+
+/// What the catalog says about a stream URL: `None` while it is not loaded. A
+/// catalog that knows nothing is not one that says "not adult".
+fn catalog_says_adult(catalog: &CatalogStore, url: &str) -> Option<bool> {
+    catalog.is_loaded().then(|| catalog.is_adult_url(url))
+}
+
+/// The record last_watched.json gets when `url` loads, or `None` to leave the
+/// file as it is. Its adult flag is the catalog's word when it can give one,
+/// else what the caller knows (`hint`: the resume passes the file's own flag
+/// on), else unknown, never "not adult" for lack of knowledge: the next start
+/// would resume an adult channel (a URL from the command line) without the PIN.
+/// A reload of the stream that plays, with nothing new known about it, leaves
+/// the file alone: the flag it has must not turn into "unknown".
+fn last_watched_record(
+    catalog: &CatalogStore,
+    url: &str,
+    live: bool,
+    hint: Option<bool>,
+    reload: bool,
+) -> Option<LastWatched> {
+    let adult = catalog_says_adult(catalog, url).or(hint);
+    if adult.is_none() && reload {
+        return None;
+    }
+    Some(LastWatched {
+        url: url.to_owned(),
+        live,
+        adult,
+    })
+}
+
+/// The favorites that show: adult ones act as if they were not there while
+/// locked.
+fn shown_favorites(favorites: &Favorites, catalog: &CatalogStore) -> Vec<FavoriteEntry> {
+    favorites
+        .iter()
+        .filter(|e| !catalog.is_hidden_live(e.stream_id, &e.name))
+        .cloned()
+        .collect()
+}
+
+/// The channel a preset recalls: none when the slot is empty, or adult while
+/// locked (it then acts as empty).
+fn preset_target(presets: &Presets, digit: u8, catalog: &CatalogStore) -> Option<i64> {
+    presets
+        .get(digit)
+        .filter(|p| !catalog.is_hidden_live(p.stream_id, &p.name))
+        .map(|p| p.stream_id)
 }
 
 /// One line of the help overlay: the key(s) and what they do. Both are static
@@ -702,10 +722,7 @@ impl TvApp {
     /// Play what was playing when the app last closed, unless that was adult
     /// content (every start is locked).
     fn resume(&mut self, lw: LastWatched) {
-        let catalog_says = self
-            .catalog
-            .is_loaded()
-            .then(|| self.catalog.is_adult_url(&lw.url));
+        let catalog_says = catalog_says_adult(&self.catalog, &lw.url);
         match resume_decision(lw.adult, catalog_says) {
             ResumeDecision::Play => {}
             ResumeDecision::Skip => {
@@ -721,7 +738,9 @@ impl TvApp {
         self.set_toast(self.t(T::ResumingLast));
         // Up/down then continues from this channel (see zap_delta).
         self.current_stream_id = self.catalog.portal().live_stream_id(&lw.url);
-        self.load_url(lw.url, lw.live);
+        // The file's flag goes on as the hint: the catalog is mostly not loaded
+        // yet, and a normal start must not record "unknown" for the next one.
+        self.load_url_with(lw.url, lw.live, lw.adult);
     }
 
     fn open_settings(&mut self) {
@@ -807,6 +826,13 @@ impl TvApp {
         tracing::info!("player: stop");
     }
 
+    /// What plays is adult content, as the catalog in use says.
+    fn playing_adult(&self) -> bool {
+        self.current_url
+            .as_deref()
+            .is_some_and(|u| self.catalog.is_adult_url(u))
+    }
+
     fn apply_settings_action(&mut self, action: SettingsAction) {
         match action {
             SettingsAction::Close => {
@@ -879,11 +905,7 @@ impl TvApp {
             SettingsAction::Lock => {
                 self.set_adult_visible(false);
                 // Adult content playing now stops, and its picture goes.
-                let playing_adult = self
-                    .current_url
-                    .as_deref()
-                    .is_some_and(|u| self.catalog.is_adult_url(u));
-                if playing_adult {
+                if self.playing_adult() {
                     self.stop_playback();
                 }
             }
@@ -940,6 +962,13 @@ impl TvApp {
     /// false so a finished file isn't reloaded on a loop). Centralises the
     /// LoadUrl send so current_url and the watchdog timer stay consistent.
     fn load_url(&mut self, url: String, watchdog: bool) {
+        self.load_url_with(url, watchdog, None);
+    }
+
+    /// `load_url`, with what the caller already knows about the stream's adult
+    /// flag (`adult_hint`) for while the catalog cannot tell yet: the resume
+    /// hands the file's own flag on.
+    fn load_url_with(&mut self, url: String, watchdog: bool, adult_hint: Option<bool>) {
         // Whatever loads now supersedes a zap still waiting for the user to
         // stop flipping.
         self.zap_pacer.cancel();
@@ -948,6 +977,10 @@ impl TvApp {
             self.paused = false;
             let _ = self.player.cmd_tx.send(Cmd::Pause(false));
         }
+        // Before current_live changes: a reload is this very stream played the
+        // same way again.
+        let reload =
+            self.current_url.as_deref() == Some(url.as_str()) && self.current_live == watchdog;
         self.current_live = watchdog;
         // Live goes through the local relay: one continuous stream for mpv
         // that rides out portal refusals instead of dying on them. The portal
@@ -965,15 +998,11 @@ impl TvApp {
         self.frame_fence.load(self.player.frames.version());
         let _ = self.player.cmd_tx.send(Cmd::LoadUrl(play));
         // Remember as last-watched so the next launch resumes it, unless it is
-        // adult content. The catalog knows that whenever it is loaded; the
-        // loads before that are the resume (already checked) and a URL given
-        // on the command line.
-        LastWatched {
-            url: url.clone(),
-            live: watchdog,
-            adult: Some(self.catalog.is_adult_url(&url)),
+        // adult content (what is known about that: see last_watched_record).
+        if let Some(record) = last_watched_record(&self.catalog, &url, watchdog, adult_hint, reload)
+        {
+            record.save(&self.storage.last_watched_path());
         }
-        .save(&self.storage.last_watched_path());
         self.current_url = Some(url);
         self.stall_watchdog_armed = watchdog;
         // Fresh stream: give it a full window to start before judging it stalled.
@@ -1820,13 +1849,9 @@ impl TvApp {
     }
 
     fn recall_preset(&mut self, digit: u8) {
-        let target = self
-            .presets
-            .get(digit)
-            .map(|p| (p.stream_id, p.name.clone()));
-        match target {
-            Some((sid, name)) if !self.catalog.is_hidden_live(sid, &name) => self.zap_by_id(sid),
-            _ => self.set_toast(self.tr(T::PresetEmpty, &[&digit.to_string()])),
+        match preset_target(&self.presets, digit, &self.catalog) {
+            Some(sid) => self.zap_by_id(sid),
+            None => self.set_toast(self.tr(T::PresetEmpty, &[&digit.to_string()])),
         }
     }
 
@@ -1965,10 +1990,7 @@ impl TvApp {
         tracing::info!("settings: portal saved to {} - connecting", path.display());
         // The new catalog starts locked, so a save locks like Lock does: asked of
         // the old catalog, the only one that knows this stream, before it goes.
-        let playing_adult = self
-            .current_url
-            .as_deref()
-            .is_some_and(|u| self.catalog.is_adult_url(u));
+        let playing_adult = self.playing_adult();
         self.creds = Some(creds.clone());
         let portal: Arc<dyn Portal> = Arc::new(XtreamPortal::new(creds));
         self.catalog = Arc::new(CatalogStore::new(portal));
@@ -2372,13 +2394,7 @@ impl TvApp {
         }
         let mut zap_id: Option<i64> = None;
         let mut remove_id: Option<i64> = None;
-        // Adult favorites act as if they were not there while locked.
-        let entries: Vec<_> = self
-            .favorites
-            .iter()
-            .filter(|e| !self.catalog.is_hidden_live(e.stream_id, &e.name))
-            .cloned()
-            .collect();
+        let entries = shown_favorites(&self.favorites, &self.catalog);
         let lang = self.lang;
 
         egui::Area::new(egui::Id::new("__favs__"))
@@ -3892,42 +3908,164 @@ mod tests {
         assert_eq!(new.adult, Some(false));
     }
 
-    #[test]
-    fn a_stopped_streams_frames_never_come_back() {
-        let mut fence = FrameFence::default();
-        assert!(fence.admit(5), "no stop: every frame shows");
-        fence.stop();
-        // A frame mpv rendered while the stop was on its way is as stale as the
-        // older ones, though it is newer than the bus was when the stop was ordered.
-        assert!(!fence.admit(5));
-        assert!(!fence.admit(6));
-        // The next stream loads; what is on the bus then is the stopped one's.
-        fence.load(6);
-        assert!(!fence.admit(6));
-        // Its first frame lifts the fence for good.
-        assert!(fence.admit(7));
-        assert!(fence.admit(7));
-        assert!(fence.admit(8));
+    /// A portal that is never asked anything: the catalog only needs one to exist.
+    fn idle_portal() -> Arc<dyn Portal> {
+        Arc::new(XtreamPortal::new(XtreamCreds {
+            username: "u".into(),
+            password: "p".into(),
+            host: "h".into(),
+            port: 80,
+        }))
+    }
+
+    /// 3 is a normal channel, 901 is adult by the portal's flag, 902 by its name.
+    fn adult_catalog() -> crate::portal::Catalog {
+        let live = |stream_id: i64, name: &str, is_adult: bool| LiveChannel {
+            stream_id,
+            name: name.into(),
+            category_id: None,
+            epg_channel_id: None,
+            tv_archive: 0,
+            tv_archive_duration: 0,
+            is_adult,
+        };
+        crate::portal::Catalog {
+            live: vec![
+                live(3, "TEST 03", false),
+                live(901, "24/7 | ADULT A", true),
+                live(902, "XXX | ADULT B", false),
+            ],
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn a_load_without_a_stop_leaves_the_frames_alone() {
-        let mut fence = FrameFence::default();
-        fence.load(10);
-        assert!(fence.admit(10));
-        assert!(fence.admit(11));
+    fn an_unloaded_catalog_says_nothing_about_a_stream_not_even_that_it_is_not_adult() {
+        let url = "http://h/live/u/p/901.m3u8";
+        assert_eq!(
+            catalog_says_adult(&CatalogStore::new(idle_portal()), url),
+            None
+        );
+        let loaded = CatalogStore::from_catalog(idle_portal(), adult_catalog());
+        assert_eq!(catalog_says_adult(&loaded, url), Some(true));
+        assert_eq!(
+            catalog_says_adult(&loaded, "http://h/live/u/p/3.m3u8"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn last_watched_never_records_not_adult_for_lack_of_knowledge() {
+        let loading = CatalogStore::new(idle_portal());
+        let loaded = CatalogStore::from_catalog(idle_portal(), adult_catalog());
+        let (adult_url, normal_url) = ("http://h/live/u/p/901.m3u8", "http://h/live/u/p/3.m3u8");
+        // The flag the file gets: `None` is unknown; the outer `None` leaves the file alone.
+        let flag = |catalog: &CatalogStore, url: &str, hint: Option<bool>, reload: bool| {
+            last_watched_record(catalog, url, true, hint, reload).map(|r| r.adult)
+        };
+        // A URL from the command line while the catalog loads: unknown, never "no".
+        assert_eq!(flag(&loading, adult_url, None, false), Some(None));
+        // The resume hands the file's flag on, so a normal start records what it read.
+        assert_eq!(
+            flag(&loading, normal_url, Some(false), false),
+            Some(Some(false))
+        );
+        // The loaded catalog's word beats the hint, either way.
+        assert_eq!(
+            flag(&loaded, adult_url, Some(false), false),
+            Some(Some(true))
+        );
+        assert_eq!(flag(&loaded, normal_url, None, false), Some(Some(false)));
+        // A reload of the stream that plays: while the catalog loads nothing new is
+        // known, so the file keeps what it has; once the catalog can tell, it is written.
+        assert_eq!(flag(&loading, normal_url, None, true), None);
+        assert_eq!(flag(&loaded, normal_url, None, true), Some(Some(false)));
+        // What else the record holds is the load's own.
+        let record = last_watched_record(&loading, normal_url, false, Some(false), false);
+        let record = record.expect("a first load is recorded");
+        assert_eq!((record.url.as_str(), record.live), (normal_url, false));
+    }
+
+    #[test]
+    fn locked_favorites_and_presets_pointing_at_adult_content_act_empty() {
+        let catalog = CatalogStore::from_catalog(idle_portal(), adult_catalog());
+        let mut favorites = Favorites::default();
+        favorites.toggle(3, "TEST 03");
+        favorites.toggle(901, "24/7 | ADULT A"); // adult by the portal's flag
+        favorites.toggle(902, "Renamed"); // adult by its name in the catalog
+        favorites.toggle(77, "XXX | Gone"); // not in the catalog: the name says it
+        let mut presets = Presets::default();
+        presets.set(1, 901, "24/7 | ADULT A");
+        presets.set(2, 902, "Renamed");
+        presets.set(3, 3, "TEST 03");
+        presets.set(4, 77, "XXX | Gone");
+        let listed = |catalog: &CatalogStore| {
+            let shown = shown_favorites(&favorites, catalog);
+            shown.iter().map(|e| e.stream_id).collect::<Vec<_>>()
+        };
+        let recalled = |catalog: &CatalogStore| {
+            (0..=5)
+                .map(|digit| preset_target(&presets, digit, catalog))
+                .collect::<Vec<_>>()
+        };
+        // Locked: only the normal channel is listed or recalled; empty slots stay empty.
+        assert_eq!(listed(&catalog), [3]);
+        assert_eq!(recalled(&catalog), [None, None, None, Some(3), None, None]);
+        // Unlocked: all of them.
+        catalog.set_adult_unlocked(true);
+        assert_eq!(listed(&catalog), [3, 901, 902, 77]);
+        assert_eq!(
+            recalled(&catalog),
+            [None, Some(901), Some(902), Some(3), Some(77), None]
+        );
+    }
+
+    #[test]
+    fn another_portal_leaves_the_guide_nothing_kept_by_the_old_ones_stream_ids() {
+        let mut guide = GuideState::default();
+        guide.epg_cache.lock().insert(7, Epg::new(Vec::new()));
+        guide.epg_pending.lock().insert(8);
+        guide.epg_failed.lock().insert(9);
+        guide.row_per_channel.insert(7, 3);
+        // A fetch of the old portal that is still in flight holds the old maps.
+        let (old_cache, old_pending) = (guide.epg_cache.clone(), guide.epg_pending.clone());
+        guide.forget_portal();
+        assert!(guide.epg_cache.lock().is_empty());
+        assert!(guide.epg_pending.lock().is_empty());
+        assert!(guide.epg_failed.lock().is_empty());
+        assert!(guide.row_per_channel.is_empty());
+        // It finishes into the old maps, which the guide no longer reads.
+        old_cache.lock().insert(8, Epg::new(Vec::new()));
+        old_pending.lock().remove(&8);
+        assert!(guide.epg_cache.lock().is_empty());
+        assert!(guide.epg_pending.lock().is_empty());
     }
 
     #[test]
     fn adult_content_never_resumes() {
         use ResumeDecision::*;
-        assert_eq!(resume_decision(Some(false), None), Play);
-        assert_eq!(resume_decision(Some(true), None), Skip);
-        assert_eq!(resume_decision(Some(true), Some(false)), Skip);
-        // A file from 0.5: only the catalog can tell.
-        assert_eq!(resume_decision(None, None), WaitForCatalog);
-        assert_eq!(resume_decision(None, Some(true)), Skip);
-        assert_eq!(resume_decision(None, Some(false)), Play);
+        // (the file's flag, the loaded catalog's answer) -> what happens
+        let cases = [
+            // A file from 0.5 and a catalog still loading: nobody knows.
+            (None, None, WaitForCatalog),
+            (None, Some(false), Play),
+            (None, Some(true), Skip),
+            (Some(false), None, Play),
+            (Some(false), Some(false), Play),
+            // Either one saying adult is enough: the file can be older than the
+            // portal's word (a channel flagged since).
+            (Some(false), Some(true), Skip),
+            (Some(true), None, Skip),
+            (Some(true), Some(false), Skip),
+            (Some(true), Some(true), Skip),
+        ];
+        for (flag, catalog, want) in cases {
+            assert_eq!(
+                resume_decision(flag, catalog),
+                want,
+                "file {flag:?}, catalog {catalog:?}"
+            );
+        }
     }
 
     #[test]

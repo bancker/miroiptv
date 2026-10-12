@@ -62,6 +62,38 @@ impl FrameBus {
     }
 }
 
+/// Which frames on the bus may show. A stopped stream's frames must not come
+/// back, and the newest of them can still be on their way when the stop is
+/// ordered: mpv renders one more while the command travels to its thread. So
+/// from the stop on nothing shows, until the next load narrows the fence to
+/// what is on the bus by then (the stopped stream's last frames); the first
+/// newer frame lifts it.
+#[derive(Debug, Default)]
+pub struct FrameFence(Option<u64>);
+
+impl FrameFence {
+    pub fn stop(&mut self) {
+        self.0 = Some(u64::MAX);
+    }
+
+    /// A stream loads; `latest` is the version of the newest frame on the bus.
+    /// Without a stop there is no fence to narrow.
+    pub fn load(&mut self, latest: u64) {
+        if self.0.is_some() {
+            self.0 = Some(latest);
+        }
+    }
+
+    /// Whether the frame with this version may show.
+    pub fn admit(&mut self, version: u64) -> bool {
+        if self.0.is_some_and(|fence| version <= fence) {
+            return false;
+        }
+        self.0 = None;
+        true
+    }
+}
+
 pub struct RenderCtx {
     raw: *mut sys::mpv_render_context,
     frames: Arc<FrameBus>,
@@ -175,5 +207,36 @@ impl Drop for RenderCtx {
             }
             self.raw = ptr::null_mut();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stopped_streams_frames_never_come_back() {
+        let mut fence = FrameFence::default();
+        assert!(fence.admit(5), "no stop: every frame shows");
+        fence.stop();
+        // A frame mpv rendered while the stop was on its way is as stale as the
+        // older ones, though it is newer than the bus was when the stop was ordered.
+        assert!(!fence.admit(5));
+        assert!(!fence.admit(6));
+        // The next stream loads; what is on the bus then is the stopped one's.
+        fence.load(6);
+        assert!(!fence.admit(6));
+        // Its first frame lifts the fence for good.
+        assert!(fence.admit(7));
+        assert!(fence.admit(7));
+        assert!(fence.admit(8));
+    }
+
+    #[test]
+    fn a_load_without_a_stop_leaves_the_frames_alone() {
+        let mut fence = FrameFence::default();
+        fence.load(10);
+        assert!(fence.admit(10));
+        assert!(fence.admit(11));
     }
 }

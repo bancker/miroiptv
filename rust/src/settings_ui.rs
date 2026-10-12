@@ -437,6 +437,7 @@ impl SettingsUi {
         ui.label(egui::RichText::new(t(lang, status)).strong());
         ui.add_space(6.0);
         let blocked = view.pin_wait_secs.is_some();
+        let pushed_before = actions.len();
         // A dialog just opened, or the section entered again with one open:
         // its first field takes the focus.
         let focus = std::mem::take(&mut self.focus_dialog) || focus_first;
@@ -455,6 +456,10 @@ impl SettingsUi {
                         }
                         if r.clicked() {
                             actions.push(SettingsAction::Lock);
+                            // Lock is replaced by Unlock, which is disabled while
+                            // PIN input is blocked and then keeps no focus: the
+                            // first button that works takes it, next frame.
+                            self.focus_first = true;
                         }
                     } else {
                         let r = ui.add_enabled(!blocked, egui::Button::new(t(lang, T::Unlock)));
@@ -581,6 +586,11 @@ impl SettingsUi {
             self.focus_first = true;
         } else {
             self.adult = dialog;
+        }
+        // What was pushed is the app's to answer now: an older note of ours must
+        // not stay in front of the one it sets.
+        if actions.len() > pushed_before {
+            self.local_note = None;
         }
         if let Some(secs) = view.pin_wait_secs {
             ui.label(tr(lang, T::PinBlocked, &[&secs.to_string()]));
@@ -1405,6 +1415,69 @@ mod tests {
         o.press(Key::ArrowDown, 3); // Adult
         o.press(Key::Enter, 1); // into it: Lock has the focus
         assert_eq!(o.frame(&[Key::Enter]), vec![SettingsAction::Lock]);
+    }
+
+    #[test]
+    fn after_locking_the_focus_is_on_the_button_that_replaced_lock() {
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.adult_unlocked = true;
+        o.press(Key::ArrowDown, 3); // Adult
+        o.press(Key::Enter, 1); // into it: Lock has the focus
+        assert_eq!(o.frame(&[Key::Enter]), vec![SettingsAction::Lock]);
+        // The app locked: the first button is Unlock now, and the keyboard can
+        // carry on from it.
+        o.adult_unlocked = false;
+        assert_eq!(o.frame(&[]), vec![]);
+        o.press(Key::Enter, 1);
+        assert!(
+            matches!(o.ui.adult, AdultDialog::Unlock { .. }),
+            "{:?}",
+            o.ui.adult
+        );
+    }
+
+    #[test]
+    fn after_locking_while_blocked_the_focus_goes_to_forgot_pin() {
+        // Wrong old PINs in Change PIN can block PIN input while unlocked. Lock
+        // then replaces itself by a disabled Unlock, which keeps no focus.
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.adult_unlocked = true;
+        o.pin_wait_secs = Some(30);
+        o.press(Key::ArrowDown, 3); // Adult
+        o.press(Key::Enter, 1); // into it: Lock has the focus
+        assert_eq!(o.frame(&[Key::Enter]), vec![SettingsAction::Lock]);
+        o.adult_unlocked = false;
+        assert_eq!(o.frame(&[]), vec![]);
+        o.press(Key::Enter, 1);
+        assert!(
+            matches!(o.ui.adult, AdultDialog::Forgot { .. }),
+            "{:?}",
+            o.ui.adult
+        );
+    }
+
+    #[test]
+    fn an_action_leaves_no_stale_note_to_mask_the_apps_own() {
+        let mut o = Overlay::new();
+        o.has_pin = true;
+        o.adult_unlocked = true;
+        o.press(Key::ArrowDown, 3); // Adult
+        o.press(Key::Enter, 1); // into it: Lock has the focus
+        o.press(Key::Tab, 1); // Change PIN
+        o.press(Key::Enter, 1);
+        assert_eq!(o.frame(&[]), vec![]);
+        o.type_text("12");
+        // On to the last field, where Enter is OK: too short, so the dialog
+        // closes with a note of its own.
+        o.press(Key::Enter, 2);
+        assert_eq!(o.frame(&[Key::Enter]), vec![]);
+        assert_eq!(o.ui.local_note, Some(T::PinFormat));
+        // Locking now is the app's to answer: the old note must not stay in front.
+        assert_eq!(o.frame(&[]), vec![]); // Lock has the focus again
+        assert_eq!(o.frame(&[Key::Enter]), vec![SettingsAction::Lock]);
+        assert_eq!(o.ui.local_note, None);
     }
 
     #[test]

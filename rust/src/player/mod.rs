@@ -4,7 +4,7 @@ pub mod mpv_sys;
 pub mod render;
 
 pub use mpv::{Mpv, MpvError};
-pub use render::{FrameBus, RenderCtx, RgbaFrame};
+pub use render::{FrameBus, FrameFence, RenderCtx, RgbaFrame};
 
 use std::sync::Arc;
 use std::thread;

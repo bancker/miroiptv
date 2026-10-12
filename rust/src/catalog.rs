@@ -57,14 +57,14 @@ fn adult_series(s: &Series) -> bool {
 struct StoredCatalog {
     catalog: PortalCatalog,
     /// Stream ids of the adult live channels (see `adult_live`).
-    adult_live: HashSet<i64>,
+    adult_live_ids: HashSet<i64>,
 }
 
 impl StoredCatalog {
     /// The one way a catalog gets stored: the fetch and `from_catalog` both come
     /// through here, so what is worked out cannot differ between them.
     fn new(catalog: PortalCatalog) -> Self {
-        let adult_ids = catalog
+        let adult_live_ids = catalog
             .live
             .iter()
             .filter(|c| adult_live(c))
@@ -72,7 +72,7 @@ impl StoredCatalog {
             .collect();
         Self {
             catalog,
-            adult_live: adult_ids,
+            adult_live_ids,
         }
     }
 }
@@ -486,7 +486,7 @@ mod zap_tests {
             ],
             ..PortalCatalog::default()
         });
-        let mut adult: Vec<i64> = stored.adult_live.iter().copied().collect();
+        let mut adult: Vec<i64> = stored.adult_live_ids.iter().copied().collect();
         adult.sort();
         assert_eq!(adult, [2, 3]);
         // The rest of the catalog reads through it.
@@ -554,7 +554,7 @@ impl CatalogStore {
             return false;
         };
         match kind {
-            StreamKind::Live | StreamKind::Timeshift => c.adult_live.contains(&id),
+            StreamKind::Live | StreamKind::Timeshift => c.adult_live_ids.contains(&id),
             StreamKind::Movie => c.movies.iter().any(|m| m.stream_id == id && adult_movie(m)),
             // Series URLs carry episode ids, not series ids.
             StreamKind::Series => false,
@@ -573,7 +573,7 @@ impl CatalogStore {
         self.inner
             .read()
             .as_ref()
-            .is_some_and(|c| c.adult_live.contains(&sid))
+            .is_some_and(|c| c.adult_live_ids.contains(&sid))
     }
 
     /// Spawn an async fetch on the current tokio runtime. Non-blocking.
