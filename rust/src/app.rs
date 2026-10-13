@@ -149,16 +149,22 @@ fn preset_target(presets: &Presets, digit: u8, catalog: &CatalogStore) -> Option
         .map(|p| p.stream_id)
 }
 
-/// Writes the guide's cache file and says so in the log.
-fn write_epg_cache(path: &std::path::Path, channels: &[crate::guide::cache::ToSave]) {
+/// Writes the guide's cache file and says so in the log. Whether it was written.
+fn write_epg_cache(path: &std::path::Path, channels: &[crate::guide::cache::ToSave]) -> bool {
     match crate::guide::cache::save(path, channels, chrono::Utc::now()) {
-        Ok((n, programmes, bytes)) => tracing::info!(
-            "guide: epg cache written ({} channels, {} programmes, {} KB)",
-            n,
-            programmes,
-            bytes / 1024
-        ),
-        Err(e) => tracing::warn!("guide: epg cache not written: {}", e),
+        Ok((n, programmes, bytes)) => {
+            tracing::info!(
+                "guide: epg cache written ({} channels, {} programmes, {} KB)",
+                n,
+                programmes,
+                bytes / 1024
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!("guide: epg cache not written: {}", e);
+            false
+        }
     }
 }
 
@@ -330,6 +336,13 @@ const WAIT_FOR_PICTURE: Duration = Duration::from_secs(1);
 /// what it held.
 type CacheRead = (u64, Result<Vec<(i64, ChannelEpg)>, String>);
 
+/// How long the guide's fetches wait for the cache file to be read, should the
+/// reading thread hang.
+const EPG_CACHE_READ_WAIT: Duration = Duration::from_secs(2);
+
+/// How long a cache write that failed waits before it is tried again.
+const EPG_CACHE_RETRY: Duration = Duration::from_secs(60);
+
 /// What the "found" lines of the news settings were worked out for: the rules'
 /// channel names and the catalog's state. Typing in a rule's patterns, label or
 /// seconds changes none of it.
@@ -490,16 +503,27 @@ pub struct TvApp {
     epg_cache_read_for: Option<u64>,
     /// What the cache file held, on its way from the reading thread.
     epg_cache_slot: Arc<Mutex<Option<CacheRead>>>,
-    /// Since when EPG has been coming in that the cache file does not hold yet.
+    /// Since when EPG has been coming in that the cache file does not hold yet
+    /// (a write that failed counts from the moment it was noticed).
     epg_cache_dirty_since: Option<Instant>,
     /// When the guide's channels were last looked through to see whether the EPG
     /// that came in is complete: a walk over the whole list, so once a second
     /// at most.
     epg_cache_checked: Option<Instant>,
-    /// The thread writing the cache file, while it runs. A write goes through a
-    /// temporary file of one fixed name, so two writers at once could corrupt
-    /// the file: only one runs at a time.
+    /// The thread writing the cache file, from its start until a frame (or exit)
+    /// takes it in once it has finished. A write goes through a temporary file
+    /// of one fixed name, so two writers at once could corrupt the file: only
+    /// one runs at a time.
     epg_cache_writer: Option<std::thread::JoinHandle<()>>,
+    /// Since when this catalog's cache file is being read, until the app has
+    /// taken in what it held. The guide's fetches wait for it (2 s at most).
+    epg_cache_reading_since: Option<Instant>,
+    /// Set by the writer when its write failed, for `note_failed_epg_cache_write`
+    /// to find once the writer has finished. A portal save makes a new one, so
+    /// the failure of a write for the old portal is no news to the new store.
+    epg_cache_write_failed: Arc<std::sync::atomic::AtomicBool>,
+    /// No write before this moment: one that failed waits a minute.
+    epg_cache_retry_after: Option<Instant>,
     /// When the stream that loads now went to the player; its first frame
     /// clears it. EPG fetching waits meanwhile (10 s at most): zapping first.
     stream_starting_since: Option<Instant>,
@@ -720,6 +744,9 @@ impl TvApp {
             epg_cache_dirty_since: None,
             epg_cache_checked: None,
             epg_cache_writer: None,
+            epg_cache_reading_since: None,
+            epg_cache_write_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            epg_cache_retry_after: None,
             stream_starting_since: None,
             pending_catchup: None,
             borderless: false,
@@ -1431,7 +1458,11 @@ impl TvApp {
         }
     }
 
-    /// The guide's EPG of the channel `stream_id` plays, while it is fresh.
+    /// The guide's EPG of the channel `stream_id` plays, while it is fresh, from
+    /// the programme on now, 100 programmes at most: what the short EPG gave the
+    /// toast, the strip and the overview (Shift+E). The past is of no use to
+    /// them, and the day table holds about 600 programmes from a week back. With
+    /// nothing on now or after, the portal is asked as before.
     /// Zapping picks the same variant as the guide's live id, so a lookup by id
     /// finds it; another variant (a quality switch) is fetched as before.
     fn fresh_guide_epg(&self, stream_id: i64) -> Option<Epg> {
@@ -1439,13 +1470,20 @@ impl TvApp {
             .guide_channels
             .iter()
             .find(|c| c.live_id == stream_id || c.archive_id == stream_id)?;
-        if self
-            .epg_store
-            .needs_fetch(channel.archive_id, chrono::Utc::now())
-        {
+        let now = chrono::Utc::now();
+        if self.epg_store.needs_fetch(channel.archive_id, now) {
             return None;
         }
-        Some((*self.epg_store.get(channel.archive_id)?.epg).clone())
+        let from_now: Vec<EpgEntry> = self
+            .epg_store
+            .get(channel.archive_id)?
+            .entries()
+            .iter()
+            .filter(|e| e.end > now)
+            .take(100)
+            .cloned()
+            .collect();
+        (!from_now.is_empty()).then(|| Epg::new(from_now))
     }
 
     fn kick_epg_fetch(&mut self, stream_id: i64) {
@@ -2248,8 +2286,13 @@ impl TvApp {
         self.guide_view = GuideView::new(crate::guide::time::day_of(chrono::Utc::now()));
         self.guide_fetching = false;
         // The new portal's file is read when its catalog loads (the generation
-        // changed); what the old portal's EPG left to write goes with it.
+        // changed); what the old portal's EPG left to write goes with it. So does
+        // a write of the old portal's that fails later: the flag it sets is not
+        // the one the new portal's store looks at.
         self.epg_cache_dirty_since = None;
+        self.epg_cache_reading_since = None;
+        self.epg_cache_retry_after = None;
+        self.epg_cache_write_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.adult_note = None;
         // Whatever waited for the old portal's catalog, or was told by it, means
         // nothing to the new one: a 0.5 resume would play the old portal's URL
@@ -3078,7 +3121,8 @@ impl TvApp {
     }
 
     /// Takes the finished EPG fetches in and starts what may start: 2 at a time
-    /// with the guide open, 1 with it closed, none while a stream starts.
+    /// with the guide open, 1 with it closed, none while a stream starts or this
+    /// catalog's cache file is being read.
     fn tick_epg(&mut self) {
         let now = Instant::now();
         let landed = self.epg_fetcher.drain(now);
@@ -3110,7 +3154,13 @@ impl TvApp {
         let starting = self
             .stream_starting_since
             .is_some_and(|t| t.elapsed() < Duration::from_secs(10));
-        let limit = if starting {
+        // What the cache file holds need not be fetched: a guide opened before
+        // the read has landed would ask the portal for channels it is about to
+        // fill. Not for ever, should the reading thread hang.
+        let reading = self
+            .epg_cache_reading_since
+            .is_some_and(|since| now.saturating_duration_since(since) < EPG_CACHE_READ_WAIT);
+        let limit = if starting || reading {
             0
         } else if self.guide_open {
             2
@@ -3170,6 +3220,7 @@ impl TvApp {
             self.epg_cache_read_for = Some(self.catalog_generation);
             if let Some(path) = self.epg_cache_path() {
                 let (slot, generation) = (self.epg_cache_slot.clone(), self.catalog_generation);
+                self.epg_cache_reading_since = Some(Instant::now());
                 std::thread::spawn(move || {
                     let read = crate::guide::cache::load(&path, chrono::Utc::now());
                     *slot.lock() = Some((generation, read));
@@ -3182,13 +3233,16 @@ impl TvApp {
         if generation != self.catalog_generation {
             return;
         }
+        // The guide's fetches may start.
+        self.epg_cache_reading_since = None;
         match read {
             Ok(channels) => {
                 let known: std::collections::HashSet<i64> =
                     self.guide_channels.iter().map(|c| c.archive_id).collect();
-                let mut kept = 0;
+                let (mut kept, mut programmes) = (0, 0);
                 for (id, epg) in channels {
                     if known.contains(&id) {
+                        programmes += epg.entries().len();
                         self.epg_store.insert(id, epg);
                         kept += 1;
                     }
@@ -3196,7 +3250,7 @@ impl TvApp {
                 tracing::info!(
                     "guide: epg cache read ({} channels, {} programmes)",
                     kept,
-                    self.epg_store.programmes()
+                    programmes
                 );
             }
             Err(e) => tracing::warn!("guide: epg cache unreadable ({}) - building a new one", e),
@@ -3215,16 +3269,24 @@ impl TvApp {
     /// the clock). The minute needs no walk. And one writer at a time: the file
     /// goes through a temporary one of a fixed name, which two writers would
     /// fill together. A write that is due while the writer still runs waits;
-    /// the store stays dirty and a later frame writes.
+    /// the store stays dirty and a later frame writes. A writer that has
+    /// finished is taken in first, whether the store is dirty or not: a write
+    /// that failed marks it dirty again.
     fn write_epg_cache_when_due(&mut self, now: Instant) {
-        let Some(since) = self.epg_cache_dirty_since else {
-            return;
-        };
         if self
             .epg_cache_writer
             .as_ref()
-            .is_some_and(|writer| !writer.is_finished())
+            .is_some_and(|writer| writer.is_finished())
         {
+            if let Some(writer) = self.epg_cache_writer.take() {
+                let _ = writer.join();
+            }
+            self.note_failed_epg_cache_write(now);
+        }
+        let Some(since) = self.epg_cache_dirty_since else {
+            return;
+        };
+        if self.epg_cache_writer.is_some() || self.epg_cache_retry_after.is_some_and(|t| now < t) {
             return;
         }
         if now.saturating_duration_since(since) < Duration::from_secs(60) {
@@ -3249,9 +3311,25 @@ impl TvApp {
         }
         if let Some((path, channels)) = self.epg_cache_contents() {
             self.epg_cache_dirty_since = None;
+            let failed = self.epg_cache_write_failed.clone();
             self.epg_cache_writer = Some(std::thread::spawn(move || {
-                write_epg_cache(&path, &channels)
+                let written = write_epg_cache(&path, &channels);
+                failed.store(!written, std::sync::atomic::Ordering::Release);
             }));
+        }
+    }
+
+    /// A cache write that failed (the writer says so in `epg_cache_write_failed`)
+    /// marks the store dirty again, from `now`, and is tried again after a
+    /// minute: not at once, since a failure that stays (the file is locked, the
+    /// disk is full) would write, fail and log on every frame.
+    fn note_failed_epg_cache_write(&mut self, now: Instant) {
+        let failed = self
+            .epg_cache_write_failed
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        if failed {
+            self.epg_cache_dirty_since.get_or_insert(now);
+            self.epg_cache_retry_after = Some(now + EPG_CACHE_RETRY);
         }
     }
 
@@ -3389,6 +3467,10 @@ impl TvApp {
 
 impl Drop for TvApp {
     fn drop(&mut self) {
+        // The player first: mpv and its audio would run on through the wait for
+        // the cache writer and through the write below, tens to a few hundred
+        // ms. Nothing below depends on mpv.
+        let _ = self.player.cmd_tx.send(Cmd::Quit);
         let _ = self.favorites.save(&self.storage.favorites_path());
         // Rules typed in settings that were still open, or not written yet
         // when they closed.
@@ -3396,17 +3478,18 @@ impl Drop for TvApp {
             let _ = self.settings.save(&self.storage.settings_path());
         }
         // A writer still at work finishes first: two would fill the same
-        // temporary file, and a write that exit killed would be lost.
+        // temporary file, and a write that exit killed would be lost. One that
+        // failed marks the store dirty again, so the write below tries again.
         if let Some(writer) = self.epg_cache_writer.take() {
             let _ = writer.join();
         }
+        self.note_failed_epg_cache_write(Instant::now());
         // The guide's EPG that came in since the last write.
         if self.epg_cache_dirty_since.is_some() {
             if let Some((path, channels)) = self.epg_cache_contents() {
                 write_epg_cache(&path, &channels);
             }
         }
-        let _ = self.player.cmd_tx.send(Cmd::Quit);
     }
 }
 
@@ -3925,6 +4008,16 @@ mod tests {
             };
             harness.frame(&[]);
             harness.frame(&[]);
+            // The cache file, which the app reads on a thread of its own once its
+            // catalog is loaded, has landed: the guide's fetches wait for it, so a
+            // test that counts them starts from there.
+            for _ in 0..2000 {
+                if harness.app.epg_cache_reading_since.is_none() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+                harness.frame(&[]);
+            }
             harness
         }
 
@@ -4785,6 +4878,9 @@ mod tests {
         /// What the catalog lists; `set_live` changes it for the next fetch.
         live: Mutex<Vec<LiveChannel>>,
         day_epg: Vec<EpgEntry>,
+        /// What the short EPG answers (the zap toast's own fetch): nothing, unless
+        /// `set_short_epg` says otherwise.
+        short_epg: Mutex<Vec<EpgEntry>>,
         catalog_gate: tokio::sync::Semaphore,
         epg_gate: tokio::sync::Semaphore,
         epg_fetches: std::sync::atomic::AtomicUsize,
@@ -4801,6 +4897,7 @@ mod tests {
                 }),
                 live: Mutex::new(live),
                 day_epg,
+                short_epg: Mutex::new(Vec::new()),
                 catalog_gate: tokio::sync::Semaphore::new(0),
                 epg_gate: tokio::sync::Semaphore::new(0),
                 epg_fetches: std::sync::atomic::AtomicUsize::new(0),
@@ -4810,6 +4907,11 @@ mod tests {
         /// The portal lists these channels from the next catalog fetch on.
         fn set_live(&self, live: Vec<LiveChannel>) {
             *self.live.lock() = live;
+        }
+
+        /// The portal answers these programmes to every short EPG.
+        fn set_short_epg(&self, programmes: Vec<EpgEntry>) {
+            *self.short_epg.lock() = programmes;
         }
 
         fn release_catalog(&self) {
@@ -4837,7 +4939,7 @@ mod tests {
             })
         }
         async fn fetch_epg(&self, _: i64) -> Result<Epg, crate::portal::PortalError> {
-            Ok(Epg::new(Vec::new()))
+            Ok(Epg::new(self.short_epg.lock().clone()))
         }
         async fn fetch_day_epg(&self, _: i64) -> Result<Epg, crate::portal::PortalError> {
             self.epg_fetches
@@ -5756,10 +5858,11 @@ mod tests {
         );
         assert_eq!(h.app.epg_store.len(), 1, "only the guide's channels");
         assert!(h.app.epg_store.get(999).is_none());
-        // What the file holds is no news to it. (A store made dirty by the read
-        // would be complete, so the same frame would write it back at once.)
+        // What the file holds is no news to it. A store made dirty by the read
+        // would be complete, so the same frame would write it back at once: and
+        // a file written from the store has 13 only, not 999.
         assert!(h.app.epg_cache_dirty_since.is_none());
-        assert!(h.app.epg_cache_writer.is_none(), "not written back");
+        assert_eq!(cached_ids(&path), [13, 999], "not written back");
     }
 
     #[tokio::test]
@@ -5774,8 +5877,14 @@ mod tests {
         *h.app.epg_cache_slot.lock() = Some((h.app.catalog_generation, Ok(old)));
         h.app.catalog_generation += 1;
         h.app.epg_cache_read_for = Some(h.app.catalog_generation);
+        // The new catalog's own read is on its way.
+        h.app.epg_cache_reading_since = Some(Instant::now());
         load_catalog(&catalog, &portal, &mut h).await;
         h.frame(&[]);
+        assert!(
+            h.app.epg_cache_reading_since.is_some(),
+            "a read of the old catalog does not end the wait for this one's"
+        );
         assert_eq!(
             h.app.guide_channels.len(),
             1,
@@ -5876,6 +5985,10 @@ mod tests {
         std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
         let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
         h.app.epg_cache_dirty_since = Some(Instant::now());
+        // Nor does the old portal's read still on its way, or its failed write
+        // waiting for a second try, hold up the new portal.
+        h.app.epg_cache_reading_since = Some(Instant::now());
+        h.app.epg_cache_retry_after = Some(Instant::now() + Duration::from_secs(60));
         let creds = XtreamCreds {
             username: "u2".into(),
             password: "p2".into(),
@@ -5889,13 +6002,15 @@ mod tests {
             h.app.epg_cache_dirty_since.is_none(),
             "the old portal's EPG is not written under the new portal's name"
         );
+        assert!(h.app.epg_cache_reading_since.is_none());
+        assert!(h.app.epg_cache_retry_after.is_none());
     }
 
     /// An app on a catalog of TEST 03 (3) with its catch-up twin (13), and a
     /// channel with no catch-up (5), which the guide has no column for. Its
-    /// portal answers every short EPG with nothing: what a zap gets from the
-    /// portal is empty, what it gets from the guide's store is not.
-    fn zap_app(root: &std::path::Path) -> Harness {
+    /// portal answers every short EPG with `short_epg`: what a zap gets from the
+    /// portal is that, what it gets from the guide's store is the store's.
+    fn zap_app(root: &std::path::Path, short_epg: Vec<EpgEntry>) -> Harness {
         let plain = |stream_id: i64, name: &str| LiveChannel {
             tv_archive: 0,
             ..archive_channel(stream_id, name)
@@ -5906,6 +6021,7 @@ mod tests {
             plain(5, "TEST 05"),
         ];
         let portal = FakePortal::new(live.clone(), Vec::new());
+        portal.set_short_epg(short_epg);
         let catalog = crate::portal::Catalog {
             live,
             ..Default::default()
@@ -5937,7 +6053,7 @@ mod tests {
     #[tokio::test]
     async fn a_zap_asks_the_portal_when_the_guide_has_no_fresh_epg_for_the_channel() {
         let dir = tempfile::tempdir().unwrap();
-        let mut h = zap_app(dir.path());
+        let mut h = zap_app(dir.path(), Vec::new());
         h.frame(&[]);
         // TEST 03's column has EPG, fetched 7 hours ago: stale. TEST 05 has no
         // column at all.
@@ -5958,6 +6074,314 @@ mod tests {
                 "zapped to {sid}: the portal's answer, not the store's"
             );
         }
+    }
+
+    // The zap toast gets the guide's EPG from the programme on now, at most 100
+    // of them: what the short EPG gave it before.
+
+    /// A programme from `from` to `to` minutes after `now`.
+    fn programme_at(
+        now: chrono::DateTime<chrono::Utc>,
+        title: &str,
+        from: i64,
+        to: i64,
+    ) -> EpgEntry {
+        EpgEntry {
+            title: title.into(),
+            start: now + chrono::Duration::minutes(from),
+            end: now + chrono::Duration::minutes(to),
+            has_archive: None,
+        }
+    }
+
+    /// The titles of the EPG the zap toast works from.
+    fn toast_titles(h: &Harness) -> Vec<String> {
+        let titles = h.app.current_epg.as_ref().map(|epg| {
+            let all = epg.entries().iter();
+            all.map(|e| e.title.clone()).collect::<Vec<_>>()
+        });
+        titles.unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn the_zap_toast_gets_the_guides_epg_from_the_programme_on_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        let now = chrono::Utc::now();
+        // The day table: a programme that ended two hours ago, the one on now
+        // and the next one.
+        let table = Epg::new(vec![
+            programme_at(now, "Gisteren", -180, -120),
+            programme_at(now, "Nu", -30, 30),
+            programme_at(now, "Straks", 30, 90),
+        ]);
+        h.app.epg_store.insert(13, ChannelEpg::new(table, now));
+        h.app.zap_by_id(3);
+        h.frame(&[]);
+        assert_eq!(toast_titles(&h), ["Nu", "Straks"], "no stale programme");
+    }
+
+    #[tokio::test]
+    async fn the_zap_toast_gets_at_most_a_hundred_programmes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        let now = chrono::Utc::now();
+        // 20 programmes that have ended, the one on now (P0) and 149 after it.
+        let programmes =
+            (-20..150).map(|i| programme_at(now, &format!("P{i}"), 10 * i - 5, 10 * i + 5));
+        let table = Epg::new(programmes.collect());
+        h.app.epg_store.insert(13, ChannelEpg::new(table, now));
+        h.app.zap_by_id(3);
+        h.frame(&[]);
+        let titles = toast_titles(&h);
+        assert_eq!(titles.len(), 100);
+        assert_eq!((titles[0].as_str(), titles[99].as_str()), ("P0", "P99"));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_store_entry_with_nothing_from_now_on_sends_the_zap_to_the_portal() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        let mut h = zap_app(dir.path(), vec![programme_at(now, "Portal", -10, 50)]);
+        h.frame(&[]);
+        // Fetched a moment ago, but everything in it has ended.
+        let table = Epg::new(vec![programme_at(now, "Gisteren", -180, -120)]);
+        h.app.epg_store.insert(13, ChannelEpg::new(table, now));
+        h.app.zap_by_id(3);
+        wait_until("the portal's answer", || {
+            h.frame(&[]);
+            h.app.current_epg.is_some()
+        })
+        .await;
+        assert_eq!(
+            toast_titles(&h),
+            ["Portal"],
+            "the portal's answer, not the store's"
+        );
+    }
+
+    // Exit stops the player first; a cache write that failed is tried again.
+
+    #[tokio::test]
+    async fn exit_stops_the_player_before_it_waits_for_the_cache_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        let Harness {
+            mut app, mut cmds, ..
+        } = started;
+        // A writer that is still at work until it is let go.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        app.epg_cache_writer = Some(std::thread::spawn(move || {
+            let _ = held.recv();
+        }));
+        // It is let go once the player has been told to quit, or after 2 s.
+        let watcher = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(2);
+            let mut told = false;
+            while !told && Instant::now() < until {
+                match cmds.try_recv() {
+                    Ok(Cmd::Quit) => told = true,
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            let _ = release.send(());
+            told
+        });
+        drop(app);
+        assert!(
+            watcher.join().unwrap(),
+            "mpv keeps running while exit waits for the writer"
+        );
+    }
+
+    /// A store with a fresh channel 13, and a directory where its cache file
+    /// should be: a write of it cannot succeed. The write starts at once and the
+    /// test waits until it has finished (and failed). The instant it started at.
+    async fn start_a_write_that_fails(h: &mut Harness, root: &std::path::Path) -> Instant {
+        let fresh = ChannelEpg::new(fresh_epg("Nu"), chrono::Utc::now());
+        h.app.epg_store.insert(13, fresh);
+        std::fs::create_dir_all(cache_path(root)).unwrap();
+        let t0 = Instant::now();
+        h.app.epg_cache_dirty_since = Some(t0);
+        h.app.write_epg_cache_when_due(t0);
+        assert!(h.app.epg_cache_dirty_since.is_none(), "the write started");
+        wait_until("the writer has finished", || {
+            let writer = h.app.epg_cache_writer.as_ref();
+            writer.is_some_and(|w| w.is_finished())
+        })
+        .await;
+        t0
+    }
+
+    #[tokio::test]
+    async fn a_failed_cache_write_marks_the_store_dirty_again_and_is_tried_a_minute_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(dir.path());
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        let t0 = start_a_write_that_fails(&mut h, dir.path()).await;
+        // The next frame takes the writer in and sees that it failed.
+        let t1 = t0 + Duration::from_secs(1);
+        h.app.write_epg_cache_when_due(t1);
+        assert!(h.app.epg_cache_writer.is_none(), "taken in");
+        assert!(
+            h.app.epg_cache_dirty_since.is_some(),
+            "the failed write is to be tried again"
+        );
+        // Not at once: a failure that stays would write, fail and log on every
+        // frame. The obstacle is gone by the time of the next try.
+        std::fs::remove_dir(&path).unwrap();
+        h.app.write_epg_cache_when_due(t1 + Duration::from_secs(30));
+        assert!(h.app.epg_cache_writer.is_none(), "not within the minute");
+        h.app.write_epg_cache_when_due(t1 + Duration::from_secs(61));
+        assert!(h.app.epg_cache_dirty_since.is_none(), "a minute later");
+        wait_until("the cache file is written", || path.is_file()).await;
+        assert_eq!(cached_ids(&path), [13]);
+    }
+
+    #[tokio::test]
+    async fn exit_tries_a_cache_write_that_failed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(dir.path());
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        start_a_write_that_fails(&mut h, dir.path()).await;
+        // The obstacle goes. Exit takes the failed writer in, and writes.
+        std::fs::remove_dir(&path).unwrap();
+        drop(h);
+        assert_eq!(cached_ids(&path), [13]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_of_the_old_portal_does_not_dirty_the_new_portals_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        // The portal is saved while that write is under way ...
+        let fresh = ChannelEpg::new(fresh_epg("Nu"), chrono::Utc::now());
+        h.app.epg_store.insert(13, fresh);
+        std::fs::create_dir_all(cache_path(dir.path())).unwrap();
+        let t0 = Instant::now();
+        h.app.epg_cache_dirty_since = Some(t0);
+        h.app.write_epg_cache_when_due(t0);
+        let saved = {
+            // The variable is the whole process's: held for the save only.
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+            let creds = XtreamCreds {
+                username: "u2".into(),
+                password: "p2".into(),
+                host: "127.0.0.1".into(),
+                port: 1,
+            };
+            let saved = h.app.apply_creds(creds, "u2:p2@127.0.0.1:1");
+            std::env::remove_var("BONGO_INI");
+            saved
+        };
+        assert!(saved.is_ok());
+        // ... and fails. That is no news of the new portal's store, which a
+        // write would turn into the new portal's cache file.
+        wait_until("the writer has finished", || {
+            let writer = h.app.epg_cache_writer.as_ref();
+            writer.is_some_and(|w| w.is_finished())
+        })
+        .await;
+        h.app.write_epg_cache_when_due(t0 + Duration::from_secs(1));
+        assert!(h.app.epg_cache_writer.is_none(), "taken in");
+        assert!(h.app.epg_cache_dirty_since.is_none());
+    }
+
+    // The guide's fetches wait for the cache file; the read log counts what the
+    // read took in.
+
+    #[tokio::test]
+    async fn the_guides_fetches_wait_while_the_cache_is_read_and_start_once_it_has_landed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = epg_app(dir.path());
+        // A read on its way. (The app's own, of a file that is not there, has
+        // landed in `Harness::start`.)
+        h.app.epg_cache_reading_since = Some(Instant::now());
+        h.app.open_guide();
+        h.frame(&[]);
+        h.frame(&[]);
+        assert!(
+            h.app.epg_fetcher.in_flight().is_empty(),
+            "nothing starts while the cache is read"
+        );
+        // The read lands, empty: the frame that takes it in, and the next one.
+        *h.app.epg_cache_slot.lock() = Some((h.app.catalog_generation, Ok(Vec::new())));
+        h.frame(&[]);
+        h.frame(&[]);
+        assert_eq!(h.app.epg_fetcher.in_flight().len(), 2, "now they start");
+    }
+
+    #[tokio::test]
+    async fn the_guides_fetches_wait_two_seconds_for_the_cache_at_most() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = epg_app(dir.path());
+        // A read that hangs.
+        let t0 = Instant::now();
+        h.app.epg_cache_reading_since = Some(t0);
+        h.app.open_guide();
+        h.app.start_epg_fetches(t0 + Duration::from_millis(1900));
+        assert!(h.app.epg_fetcher.in_flight().is_empty(), "still waiting");
+        h.app.start_epg_fetches(t0 + Duration::from_secs(2));
+        assert_eq!(h.app.epg_fetcher.in_flight().len(), 2, "not for ever");
+    }
+
+    #[tokio::test]
+    async fn a_guide_opened_as_the_catalog_loads_does_not_fetch_what_the_cache_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        let held = crate::guide::cache::ToSave {
+            id: 13,
+            epg: ChannelEpg::new(fresh_epg("Nu"), now),
+            archive_days: 7,
+        };
+        crate::guide::cache::save(&cache_path(dir.path()), &[held], now).unwrap();
+        let portal = FakePortal::new(vec![archive_channel(13, "TEST 03 HD")], Vec::new());
+        portal.release_epg();
+        let catalog = Arc::new(CatalogStore::new(portal.clone()));
+        let mut h = Harness::start(dir.path(), catalog.clone(), PortalState::Configured, None);
+        // The frame in which the catalog loads starts the read; the guide is
+        // opened right then.
+        load_catalog(&catalog, &portal, &mut h).await;
+        h.app.open_guide();
+        wait_until("the cache is in the store", || {
+            h.frame(&[]);
+            h.app.epg_store.get(13).is_some()
+        })
+        .await;
+        for _ in 0..10 {
+            h.frame(&[]);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(portal.epg_fetches(), 0, "the cache had it");
+    }
+
+    #[tokio::test]
+    async fn the_read_log_counts_what_the_read_took_in_not_the_stores_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        let now = chrono::Utc::now();
+        // The store holds a channel of its own already, with three programmes.
+        let own = (0..3).map(|i| programme_at(now, &format!("Eigen {i}"), 10 * i, 10 * i + 10));
+        let own = ChannelEpg::new(Epg::new(own.collect()), now);
+        h.app.epg_store.insert(999, own);
+        // A read lands with the guide's channel (one programme) and one the guide
+        // does not list (two).
+        let log = LogCapture::start();
+        let two = Epg::new(vec![
+            programme_at(now, "Een", 0, 10),
+            programme_at(now, "Twee", 10, 20),
+        ]);
+        let landed = vec![
+            (13, ChannelEpg::new(fresh_epg("Nu"), now)),
+            (888, ChannelEpg::new(two, now)),
+        ];
+        *h.app.epg_cache_slot.lock() = Some((h.app.catalog_generation, Ok(landed)));
+        h.frame(&[]);
+        let text = log.text();
+        let read = "guide: epg cache read (1 channels, 1 programmes)";
+        assert!(text.contains(read), "{text}");
     }
 
     // ---- the news picker ----
