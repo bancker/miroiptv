@@ -3434,8 +3434,11 @@ impl TvApp {
             Some(GuideAction::Close) => self.close_guide(),
             Some(GuideAction::Help) => self.show_help = true,
             Some(GuideAction::Search) => {
-                // The search box is drawn later in this frame: the press and its
-                // letter are spent, or it would find an f to type.
+                // The search box is drawn later in this frame. It would not type
+                // this f today (it asks for the keyboard only after it is drawn,
+                // and a new area is invisible in its first frame), but the press
+                // and its letter are spent all the same: a guard, so that no change
+                // to that order can make the box find an f to type.
                 spend_key(ctx, Key::F);
                 self.show_search = true;
                 self.search_query.clear();
@@ -4775,6 +4778,13 @@ mod tests {
                 if u.contains("/movie/") && u.ends_with("/501.mp4"))),
             "{sent:?}"
         );
+        // One load only: the Enter that picked is not the guide's too, or the
+        // programme on now would play as well.
+        let loads = sent.iter().filter(|c| matches!(c, Cmd::LoadUrl(_))).count();
+        assert_eq!(
+            loads, 1,
+            "the Enter that picked reached the guide: {sent:?}"
+        );
         assert!(!h.app.guide_open, "the pick closes the guide");
         assert!(!h.app.show_search, "and the search");
         let text = log.text();
@@ -4795,6 +4805,13 @@ mod tests {
             sent.iter()
                 .any(|c| matches!(c, Cmd::LoadUrl(u) if *u == live_url(3))),
             "{sent:?}"
+        );
+        // One load only: the guide's programme on now is the same channel, so a
+        // second one would be the same URL again.
+        let loads = sent.iter().filter(|c| matches!(c, Cmd::LoadUrl(_))).count();
+        assert_eq!(
+            loads, 1,
+            "the Enter that picked reached the guide: {sent:?}"
         );
         assert_eq!(h.app.current_stream_id, Some(3));
         assert!(h.app.current_live, "live, through the stall watchdog");
@@ -4918,6 +4935,37 @@ mod tests {
         h.press(&[Key::Enter]);
         let sent = h.sent();
         assert!(zapped(&sent), "Enter plays the programme on now: {sent:?}");
+    }
+
+    #[tokio::test]
+    async fn question_mark_and_o_typed_in_the_search_over_the_guide_are_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        search_over_the_guide(&mut h);
+        // ? asks for the help and o for the settings, in the guide and in the
+        // viewer; not here, where the search box has the keyboard.
+        let question = egui::Event::Key {
+            key: Key::Questionmark,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        };
+        let typed_question = vec![question, egui::Event::Text("?".into())];
+        h.frame_holding(egui::Modifiers::SHIFT, typed_question);
+        h.frame_with(vec![key_press(Key::O), egui::Event::Text("o".into())]);
+        h.frame(&[]);
+        h.frame(&[]);
+        assert_eq!(h.app.search_query, "?o", "typed in the search box");
+        assert!(!h.app.show_help, "? is a character, not the help");
+        assert!(
+            h.app.settings_ui.is_none(),
+            "o is a character, not the settings"
+        );
+        assert!(
+            h.app.show_search && h.app.guide_open,
+            "and the search is still over the guide"
+        );
     }
 
     #[tokio::test]
