@@ -2340,6 +2340,10 @@ impl TvApp {
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 self.show_search = false;
                 self.search_query.clear();
+                // Over the guide this Esc is the search's alone: the guide is
+                // drawn in this same frame with its keys back, and would take
+                // it to wipe its filter, or else to close.
+                spend_key(ctx, Key::Escape);
             }
             return;
         }
@@ -2760,6 +2764,8 @@ impl TvApp {
         }
         self.show_search = false;
         self.search_query.clear();
+        // Picked over the guide: the pick plays, and the guide has done its job.
+        self.close_guide();
     }
 
     fn paint_favs(&mut self, ctx: &egui::Context) {
@@ -3378,9 +3384,11 @@ impl TvApp {
     }
 
     /// The guide over the whole window, and what the user did in it. Under the
-    /// help it takes no keys; `?` or Esc closes the help.
+    /// help it takes no keys; `?` or Esc closes the help. Under the search (`f`
+    /// opens it over the guide) it takes none either, and no click and no wheel:
+    /// the search has the keyboard until Esc, or a pick, which closes the guide.
     fn paint_guide(&mut self, ctx: &egui::Context) {
-        let keys = !self.show_help;
+        let keys = !self.show_help && !self.show_search;
         if self.show_help {
             let (question, esc) = ctx.input(|i| {
                 (
@@ -3415,6 +3423,13 @@ impl TvApp {
             }) => self.guide_play(channel, entry, playable),
             Some(GuideAction::Close) => self.close_guide(),
             Some(GuideAction::Help) => self.show_help = true,
+            Some(GuideAction::Search) => {
+                // The search box is drawn later in this frame: the press and its
+                // letter are spent, or it would find an f to type.
+                spend_key(ctx, Key::F);
+                self.show_search = true;
+                self.search_query.clear();
+            }
             None => {}
         }
     }
@@ -3616,11 +3631,13 @@ impl TvApp {
         // The open guide reads its own keys in paint_guide, as the settings
         // overlay does in paint_settings (typing in its filter must not fire
         // hotkeys); the setup prompt owns the keyboard. The wait screen of a
-        // catch-up pick takes Esc and g only.
+        // catch-up pick takes Esc and g only. The search that `f` opened over
+        // the guide has the keyboard: `handle_keys` then does its Esc, and
+        // nothing else.
         if self.settings_ui.is_none() && !setup_prompt {
             if self.pending_catchup.is_some() {
                 self.handle_wait_keys(ctx);
-            } else if !self.guide_open {
+            } else if !self.guide_open || self.show_search {
                 self.handle_keys(ctx);
             }
         }
@@ -3633,6 +3650,9 @@ impl TvApp {
             self.paint_wait(ctx);
         } else if self.guide_open {
             self.paint_guide(ctx);
+            // The search of `f`, in front of the guide, which keeps its state
+            // under it. After the guide: its `f` opens the search in this frame.
+            self.paint_search(ctx);
         } else if setup_prompt {
             // First-run: no credentials yet - show the portal setup prompt
             // over a dark background instead of the video surface.
@@ -3652,7 +3672,8 @@ impl TvApp {
                     }
                 });
             // Overlays only make sense in video mode - inside the guide they
-            // would compete visually with the schedule grid.
+            // would compete visually with the schedule grid (the search, which
+            // `f` opens over the guide too, is drawn in the guide's branch).
             self.paint_search(ctx);
             self.paint_news_picker(ctx);
             self.paint_favs(ctx);
@@ -4584,6 +4605,306 @@ mod tests {
             "and the new column is drawn: {:?}",
             h.painted
         );
+    }
+
+    // ---- `f` in the guide: the search over everything ----
+
+    /// `guide_catalog`'s channels (TEST 03 and its catch-up twin) and a library:
+    /// the film "Zebra Film" (501) and the series "Zebra Serie" (71).
+    fn library_catalog() -> Arc<CatalogStore> {
+        let channel = |stream_id: i64, name: &str, archive: i32| LiveChannel {
+            stream_id,
+            name: name.into(),
+            category_id: None,
+            epg_channel_id: None,
+            tv_archive: archive,
+            tv_archive_duration: 7 * archive,
+            is_adult: false,
+            stream_icon: None,
+        };
+        let catalog = crate::portal::Catalog {
+            live: vec![channel(3, "TEST 03", 0), channel(13, "TEST 03 HD", 1)],
+            movies: vec![crate::portal::Movie {
+                stream_id: 501,
+                name: "Zebra Film".into(),
+                container_extension: Some("mp4".into()),
+                is_adult: false,
+            }],
+            series: vec![crate::portal::Series {
+                series_id: 71,
+                name: "Zebra Serie".into(),
+                is_adult: false,
+            }],
+        };
+        Arc::new(CatalogStore::from_catalog(idle_portal(), catalog))
+    }
+
+    /// The press of `f` as a keyboard makes it: the key and its letter, together.
+    fn f_pressed() -> Vec<egui::Event> {
+        vec![key_press(Key::F), egui::Event::Text("f".into())]
+    }
+
+    /// The guide open on `h` with programmes, and the search opened over it by
+    /// `f`; the frame after that one has drawn.
+    fn search_over_the_guide(h: &mut Harness) {
+        open_guide(h, true);
+        h.frame_with(f_pressed());
+        assert!(
+            h.app.show_search && h.app.guide_open,
+            "f opens the search over the guide"
+        );
+        h.frame(&[]);
+    }
+
+    #[tokio::test]
+    async fn f_in_the_guide_opens_the_search_over_it_and_does_not_type_the_f() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, true);
+        // Twice: the search's area is new at the first f and invisible for its
+        // first frame, which would keep the f out of the box on its own.
+        for round in 1..=2 {
+            // What an earlier search left in the box is gone.
+            h.app.search_query = "stale".into();
+            h.frame_with(f_pressed());
+            assert!(h.app.show_search, "f opens the search (round {round})");
+            assert!(h.app.guide_open, "over the guide, which stays open");
+            assert!(
+                h.app.search_query.is_empty(),
+                "the f that opened it is not typed into it (round {round})"
+            );
+            h.frame(&[]);
+            assert!(h.app.search_query.is_empty(), "nor a frame later");
+            h.frame(&[Key::Escape]);
+            h.frame(&[]);
+            assert!(!h.app.show_search && h.app.guide_open, "back in the guide");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_f_that_opens_the_search_is_spent_for_the_rest_of_its_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, true);
+        h.frame_with(f_pressed());
+        // The search box is drawn in this very frame, after the guide: the press
+        // and its letter must not be there for it to find.
+        let left = h.ctx.input(|i| i.events.clone());
+        assert!(left.is_empty(), "the frame still holds {left:?}");
+    }
+
+    #[tokio::test]
+    async fn the_search_over_the_guide_is_drawn_in_front_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        search_over_the_guide(&mut h);
+        h.frame(&[]);
+        let at = |h: &Harness, text: &str| h.painted.iter().position(|t| t == text);
+        let guide = at(&h, "Journaal 0");
+        let search = at(&h, "search live / movie / series...");
+        assert!(guide.is_some(), "the guide is still there: {:?}", h.painted);
+        assert!(search.is_some(), "and so is the search: {:?}", h.painted);
+        assert!(guide < search, "painted after the guide, so in front of it");
+        let top = h.ctx.layer_id_at(egui::pos2(640.0, 80.0));
+        assert_eq!(top.map(|layer| layer.id), Some(egui::Id::new("__search__")));
+    }
+
+    #[tokio::test]
+    async fn a_film_picked_in_the_search_over_the_guide_plays_and_closes_the_guide() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        let log = LogCapture::start();
+        search_over_the_guide(&mut h);
+        h.type_text("zebra");
+        let hits: Vec<_> = h
+            .app
+            .search_hits
+            .iter()
+            .map(|it| (it.kind, &it.name[..]))
+            .collect();
+        assert!(
+            hits.contains(&(ItemKind::Movie, "Zebra Film")),
+            "the film is a hit: {hits:?}"
+        );
+        h.sent();
+        h.press(&[Key::Enter]);
+        let sent = h.sent();
+        assert!(
+            sent.iter().any(|c| matches!(c, Cmd::LoadUrl(u)
+                if u.contains("/movie/") && u.ends_with("/501.mp4"))),
+            "{sent:?}"
+        );
+        assert!(!h.app.guide_open, "the pick closes the guide");
+        assert!(!h.app.show_search, "and the search");
+        let text = log.text();
+        let closed = text.lines().filter(|l| l.contains("guide: closed")).count();
+        assert_eq!(closed, 1, "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_channel_picked_in_the_search_over_the_guide_zaps_and_closes_the_guide() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        search_over_the_guide(&mut h);
+        h.type_text("test 03");
+        h.sent();
+        h.press(&[Key::Enter]);
+        let sent = h.sent();
+        assert!(
+            sent.iter()
+                .any(|c| matches!(c, Cmd::LoadUrl(u) if *u == live_url(3))),
+            "{sent:?}"
+        );
+        assert_eq!(h.app.current_stream_id, Some(3));
+        assert!(h.app.current_live, "live, through the stall watchdog");
+        assert!(!h.app.guide_open, "the pick closes the guide");
+        assert!(!h.app.show_search);
+    }
+
+    #[tokio::test]
+    async fn a_series_picked_in_the_search_over_the_guide_does_what_it_does_and_closes_the_guide() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        search_over_the_guide(&mut h);
+        h.type_text("zebra serie");
+        h.sent();
+        h.press(&[Key::Enter]);
+        assert!(!zapped(&h.sent()), "a series does not play yet");
+        let toast = h.app.toast.as_ref().map(|(t, _, _)| t.as_str());
+        assert_eq!(
+            toast,
+            Some("playing series is not available yet: Zebra Serie")
+        );
+        assert!(!h.app.guide_open, "but the pick closes the guide");
+        assert!(!h.app.show_search);
+    }
+
+    #[tokio::test]
+    async fn esc_in_the_search_over_the_guide_closes_only_the_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        search_over_the_guide(&mut h);
+        h.type_text("zeb");
+        // The guide is drawn in the frame of the Esc, with its keys back: it
+        // would take that Esc for its own and close (the guide has no filter).
+        h.frame(&[Key::Escape]);
+        assert!(!h.app.show_search, "Esc closes the search");
+        assert!(h.app.search_query.is_empty(), "and wipes what was typed");
+        assert!(h.app.guide_open, "the guide is still open");
+        // In the very next frame the arrow is the guide's: the cursor moves to
+        // the programme still to come, which Enter cannot play.
+        h.frame(&[Key::ArrowDown]);
+        h.sent();
+        h.press(&[Key::Enter]);
+        assert!(!zapped(&h.sent()));
+        let toast = h.app.toast.as_ref().map(|(t, _, _)| t.clone());
+        assert!(toast.is_some_and(|t| t.starts_with("starts at")));
+        assert!(h.app.guide_open, "and the guide stays");
+    }
+
+    #[tokio::test]
+    async fn esc_in_the_search_over_the_guide_leaves_the_guides_filter_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, true);
+        // A filter that keeps the column, and the box let go of again, so that
+        // the next f is the search's.
+        h.frame_with(vec![egui::Event::Text("/".into())]);
+        h.type_text("test");
+        h.press(&[Key::Enter]);
+        assert!(
+            h.app.guide_view.filtered().is_some(),
+            "the guide is filtered"
+        );
+        h.frame_with(f_pressed());
+        h.frame(&[]);
+        assert!(h.app.show_search, "f is the search's, not the box's");
+        h.frame(&[Key::Escape]);
+        assert!(!h.app.show_search && h.app.guide_open);
+        assert!(
+            h.app.guide_view.filtered().is_some(),
+            "the Esc that closed the search did not wipe the filter"
+        );
+        // The guide's own Esc chain is as it was: the filter, then the guide.
+        h.press(&[Key::Escape]);
+        assert!(
+            h.app.guide_view.filtered().is_none(),
+            "the next Esc wipes it"
+        );
+        assert!(h.app.guide_open);
+        h.press(&[Key::Escape]);
+        assert!(!h.app.guide_open, "and the one after closes the guide");
+    }
+
+    #[tokio::test]
+    async fn while_the_search_shows_the_guide_takes_no_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        search_over_the_guide(&mut h);
+        // Down, g and d are the guide's keys: here they are the search's.
+        h.frame(&[Key::ArrowDown]);
+        h.frame_with(vec![key_press(Key::G), egui::Event::Text("g".into())]);
+        assert!(h.app.guide_open, "g does not close the guide");
+        h.frame_with(vec![key_press(Key::D), egui::Event::Text("d".into())]);
+        h.frame(&[]);
+        h.frame(&[]);
+        assert_eq!(h.app.search_query, "gd", "they are typed in the search box");
+        assert!(
+            !h.painted.iter().any(|t| t == "Yesterday"),
+            "d does not open the date list: {:?}",
+            h.painted
+        );
+        // Back in the guide the cursor is where it was: Down did not move it.
+        h.frame(&[Key::Escape]);
+        h.sent();
+        h.press(&[Key::Enter]);
+        let sent = h.sent();
+        assert!(zapped(&sent), "Enter plays the programme on now: {sent:?}");
+    }
+
+    #[tokio::test]
+    async fn while_the_search_shows_a_click_on_the_guide_plays_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        search_over_the_guide(&mut h);
+        h.sent();
+        // The programme on now, in the first column: not under the search.
+        let on_now = egui::pos2(60.0, 325.0);
+        click_at(&mut h, on_now);
+        assert!(!zapped(&h.sent()), "no guide programme was played");
+        assert!(h.app.guide_open && h.app.show_search, "and nothing closed");
+        // The same click is a pick once the search is gone.
+        h.frame(&[Key::Escape]);
+        click_at(&mut h, on_now);
+        assert!(
+            zapped(&h.sent()),
+            "the click does play it without the search"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_f_typed_in_the_search_over_the_guide_is_a_letter() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        search_over_the_guide(&mut h);
+        h.frame_with(f_pressed());
+        assert_eq!(h.app.search_query, "f");
+        assert!(h.app.show_search && h.app.guide_open);
+    }
+
+    #[tokio::test]
+    async fn outside_the_guide_f_opens_the_search_and_esc_closes_it_as_ever() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        h.frame_with(f_pressed());
+        assert!(h.app.show_search && !h.app.guide_open);
+        assert!(h.app.search_query.is_empty(), "the f is not typed");
+        h.frame(&[]);
+        h.type_text("zeb");
+        assert_eq!(h.app.search_query, "zeb");
+        h.frame(&[Key::Escape]);
+        assert!(!h.app.show_search && !h.app.guide_open);
+        assert!(h.app.search_query.is_empty());
     }
 
     // ---- the wait screen of a catch-up pick ----
@@ -5791,7 +6112,9 @@ mod tests {
         h.app.refresh_guide_channels();
         h.app.guide_open = true;
         h.frame(&[]);
-        h.press(&[Key::F]);
+        // The guide's filter box has `/`; `f` is the search's.
+        h.frame_with(vec![egui::Event::Text("/".into())]);
+        h.frame(&[]);
         h.type_text("zebra");
         h.frame(&[]);
         assert_eq!(h.app.guide_view.visible_columns(), [2, 8], "the two shown");

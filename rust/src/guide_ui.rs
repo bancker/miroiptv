@@ -35,6 +35,9 @@ pub enum GuideAction {
     },
     Close,
     Help,
+    /// `f`: the search over everything (live, films, series), which app.rs
+    /// draws over the guide. The guide's own filter has `/`.
+    Search,
 }
 
 /// ↑ ↓ Home End in a column.
@@ -128,7 +131,7 @@ pub struct GuideView {
     /// The filter box had the keyboard in the frame before: what it typed, and
     /// the Enter or Esc that left it, is not the guide's.
     filter_had_focus: bool,
-    /// The keyboard went into the filter box by `f` or a click. It gets there
+    /// The keyboard went into the filter box by `/` or a click. It gets there
     /// no other way: a Tab that puts it there is undone.
     filter_wanted: bool,
     /// How often `realign` ran: a frame in which it did, or the page moved, asks
@@ -652,7 +655,8 @@ pub struct GuideData<'a> {
     pub playing: Option<&'a str>,
     pub now: DateTime<Utc>,
     pub today: NaiveDate,
-    /// The guide reads the keyboard (not while the help is over it).
+    /// The guide reads the keyboard and takes clicks and the wheel (not while the
+    /// help or the search is over it).
     pub keys: bool,
 }
 
@@ -671,7 +675,10 @@ struct Keys {
     now_next: bool,
     primetime: bool,
     dates: bool,
+    /// `/`: the keyboard goes into the filter box.
     filter: bool,
+    /// `f`: the search over everything.
+    search: bool,
     close: bool,
     help: bool,
 }
@@ -691,7 +698,13 @@ fn read_keys(ctx: &egui::Context) -> Keys {
         now_next: i.key_pressed(Key::N),
         primetime: i.key_pressed(Key::P),
         dates: i.key_pressed(Key::D),
-        filter: i.key_pressed(Key::F),
+        // Read from the text, as `?` is: egui 0.27 has no key for it, and where it
+        // sits differs per layout (on a German keyboard `/` is Shift+7).
+        filter: i
+            .events
+            .iter()
+            .any(|e| matches!(e, egui::Event::Text(t) if t == "/")),
+        search: i.key_pressed(Key::F),
         close: i.key_pressed(Key::G),
         help: i
             .events
@@ -950,14 +963,21 @@ impl GuideView {
             return Some(GuideAction::Close);
         }
         if k.filter {
-            // The f puts the keyboard in the box; it is no letter typed into it.
+            // The / puts the keyboard in the box; it is no character typed into
+            // it. (Once the box has the keyboard this code does not run, and a /
+            // is a character like any other: "AC/DC".)
             ctx.input_mut(|i| {
                 i.events
-                    .retain(|e| !matches!(e, egui::Event::Text(t) if t.eq_ignore_ascii_case("f")))
+                    .retain(|e| !matches!(e, egui::Event::Text(t) if t == "/"))
             });
             ctx.memory_mut(|m| m.request_focus(filter_id()));
             self.filter_wanted = true;
             return None;
+        }
+        if k.search {
+            // The f is the search's, not the box's: app.rs spends the press and
+            // opens the search over the guide.
+            return Some(GuideAction::Search);
         }
         if k.now_next {
             self.now_and_next(page.today);
@@ -1032,8 +1052,8 @@ impl GuideView {
             );
             chevron_down(p, bar.date.right_center() - Vec2::new(16.0, 0.0));
         }
-        // Under the help a click does nothing, as a key does nothing there: the
-        // buttons and rows beside it would act behind it.
+        // Under the help (or the search) a click does nothing, as a key does
+        // nothing there: the buttons and rows beside it would act behind it.
         let clicks = data.keys;
         if date.clicked() && clicks {
             if self.date_pick.is_some() {
@@ -1059,11 +1079,11 @@ impl GuideView {
         if prime.clicked() && clicks {
             self.primetime();
         }
-        // The filter box: the keyboard gets there by `f` or a click only, and
-        // not at all while the help is over the guide. It is as big as its slot
-        // like the buttons beside it: the margins make up the height the text
-        // does not need (which also keeps the hint text, drawn at the top of
-        // the text area, level with what is typed).
+        // The filter box: the keyboard gets there by `/` or a click only, and
+        // not at all while the help or the search is over the guide. It is as
+        // big as its slot like the buttons beside it: the margins make up the
+        // height the text does not need (which also keeps the hint text, drawn
+        // at the top of the text area, level with what is typed).
         let font = FontId::proportional(15.0);
         let row_h = ui.fonts(|f| f.row_height(&font));
         let pad = egui::Margin::symmetric(8.0, ((bar.filter.height() - row_h) / 2.0).max(0.0));
@@ -1149,7 +1169,7 @@ impl GuideView {
         let (hover, wheel) = ctx.input(|i| (i.pointer.hover_pos(), i.raw_scroll_delta.y));
         // The wheel turns what is under the pointer: the guide's own panel. Not
         // a column that lies under the date list (or any other window over the
-        // guide), and not while the help has the keyboard.
+        // guide), and not while the help or the search has the keyboard.
         let wheel_at = hover
             .filter(|_| wheel != 0.0 && data.keys)
             .filter(|&p| ctx.layer_id_at(p) == Some(ui.layer_id()));
@@ -2504,16 +2524,16 @@ mod tests {
     }
 
     #[test]
-    fn f_opens_the_filter_box_and_letters_there_are_no_hotkeys() {
+    fn slash_opens_the_filter_box_and_letters_there_are_no_hotkeys() {
         let f = Fixture::new(3, &[]);
         let none = HashSet::new();
         let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
         let d = data(&f, &none, true);
         s.frame(&mut v, &d, vec![]);
-        s.frame(&mut v, &d, vec![key(Key::F), text("f")]);
+        s.frame(&mut v, &d, vec![text("/")]);
         s.frame(&mut v, &d, vec![]);
-        assert!(s.focused(), "f puts the keyboard in the box");
-        assert_eq!(v.filter, "", "and is no letter typed into it");
+        assert!(s.focused(), "/ puts the keyboard in the box");
+        assert_eq!(v.filter, "", "and is no character typed into it");
         for (k, c) in [(Key::N, "n"), (Key::P, "p"), (Key::G, "g"), (Key::D, "d")] {
             let (action, _) = s.frame(&mut v, &d, vec![key(k), text(c)]);
             assert_eq!(action, None);
@@ -2537,7 +2557,7 @@ mod tests {
         let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
         let d = data(&f, &none, true);
         s.frame(&mut v, &d, vec![]);
-        s.frame(&mut v, &d, vec![key(Key::F), text("f")]);
+        s.frame(&mut v, &d, vec![text("/")]);
         s.frame(&mut v, &d, vec![text("z")]);
         let (action, _) = s.frame(&mut v, &d, vec![key(Key::Escape)]);
         assert_eq!(action, None);
@@ -2552,6 +2572,106 @@ mod tests {
             Some(GuideAction::Close),
             "the third closes the guide"
         );
+    }
+
+    #[test]
+    fn slash_is_read_from_the_text_whatever_key_makes_it() {
+        // A US keyboard has a key for it; a German one makes it with Shift+7, and
+        // egui 0.27 names no slash key at all: the text is what every layout has.
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        let shift_7 = egui::Event::Key {
+            key: Key::Num7,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        };
+        s.frame(&mut v, &d, vec![shift_7, text("/")]);
+        s.frame(&mut v, &d, vec![]);
+        assert!(
+            s.focused(),
+            "Shift+7 that types a / puts the keyboard in the box"
+        );
+        assert_eq!(v.filter, "", "and the / is not typed into it");
+    }
+
+    #[test]
+    fn a_slash_typed_while_the_box_has_the_keyboard_is_a_character() {
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        s.frame(&mut v, &d, vec![text("/")]);
+        for c in ["A", "C", "/", "D", "C"] {
+            let (action, _) = s.frame(&mut v, &d, vec![text(c)]);
+            assert_eq!(action, None);
+        }
+        assert_eq!(v.filter, "AC/DC", "the slash in the middle is typed");
+        assert!(s.focused(), "and the box keeps the keyboard");
+    }
+
+    #[test]
+    fn f_asks_for_the_search_and_does_not_put_the_keyboard_in_the_box() {
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        let (action, _) = s.frame(&mut v, &d, vec![key(Key::F), text("f")]);
+        assert_eq!(action, Some(GuideAction::Search));
+        s.frame(&mut v, &d, vec![]);
+        assert!(!s.focused(), "f is no longer the filter's key");
+        assert_eq!(v.filter, "", "and nothing was typed into it");
+    }
+
+    #[test]
+    fn f_typed_while_the_box_has_the_keyboard_is_a_letter() {
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        s.frame(&mut v, &d, vec![text("/")]);
+        let (action, _) = s.frame(&mut v, &d, vec![key(Key::F), text("f")]);
+        assert_eq!(action, None, "no search while the box has the keyboard");
+        assert_eq!(v.filter, "f");
+        assert!(s.focused());
+    }
+
+    #[test]
+    fn a_slash_and_an_f_in_one_frame_are_the_filters_and_a_letter_in_it() {
+        // The / comes first: the f that comes with it is typed, not asked for.
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        let (action, _) = s.frame(&mut v, &d, vec![text("/"), key(Key::F), text("f")]);
+        assert_eq!(action, None);
+        s.frame(&mut v, &d, vec![]);
+        assert!(s.focused());
+        assert_eq!(v.filter, "f");
+    }
+
+    #[test]
+    fn neither_slash_nor_f_does_anything_while_the_guide_takes_no_keys() {
+        // The help or the search lies over the guide.
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let off = data(&f, &none, false);
+        s.frame(&mut v, &off, vec![]);
+        let (action, _) = s.frame(&mut v, &off, vec![key(Key::F), text("f")]);
+        assert_eq!(action, None, "no search");
+        s.frame(&mut v, &off, vec![text("/")]);
+        s.frame(&mut v, &off, vec![]);
+        assert!(!s.focused(), "and no filter");
+        assert_eq!(v.filter, "");
     }
 
     #[test]
@@ -2975,7 +3095,7 @@ mod tests {
         let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
         let d = data(&f, &none, true);
         s.frame(&mut v, &d, vec![]);
-        s.frame(&mut v, &d, vec![key(Key::F), text("f")]);
+        s.frame(&mut v, &d, vec![text("/")]);
         s.frame(&mut v, &d, vec![text("special")]);
         let (_, painted) = s.frame(&mut v, &d, vec![]);
         assert_eq!(v.filter, "special");
