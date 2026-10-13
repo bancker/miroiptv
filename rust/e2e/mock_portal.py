@@ -143,7 +143,10 @@ def guide_streams():
 def guide_epg(k):
     """Hour-long programmes from local midnight a week ago to three days ahead,
     "Journaal k" at 19:00. The programme on now twice and an overlap at its end;
-    has_archive 1 for the past week (0 before it and ahead), none on channel 2."""
+    has_archive 1 for the past week (0 before it and ahead), none on channel 2.
+    The hours are counted on the wall clock, so the second pass of the hour the
+    clocks go back (the last Sunday of October, 02:00-03:00) has no programme:
+    then nothing is on now, and nothing comes twice."""
     now = time.time()
     first = datetime.datetime.combine(datetime.date.today() - datetime.timedelta(days=7),
                                       datetime.time())
@@ -152,9 +155,10 @@ def guide_epg(k):
         at = first + datetime.timedelta(hours=h)
         title = f"Journaal {k}" if at.hour == 19 else f"Programma {k}-{h}"
         progs.append((title, at.timestamp(), at.timestamp() + 3600))
-    on_now = next(p for p in progs if p[1] <= now < p[2])
-    progs.append((on_now[0], on_now[1] + 300, on_now[2] + 300))
-    progs.append((f"Overlap {k}", on_now[2] - 600, on_now[2] + 1200))
+    on_now = next((p for p in progs if p[1] <= now < p[2]), None)
+    if on_now:
+        progs.append((on_now[0], on_now[1] + 300, on_now[2] + 300))
+        progs.append((f"Overlap {k}", on_now[2] - 600, on_now[2] + 1200))
     fmt = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
     out = []
     for i, (t, s, e) in enumerate(progs, 1):
