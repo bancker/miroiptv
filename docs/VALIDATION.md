@@ -77,6 +77,18 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] Press `*` again on that channel → toast "removed"
 - [ ] Restart app → favorites persist (still in Shift+F list)
 
+## Guide (g)
+- [ ] `g` opens the guide with only the channels that have programme information: no empty columns; each column shows its logo, or its badge and name
+- [ ] Every column lines up the programme on now on one line, with a progress bar; one LIVE programme per column, no doubles
+- [ ] The wheel over a column scrolls only that column; Up/Down move the cursor in the chosen column; Left/Right change column; PgUp/PgDn (or ‹ ›) change page
+- [ ] While you browse a column, new EPG arriving for it keeps your programme; a column you did not touch jumps to now
+- [ ] `d` (or the date button) opens the date list; another day jumps to 19:00; "Nu & straks" (`n`) goes back to now; `p` = 19:00 on the chosen day
+- [ ] `f` (or a click) puts the keyboard in the filter box; n, p and g typed there switch nothing; a channel name or a programme title filters; Esc leaves the box, Esc again clears the filter; a filter without matches says "niets gevonden"
+- [ ] Enter on now plays live; on a past programme the wait screen shows, then the programme from its start; Esc on the wait screen goes back to the guide; a programme still to come says when it starts; one too old is dimmed and says "niet terug te kijken"
+- [ ] Close the app with the guide loaded: the next start opens the guide complete at once (`%APPDATA%\BongoPlayer\config\cache\epg-<host>_<port>.json`)
+- [ ] Locked: no adult columns; unlocked: they show; lock with the guide open: they go at once
+- [ ] After F5 (catalog reload) the guide shows the new channel list without a restart
+
 ## Catch-up
 - [ ] `g` → pick a finished programme on an archive channel → picture within ~4 s (log: `relay: catch-up playlist in <n> ms`, loadfile `http://127.0.0.1:<port>/vod/<n>.m3u8`)
 - [ ] Left/right arrow seek ±30 s within it
