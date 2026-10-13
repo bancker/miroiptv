@@ -2751,22 +2751,30 @@ impl TvApp {
         }
     }
 
+    /// A pick in the search. When the search was opened over the guide, a pick
+    /// that plays has done the guide's job and closes it; a series plays nothing
+    /// yet (the toast says so), so there only the search goes and the guide stays
+    /// as it was.
     fn handle_search_pick(&mut self, id: i64, name: &str, kind: ItemKind) {
-        match kind {
+        let plays = match kind {
             ItemKind::Live => {
                 self.zap_by_id(id);
+                true
             }
             ItemKind::Movie => {
                 self.play_movie(id, name);
+                true
             }
             ItemKind::Series => {
                 self.set_toast(self.tr(T::SeriesNotYet, &[name]));
+                false
             }
-        }
+        };
         self.show_search = false;
         self.search_query.clear();
-        // Picked over the guide: the pick plays, and the guide has done its job.
-        self.close_guide();
+        if plays {
+            self.close_guide();
+        }
     }
 
     fn paint_favs(&mut self, ctx: &egui::Context) {
@@ -3387,7 +3395,8 @@ impl TvApp {
     /// The guide over the whole window, and what the user did in it. Under the
     /// help it takes no keys; `?` or Esc closes the help. Under the search (`f`
     /// opens it over the guide) it takes none either, and no click and no wheel:
-    /// the search has the keyboard until Esc, or a pick, which closes the guide.
+    /// the search has the keyboard until Esc, or a pick that plays, which closes
+    /// the guide.
     fn paint_guide(&mut self, ctx: &egui::Context) {
         let keys = !self.show_help && !self.show_search;
         if self.show_help {
@@ -4787,21 +4796,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_series_picked_in_the_search_over_the_guide_does_what_it_does_and_closes_the_guide() {
+    async fn a_series_picked_in_the_search_over_the_guide_closes_only_the_search() {
         let dir = tempfile::tempdir().unwrap();
         let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        let log = LogCapture::start();
         search_over_the_guide(&mut h);
         h.type_text("zebra serie");
         h.sent();
         h.press(&[Key::Enter]);
+        // Nothing plays: not the series, and not the programme under the search
+        // (the Enter that picked is not the guide's too).
         assert!(!zapped(&h.sent()), "a series does not play yet");
         let toast = h.app.toast.as_ref().map(|(t, _, _)| t.as_str());
         assert_eq!(
             toast,
             Some("playing series is not available yet: Zebra Serie")
         );
-        assert!(!h.app.guide_open, "but the pick closes the guide");
-        assert!(!h.app.show_search);
+        assert!(!h.app.show_search, "the search is gone");
+        assert!(h.app.search_query.is_empty());
+        assert!(h.app.guide_open, "but nothing played, so the guide stays");
+        assert!(
+            !log.text().contains("guide: closed"),
+            "and no close is logged"
+        );
+        // The guide has its keys back at once: Down steps to the programme still
+        // to come, which Enter cannot play.
+        h.frame(&[Key::ArrowDown]);
+        h.sent();
+        h.press(&[Key::Enter]);
+        assert!(!zapped(&h.sent()));
+        let toast = h.app.toast.as_ref().map(|(t, _, _)| t.clone());
+        assert!(toast.is_some_and(|t| t.starts_with("starts at")));
+        assert!(h.app.guide_open, "and the guide is still there");
     }
 
     #[tokio::test]
