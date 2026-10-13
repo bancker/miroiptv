@@ -334,7 +334,10 @@ function Group-G {
     # guide closes (no guide pick is logged). The mock has films with MOCK_ADULT ("Gewone Film" is not adult) or MOCK_XXX.
     Scn 'G-search' @{ MockEnv = @{ MOCK_GUIDE = '1'; MOCK_ADULT = '1' }; Resume = 3; Seconds = 18; Keys = 'g;SLEEP:3000;f;SLEEP:400;TEXT:gewone;SLEEP:800;ENTER'; Expect = 'toast: \[FILM\] Gewone Film', 'loadfile http://127.0.0.1:18080/movie/<u>/<p>/9002\.mp4', 'guide: closed'; Forbid = 'guide: \[' }
     # Esc in that search brings the guide back as it was: Enter then plays the programme on now in the first column.
-    Scn 'G-search-esc' @{ MockEnv = $G; Resume = 3; Seconds = 20; Keys = 'g;SLEEP:3000;f;SLEEP:400;ESC;SLEEP:400;ENTER'; Expect = 'guide: \[LIVE\] NL \| GIDS 1 \|' }
+    # The zz tells the new f from the old one. In the search it goes nowhere near the guide (and Esc wipes it). Had f still
+    # focused the guide's filter, zz would filter the guide to nothing (no channel or programme of the mock has zz in it),
+    # Esc would only leave the box, and Enter would play nothing: no "guide: [LIVE]" line, so the Expect fails.
+    Scn 'G-search-esc' @{ MockEnv = $G; Resume = 3; Seconds = 20; Keys = 'g;SLEEP:3000;f;SLEEP:400;TEXT:zz;ESC;SLEEP:400;ENTER'; Expect = 'guide: \[LIVE\] NL \| GIDS 1 \|' }
     Scn 'G-page' @{ MockEnv = $G; Resume = 3; Seconds = 22; Keys = 'g;SLEEP:3000;PGDN;SLEEP:2000;ENTER'; Expect = 'guide: \[LIVE\] NL \| GIDS 6 \|' }
     # The cache file: the second start has the whole guide from the first.
     $dc = Fresh 'g-cache'
