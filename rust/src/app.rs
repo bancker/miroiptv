@@ -2612,7 +2612,9 @@ impl TvApp {
     /// A catch-up wait ends on the first picture newer than mpv's restart (`picture`
     /// is the version of the one that was just put in the texture), or a second
     /// after the restart if none comes: audio only, or a stream without video.
-    /// A failed wait stays, for the user to read it.
+    /// That second leaves the empty state, never the channel before: no frame that
+    /// is not newer than the restart shows any more. A failed wait stays, for the
+    /// user to read it.
     fn end_catchup_wait(&mut self, picture: Option<u64>, now: Instant) {
         let Some(wait) = &self.pending_catchup else {
             return;
@@ -2627,6 +2629,15 @@ impl TvApp {
             tracing::info!("catch-up: first frame");
         } else if now.saturating_duration_since(at) >= WAIT_FOR_PICTURE {
             tracing::info!("catch-up: no picture 1 s after the start");
+            // A frame of the channel before can have slipped in after the pick
+            // (mpv renders one more while the load travels to its thread). It
+            // spent the pick's fence, and dropping the texture alone does not
+            // help: `upload_newest_frame` puts the bus's newest frame back
+            // whenever the texture is gone. So the fence is set again, at the
+            // restart: the first frame newer than that lifts it.
+            self.frame_fence.stop();
+            self.frame_fence.load(restart);
+            self.video_tex = None;
         } else {
             return;
         }
@@ -3458,7 +3469,8 @@ impl TvApp {
                 // The picture of the channel before goes, as on a stop, and none
                 // of its frames comes back: the wait screen covers the window
                 // until the programme's first one, and a wait that ends without
-                // a picture (the 1 s cap) shows the empty state, not that channel.
+                // a picture (the 1 s cap) shows the empty state, not that channel
+                // (`end_catchup_wait` fences a frame that slipped in after this).
                 self.frame_fence.stop();
                 self.video_tex = None;
                 self.load_url_with(url, false, Some(channel.adult));
@@ -4727,6 +4739,63 @@ mod tests {
             "the empty state shows: {:?}",
             h.painted
         );
+    }
+
+    #[tokio::test]
+    async fn a_frame_of_the_channel_before_that_slips_in_after_the_pick_never_shows_at_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        // The channel watched before the pick: its last picture is on screen.
+        h.put_frame(4, 2);
+        h.frame(&[]);
+        assert!(h.app.video_tex.is_some(), "a live picture");
+        pick_catch_up(&mut h);
+        assert!(h.app.video_tex.is_none(), "the pick takes the picture away");
+        // mpv renders one more frame of that channel while the load command is on
+        // its way: newer than the bus was at the pick, so the fence lets it through
+        // and is gone. The wait screen hides it.
+        h.put_frame(6, 3);
+        h.frame(&[]);
+        assert_eq!(
+            h.app.video_tex.as_ref().map(|t| t.size()),
+            Some([6, 3]),
+            "the fence let it through"
+        );
+        assert!(h.painted.iter().any(|t| t == "loading the programme…"));
+        // The restart, and a second later no picture of the programme has come.
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.frame(&[]);
+        assert!(h.app.pending_catchup.is_some(), "the wait goes on");
+        let ago = Instant::now()
+            .checked_sub(Duration::from_millis(1100))
+            .unwrap();
+        let wait = h.app.pending_catchup.as_mut().unwrap();
+        let restart = wait.started.expect("the restart is noted").0;
+        wait.started = Some((restart, ago));
+        h.frame(&[]);
+        assert!(h.app.pending_catchup.is_none(), "the cap ends the wait");
+        assert!(h.app.video_tex.is_none(), "the old picture is gone");
+        assert!(
+            h.painted.iter().any(|t| t == crate::APP_NAME),
+            "the empty state shows: {:?}",
+            h.painted
+        );
+        // The straggler is no newer than the restart: it does not come back.
+        for _ in 0..2 {
+            h.frame(&[]);
+            assert!(h.app.video_tex.is_none(), "the old picture came back");
+            assert!(
+                h.painted.iter().any(|t| t == crate::APP_NAME),
+                "the empty state stays: {:?}",
+                h.painted
+            );
+        }
+        // A picture newer than the restart still shows.
+        h.put_frame(8, 4);
+        h.frame(&[]);
+        let video = h.app.video_tex.as_ref().expect("a new picture shows");
+        assert_eq!(video.size(), [8, 4], "its texture holds the new picture");
+        assert!(h.drawn.contains(&video.id()), "and it is what is drawn");
     }
 
     #[tokio::test]
