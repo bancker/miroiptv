@@ -103,8 +103,13 @@ pub fn save(
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path)?;
+    let written = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = written {
+        // A write that failed halfway, or a rename that failed, leaves no
+        // temporary file behind: the next write starts afresh.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok((count, programmes, bytes.len() as u64))
 }
 
@@ -200,6 +205,23 @@ mod tests {
         assert_eq!(back[1].1.fetched_at, t(-3));
         let tmp = path.with_extension("json.tmp");
         assert!(!tmp.exists(), "no temporary file is left behind");
+    }
+
+    #[test]
+    fn a_write_that_fails_leaves_no_temporary_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        // A folder where the file goes: the temporary file is written, the
+        // rename over the folder fails.
+        let path = dir.path().join("epg.json");
+        std::fs::create_dir(&path).unwrap();
+        let channel = ToSave {
+            id: 601,
+            epg: ChannelEpg::new(Epg::new(vec![entry("Nu", -1, 1, None)]), t(0)),
+            archive_days: 7,
+        };
+        assert!(save(&path, &[channel], t(0)).is_err());
+        let tmp = path.with_extension("json.tmp");
+        assert!(!tmp.exists(), "{} is left behind", tmp.display());
     }
 
     #[test]
