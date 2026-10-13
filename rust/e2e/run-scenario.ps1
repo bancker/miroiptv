@@ -16,9 +16,9 @@ the app exited by itself before the run ended, or it left a panic-*.log. Exit
 code 0 otherwise.
 
 It refuses to start (exit code 1, naming the key) while Tab, Shift, Ctrl, Alt,
-Enter, Esc, Space or an arrow key is held down: winit turns a key Windows reports
-as down into a key press when the window gets the focus, so the result would
-depend on the keyboard's state (see held-keys.ps1).
+Enter, Esc, Space, an arrow key, PgUp, PgDn, Home or End is held down: winit
+turns a key Windows reports as down into a key press when the window gets the
+focus, so the result would depend on the keyboard's state (see held-keys.ps1).
 
 -Settings replaces settings.json; without it a folder that has none gets
 {"language":"nl"}, so the first-start language screen stays away unless

@@ -9,7 +9,8 @@
 # that exe and -Exe (baseline, new, baseline, new, ...), so both see the same
 # machine state, and prints one summary line per exe; -Runs counts runs per exe.
 # Like run-scenario.ps1 it refuses to start while Tab, Shift, Ctrl, Alt, Enter,
-# Esc, Space or an arrow key is held down (see held-keys.ps1).
+# Esc, Space, an arrow key, PgUp, PgDn, Home or End is held down (see
+# held-keys.ps1).
 param(
     [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\BongoPlayer.exe'),
     [int]$Runs = 10,

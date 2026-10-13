@@ -2,10 +2,10 @@
 # the scenarios depend on is held down.
 #
 # winit turns a key that Windows reports as down into a key press when its window
-# gets the focus. A stuck Tab (or a held Shift, Ctrl, Alt, Enter, Esc, Space or
-# arrow key) therefore changes what a scenario does, and a result then depends on
-# the state of the keyboard instead of on the app. This only reads the keyboard
-# state (GetAsyncKeyState); it sends nothing.
+# gets the focus. A stuck Tab (or a held Shift, Ctrl, Alt, Enter, Esc, Space,
+# arrow, PgUp, PgDn, Home or End key) therefore changes what a scenario does, and
+# a result then depends on the state of the keyboard instead of on the app. This
+# only reads the keyboard state (GetAsyncKeyState); it sends nothing.
 Add-Type -Namespace E2E -Name Keys -MemberDefinition @'
 [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
 '@
@@ -15,6 +15,8 @@ $script:WatchedKeys = [ordered]@{
     'Tab' = 0x09; 'Shift' = 0x10; 'Ctrl' = 0x11; 'Alt' = 0x12; 'Enter' = 0x0D
     'Esc' = 0x1B; 'Space' = 0x20
     'Left arrow' = 0x25; 'Up arrow' = 0x26; 'Right arrow' = 0x27; 'Down arrow' = 0x28
+    # The guide (regression group G) pages and jumps with these.
+    'PgUp' = 0x21; 'PgDn' = 0x22; 'Home' = 0x24; 'End' = 0x23
 }
 
 # The names of the watched keys that are down now. -IsDown takes a virtual-key code

@@ -20,7 +20,8 @@ programme on now comes twice (5 minutes apart) with an overlapping one at its
 end, as the real portal sends it; channel 2 sends no `has_archive`.
 
 `run-scenario.ps1` and `measure-startup.ps1` refuse to start while Tab, Shift,
-Ctrl, Alt, Enter, Esc, Space or an arrow key is held down (`held-keys.ps1`):
+Ctrl, Alt, Enter, Esc, Space, an arrow key, PgUp, PgDn, Home or End is held
+down (`held-keys.ps1`):
 winit turns a key that Windows reports as down into a key press when the window
 gets the focus, which would make a run depend on the keyboard's state. Press and
 release the key once and run again. `test-held-keys.ps1` checks that guard against

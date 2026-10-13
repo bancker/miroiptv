@@ -16,6 +16,11 @@ foreach ($name in $script:WatchedKeys.Keys) {
     $held = @(Get-HeldKeys ([scriptblock]::Create("param(`$vk) `$vk -eq $code")))
     Check "only $name held: exactly $name is named" ($held.Count -eq 1 -and $held[0] -eq $name)
 }
+# Group G of the regression set pages and jumps with these: they are watched too.
+foreach ($code in 0x21, 0x22, 0x23, 0x24) {
+    $held = @(Get-HeldKeys ([scriptblock]::Create("param(`$vk) `$vk -eq $code")))
+    Check ("virtual key 0x{0:X2} (PgUp, PgDn, End or Home) held: it is named" -f $code) ($held.Count -eq 1)
+}
 $many = @(Get-HeldKeys { param($vk) $vk -in 0x11, 0x10, 0x28 })
 Check 'Ctrl, Shift and Down held: all three named' (($many -join ',') -eq 'Shift,Ctrl,Down arrow')
 Check 'a key that is not watched is ignored' ((Get-HeldKeys { param($vk) $vk -eq 0x41 }).Count -eq 0)
