@@ -196,14 +196,20 @@ impl GuideView {
     /// The guide opens: in Nu & straks it lines up on now (today) again; the
     /// rest is as it was left.
     pub fn opened(&mut self, today: NaiveDate) {
-        self.date_pick = None;
-        // The box does not keep the keyboard over a close and an open.
-        self.filter_had_focus = false;
-        self.filter_wanted = false;
+        self.reopened();
         if self.mode == Mode::NowAndNext {
             self.set_day(today);
             self.realign();
         }
+    }
+
+    /// The guide comes back from the wait screen as it was left, in Nu & straks
+    /// too: the cursor stays on the programme picked. Only the date list is
+    /// closed, and the box does not keep the keyboard over a close and an open.
+    pub fn reopened(&mut self) {
+        self.date_pick = None;
+        self.filter_had_focus = false;
+        self.filter_wanted = false;
     }
 
     /// Every column lines up again as soon as it shows with programmes.

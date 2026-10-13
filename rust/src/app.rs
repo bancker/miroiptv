@@ -3113,6 +3113,15 @@ impl TvApp {
         tracing::info!("guide: opened ({} channels)", self.guide_channels.len());
     }
 
+    /// The guide back from the wait screen, as it was left: not lined up on
+    /// now, as `g` does in Nu & straks, since the user picked a programme there.
+    fn reopen_guide(&mut self) {
+        self.guide_view.reopened();
+        self.guide_open = true;
+        self.guide_fetching = true;
+        tracing::info!("guide: opened ({} channels)", self.guide_channels.len());
+    }
+
     fn close_guide(&mut self) {
         if self.guide_open {
             self.guide_open = false;
@@ -3444,7 +3453,7 @@ impl TvApp {
             // closing).
             spend_key(ctx, Key::Escape);
             spend_key(ctx, Key::G);
-            self.open_guide();
+            self.reopen_guide();
         }
     }
 
@@ -4609,6 +4618,29 @@ mod tests {
             "the stop ends the load, and the EPG fetching goes on"
         );
         assert!(h.app.guide_open, "back in the guide");
+    }
+
+    #[tokio::test]
+    async fn the_guide_comes_back_from_the_wait_screen_on_the_programme_picked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        // In Nu & straks, where a plain `g` lines up on now again.
+        pick_catch_up(&mut h);
+        let picked = h.sent().into_iter().find_map(|c| match c {
+            Cmd::LoadUrl(u) => Some(u),
+            _ => None,
+        });
+        let picked = picked.expect("the pick loads");
+        h.press(&[Key::Escape]);
+        assert!(h.app.guide_open, "back in the guide");
+        h.sent();
+        h.press(&[Key::Enter]);
+        let sent = h.sent();
+        assert!(
+            sent.iter()
+                .any(|c| matches!(c, Cmd::LoadUrl(u) if *u == picked)),
+            "{sent:?} should pick {picked} again"
+        );
     }
 
     #[test]
