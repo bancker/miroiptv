@@ -83,7 +83,8 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] The wheel over a column scrolls only that column; Up/Down move the cursor in the chosen column; Left/Right change column; PgUp/PgDn (or ‹ ›) change page
 - [ ] While you browse a column, new EPG arriving for it keeps your programme; a column you did not touch jumps to now
 - [ ] `d` (or the date button) opens the date list; another day jumps to 19:00; "Nu & straks" (`n`) goes back to now; `p` = 19:00 on the chosen day
-- [ ] `f` (or a click) puts the keyboard in the filter box; n, p and g typed there switch nothing; a channel name or a programme title filters; Esc leaves the box, Esc again clears the filter; a filter without matches says "niets gevonden"
+- [ ] `/` (or a click) puts the keyboard in the filter box; n, p and g typed there switch nothing; a channel name or a programme title filters; Esc leaves the box, Esc again clears the filter; a filter without matches says "niets gevonden"
+- [ ] `f` in the guide opens the search over it; Esc returns to the guide as it was; a pick plays and closes the guide
 - [ ] Enter on now plays live; on a past programme the wait screen shows, then the programme from its start; Esc on the wait screen goes back to the guide; a programme still to come says when it starts; one too old is dimmed and says "niet terug te kijken"
 - [ ] Close the app with the guide loaded: the next start opens the guide complete at once (`%APPDATA%\BongoPlayer\config\cache\epg-<host>_<port>.json`)
 - [ ] Locked: no adult columns; unlocked: they show; lock, then `g`: they are gone
