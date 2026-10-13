@@ -3405,7 +3405,12 @@ impl TvApp {
                 self.current_idx = None;
                 self.current_stream_id = Some(channel.live_id);
                 self.current_name = Some(channel.name.clone());
-                self.current_epg = None;
+                // `e` and Shift+E: the store holds the EPG just picked from,
+                // with no request. A stale copy is fetched as a zap fetches it.
+                self.current_epg = self.fresh_guide_epg(channel.live_id);
+                if self.current_epg.is_none() {
+                    self.kick_epg_fetch(channel.live_id);
+                }
                 self.set_toast(self.tr(T::GuideLiveToast, &[&channel.name, &entry.title]));
                 self.close_guide();
             }
@@ -4136,30 +4141,35 @@ mod tests {
         assert!(h.app.favorites.contains(3), "and nothing deleted");
     }
 
-    /// The guide open on `h`. With `programme`, TEST 03's catch-up twin (13) has
-    /// an hour-long programme on now ("Journaal 0", since 10 minutes), the two
+    /// An hour-long programme on `now` ("Journaal 0", since 10 minutes), the two
     /// before it and the two after it. Within three hours of local midnight they
     /// are shorter, so that the ones next to the one on now are still on the
     /// day the guide shows: these tests run at any time of day.
+    fn programmes_around(now: chrono::DateTime<chrono::Utc>) -> Epg {
+        let (from, to) = crate::guide::time::day_bounds(crate::guide::time::day_of(now));
+        let hour = chrono::Duration::hours(1).min((now - from).min(to - now) / 3);
+        let entries = (-2..3)
+            .map(|k: i32| {
+                let start = now + hour * k - hour / 6;
+                EpgEntry {
+                    title: format!("Journaal {k}"),
+                    start,
+                    end: start + hour,
+                    has_archive: None,
+                }
+            })
+            .collect();
+        Epg::new(entries)
+    }
+
+    /// The guide open on `h`. With `programme`, TEST 03's catch-up twin (13) has
+    /// the programmes of `programmes_around`, fetched now.
     fn open_guide(h: &mut Harness, programme: bool) {
         if programme {
             let now = chrono::Utc::now();
-            let (from, to) = crate::guide::time::day_bounds(crate::guide::time::day_of(now));
-            let hour = chrono::Duration::hours(1).min((now - from).min(to - now) / 3);
-            let entries = (-2..3)
-                .map(|k: i32| {
-                    let start = now + hour * k - hour / 6;
-                    EpgEntry {
-                        title: format!("Journaal {k}"),
-                        start,
-                        end: start + hour,
-                        has_archive: None,
-                    }
-                })
-                .collect();
             h.app
                 .epg_store
-                .insert(13, ChannelEpg::new(Epg::new(entries), now));
+                .insert(13, ChannelEpg::new(programmes_around(now), now));
         }
         h.app.open_guide();
         h.frame(&[]);
@@ -4269,6 +4279,44 @@ mod tests {
         // stall watchdog watching.
         assert!(h.app.current_live);
         assert!(h.app.stall_watchdog_armed);
+    }
+
+    #[tokio::test]
+    async fn after_a_live_pick_in_the_guide_e_shows_the_programme_from_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, true);
+        h.press(&[Key::Enter]);
+        assert_eq!(h.app.current_stream_id, Some(3), "it plays live");
+        // What `e` and Shift+E show: the store's EPG of the channel, from the
+        // programme on now.
+        let titles = toast_titles(&h);
+        assert_eq!(titles, ["Journaal 0", "Journaal 1", "Journaal 2"]);
+        // The store had it, so nothing was asked and the pick's toast stays.
+        h.frame(&[]);
+        let toast = h.app.toast.as_ref().map(|(t, _, _)| t.as_str());
+        assert_eq!(toast, Some("[LIVE] TEST 03 · Journaal 0"));
+    }
+
+    #[tokio::test]
+    async fn after_a_live_pick_on_a_stale_column_the_portal_is_asked_as_on_a_zap() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        let mut h = zap_app(dir.path(), vec![programme_at(now, "Portal", -10, 50)]);
+        // TEST 03's column, fetched 7 hours ago: stale, though the guide shows it.
+        let old = now - chrono::Duration::hours(7);
+        h.app
+            .epg_store
+            .insert(13, ChannelEpg::new(programmes_around(now), old));
+        open_guide(&mut h, false);
+        h.press(&[Key::Enter]);
+        assert_eq!(h.app.current_stream_id, Some(3), "it plays live");
+        wait_until("the portal's answer", || {
+            h.frame(&[]);
+            h.app.current_epg.is_some()
+        })
+        .await;
+        assert_eq!(toast_titles(&h), ["Portal"], "the portal's answer");
     }
 
     #[tokio::test]
