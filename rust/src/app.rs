@@ -3450,6 +3450,12 @@ impl TvApp {
                 let minutes = (entry.end - entry.start).num_minutes().max(1) as u32;
                 let portal = self.catalog.portal();
                 let url = portal.catchup_url(channel.archive_id, entry.start, minutes);
+                // The picture of the channel before goes, as on a stop, and none
+                // of its frames comes back: the wait screen covers the window
+                // until the programme's first one, and a wait that ends without
+                // a picture (the 1 s cap) shows the empty state, not that channel.
+                self.frame_fence.stop();
+                self.video_tex = None;
                 self.load_url_with(url, false, Some(channel.adult));
                 self.current_idx = None;
                 self.current_stream_id = Some(channel.archive_id);
@@ -4594,8 +4600,7 @@ mod tests {
             "the wait goes on after the restart"
         );
         assert!(h.painted.iter().any(|t| t == "loading the programme…"));
-        let old = h.app.video_tex.as_ref().expect("the old picture").id();
-        assert!(!h.drawn.contains(&old), "the old picture is not drawn");
+        assert!(h.app.video_tex.is_none(), "the old picture is gone");
         // The first picture of the programme ends it, and in that very frame
         // nothing but that picture is drawn.
         h.put_frame(8, 4);
@@ -4664,6 +4669,33 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("catch-up: first frame"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_ends_without_a_picture_never_shows_the_channel_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        // The channel watched before the pick: its last picture is on screen.
+        h.put_frame(4, 2);
+        h.frame(&[]);
+        assert!(h.app.video_tex.is_some(), "a live picture");
+        pick_catch_up(&mut h);
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.frame(&[]);
+        // A second after the restart no picture has come: audio only.
+        let ago = Instant::now().checked_sub(Duration::from_millis(1100)).unwrap();
+        let wait = h.app.pending_catchup.as_mut().unwrap();
+        let version = wait.started.expect("the restart is noted").0;
+        wait.started = Some((version, ago));
+        h.frame(&[]);
+        assert!(h.app.pending_catchup.is_none(), "the cap ends the wait");
+        h.frame(&[]);
+        assert!(h.app.video_tex.is_none(), "the old picture is gone");
+        assert!(
+            h.painted.iter().any(|t| t == crate::APP_NAME),
+            "the empty state shows: {:?}",
+            h.painted
+        );
     }
 
     #[tokio::test]
