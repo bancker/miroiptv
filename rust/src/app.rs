@@ -149,6 +149,19 @@ fn preset_target(presets: &Presets, digit: u8, catalog: &CatalogStore) -> Option
         .map(|p| p.stream_id)
 }
 
+/// Writes the guide's cache file and says so in the log.
+fn write_epg_cache(path: &std::path::Path, channels: &[crate::guide::cache::ToSave]) {
+    match crate::guide::cache::save(path, channels, chrono::Utc::now()) {
+        Ok((n, programmes, bytes)) => tracing::info!(
+            "guide: epg cache written ({} channels, {} programmes, {} KB)",
+            n,
+            programmes,
+            bytes / 1024
+        ),
+        Err(e) => tracing::warn!("guide: epg cache not written: {}", e),
+    }
+}
+
 /// One line of the help overlay: the key(s) and what they do. Both are static
 /// texts (key names or `i18n` lookups), so the rows allocate no strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +317,10 @@ struct PendingCatchup {
     /// Why it failed before its first frame, once it did.
     failed: Option<String>,
 }
+
+/// The cache file as read on its own thread: for which catalog generation, and
+/// what it held.
+type CacheRead = (u64, Result<Vec<(i64, ChannelEpg)>, String>);
 
 /// What the "found" lines of the news settings were worked out for: the rules'
 /// channel names and the catalog's state. Typing in a rule's patterns, label or
@@ -461,6 +478,20 @@ pub struct TvApp {
     /// The guide was opened this session: its EPG is fetched from then on.
     guide_fetching: bool,
     logos: LogoStore,
+    /// The catalog generation whose EPG cache file was read (or is being read).
+    epg_cache_read_for: Option<u64>,
+    /// What the cache file held, on its way from the reading thread.
+    epg_cache_slot: Arc<Mutex<Option<CacheRead>>>,
+    /// Since when EPG has been coming in that the cache file does not hold yet.
+    epg_cache_dirty_since: Option<Instant>,
+    /// When the guide's channels were last looked through to see whether the EPG
+    /// that came in is complete: a walk over the whole list, so once a second
+    /// at most.
+    epg_cache_checked: Option<Instant>,
+    /// The thread writing the cache file, while it runs. A write goes through a
+    /// temporary file of one fixed name, so two writers at once could corrupt
+    /// the file: only one runs at a time.
+    epg_cache_writer: Option<std::thread::JoinHandle<()>>,
     /// When the stream that loads now went to the player; its first frame
     /// clears it. EPG fetching waits meanwhile (10 s at most): zapping first.
     stream_starting_since: Option<Instant>,
@@ -676,6 +707,11 @@ impl TvApp {
             epg_fetcher,
             guide_fetching: false,
             logos,
+            epg_cache_read_for: None,
+            epg_cache_slot: Arc::new(Mutex::new(None)),
+            epg_cache_dirty_since: None,
+            epg_cache_checked: None,
+            epg_cache_writer: None,
             stream_starting_since: None,
             pending_catchup: None,
             borderless: false,
@@ -1381,7 +1417,31 @@ impl TvApp {
         }
     }
 
+    /// The guide's EPG of the channel `stream_id` plays, while it is fresh.
+    /// Zapping picks the same variant as the guide's live id, so a lookup by id
+    /// finds it; another variant (a quality switch) is fetched as before.
+    fn fresh_guide_epg(&self, stream_id: i64) -> Option<Epg> {
+        let channel = self
+            .guide_channels
+            .iter()
+            .find(|c| c.live_id == stream_id || c.archive_id == stream_id)?;
+        if self
+            .epg_store
+            .needs_fetch(channel.archive_id, chrono::Utc::now())
+        {
+            return None;
+        }
+        Some((*self.epg_store.get(channel.archive_id)?.epg).clone())
+    }
+
     fn kick_epg_fetch(&mut self, stream_id: i64) {
+        // The guide's store has this channel fresh: no request to the portal.
+        if let Some(epg) = self.fresh_guide_epg(stream_id) {
+            tracing::info!("epg for sid={} from the guide's store", stream_id);
+            self.epg_fetch_pending_for = Some(stream_id);
+            *self.epg_slot.lock() = Some((stream_id, epg));
+            return;
+        }
         let portal = self.catalog.portal().clone();
         let slot = self.epg_slot.clone();
         self.epg_fetch_pending_for = Some(stream_id);
@@ -2173,6 +2233,9 @@ impl TvApp {
         self.epg_fetcher.reset(self.catalog.portal().clone());
         self.guide_view = GuideView::new(crate::guide::time::day_of(chrono::Utc::now()));
         self.guide_fetching = false;
+        // The new portal's file is read when its catalog loads (the generation
+        // changed); what the old portal's EPG left to write goes with it.
+        self.epg_cache_dirty_since = None;
         self.adult_note = None;
         // Whatever waited for the old portal's catalog, or was told by it, means
         // nothing to the new one: a 0.5 resume would play the old portal's URL
@@ -2975,6 +3038,7 @@ impl TvApp {
             if let Ok(epg) = fetched.result {
                 self.epg_store
                     .insert(fetched.archive_id, ChannelEpg::new(epg, chrono::Utc::now()));
+                self.epg_cache_dirty_since.get_or_insert_with(Instant::now);
             }
         }
         if self.guide_fetching {
@@ -3022,6 +3086,124 @@ impl TvApp {
         );
         self.epg_fetcher
             .tick(&self.epg_store, order, limit, now, chrono::Utc::now());
+    }
+
+    /// The guide's cache file of the portal in use (none without one).
+    fn epg_cache_path(&self) -> Option<std::path::PathBuf> {
+        let creds = self.creds.as_ref()?;
+        let name = crate::guide::cache::file_name(&creds.host, creds.port);
+        Some(self.storage.cache_dir().join(name))
+    }
+
+    /// What the cache file gets: the guide's channels that have EPG; adult ones
+    /// never.
+    fn epg_cache_contents(&self) -> Option<(std::path::PathBuf, Vec<crate::guide::cache::ToSave>)> {
+        let path = self.epg_cache_path()?;
+        let channels = self
+            .guide_channels
+            .iter()
+            .filter(|c| !c.adult)
+            .filter_map(|c| {
+                Some(crate::guide::cache::ToSave {
+                    id: c.archive_id,
+                    epg: self.epg_store.get(c.archive_id)?.clone(),
+                    archive_days: c.archive_days,
+                })
+            })
+            .collect();
+        Some((path, channels))
+    }
+
+    /// Reads the cache file once per catalog, on a thread of its own, as soon
+    /// as the catalog has loaded, and takes in what it held.
+    fn read_epg_cache(&mut self) {
+        if self.epg_cache_read_for != Some(self.catalog_generation) && self.catalog.is_loaded() {
+            self.epg_cache_read_for = Some(self.catalog_generation);
+            if let Some(path) = self.epg_cache_path() {
+                let (slot, generation) = (self.epg_cache_slot.clone(), self.catalog_generation);
+                std::thread::spawn(move || {
+                    let read = crate::guide::cache::load(&path, chrono::Utc::now());
+                    *slot.lock() = Some((generation, read));
+                });
+            }
+        }
+        let Some((generation, read)) = self.epg_cache_slot.lock().take() else {
+            return;
+        };
+        if generation != self.catalog_generation {
+            return;
+        }
+        match read {
+            Ok(channels) => {
+                let known: std::collections::HashSet<i64> =
+                    self.guide_channels.iter().map(|c| c.archive_id).collect();
+                let mut kept = 0;
+                for (id, epg) in channels {
+                    if known.contains(&id) {
+                        self.epg_store.insert(id, epg);
+                        kept += 1;
+                    }
+                }
+                tracing::info!(
+                    "guide: epg cache read ({} channels, {} programmes)",
+                    kept,
+                    self.epg_store.programmes()
+                );
+            }
+            Err(e) => tracing::warn!("guide: epg cache unreadable ({}) - building a new one", e),
+        }
+    }
+
+    /// Writes the cache file, on a thread of its own, once the EPG that came in
+    /// is complete (nothing in flight, no guide channel left to fetch), or once
+    /// it has been coming in for a minute (a long first round, channels that
+    /// keep failing). Not at a pause of the fetching: a stream that starts
+    /// stops it for a while, and a file written then would hold a few channels.
+    ///
+    /// This runs every frame while the store is dirty, so what it costs stays
+    /// small. Whether the round is complete is a walk over the guide's channels:
+    /// it runs when nothing is in flight, and once a second at most (`now` is
+    /// the clock). The minute needs no walk. And one writer at a time: the file
+    /// goes through a temporary one of a fixed name, which two writers would
+    /// fill together. A write that is due while the writer still runs waits;
+    /// the store stays dirty and a later frame writes.
+    fn write_epg_cache_when_due(&mut self, now: Instant) {
+        let Some(since) = self.epg_cache_dirty_since else {
+            return;
+        };
+        if self
+            .epg_cache_writer
+            .as_ref()
+            .is_some_and(|writer| !writer.is_finished())
+        {
+            return;
+        }
+        if now.saturating_duration_since(since) < Duration::from_secs(60) {
+            if !self.epg_fetcher.in_flight().is_empty() {
+                return;
+            }
+            let looked_lately = self
+                .epg_cache_checked
+                .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(1));
+            if looked_lately {
+                return;
+            }
+            self.epg_cache_checked = Some(now);
+            let utc_now = chrono::Utc::now();
+            let left_to_fetch = self
+                .guide_channels
+                .iter()
+                .any(|c| self.epg_store.needs_fetch(c.archive_id, utc_now));
+            if left_to_fetch {
+                return;
+            }
+        }
+        if let Some((path, channels)) = self.epg_cache_contents() {
+            self.epg_cache_dirty_since = None;
+            self.epg_cache_writer = Some(std::thread::spawn(move || {
+                write_epg_cache(&path, &channels)
+            }));
+        }
     }
 
     /// The guide over the whole window, and what the user did in it. Under the
@@ -3163,6 +3345,17 @@ impl Drop for TvApp {
         if self.settings_dirty {
             let _ = self.settings.save(&self.storage.settings_path());
         }
+        // A writer still at work finishes first: two would fill the same
+        // temporary file, and a write that exit killed would be lost.
+        if let Some(writer) = self.epg_cache_writer.take() {
+            let _ = writer.join();
+        }
+        // The guide's EPG that came in since the last write.
+        if self.epg_cache_dirty_since.is_some() {
+            if let Some((path, channels)) = self.epg_cache_contents() {
+                write_epg_cache(&path, &channels);
+            }
+        }
         let _ = self.player.cmd_tx.send(Cmd::Quit);
     }
 }
@@ -3190,6 +3383,8 @@ impl TvApp {
         self.drain_conn_check();
         self.refresh_guide_channels();
         self.tick_epg();
+        self.read_epg_cache();
+        self.write_epg_cache_when_due(Instant::now());
         self.logos.drain();
         // First start: nothing else until a language is chosen.
         if let Some(selected) = self.choosing_language.as_mut() {
@@ -4996,6 +5191,544 @@ mod tests {
             h.app.guide_channels.is_empty(),
             "the new catalog has not loaded"
         );
+    }
+
+    // ---- the guide's EPG cache file, and the zap toast from the store ----
+
+    /// EPG from now for 30 hours: fresh in the store.
+    fn fresh_epg(title: &str) -> Epg {
+        let now = chrono::Utc::now();
+        Epg::new(vec![EpgEntry {
+            title: title.into(),
+            start: now - chrono::Duration::minutes(5),
+            end: now + chrono::Duration::hours(30),
+            has_archive: None,
+        }])
+    }
+
+    #[tokio::test]
+    async fn the_epg_cache_file_leaves_adult_channels_out_and_the_next_start_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        h.app.set_adult_visible(true);
+        h.frame(&[]);
+        let now = chrono::Utc::now();
+        h.app
+            .epg_store
+            .insert(13, ChannelEpg::new(fresh_epg("Nu"), now));
+        h.app
+            .epg_store
+            .insert(911, ChannelEpg::new(fresh_epg("Adult"), now));
+        let (path, channels) = h.app.epg_cache_contents().unwrap();
+        assert_eq!(path, dir.path().join("cache").join("epg-h_80.json"));
+        write_epg_cache(&path, &channels);
+        let ids: Vec<i64> = crate::guide::cache::load(&path, chrono::Utc::now())
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, [13], "adult EPG never goes to disk");
+        drop(h);
+        let mut next = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        wait_until("the cache file is read", || {
+            next.frame(&[]);
+            next.app.epg_store.get(13).is_some()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_cache_file_is_written_when_a_fetch_round_is_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = vec![
+            LiveChannel {
+                stream_id: 3,
+                name: "TEST 03".into(),
+                category_id: None,
+                epg_channel_id: None,
+                tv_archive: 0,
+                tv_archive_duration: 0,
+                is_adult: false,
+                stream_icon: None,
+            },
+            archive_channel(13, "TEST 03 HD"),
+        ];
+        let portal = FakePortal::new(live, fresh_epg("Nu").entries().to_vec());
+        portal.release_catalog();
+        portal.release_epg();
+        let catalog = Arc::new(CatalogStore::new(portal.clone()));
+        catalog.spawn_fetch();
+        wait_until("the catalog loads", || catalog.is_loaded()).await;
+        let mut h = Harness::start(dir.path(), catalog, PortalState::Configured, None);
+        h.app.open_guide();
+        let path = dir.path().join("cache").join("epg-h_80.json");
+        wait_until("the cache file is written", || {
+            h.frame(&[]);
+            path.exists()
+        })
+        .await;
+        assert_eq!(portal.epg_fetches(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_zap_takes_now_and_next_from_the_guides_store_when_it_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        h.frame(&[]);
+        h.app.epg_store.insert(
+            13,
+            ChannelEpg::new(fresh_epg("Journaal"), chrono::Utc::now()),
+        );
+        h.app.zap_by_id(3);
+        h.frame(&[]);
+        let title = h
+            .app
+            .current_epg
+            .as_ref()
+            .and_then(|e| e.entries().first().map(|x| x.title.clone()));
+        assert_eq!(title.as_deref(), Some("Journaal"), "no portal asked");
+    }
+
+    /// Where the tests' portal ("h", port 80) keeps its cache file.
+    fn cache_path(root: &std::path::Path) -> std::path::PathBuf {
+        root.join("cache").join("epg-h_80.json")
+    }
+
+    /// The channel ids a cache file holds, smallest first.
+    fn cached_ids(path: &std::path::Path) -> Vec<i64> {
+        let mut ids: Vec<i64> = crate::guide::cache::load(path, chrono::Utc::now())
+            .expect("the cache file reads")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// What this thread logs from `start` until the capture is dropped. Lines
+    /// of other threads are not captured: the subscriber is this thread's.
+    /// (With one dispatcher registered, tracing works a log line's interest out
+    /// from whoever hits it first: another test's thread, which has none, would
+    /// silence the line for this one. A second dispatcher stops that.)
+    struct LogCapture {
+        buffer: LogBuffer,
+        _second: tracing::Dispatch,
+        _logging: tracing::subscriber::DefaultGuard,
+    }
+
+    impl LogCapture {
+        fn start() -> Self {
+            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let buffer = LogBuffer::default();
+            let sink = buffer.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || sink.clone())
+                .with_ansi(false)
+                .finish();
+            Self {
+                buffer,
+                _second: second,
+                _logging: tracing::subscriber::set_default(subscriber),
+            }
+        }
+
+        fn text(&self) -> String {
+            self.buffer.text()
+        }
+    }
+
+    // R15.1: the check for a complete round is a walk over the guide's channels.
+
+    #[tokio::test]
+    async fn the_cache_write_looks_through_the_channels_once_a_second_at_most() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        // EPG came in, but the guide's one channel has none in the store: the
+        // round is not complete.
+        let t0 = Instant::now();
+        h.app.epg_cache_dirty_since = Some(t0);
+        h.app.write_epg_cache_when_due(t0);
+        assert!(h.app.epg_cache_dirty_since.is_some(), "not complete: waits");
+        // Its EPG lands. Within a second of the look that found it missing the
+        // channels are not looked through again ...
+        let fresh = ChannelEpg::new(fresh_epg("Nu"), chrono::Utc::now());
+        h.app.epg_store.insert(13, fresh);
+        h.app
+            .write_epg_cache_when_due(t0 + Duration::from_millis(900));
+        assert!(
+            h.app.epg_cache_dirty_since.is_some(),
+            "no new walk within a second"
+        );
+        // ... a second after it they are: complete, and the write starts.
+        h.app.write_epg_cache_when_due(t0 + Duration::from_secs(1));
+        assert!(h.app.epg_cache_dirty_since.is_none(), "complete: written");
+        assert!(h.app.epg_cache_writer.is_some(), "on a thread of its own");
+        let path = cache_path(dir.path());
+        wait_until("the cache file is written", || path.exists()).await;
+        assert_eq!(cached_ids(&path), [13]);
+    }
+
+    #[tokio::test]
+    async fn the_cache_write_waits_for_a_complete_round_but_never_longer_than_a_minute() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        // EPG came in, but not for the guide's one channel: a pause of the
+        // fetching, not the end of the round.
+        let t0 = Instant::now();
+        h.app.epg_cache_dirty_since = Some(t0);
+        h.app
+            .write_epg_cache_when_due(t0 + Duration::from_millis(59_900));
+        assert!(h.app.epg_cache_dirty_since.is_some(), "waits for the round");
+        // The minute needs no look at the channels, so it is exact: it comes
+        // 100 ms after the look above, well within the second between looks.
+        h.app.write_epg_cache_when_due(t0 + Duration::from_secs(60));
+        assert!(h.app.epg_cache_dirty_since.is_none(), "a minute is enough");
+        let path = cache_path(dir.path());
+        wait_until("the cache file is written", || path.exists()).await;
+    }
+
+    #[tokio::test]
+    async fn the_cache_write_waits_while_a_fetch_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = epg_app(dir.path());
+        h.app.open_guide();
+        h.frame(&[]);
+        assert_eq!(h.app.epg_fetcher.in_flight().len(), 2);
+        // Every channel is fresh in the store, yet two fetches have not landed:
+        // what they bring is not in the file yet.
+        let now = chrono::Utc::now();
+        for id in [601, 602, 603] {
+            h.app
+                .epg_store
+                .insert(id, ChannelEpg::new(fresh_epg("Nu"), now));
+        }
+        let t0 = Instant::now();
+        h.app.epg_cache_dirty_since = Some(t0);
+        h.app.write_epg_cache_when_due(t0 + Duration::from_secs(30));
+        assert!(
+            h.app.epg_cache_dirty_since.is_some(),
+            "a fetch is on its way"
+        );
+    }
+
+    // R15.2: one writer at a time.
+
+    #[tokio::test]
+    async fn a_due_cache_write_waits_while_the_writer_runs() {
+        // Due because the round is complete, or because EPG has been coming in
+        // for a minute.
+        for (complete, minutes) in [(true, 0), (false, 1)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+            if complete {
+                let fresh = ChannelEpg::new(fresh_epg("Nu"), chrono::Utc::now());
+                h.app.epg_store.insert(13, fresh);
+            }
+            // A writer that is still at work until the test lets it go.
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            h.app.epg_cache_writer = Some(std::thread::spawn(move || {
+                let _ = held.recv();
+            }));
+            let t0 = Instant::now();
+            let due = t0 + Duration::from_secs(60 * minutes);
+            h.app.epg_cache_dirty_since = Some(t0);
+            h.app.write_epg_cache_when_due(due);
+            let path = cache_path(dir.path());
+            assert!(
+                h.app.epg_cache_dirty_since.is_some(),
+                "complete {complete}: the write waits, the store stays dirty"
+            );
+            assert!(!path.exists());
+            // The writer is done: the next frame writes.
+            release.send(()).unwrap();
+            wait_until("the writer is done", || {
+                h.app
+                    .epg_cache_writer
+                    .as_ref()
+                    .is_some_and(|w| w.is_finished())
+            })
+            .await;
+            h.app.write_epg_cache_when_due(due);
+            assert!(
+                h.app.epg_cache_dirty_since.is_none(),
+                "complete {complete}: written once the writer is free"
+            );
+            wait_until("the cache file is written", || path.exists()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn exit_waits_for_a_running_cache_writer_before_its_own_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(dir.path());
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        let fresh = ChannelEpg::new(fresh_epg("Nu"), chrono::Utc::now());
+        h.app.epg_store.insert(13, fresh);
+        h.app.epg_cache_dirty_since = Some(Instant::now());
+        // A slow writer: it writes its file once it is let go. Had exit not
+        // waited for it, that file would come after exit's own.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (finished, wait_for_it) = std::sync::mpsc::channel::<()>();
+        let slow = path.clone();
+        h.app.epg_cache_writer = Some(std::thread::spawn(move || {
+            let _ = held.recv();
+            std::fs::create_dir_all(slow.parent().unwrap()).unwrap();
+            std::fs::write(&slow, b"not exit's file").unwrap();
+            let _ = finished.send(());
+        }));
+        // It is let go while exit waits (or after exit, if it does not wait).
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = release.send(());
+        });
+        drop(h);
+        wait_for_it
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the slow writer finished");
+        letting_go.join().unwrap();
+        assert_eq!(cached_ids(&path), [13], "exit's own write came last");
+    }
+
+    // The rest of the cache's life: reading, writing at exit, a portal save.
+
+    #[tokio::test]
+    async fn the_cache_read_keeps_what_the_guide_lists_and_leaves_the_store_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        let held = |id: i64| crate::guide::cache::ToSave {
+            id,
+            epg: ChannelEpg::new(fresh_epg("Nu"), now),
+            archive_days: 7,
+        };
+        // 999 is a channel the portal does not list (any more).
+        let path = cache_path(dir.path());
+        crate::guide::cache::save(&path, &[held(13), held(999)], now).unwrap();
+        let log = LogCapture::start();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        wait_until("the cache file is read", || {
+            h.frame(&[]);
+            h.app.epg_store.get(13).is_some()
+        })
+        .await;
+        // Once per catalog, not once per frame.
+        for _ in 0..20 {
+            h.frame(&[]);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let text = log.text();
+        let reads = text
+            .lines()
+            .filter(|l| l.contains("epg cache read ("))
+            .count();
+        assert_eq!(reads, 1, "{text}");
+        assert!(
+            text.contains("epg cache read (1 channels, 1 programmes)"),
+            "{text}"
+        );
+        assert_eq!(h.app.epg_store.len(), 1, "only the guide's channels");
+        assert!(h.app.epg_store.get(999).is_none());
+        // What the file holds is no news to it. (A store made dirty by the read
+        // would be complete, so the same frame would write it back at once.)
+        assert!(h.app.epg_cache_dirty_since.is_none());
+        assert!(h.app.epg_cache_writer.is_none(), "not written back");
+    }
+
+    #[tokio::test]
+    async fn a_cache_read_for_an_older_catalog_is_not_taken_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let portal = FakePortal::new(vec![archive_channel(13, "TEST 03 HD")], Vec::new());
+        let catalog = Arc::new(CatalogStore::new(portal.clone()));
+        let mut h = Harness::start(dir.path(), catalog.clone(), PortalState::Configured, None);
+        // The portal changed (a new catalog generation) while a read that began
+        // for the old one was on its way: its result lands in the slot.
+        let old = vec![(13, ChannelEpg::new(fresh_epg("Oud"), chrono::Utc::now()))];
+        *h.app.epg_cache_slot.lock() = Some((h.app.catalog_generation, Ok(old)));
+        h.app.catalog_generation += 1;
+        h.app.epg_cache_read_for = Some(h.app.catalog_generation);
+        load_catalog(&catalog, &portal, &mut h).await;
+        h.frame(&[]);
+        assert_eq!(
+            h.app.guide_channels.len(),
+            1,
+            "13 is a column of the new catalog"
+        );
+        assert!(
+            h.app.epg_store.get(13).is_none(),
+            "the old portal's ids mean other channels"
+        );
+        assert!(h.app.epg_cache_slot.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_cache_file_is_logged_and_replaced_by_the_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{not json").unwrap();
+        let log = LogCapture::start();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        wait_until("the broken file is noticed", || {
+            h.frame(&[]);
+            log.text().contains("guide: epg cache unreadable (")
+        })
+        .await;
+        let text = log.text();
+        assert!(text.contains(") - building a new one"), "{text}");
+        assert!(h.app.epg_store.is_empty());
+        // The EPG that comes in afterwards is written over it.
+        let fresh = ChannelEpg::new(fresh_epg("Nu"), chrono::Utc::now());
+        h.app.epg_store.insert(13, fresh);
+        h.app.epg_cache_dirty_since = Some(Instant::now());
+        h.frame(&[]);
+        wait_until("the file is made anew", || {
+            crate::guide::cache::load(&path, chrono::Utc::now()).is_ok()
+        })
+        .await;
+        assert_eq!(cached_ids(&path), [13]);
+    }
+
+    #[tokio::test]
+    async fn the_cache_logs_what_the_regression_scenarios_look_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = LogCapture::start();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        let fresh = ChannelEpg::new(fresh_epg("Journaal"), chrono::Utc::now());
+        h.app.epg_store.insert(13, fresh);
+        // A zap takes the channel's EPG from the store.
+        h.app.zap_by_id(3);
+        // The file is written. The writer's thread logs this line where this
+        // thread's subscriber cannot see it, so the function runs here.
+        let (path, channels) = h.app.epg_cache_contents().unwrap();
+        write_epg_cache(&path, &channels);
+        drop(h);
+        // The next start reads it.
+        let mut next = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        wait_until("the cache file is read", || {
+            next.frame(&[]);
+            next.app.epg_store.get(13).is_some()
+        })
+        .await;
+        let text = log.text();
+        let has = |what: &str| text.lines().any(|l| l.contains(what));
+        assert!(has("epg for sid=3 from the guide's store"), "{text}");
+        let written = "guide: epg cache written (1 channels, 1 programmes, 0 KB)";
+        assert!(has(written), "{text}");
+        let read = "guide: epg cache read (1 channels, 1 programmes)";
+        assert!(has(read), "{text}");
+    }
+
+    #[tokio::test]
+    async fn exit_writes_the_epg_that_came_in_since_the_last_write_and_only_that() {
+        for came_in in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+            let fresh = ChannelEpg::new(fresh_epg("Nu"), chrono::Utc::now());
+            h.app.epg_store.insert(13, fresh);
+            if came_in {
+                h.app.epg_cache_dirty_since = Some(Instant::now());
+            }
+            drop(h);
+            let path = cache_path(dir.path());
+            assert_eq!(
+                path.exists(),
+                came_in,
+                "came in since the last write: {came_in}"
+            );
+            if came_in {
+                assert_eq!(cached_ids(&path), [13]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_portal_save_forgets_the_epg_that_waited_for_the_cache_file() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        h.app.epg_cache_dirty_since = Some(Instant::now());
+        let creds = XtreamCreds {
+            username: "u2".into(),
+            password: "p2".into(),
+            host: "127.0.0.1".into(),
+            port: 1,
+        };
+        let saved = h.app.apply_creds(creds, "u2:p2@127.0.0.1:1");
+        std::env::remove_var("BONGO_INI");
+        assert!(saved.is_ok());
+        assert!(
+            h.app.epg_cache_dirty_since.is_none(),
+            "the old portal's EPG is not written under the new portal's name"
+        );
+    }
+
+    /// An app on a catalog of TEST 03 (3) with its catch-up twin (13), and a
+    /// channel with no catch-up (5), which the guide has no column for. Its
+    /// portal answers every short EPG with nothing: what a zap gets from the
+    /// portal is empty, what it gets from the guide's store is not.
+    fn zap_app(root: &std::path::Path) -> Harness {
+        let plain = |stream_id: i64, name: &str| LiveChannel {
+            tv_archive: 0,
+            ..archive_channel(stream_id, name)
+        };
+        let live = vec![
+            plain(3, "TEST 03"),
+            archive_channel(13, "TEST 03 HD"),
+            plain(5, "TEST 05"),
+        ];
+        let portal = FakePortal::new(live.clone(), Vec::new());
+        let catalog = crate::portal::Catalog {
+            live,
+            ..Default::default()
+        };
+        let catalog = Arc::new(CatalogStore::from_catalog(portal, catalog));
+        Harness::start(root, catalog, PortalState::Configured, None)
+    }
+
+    #[tokio::test]
+    async fn a_zap_to_either_variant_of_a_guide_channel_takes_the_guides_epg() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        h.frame(&[]);
+        let fresh = ChannelEpg::new(fresh_epg("Journaal"), chrono::Utc::now());
+        h.app.epg_store.insert(13, fresh);
+        // The live variant the guide plays, and the catch-up twin it fetches.
+        for sid in [3, 13] {
+            h.app.zap_by_id(sid);
+            h.frame(&[]);
+            let title = h
+                .app
+                .current_epg
+                .as_ref()
+                .and_then(|e| e.entries().first().map(|x| x.title.clone()));
+            assert_eq!(title.as_deref(), Some("Journaal"), "zapped to {sid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_zap_asks_the_portal_when_the_guide_has_no_fresh_epg_for_the_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = zap_app(dir.path());
+        h.frame(&[]);
+        // TEST 03's column has EPG, fetched 7 hours ago: stale. TEST 05 has no
+        // column at all.
+        let old = chrono::Utc::now() - chrono::Duration::hours(7);
+        h.app
+            .epg_store
+            .insert(13, ChannelEpg::new(fresh_epg("Gisteren"), old));
+        for sid in [3, 5] {
+            h.app.zap_by_id(sid);
+            wait_until("the portal's answer", || {
+                h.frame(&[]);
+                h.app.current_epg.is_some()
+            })
+            .await;
+            let programmes = h.app.current_epg.as_ref().map_or(0, |e| e.entries().len());
+            assert_eq!(
+                programmes, 0,
+                "zapped to {sid}: the portal's answer, not the store's"
+            );
+        }
     }
 
     // ---- the news picker ----
