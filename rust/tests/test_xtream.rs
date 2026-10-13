@@ -435,6 +435,38 @@ async fn a_busy_short_epg_is_an_error_not_an_empty_one() {
 }
 
 #[tokio::test]
+async fn a_day_table_that_is_no_json_is_an_error_not_an_empty_guide() {
+    // A hiccup of the portal: an error page, or nothing at all, served with 200.
+    // An empty guide would stand in for good EPG for an hour.
+    for body in ["<html><body>Service Unavailable</body></html>", ""] {
+        let server = MockServer::start().await;
+        mount_action(&server, "get_simple_data_table", body.to_string()).await;
+        let portal = XtreamPortal::new(creds_for(&server));
+        let result = portal.fetch_day_epg(601).await;
+        let programmes = result.as_ref().map(|epg| epg.entries().len());
+        assert!(programmes.is_err(), "{body:?} gave {programmes:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_short_epg_that_is_no_json_is_an_error_too() {
+    let server = MockServer::start().await;
+    mount_action(&server, "get_short_epg", "<html>busy</html>".to_string()).await;
+    let portal = XtreamPortal::new(creds_for(&server));
+    assert!(portal.fetch_epg(601).await.is_err());
+}
+
+#[tokio::test]
+async fn an_empty_list_is_an_empty_guide_not_an_error() {
+    let server = MockServer::start().await;
+    let body = r#"{"epg_listings":[]}"#;
+    mount_action(&server, "get_simple_data_table", body.to_string()).await;
+    let portal = XtreamPortal::new(creds_for(&server));
+    let epg = portal.fetch_day_epg(601).await.unwrap();
+    assert!(epg.entries().is_empty());
+}
+
+#[tokio::test]
 async fn a_day_table_is_read_with_its_archive_flags() {
     let server = MockServer::start().await;
     let body = r#"{"epg_listings":[{"title":"Tk9T","start_timestamp":"1781021400","stop_timestamp":"1781024700","has_archive":"1"}]}"#;

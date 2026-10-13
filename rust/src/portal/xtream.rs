@@ -78,7 +78,7 @@ impl XtreamPortal {
             return Err(PortalError::Status(status.as_u16()));
         }
         let txt = resp.text().await?;
-        Ok(parse_epg_body(&txt))
+        parse_epg_body(&txt)
     }
 }
 
@@ -259,13 +259,30 @@ fn epoch_or_dt(ts: &serde_json::Value, dt: Option<&str>) -> Option<chrono::DateT
 /// Parse an Xtream EPG body into an `Epg`. Tolerant of the shapes seen in the
 /// wild (wrapped `{epg_listings:[...]}`, bare array, or a top-level object
 /// under a known key). Pure + sync so it's unit-testable without HTTP.
-fn parse_epg_body(txt: &str) -> Epg {
+///
+/// A body that is no JSON (an error page or nothing served with 200, a cut-off
+/// download), or JSON that is neither an object nor a list, is an error, not
+/// "no programmes": the guide would keep an empty listing for an hour in place
+/// of the EPG it had, and write it to its cache file. JSON with an empty list
+/// is an empty EPG.
+fn parse_epg_body(txt: &str) -> Result<Epg, PortalError> {
     let bytes = txt.len();
     let listings: Vec<EpgRaw> = if let Ok(w) = serde_json::from_str::<EpgWrapper>(txt) {
         w.epg_listings
     } else if let Ok(arr) = serde_json::from_str::<Vec<EpgRaw>>(txt) {
         arr
-    } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(txt) {
+    } else {
+        let v = match serde_json::from_str::<serde_json::Value>(txt) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("EPG body not parseable as JSON ({} bytes)", bytes);
+                return Err(PortalError::Json(e));
+            }
+        };
+        if !(v.is_object() || v.is_array()) {
+            tracing::warn!("EPG body is JSON but no object or list ({} bytes)", bytes);
+            return Err(PortalError::Shape("EPG body is no object or list".into()));
+        }
         v.as_object()
             .and_then(|o| {
                 ["epg_listings", "epg", "data", "listings", "items"]
@@ -278,9 +295,6 @@ fn parse_epg_body(txt: &str) -> Epg {
             .into_iter()
             .filter_map(|x| serde_json::from_value::<EpgRaw>(x).ok())
             .collect()
-    } else {
-        tracing::warn!("EPG body not parseable as JSON ({} bytes)", bytes);
-        return Epg::new(Vec::new());
     };
 
     let raw_count = listings.len();
@@ -305,12 +319,37 @@ fn parse_epg_body(txt: &str) -> Epg {
             sample
         );
     }
-    Epg::new(entries)
+    Ok(Epg::new(entries))
 }
 
 #[cfg(test)]
 mod epg_tests {
-    use super::parse_epg_body;
+    use super::{parse_epg_body, PortalError};
+
+    #[test]
+    fn a_body_that_is_no_json_is_an_error() {
+        let cut_off = r#"{"epg_listings":[{"title":"QQ==","start_timestamp":"17810"#;
+        for body in ["<html>Service Unavailable</html>", "", cut_off] {
+            let parsed = parse_epg_body(body);
+            assert!(matches!(parsed, Err(PortalError::Json(_))), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn json_that_is_neither_an_object_nor_a_list_is_an_error() {
+        for body in ["null", "\"busy\"", "42", "true"] {
+            let parsed = parse_epg_body(body);
+            assert!(matches!(parsed, Err(PortalError::Shape(_))), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_list_in_any_shape_is_an_empty_epg() {
+        for body in [r#"{"epg_listings":[]}"#, "[]", "{}", r#"{"data":[]}"#] {
+            let epg = parse_epg_body(body).unwrap_or_else(|e| panic!("{body:?}: {e}"));
+            assert!(epg.entries().is_empty(), "{body:?}");
+        }
+    }
 
     #[test]
     fn parses_listing_with_both_start_and_start_timestamp() {
@@ -322,7 +361,7 @@ mod epg_tests {
              "start":"2026-06-16 18:10:00","end":"2026-06-16 19:05:00",
              "start_timestamp":"1781021400","stop_timestamp":"1781024700"}
         ]}"#;
-        let epg = parse_epg_body(body);
+        let epg = parse_epg_body(body).unwrap();
         assert_eq!(epg.entries().len(), 1, "must parse despite dual fields");
         assert_eq!(epg.entries()[0].title, "Below Deck Down Under");
     }
@@ -330,25 +369,26 @@ mod epg_tests {
     #[test]
     fn parses_epoch_only() {
         let body = r#"{"epg_listings":[{"title":"VGVzdA==","start_timestamp":1781021400,"stop_timestamp":1781024700}]}"#;
-        assert_eq!(parse_epg_body(body).entries().len(), 1);
+        assert_eq!(parse_epg_body(body).unwrap().entries().len(), 1);
     }
 
     #[test]
     fn parses_datetime_only_fallback() {
         let body = r#"{"epg_listings":[{"title":"VGVzdA==","start":"2026-06-16 18:10:00","end":"2026-06-16 19:05:00"}]}"#;
-        assert_eq!(parse_epg_body(body).entries().len(), 1);
+        assert_eq!(parse_epg_body(body).unwrap().entries().len(), 1);
     }
 
     #[test]
     fn empty_listings_is_no_entries() {
-        assert_eq!(parse_epg_body(r#"{"epg_listings":[]}"#).entries().len(), 0);
+        let epg = parse_epg_body(r#"{"epg_listings":[]}"#).unwrap();
+        assert_eq!(epg.entries().len(), 0);
     }
 
     #[test]
     fn bare_array_shape_parses() {
         let body =
             r#"[{"title":"VGVzdA==","start_timestamp":"1781021400","stop_timestamp":"1781024700"}]"#;
-        assert_eq!(parse_epg_body(body).entries().len(), 1);
+        assert_eq!(parse_epg_body(body).unwrap().entries().len(), 1);
     }
 
     #[test]
@@ -360,6 +400,7 @@ mod epg_tests {
             {"title":"RA==","start_timestamp":"1781031900","stop_timestamp":"1781035500"}
         ]}"#;
         let flags: Vec<Option<bool>> = parse_epg_body(body)
+            .unwrap()
             .entries()
             .iter()
             .map(|e| e.has_archive)
@@ -420,7 +461,7 @@ impl Portal for XtreamPortal {
             return Err(PortalError::Status(status.as_u16()));
         }
         let txt = resp.text().await?;
-        let epg = parse_epg_body(&txt);
+        let epg = parse_epg_body(&txt)?;
         let (yes, no, unknown) = archive_counts(epg.entries());
         tracing::info!(
             "epg: day table for sid={} - {} KB, {} programmes, has_archive 1/0/-: {}/{}/{}",
