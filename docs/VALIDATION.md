@@ -86,7 +86,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] `f` (or a click) puts the keyboard in the filter box; n, p and g typed there switch nothing; a channel name or a programme title filters; Esc leaves the box, Esc again clears the filter; a filter without matches says "niets gevonden"
 - [ ] Enter on now plays live; on a past programme the wait screen shows, then the programme from its start; Esc on the wait screen goes back to the guide; a programme still to come says when it starts; one too old is dimmed and says "niet terug te kijken"
 - [ ] Close the app with the guide loaded: the next start opens the guide complete at once (`%APPDATA%\BongoPlayer\config\cache\epg-<host>_<port>.json`)
-- [ ] Locked: no adult columns; unlocked: they show; lock with the guide open: they go at once
+- [ ] Locked: no adult columns; unlocked: they show; lock, then `g`: they are gone
 - [ ] After F5 (catalog reload) the guide shows the new channel list without a restart
 
 ## Catch-up
