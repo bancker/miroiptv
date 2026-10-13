@@ -326,9 +326,15 @@ function Group-G {
     # The mock takes 2.5 s to make a catch-up playlist: Esc comes before the first frame.
     Scn 'G-wait-esc' @{ MockEnv = $G; Resume = 3; Seconds = 20; Keys = 'g;SLEEP:3000;UP;ENTER;SLEEP:800;ESC'; Expect = 'catch-up: cancelled'; Forbid = 'catch-up: first frame' }
     Scn 'G-date' @{ MockEnv = $G; Resume = 3; Seconds = 26; Keys = 'g;SLEEP:3000;d;SLEEP:300;UP;ENTER;SLEEP:800;ENTER'; Expect = 'guide: primetime on', 'guide: \[CATCHUP\] NL \| GIDS 1 \| Journaal 1' }
-    Scn 'G-filter' @{ MockEnv = $G; Resume = 3; Seconds = 22; Keys = 'g;SLEEP:3000;f;TEXT:gids 3;ENTER;SLEEP:800;ENTER'; Expect = 'guide: \[LIVE\] NL \| GIDS 3 \|' }
+    # The guide's filter box has `/` (TEXT:/ posts the character: Shift+7 on some layouts); `f` is the search.
+    Scn 'G-filter' @{ MockEnv = $G; Resume = 3; Seconds = 22; Keys = 'g;SLEEP:3000;TEXT:/;TEXT:gids 3;ENTER;SLEEP:800;ENTER'; Expect = 'guide: \[LIVE\] NL \| GIDS 3 \|' }
     # Letters in the filter box are no hotkeys; Esc leaves the box, wipes the filter, closes.
-    Scn 'G-filter-keys' @{ MockEnv = $G; Resume = 3; Seconds = 20; Keys = 'g;SLEEP:3000;f;TEXT:np dg;ESC;SLEEP:300;ESC;SLEEP:300;ESC'; Expect = 'guide: closed'; Forbid = 'guide: primetime', 'guide: now and next' }
+    Scn 'G-filter-keys' @{ MockEnv = $G; Resume = 3; Seconds = 20; Keys = 'g;SLEEP:3000;TEXT:/;TEXT:np dg;ESC;SLEEP:300;ESC;SLEEP:300;ESC'; Expect = 'guide: closed'; Forbid = 'guide: primetime', 'guide: now and next' }
+    # `f` in the guide is the big search over everything, in front of the guide: a film picked there plays and the
+    # guide closes (no guide pick is logged). The mock has films with MOCK_ADULT ("Gewone Film" is not adult) or MOCK_XXX.
+    Scn 'G-search' @{ MockEnv = @{ MOCK_GUIDE = '1'; MOCK_ADULT = '1' }; Resume = 3; Seconds = 18; Keys = 'g;SLEEP:3000;f;SLEEP:400;TEXT:gewone;SLEEP:800;ENTER'; Expect = 'toast: \[FILM\] Gewone Film', 'loadfile http://127.0.0.1:18080/movie/<u>/<p>/9002\.mp4', 'guide: closed'; Forbid = 'guide: \[' }
+    # Esc in that search brings the guide back as it was: Enter then plays the programme on now in the first column.
+    Scn 'G-search-esc' @{ MockEnv = $G; Resume = 3; Seconds = 20; Keys = 'g;SLEEP:3000;f;SLEEP:400;ESC;SLEEP:400;ENTER'; Expect = 'guide: \[LIVE\] NL \| GIDS 1 \|' }
     Scn 'G-page' @{ MockEnv = $G; Resume = 3; Seconds = 22; Keys = 'g;SLEEP:3000;PGDN;SLEEP:2000;ENTER'; Expect = 'guide: \[LIVE\] NL \| GIDS 6 \|' }
     # The cache file: the second start has the whole guide from the first.
     $dc = Fresh 'g-cache'
