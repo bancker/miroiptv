@@ -7,7 +7,7 @@ use crate::guide::fetch::EpgFetcher;
 use crate::guide::logos::LogoStore;
 use crate::guide::store::{fetch_order, ChannelEpg, EpgStore};
 use crate::guide::time::Playable;
-use crate::guide_ui::{paint_wait_screen, GuideAction, GuideData, GuideView, WaitInfo};
+use crate::guide_ui::{paint_wait_screen, starts_text, GuideAction, GuideData, GuideView, WaitInfo};
 use crate::i18n::{Lang, T};
 use crate::news::NewsRule;
 use crate::pin::{PinGate, PinHash};
@@ -3411,7 +3411,10 @@ impl TvApp {
     fn guide_play(&mut self, channel: GuideChannel, entry: EpgEntry, playable: Playable) {
         let (from, to) = (crate::epg::hhmm(entry.start), crate::epg::hhmm(entry.end));
         match playable {
-            Playable::Future => self.set_toast(self.tr(T::GuideStartsAt, &[&from])),
+            Playable::Future => {
+                let today = crate::guide::time::day_of(chrono::Utc::now());
+                self.set_toast(starts_text(self.lang, entry.start, today));
+            }
             Playable::Unavailable => self.set_toast(self.t(T::GuideNotReplayable)),
             Playable::Live => {
                 tracing::info!(
@@ -4410,6 +4413,26 @@ mod tests {
             .unwrap_or_default();
         assert!(toast.starts_with("starts at"), "{toast}");
         assert!(h.app.guide_open, "the guide stays");
+    }
+
+    #[tokio::test]
+    async fn a_programme_on_a_later_day_says_the_day_it_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, false);
+        let today = crate::guide::time::day_of(chrono::Utc::now());
+        let tomorrow = today.succ_opt().unwrap();
+        let start = crate::guide::time::at_hour(tomorrow, 20);
+        let entry = EpgEntry {
+            title: "Morgen".into(),
+            start,
+            end: start + chrono::Duration::hours(1),
+            has_archive: None,
+        };
+        let channel = h.app.guide_channels[0].clone();
+        h.app.guide_play(channel, entry, Playable::Future);
+        let toast = h.app.toast.as_ref().map(|(t, _, _)| t.as_str());
+        assert_eq!(toast, Some("starts tomorrow at 20:00"));
     }
 
     #[tokio::test]

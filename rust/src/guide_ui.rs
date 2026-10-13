@@ -1611,6 +1611,23 @@ pub(crate) fn channel_badge_label(name: &str) -> String {
         .unwrap_or_else(|| "?".into())
 }
 
+/// What the guide says of a programme still to come: when it starts, and on
+/// which day unless that is `today` ("begint om 20:30", "begint morgen om
+/// 20:30", "begint do 15 okt om 20:30").
+pub fn starts_text(lang: Lang, start: DateTime<Utc>, today: NaiveDate) -> String {
+    let at = crate::epg::hhmm(start);
+    let day = time::day_of(start);
+    if day == today {
+        return i18n::tr(lang, T::GuideStartsAt, &[&at]);
+    }
+    let mut label = i18n::day_label(lang, day, today);
+    // "Morgen" is how the date button says it; inside a sentence it is "morgen".
+    if (day - today).num_days() == 1 {
+        label = label.to_lowercase();
+    }
+    i18n::tr(lang, T::GuideStartsOn, &[&label, &at])
+}
+
 /// What the wait screen shows while a catch-up programme loads.
 pub struct WaitInfo<'a> {
     pub lang: Lang,
@@ -3387,10 +3404,11 @@ mod tests {
 
     #[test]
     fn the_footer_of_the_narrowest_window_still_says_how_to_close_the_guide() {
+        // And, after that, how to get the help, which names every other key.
         let closing = [
-            (Lang::Nl, "Esc of g = sluiten"),
-            (Lang::En, "Esc or g = close"),
-            (Lang::De, "Esc oder g = schließen"),
+            (Lang::Nl, "Esc of g = sluiten   /   ? = hulp   /   "),
+            (Lang::En, "Esc or g = close   /   ? = help   /   "),
+            (Lang::De, "Esc oder g = schließen   /   ? = Hilfe   /   "),
         ];
         for (lang, closing) in closing {
             let footer = i18n::t(lang, T::GuideKeysFooter);
@@ -3427,6 +3445,24 @@ mod tests {
                 "{lang:?}: {hint:?} is {width} px wide in a box with {room} px of room"
             );
         }
+    }
+
+    #[test]
+    fn a_programme_still_to_come_names_its_day_unless_it_is_today() {
+        // 12 October 2026 is a Monday.
+        let today = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        let says = |lang, days| {
+            let start = time::at_hour(today + Duration::days(days), 20);
+            starts_text(lang, start, today)
+        };
+        assert_eq!(says(Lang::Nl, 0), "begint om 20:00");
+        assert_eq!(says(Lang::En, 0), "starts at 20:00");
+        assert_eq!(says(Lang::Nl, 1), "begint morgen om 20:00");
+        assert_eq!(says(Lang::En, 1), "starts tomorrow at 20:00");
+        assert_eq!(says(Lang::De, 1), "beginnt morgen um 20:00");
+        assert_eq!(says(Lang::Nl, 3), "begint do 15 okt om 20:00");
+        assert_eq!(says(Lang::En, 3), "starts Thu 15 Oct at 20:00");
+        assert_eq!(says(Lang::De, 3), "beginnt Do. 15. Okt. um 20:00");
     }
 
     // ---- the wait screen ----
