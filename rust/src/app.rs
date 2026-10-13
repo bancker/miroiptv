@@ -7,7 +7,9 @@ use crate::guide::fetch::EpgFetcher;
 use crate::guide::logos::LogoStore;
 use crate::guide::store::{fetch_order, ChannelEpg, EpgStore};
 use crate::guide::time::Playable;
-use crate::guide_ui::{paint_wait_screen, starts_text, GuideAction, GuideData, GuideView, WaitInfo};
+use crate::guide_ui::{
+    paint_wait_screen, starts_text, GuideAction, GuideData, GuideView, WaitInfo,
+};
 use crate::i18n::{Lang, T};
 use crate::news::NewsRule;
 use crate::pin::{PinGate, PinHash};
@@ -4500,7 +4502,11 @@ mod tests {
                 h.press(&[Key::ArrowRight, Key::Enter]);
             }
             let played = h.app.current_url.clone().unwrap_or_default();
-            let id = if live_flagged { "/911.m3u8" } else { "/901.m3u8" };
+            let id = if live_flagged {
+                "/911.m3u8"
+            } else {
+                "/901.m3u8"
+            };
             assert!(played.ends_with(id), "{played}");
             if !live_flagged {
                 // The stall watchdog's reload is the same stream: still adult.
@@ -4706,7 +4712,9 @@ mod tests {
         h.events.send(Event::PlaybackStarted).unwrap();
         h.frame(&[]);
         // A second after the restart no picture has come: audio only.
-        let ago = Instant::now().checked_sub(Duration::from_millis(1100)).unwrap();
+        let ago = Instant::now()
+            .checked_sub(Duration::from_millis(1100))
+            .unwrap();
         let wait = h.app.pending_catchup.as_mut().unwrap();
         let version = wait.started.expect("the restart is noted").0;
         wait.started = Some((version, ago));
