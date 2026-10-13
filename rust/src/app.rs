@@ -82,12 +82,14 @@ fn catalog_says_adult(catalog: &CatalogStore, url: &str) -> Option<bool> {
 }
 
 /// The record last_watched.json gets when `url` loads, or `None` to leave the
-/// file as it is. Its adult flag is the catalog's word when it can give one,
-/// else what the caller knows (`hint`: the resume passes the file's own flag
-/// on), else unknown, never "not adult" for lack of knowledge: the next start
-/// would resume an adult channel (a URL from the command line) without the PIN.
-/// A reload of the stream that plays, with nothing new known about it, leaves
-/// the file alone: the flag it has must not turn into "unknown".
+/// file as it is. Its adult flag is "adult" when the catalog or the caller says
+/// so (`hint`: the resume passes the file's own flag on, a guide pick whether
+/// its column is adult, which it is when any variant carries the flag, maybe
+/// not this stream). Else it is the catalog's word when it can give one, else
+/// the hint, else unknown, never "not adult" for lack of knowledge: the next
+/// start would resume an adult channel (a URL from the command line) without
+/// the PIN. A reload of the stream that plays, with nothing new known about
+/// it, leaves the file alone: the flag it has must not turn into "unknown".
 fn last_watched_record(
     catalog: &CatalogStore,
     url: &str,
@@ -95,7 +97,12 @@ fn last_watched_record(
     hint: Option<bool>,
     reload: bool,
 ) -> Option<LastWatched> {
-    let adult = catalog_says_adult(catalog, url).or(hint);
+    let catalog_says = catalog_says_adult(catalog, url);
+    let adult = if catalog_says == Some(true) || hint == Some(true) {
+        Some(true)
+    } else {
+        catalog_says.or(hint)
+    };
     if adult.is_none() && reload {
         return None;
     }
@@ -539,6 +546,10 @@ pub struct TvApp {
     current_url: Option<String>,
     /// Whether that stream is live TV (else a film, series or catch-up).
     current_live: bool,
+    /// That stream was picked in a guide column that is adult: a variant of the
+    /// channel carries the portal's flag, maybe not this one. Lock stops it, and
+    /// it is never resumed. Any other load clears it, and so does a stop.
+    current_adult_hint: bool,
     /// Paused with the space bar (films, series and catch-up only).
     paused: bool,
     /// Last FrameBus.version we observed, and when it last advanced.
@@ -753,6 +764,7 @@ impl TvApp {
             show_help: false,
             current_url: None,
             current_live: false,
+            current_adult_hint: false,
             paused: false,
             last_progress_version: 0,
             last_progress_at: Instant::now(),
@@ -954,6 +966,7 @@ impl TvApp {
         self.zap_pacer.cancel();
         self.current_url = None;
         self.current_live = false;
+        self.current_adult_hint = false;
         self.current_idx = None;
         self.current_name = None;
         self.current_stream_id = None;
@@ -966,11 +979,12 @@ impl TvApp {
         tracing::info!("player: stop");
     }
 
-    /// What plays is adult content, as the catalog in use says.
+    /// What plays is adult content: as the catalog in use says, or as the guide
+    /// column it was picked in says (`current_adult_hint`).
     fn playing_adult(&self) -> bool {
         self.current_url
             .as_deref()
-            .is_some_and(|u| self.catalog.is_adult_url(u))
+            .is_some_and(|u| self.current_adult_hint || self.catalog.is_adult_url(u))
     }
 
     fn apply_settings_action(&mut self, action: SettingsAction) {
@@ -1173,8 +1187,8 @@ impl TvApp {
     }
 
     /// `load_url`, with what the caller already knows about the stream's adult
-    /// flag (`adult_hint`) for while the catalog cannot tell yet: the resume
-    /// hands the file's own flag on.
+    /// flag (`adult_hint`): the resume hands the file's own flag on for while
+    /// the catalog cannot tell yet, a guide pick whether its column is adult.
     fn load_url_with(&mut self, url: String, watchdog: bool, adult_hint: Option<bool>) {
         // Whatever loads now supersedes a zap still waiting for the user to
         // stop flipping.
@@ -1189,6 +1203,14 @@ impl TvApp {
         let reload =
             self.current_url.as_deref() == Some(url.as_str()) && self.current_live == watchdog;
         self.current_live = watchdog;
+        // A stream picked in an adult guide column stays adult when the stall
+        // watchdog or an eof reloads it; any other load starts without the mark.
+        let adult_hint = if reload && self.current_adult_hint {
+            Some(true)
+        } else {
+            adult_hint
+        };
+        self.current_adult_hint = adult_hint == Some(true);
         // Another stream is a pick, which the catalog's first word leaves alone.
         if !reload {
             self.playing_resumed = false;
@@ -3400,7 +3422,9 @@ impl TvApp {
                     to
                 );
                 let url = self.catalog.portal().live_stream_url(channel.live_id);
-                self.load_url(url, true);
+                // The column is adult when any variant is flagged: Lock and the
+                // resume go by that, not by this stream's own flag alone.
+                self.load_url_with(url, true, Some(channel.adult));
                 // Up/down continues from this channel.
                 self.current_idx = None;
                 self.current_stream_id = Some(channel.live_id);
@@ -3426,7 +3450,7 @@ impl TvApp {
                 let minutes = (entry.end - entry.start).num_minutes().max(1) as u32;
                 let portal = self.catalog.portal();
                 let url = portal.catchup_url(channel.archive_id, entry.start, minutes);
-                self.load_url(url, false);
+                self.load_url_with(url, false, Some(channel.adult));
                 self.current_idx = None;
                 self.current_stream_id = Some(channel.archive_id);
                 self.current_name = Some(format!("{} - {}", channel.name, entry.title));
@@ -3686,6 +3710,12 @@ mod tests {
     /// The guide's channels: TEST 03 with its catch-up twin 13, and the adult
     /// 901 with its twin 911.
     fn guide_catalog() -> Arc<CatalogStore> {
+        flagged_guide_catalog(true, true)
+    }
+
+    /// `guide_catalog` with the portal's adult flag on 901 (`live`) and on 911
+    /// (`archive`) as given. Its column is adult when either carries it.
+    fn flagged_guide_catalog(live: bool, archive: bool) -> Arc<CatalogStore> {
         let ch = |stream_id: i64, name: &str, archive: i32, is_adult: bool| LiveChannel {
             stream_id,
             name: name.into(),
@@ -3700,8 +3730,8 @@ mod tests {
             live: vec![
                 ch(3, "TEST 03", 0, false),
                 ch(13, "TEST 03 HD", 1, false),
-                ch(901, "24/7 | ADULT A", 0, true),
-                ch(911, "24/7 | ADULT A HD", 1, true),
+                ch(901, "24/7 | ADULT A", 0, live),
+                ch(911, "24/7 | ADULT A HD", 1, archive),
             ],
             ..Default::default()
         };
@@ -3739,12 +3769,18 @@ mod tests {
             flag(&loading, normal_url, Some(false), false),
             Some(Some(false))
         );
-        // The loaded catalog's word beats the hint, either way.
+        // The loaded catalog's word beats a hint that says "not adult" ...
         assert_eq!(
             flag(&loaded, adult_url, Some(false), false),
             Some(Some(true))
         );
         assert_eq!(flag(&loaded, normal_url, None, false), Some(Some(false)));
+        // ... but not one that says "adult": the guide's column is adult when any
+        // of its variants carries the flag, and the stream's own may not.
+        assert_eq!(
+            flag(&loaded, normal_url, Some(true), false),
+            Some(Some(true))
+        );
         // A reload of the stream that plays: while the catalog loads nothing new is
         // known, so the file keeps what it has; once the catalog can tell, it is written.
         assert_eq!(flag(&loading, normal_url, None, true), None);
@@ -4411,6 +4447,64 @@ mod tests {
             "and it is drawn: {:?}",
             h.painted
         );
+    }
+
+    #[tokio::test]
+    async fn a_guide_pick_in_an_adult_column_is_adult_whichever_variant_carries_the_flag() {
+        // Only 901 flagged: a catch-up pick plays the unflagged twin 911. Only 911
+        // flagged: a live pick plays the unflagged 901.
+        for live_flagged in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = flagged_guide_catalog(live_flagged, !live_flagged);
+            let mut h = Harness::start(dir.path(), catalog, PortalState::Configured, None);
+            h.app.set_adult_visible(true);
+            let now = chrono::Utc::now();
+            h.app
+                .epg_store
+                .insert(911, ChannelEpg::new(programmes_around(now), now));
+            open_guide(&mut h, false);
+            // ADULT A's column: the programme before the one on now, or that one.
+            if live_flagged {
+                h.press(&[Key::ArrowRight, Key::ArrowUp, Key::Enter]);
+                show_first_picture(&mut h);
+            } else {
+                h.press(&[Key::ArrowRight, Key::Enter]);
+            }
+            let played = h.app.current_url.clone().unwrap_or_default();
+            let id = if live_flagged { "/911.m3u8" } else { "/901.m3u8" };
+            assert!(played.ends_with(id), "{played}");
+            if !live_flagged {
+                // The stall watchdog's reload is the same stream: still adult.
+                h.app.load_url(played.clone(), true);
+            }
+            let adult = read_last_watched(dir.path()).adult;
+            assert_eq!(adult, Some(true), "{played} is never resumed");
+            h.sent();
+            h.app.apply_settings_action(SettingsAction::Lock);
+            assert!(stopped(&h.sent()), "Lock stops {played}");
+            assert_eq!(h.app.current_url, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn after_an_adult_guide_pick_the_next_load_is_judged_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = flagged_guide_catalog(false, true);
+        let mut h = Harness::start(dir.path(), catalog, PortalState::Configured, None);
+        h.app.set_adult_visible(true);
+        let now = chrono::Utc::now();
+        h.app
+            .epg_store
+            .insert(911, ChannelEpg::new(programmes_around(now), now));
+        open_guide(&mut h, false);
+        h.press(&[Key::ArrowRight, Key::Enter]);
+        assert_eq!(h.app.current_url, Some(live_url(901)));
+        // A zap to TEST 03 afterwards: an ordinary channel.
+        h.app.zap_by_id(3);
+        assert_eq!(read_last_watched(dir.path()).adult, Some(false));
+        h.sent();
+        h.app.apply_settings_action(SettingsAction::Lock);
+        assert!(!stopped(&h.sent()), "Lock leaves TEST 03 playing");
     }
 
     #[tokio::test]
