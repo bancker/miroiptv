@@ -244,7 +244,8 @@ fn help_rows(lang: Lang, swap_zap_keys: bool) -> [(T, Vec<HelpRow>); 2] {
                 row("Enter", t(T::HelpGuidePlay)),
                 row("n / p", t(T::HelpGuideTimeMode)),
                 row("d", t(T::HelpGuideDate)),
-                row("f", t(T::HelpGuideFilter)),
+                row("/", t(T::HelpGuideFilter)),
+                row("f", t(T::HelpGuideSearch)),
                 row("Esc", t(T::HelpGuideEsc)),
                 row("g", t(T::HelpGuideClose)),
             ],
@@ -4008,6 +4009,30 @@ mod tests {
         // The catalog loading, and the adult lock changing which channels show.
         assert!(stale(&rules, false, false));
         assert!(stale(&rules, true, true));
+    }
+
+    #[test]
+    fn the_guides_help_names_slash_for_the_filter_and_f_for_the_search() {
+        let search = [
+            (Lang::Nl, "zoeken in alles: zenders, films, series"),
+            (Lang::En, "search everything: channels, films, series"),
+            (Lang::De, "alles durchsuchen: Sender, Filme, Serien"),
+        ];
+        for (lang, search) in search {
+            let sections = help_rows(lang, false);
+            let guide = &sections[1].1;
+            let action = |key: &str| guide.iter().find(|r| r.key == key).map(|r| r.action);
+            assert_eq!(
+                action("/"),
+                Some(crate::i18n::t(lang, T::HelpGuideFilter)),
+                "{lang:?}: the filter"
+            );
+            assert_eq!(action("f"), Some(search), "{lang:?}: the search");
+            // The viewer's `f` is the same search, in the other section.
+            let viewer = &sections[0].1;
+            let viewer_f = viewer.iter().find(|r| r.key == "f").map(|r| r.action);
+            assert_eq!(viewer_f, Some(crate::i18n::t(lang, T::HelpSearch)));
+        }
     }
 
     #[test]

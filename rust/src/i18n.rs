@@ -191,6 +191,7 @@ texts! {
     HelpThisHelp => ["deze hulp", "this help", "diese Hilfe"],
     HelpCloseOverlays => ["vensters sluiten", "close overlays", "Fenster schließen"],
     HelpGuideFilter => ["filter: zender of programma", "filter: channel or programme", "Filter: Sender oder Sendung"],
+    HelpGuideSearch => ["zoeken in alles: zenders, films, series", "search everything: channels, films, series", "alles durchsuchen: Sender, Filme, Serien"],
     HelpGuideRows => ["programma kiezen in de kolom", "programme cursor in the column", "Sendung in der Spalte wählen"],
     HelpGuideColumns => ["andere kolom", "switch column", "Spalte wechseln"],
     HelpGuidePages => ["vorige / volgende pagina zenders", "previous / next page of channels", "vorherige / nächste Seite der Sender"],
@@ -214,7 +215,7 @@ texts! {
     GuideStartsOn => ["begint {0} om {1}", "starts {0} at {1}", "beginnt {0} um {1}"],
     GuideNotReplayable => ["niet terug te kijken", "not available to watch back", "nicht als Wiederholung verfügbar"],
     GuideLiveToast => ["[LIVE] {0} · {1}", "[LIVE] {0} · {1}", "[LIVE] {0} · {1}"],
-    GuideKeysFooter => ["Esc of g = sluiten   /   ? = hulp   /   pijlen = navigeren   /   PgUp/PgDn = andere zenders   /   Enter = afspelen   /   n / p = nu / primetime   /   d = datum   /   f = filter", "Esc or g = close   /   ? = help   /   arrows = navigate   /   PgUp/PgDn = other channels   /   Enter = play   /   n / p = now / primetime   /   d = date   /   f = filter", "Esc oder g = schließen   /   ? = Hilfe   /   Pfeile = navigieren   /   PgUp/PgDn = andere Sender   /   Enter = abspielen   /   n / p = jetzt / Primetime   /   d = Datum   /   f = Filter"],
+    GuideKeysFooter => ["Esc of g = sluiten  ·  ? = hulp  ·  pijlen = navigeren  ·  PgUp/PgDn = andere zenders  ·  Enter = afspelen  ·  n / p = nu / primetime  ·  d = datum  ·  / = filter  ·  f = zoeken in alles", "Esc or g = close  ·  ? = help  ·  arrows = navigate  ·  PgUp/PgDn = other channels  ·  Enter = play  ·  n / p = now / primetime  ·  d = date  ·  / = filter  ·  f = search everything", "Esc oder g = schließen  ·  ? = Hilfe  ·  Pfeile = navigieren  ·  PgUp/PgDn = andere Sender  ·  Enter = abspielen  ·  n / p = jetzt / Primetime  ·  d = Datum  ·  / = Filter  ·  f = alles durchsuchen"],
     // Days in the guide
     DayYesterday => ["Gisteren", "Yesterday", "Gestern"],
     DayToday => ["Vandaag", "Today", "Heute"],

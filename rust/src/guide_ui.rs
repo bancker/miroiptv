@@ -3616,9 +3616,9 @@ mod tests {
     fn the_footer_of_the_narrowest_window_still_says_how_to_close_the_guide() {
         // And, after that, how to get the help, which names every other key.
         let closing = [
-            (Lang::Nl, "Esc of g = sluiten   /   ? = hulp   /   "),
-            (Lang::En, "Esc or g = close   /   ? = help   /   "),
-            (Lang::De, "Esc oder g = schließen   /   ? = Hilfe   /   "),
+            (Lang::Nl, "Esc of g = sluiten  ·  ? = hulp  ·  "),
+            (Lang::En, "Esc or g = close  ·  ? = help  ·  "),
+            (Lang::De, "Esc oder g = schließen  ·  ? = Hilfe  ·  "),
         ];
         for (lang, closing) in closing {
             let footer = i18n::t(lang, T::GuideKeysFooter);
@@ -3633,6 +3633,25 @@ mod tests {
             );
             let wide = as_drawn(&drawn(1280.0, lang), footer);
             assert_eq!(wide, footer, "{lang:?}: 1280 px holds all of it");
+        }
+    }
+
+    #[test]
+    fn the_footer_names_slash_for_the_filter_and_f_for_the_search() {
+        let names = [
+            (Lang::Nl, "/ = filter  ·  f = zoeken in alles"),
+            (Lang::En, "/ = filter  ·  f = search everything"),
+            (Lang::De, "/ = Filter  ·  f = alles durchsuchen"),
+        ];
+        for (lang, names) in names {
+            let footer = i18n::t(lang, T::GuideKeysFooter);
+            assert!(footer.ends_with(names), "{lang:?}: {footer:?}");
+            // A slash between the entries would read as a key of its own.
+            assert!(!footer.contains("   /   "), "{lang:?}: {footer:?}");
+            // The other keys are still named.
+            assert!(footer.contains("n / p = "), "{lang:?}: {footer:?}");
+            assert!(footer.contains("d = "), "{lang:?}: {footer:?}");
+            assert!(footer.contains("PgUp/PgDn = "), "{lang:?}: {footer:?}");
         }
     }
 
