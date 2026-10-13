@@ -4159,12 +4159,19 @@ mod tests {
 
         /// One frame in which these events arrive.
         fn frame_with(&mut self, events: Vec<egui::Event>) {
+            self.frame_holding(egui::Modifiers::NONE, events);
+        }
+
+        /// One frame in which these events arrive while the modifier keys are
+        /// held down (a key press carries its own copy of them in its event).
+        fn frame_holding(&mut self, modifiers: egui::Modifiers, events: Vec<egui::Event>) {
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::vec2(1280.0, 720.0),
                 )),
                 events,
+                modifiers,
                 ..Default::default()
             };
             let app = &mut self.app;
@@ -4956,6 +4963,76 @@ mod tests {
         h.frame(&[Key::Escape]);
         assert!(!h.app.show_search && !h.app.guide_open);
         assert!(h.app.search_query.is_empty());
+    }
+
+    /// A press of Shift+F as a window reports it: the key with Shift in its own
+    /// copy of the modifiers, and the capital it types.
+    fn shift_f_pressed() -> Vec<egui::Event> {
+        let shift_f = egui::Event::Key {
+            key: Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        };
+        vec![shift_f, egui::Event::Text("F".into())]
+    }
+
+    #[tokio::test]
+    async fn outside_the_guide_shift_f_is_still_the_favourites_and_not_the_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        h.frame_holding(egui::Modifiers::SHIFT, shift_f_pressed());
+        assert!(h.app.show_favs, "Shift+F lists the favourites");
+        assert!(!h.app.show_search, "and is not the search");
+    }
+
+    #[tokio::test]
+    async fn shift_f_in_the_guide_opens_neither_the_search_nor_the_favourites() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, true);
+        h.frame_holding(egui::Modifiers::SHIFT, shift_f_pressed());
+        h.frame(&[]);
+        h.frame(&[]);
+        assert!(!h.app.show_search, "Shift+F is not the search's");
+        assert!(
+            !h.app.show_favs,
+            "the favourites do not show over the guide"
+        );
+        assert!(h.app.guide_open, "and the guide is as it was");
+        // The keyboard did not go to the guide's filter box either: what is typed
+        // now filters nothing.
+        h.type_text("zz");
+        assert!(
+            h.app.guide_view.filtered().is_none(),
+            "the box has no keyboard"
+        );
+        // A plain f is still the search.
+        h.frame_with(f_pressed());
+        assert!(h.app.show_search && h.app.guide_open);
+    }
+
+    #[tokio::test]
+    async fn ctrl_f_in_the_guide_opens_the_search_like_f() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        open_guide(&mut h, true);
+        let ctrl_f = egui::Event::Key {
+            key: Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        h.frame_holding(egui::Modifiers::CTRL, vec![ctrl_f]);
+        assert!(
+            h.app.show_search && h.app.guide_open,
+            "Ctrl+F opens the search"
+        );
+        assert!(h.app.search_query.is_empty());
+        let left = h.ctx.input(|i| i.events.clone());
+        assert!(left.is_empty(), "and its press is spent: {left:?}");
     }
 
     // ---- the wait screen of a catch-up pick ----

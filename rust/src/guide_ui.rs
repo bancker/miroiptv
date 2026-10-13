@@ -698,13 +698,16 @@ fn read_keys(ctx: &egui::Context) -> Keys {
         now_next: i.key_pressed(Key::N),
         primetime: i.key_pressed(Key::P),
         dates: i.key_pressed(Key::D),
-        // Read from the text, as `?` is: egui 0.27 has no key for it, and where it
-        // sits differs per layout (on a German keyboard `/` is Shift+7).
+        // Read from the text, as `?` is, so that it works on every keyboard layout:
+        // the keys that make a `/` differ (on a German keyboard it is Shift+7),
+        // and the character typed is what the user means, whichever keys made it.
         filter: i
             .events
             .iter()
             .any(|e| matches!(e, egui::Event::Text(t) if t == "/")),
-        search: i.key_pressed(Key::F),
+        // Not with Shift, as outside the guide: Shift+F is the favourites list
+        // there, which does not show over the guide, so here it does nothing.
+        search: i.key_pressed(Key::F) && !i.modifiers.shift,
         close: i.key_pressed(Key::G),
         help: i
             .events
@@ -2411,6 +2414,9 @@ mod tests {
         height: f32,
         /// When the last frame asked to be drawn again (zero: at once).
         repaint_in: std::time::Duration,
+        /// The modifier keys held down in the frames that follow (as the window
+        /// reports them; a key press carries its own copy in its event).
+        holding: egui::Modifiers,
         _dir: tempfile::TempDir,
     }
 
@@ -2427,6 +2433,7 @@ mod tests {
                 width,
                 height,
                 repaint_in: std::time::Duration::MAX,
+                holding: egui::Modifiers::NONE,
                 _dir: dir,
             }
         }
@@ -2444,6 +2451,7 @@ mod tests {
                     Vec2::new(self.width, self.height),
                 )),
                 events,
+                modifiers: self.holding,
                 ..Default::default()
             };
             let mut action = None;
@@ -2576,21 +2584,19 @@ mod tests {
 
     #[test]
     fn slash_is_read_from_the_text_whatever_key_makes_it() {
-        // A US keyboard has a key for it; a German one makes it with Shift+7, and
-        // egui 0.27 names no slash key at all: the text is what every layout has.
+        // A US keyboard makes a / with a key of its own, a German one with Shift+7:
+        // whichever keys make it, the text is a /, and the text is what the guide
+        // reads. Shift is held here, so that a rule about Shift (the `f` has one)
+        // cannot creep into the slash unseen.
         let f = Fixture::new(3, &[]);
         let none = HashSet::new();
         let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
         let d = data(&f, &none, true);
         s.frame(&mut v, &d, vec![]);
-        let shift_7 = egui::Event::Key {
-            key: Key::Num7,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::SHIFT,
-        };
+        s.holding = egui::Modifiers::SHIFT;
+        let shift_7 = key_with(Key::Num7, egui::Modifiers::SHIFT);
         s.frame(&mut v, &d, vec![shift_7, text("/")]);
+        s.holding = egui::Modifiers::NONE;
         s.frame(&mut v, &d, vec![]);
         assert!(
             s.focused(),
@@ -2627,6 +2633,51 @@ mod tests {
         s.frame(&mut v, &d, vec![]);
         assert!(!s.focused(), "f is no longer the filter's key");
         assert_eq!(v.filter, "", "and nothing was typed into it");
+    }
+
+    /// A press of `key` with `modifiers` held, as the window reports it.
+    fn key_with(key: Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn shift_f_does_nothing_in_the_guide() {
+        // Outside the guide Shift+F is the favourites list, which does not show
+        // over the guide: here it is neither the search's nor the filter's.
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        s.holding = egui::Modifiers::SHIFT;
+        let shift_f = key_with(Key::F, egui::Modifiers::SHIFT);
+        let (action, _) = s.frame(&mut v, &d, vec![shift_f, text("F")]);
+        assert_eq!(action, None, "no search");
+        s.holding = egui::Modifiers::NONE;
+        s.frame(&mut v, &d, vec![]);
+        assert!(!s.focused(), "and the filter box has not got the keyboard");
+        assert_eq!(v.filter, "");
+    }
+
+    #[test]
+    fn ctrl_f_asks_for_the_search_like_f() {
+        // As outside the guide: only Shift tells the favourites from the search.
+        // A window gives no text for a command key.
+        let f = Fixture::new(3, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        s.frame(&mut v, &d, vec![]);
+        s.holding = egui::Modifiers::CTRL;
+        let ctrl_f = key_with(Key::F, egui::Modifiers::CTRL);
+        let (action, _) = s.frame(&mut v, &d, vec![ctrl_f]);
+        assert_eq!(action, Some(GuideAction::Search));
     }
 
     #[test]
