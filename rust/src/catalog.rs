@@ -814,46 +814,11 @@ impl CatalogStore {
         }
     }
 
-    /// Archive (catch-up) channels: `tv_archive == 1`. These serve
-    /// `/timeshift/...` and `get_simple_data_table` returns the full
-    /// catch-up history; the matching live channel (`tv_archive == 0`)
-    /// is needed for live URLs.
-    pub fn archive_channels(&self) -> Vec<LiveChannel> {
-        self.inner
-            .read()
-            .as_ref()
-            .map(|c| {
-                c.live
-                    .iter()
-                    .filter(|x| x.tv_archive == 1 && self.shows_live(x))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Find the live (non-archive) variant of a channel by exact name match.
-    /// Used by the guide when the user picks an airing-now programme on an
-    /// archive channel - we have to swap to the live id to actually play.
-    pub fn live_id_by_name(&self, name: &str) -> Option<i64> {
-        let target = normalize_channel_name(name);
-        self.inner.read().as_ref().and_then(|c| {
-            c.live
-                .iter()
-                .find(|x| {
-                    x.tv_archive != 1
-                        && normalize_channel_name(&x.name) == target
-                        && self.shows_live(x)
-                })
-                .map(|x| x.stream_id)
-        })
-    }
-
-    /// Reverse of live_id_by_name. Used by the zap toast's EPG fetch
-    /// path: some Xtream portals (hnlol et al.) only populate EPG against
-    /// the tv_archive=1 stream_ids - the live variants return empty even
-    /// though they share a programme schedule with their archive twin.
-    /// Matching is by normalized name so 'NL | NPO 1' (live) and
+    /// The catch-up (`tv_archive == 1`) variant of a channel, by name. Used by
+    /// the zap toast's EPG fetch path: some Xtream portals (hnlol et al.) only
+    /// populate EPG against the tv_archive=1 stream_ids - the live variants
+    /// return empty even though they share a programme schedule with their
+    /// archive twin. Matching is by normalized name so 'NL | NPO 1' (live) and
     /// 'NL | NPO1 HD' (archive) resolve to the same canonical key.
     pub fn archive_id_by_name(&self, name: &str) -> Option<i64> {
         let target = normalize_channel_name(name);

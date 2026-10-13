@@ -111,7 +111,6 @@ fn locked_hides_adult_channels_and_films_everywhere() {
     assert_eq!(ids(s.live_channels()), [1]);
     let found: Vec<i64> = s.search_items().into_iter().map(|i| i.id).collect();
     assert_eq!(found, [1, 10]);
-    assert_eq!(s.live_id_by_name("XXX | MEIDEN VAN HOLLAND"), None);
     assert!(s.quality_nav(2).ladder.is_empty());
 }
 
@@ -164,12 +163,16 @@ fn locked_hides_adult_catch_up_channels_and_their_name_lookups() {
             ..Catalog::default()
         },
     );
-    assert_eq!(ids(s.archive_channels()), [1]);
+    // The guide's columns are the catch-up channels the app lists.
+    let columns = |s: &CatalogStore| -> Vec<i64> {
+        s.guide_channels().iter().map(|c| c.archive_id).collect()
+    };
+    assert_eq!(columns(&s), [1]);
     assert_eq!(s.archive_id_by_name("NL | NPO 1"), Some(1));
     assert_eq!(s.archive_id_by_name("24/7 | SHOPLYFTER 1"), None);
     assert_eq!(s.archive_id_by_name("XXX | MEIDEN VAN HOLLAND"), None);
     s.set_adult_unlocked(true);
-    assert_eq!(ids(s.archive_channels()), [1, 2, 3]);
+    assert_eq!(columns(&s), [1, 2, 3]);
     assert_eq!(s.archive_id_by_name("24/7 | SHOPLYFTER 1"), Some(2));
 }
 
@@ -237,7 +240,6 @@ fn only_the_portals_flag_marks_adult_content_never_a_name() {
     assert_eq!(listed(&s), [1, 2, 10, 11, 20]);
     let hits = s.search("state of the union");
     assert_eq!(hits.iter().map(|i| i.id).collect::<Vec<_>>(), [10]);
-    assert_eq!(s.live_id_by_name("XXX Something"), Some(2));
     assert!(!s.quality_nav(2).ladder.is_empty());
     assert!(s.quality_nav(3).ladder.is_empty());
     // What plays and what is saved follow the flag too.
