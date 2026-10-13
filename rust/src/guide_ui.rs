@@ -1032,7 +1032,10 @@ impl GuideView {
             );
             chevron_down(p, bar.date.right_center() - Vec2::new(16.0, 0.0));
         }
-        if date.clicked() {
+        // Under the help a click does nothing, as a key does nothing there: the
+        // buttons and rows beside it would act behind it.
+        let clicks = data.keys;
+        if date.clicked() && clicks {
             if self.date_pick.is_some() {
                 self.date_pick = None;
             } else {
@@ -1046,12 +1049,14 @@ impl GuideView {
         let prime_half = Rect::from_min_max(Pos2::new(mid, bar.modes.min.y), bar.modes.max);
         let now_text = i18n::t(lang, T::GuideNow);
         let now_active = self.mode == Mode::NowAndNext;
-        if segment(ui, now_half, "__guide_now__", now_text, now_active).clicked() {
+        let now = segment(ui, now_half, "__guide_now__", now_text, now_active);
+        if now.clicked() && clicks {
             self.now_and_next(data.today);
         }
         let prime_text = i18n::t(lang, T::GuidePrime);
         let prime_active = self.mode == Mode::Primetime;
-        if segment(ui, prime_half, "__guide_prime__", prime_text, prime_active).clicked() {
+        let prime = segment(ui, prime_half, "__guide_prime__", prime_text, prime_active);
+        if prime.clicked() && clicks {
             self.primetime();
         }
         // The filter box: the keyboard gets there by `f` or a click only, and
@@ -1088,10 +1093,10 @@ impl GuideView {
             self.realign();
         }
         // ‹ › a page of channels.
-        if chevron_button(ui, bar.prev, "__guide_prev__", false).clicked() {
+        if chevron_button(ui, bar.prev, "__guide_prev__", false).clicked() && clicks {
             self.move_page(page, false);
         }
-        if chevron_button(ui, bar.next, "__guide_next__", true).clicked() {
+        if chevron_button(ui, bar.next, "__guide_next__", true).clicked() && clicks {
             self.move_page(page, true);
         }
         // Which channels show, and what plays.
@@ -1166,14 +1171,15 @@ impl GuideView {
             if wheel_at.is_some_and(|p| rows.contains(p)) {
                 self.scroll(page, col, -wheel / ROW_H);
             }
-            if let Some(a) = self.rows(ui, page, matches, col, ch, rows, live_label) {
+            if let Some(a) = self.rows(ui, page, matches, col, ch, rows, live_label, data.keys) {
                 action = Some(a);
             }
         }
         action
     }
 
-    /// The visible rows of one column; a click plays the programme.
+    /// The visible rows of one column; a click plays the programme (with
+    /// `clicks`: not under the help).
     #[allow(clippy::too_many_arguments)]
     fn rows(
         &mut self,
@@ -1184,6 +1190,7 @@ impl GuideView {
         ch: &GuideChannel,
         area: Rect,
         live_label: &str,
+        clicks: bool,
     ) -> Option<GuideAction> {
         let epg = page.store.get(ch.archive_id)?;
         let entries = epg.entries();
@@ -1226,7 +1233,7 @@ impl GuideView {
                 hit: hits.is_some_and(|h| h.binary_search(&i).is_ok()),
             };
             paint_row(&painter, row, entry, look, page.now, live_label);
-            if response.clicked() {
+            if response.clicked() && clicks {
                 clicked = Some(i);
             }
         }
@@ -1283,7 +1290,7 @@ impl GuideView {
                         FontId::proportional(14.0),
                         color,
                     );
-                    if response.clicked() {
+                    if response.clicked() && data.keys {
                         clicked = Some(*day);
                     }
                 }
@@ -2674,6 +2681,43 @@ mod tests {
         assert_eq!(action, Some(GuideAction::Help));
         let (action, _) = s.frame(&mut v, &data(&f, &none, false), vec![key(Key::Enter)]);
         assert_eq!(action, None, "under the help the guide takes no keys");
+    }
+
+    #[test]
+    fn under_the_help_no_click_does_anything() {
+        let f = Fixture::new(12, &[]);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let under_help = data(&f, &none, false);
+        s.frame(&mut v, &under_help, vec![]);
+        let before = (v.cursor.clone(), v.selected, v.visible_window());
+        // A programme beside the help.
+        let (_, line) = rows_and_line();
+        let y = TOP_BAR_H + HEADER_H + line as f32 * ROW_H + ROW_H / 2.0;
+        let x = MARGIN + COLUMN_W + COLUMN_GAP + COLUMN_W / 2.0;
+        assert_eq!(s.click(&mut v, &under_help, Pos2::new(x, y)), None);
+        // The date, Primetime and ›.
+        let bar = TopBar::new(Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(1280.0, TOP_BAR_H),
+        ));
+        let primetime = Pos2::new(bar.modes.center().x + 20.0, bar.modes.center().y);
+        for at in [bar.date.center(), primetime, bar.next.center()] {
+            assert_eq!(s.click(&mut v, &under_help, at), None);
+        }
+        assert_eq!((v.date_pick, v.mode), (None, Mode::NowAndNext));
+        let after = (v.cursor.clone(), v.selected, v.visible_window());
+        assert_eq!(after, before, "the cursor and the page stay");
+        // A day in the date list, opened with the keys before the help came.
+        s.frame(&mut v, &data(&f, &none, true), vec![key(Key::D)]);
+        s.frame(&mut v, &under_help, vec![]);
+        let first = Pos2::new(
+            bar.date.left() + 20.0,
+            bar.date.bottom() + 4.0 + DATE_ROW_H / 2.0,
+        );
+        s.click(&mut v, &under_help, first);
+        assert_eq!(v.day, time::day_of(now()), "no day is picked");
+        assert!(v.date_pick.is_some(), "and the list stays open");
     }
 
     // --- Rulings R7 and R17 ---
