@@ -4652,7 +4652,7 @@ mod tests {
         let ago = |ms| Instant::now().checked_sub(Duration::from_millis(ms));
         let wait = h.app.pending_catchup.as_mut().unwrap();
         let version = wait.started.expect("the restart is noted").0;
-        wait.started = Some((version, ago(900).unwrap()));
+        wait.started = Some((version, ago(700).unwrap()));
         h.frame(&[]);
         assert!(h.app.pending_catchup.is_some(), "not before the second");
         let log = LogCapture::start();
