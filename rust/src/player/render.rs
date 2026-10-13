@@ -48,7 +48,9 @@ impl FrameBus {
         self.inner.lock().version
     }
 
-    fn write(&self, w: u32, h: u32, data: Vec<u8>) {
+    /// Publishes a frame. The render thread does; `pub(crate)` so that the app's
+    /// tests can put a picture on the bus without mpv.
+    pub(crate) fn write(&self, w: u32, h: u32, data: Vec<u8>) {
         {
             let mut g = self.inner.lock();
             g.w = w;

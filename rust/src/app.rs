@@ -316,7 +316,15 @@ struct PendingCatchup {
     end: chrono::DateTime<chrono::Utc>,
     /// Why it failed before its first frame, once it did.
     failed: Option<String>,
+    /// Once mpv has restarted playback: the version of the newest frame on the
+    /// bus then, and the time. mpv restarts before it renders anything, so the
+    /// wait ends on the first frame newer than that version, or a second after
+    /// the restart if none comes.
+    started: Option<(u64, Instant)>,
 }
+
+/// How long a catch-up wait goes on after mpv's restart when no picture comes.
+const WAIT_FOR_PICTURE: Duration = Duration::from_secs(1);
 
 /// The cache file as read on its own thread: for which catalog generation, and
 /// what it held.
@@ -589,10 +597,10 @@ fn spend_key(ctx: &egui::Context, key: Key) {
     ctx.input_mut(|i| {
         i.events.retain(|e| match e {
             egui::Event::Key {
-                key: pressed,
+                key: event_key,
                 pressed: true,
                 ..
-            } => *pressed != key,
+            } => *event_key != key,
             egui::Event::Text(typed) => !typed.eq_ignore_ascii_case(key.name()),
             _ => true,
         })
@@ -1242,13 +1250,19 @@ impl TvApp {
                     // this point (startup/zap) is shown live but not tallied.
                     self.health.mark_started();
                     self.stream_starting_since = None;
-                    if self.pending_catchup.take().is_some() {
-                        tracing::info!("catch-up: first frame");
+                    // mpv restarts before it renders the first picture of the new
+                    // file, and the bus still holds the last one of the stream
+                    // before. A catch-up wait goes on until a newer picture is
+                    // there (`end_catchup_wait`); the first restart counts.
+                    let frames = &self.player.frames;
+                    if let Some(wait) = self.pending_catchup.as_mut() {
+                        wait.started
+                            .get_or_insert_with(|| (frames.version(), Instant::now()));
                     }
                 }
                 Event::EndOfFile { reason } => {
-                    // Before its first frame a catch-up pick that ends has failed; the
-                    // stop of the stream before it ("stop") is no failure.
+                    // Before its first picture a catch-up pick that ends has failed;
+                    // the stop of the stream before it ("stop") is no failure.
                     if reason == "error" || reason == "eof" {
                         if let Some(wait) = self.pending_catchup.as_mut() {
                             if wait.failed.is_none() {
@@ -2490,17 +2504,27 @@ impl TvApp {
         }
     }
 
+    /// The video texture follows the bus. This runs before the frame is painted,
+    /// so the frame that ends a catch-up wait draws the picture that ended it.
     fn update_video_texture(&mut self, ctx: &egui::Context) {
+        let picture = self.upload_newest_frame(ctx);
+        self.end_catchup_wait(picture, Instant::now());
+    }
+
+    /// Puts the newest frame on the bus into the video texture, unless it is the
+    /// one there already or the fence holds it back. The version of the frame it
+    /// put there, if it did.
+    fn upload_newest_frame(&mut self, ctx: &egui::Context) -> Option<u64> {
         let frame: RgbaFrame = self.player.frames.read();
         if frame.w == 0 || frame.h == 0 {
-            return;
+            return None;
         }
         // After a stop the last picture must not come back.
         if !self.frame_fence.admit(frame.version) {
-            return;
+            return None;
         }
         if frame.version == self.last_frame_version && self.video_tex.is_some() {
-            return;
+            return None;
         }
         self.last_frame_version = frame.version;
 
@@ -2515,6 +2539,31 @@ impl TvApp {
             Some(t) => t.set(img, TextureOptions::LINEAR),
             None => self.video_tex = Some(ctx.load_texture("video", img, TextureOptions::LINEAR)),
         }
+        Some(frame.version)
+    }
+
+    /// A catch-up wait ends on the first picture newer than mpv's restart (`picture`
+    /// is the version of the one that was just put in the texture), or a second
+    /// after the restart if none comes: audio only, or a stream without video.
+    /// A failed wait stays, for the user to read it.
+    fn end_catchup_wait(&mut self, picture: Option<u64>, now: Instant) {
+        let Some(wait) = &self.pending_catchup else {
+            return;
+        };
+        let Some((restart, at)) = wait.started else {
+            return;
+        };
+        if wait.failed.is_some() {
+            return;
+        }
+        if picture.is_some_and(|version| version > restart) {
+            tracing::info!("catch-up: first frame");
+        } else if now.saturating_duration_since(at) >= WAIT_FOR_PICTURE {
+            tracing::info!("catch-up: no picture 1 s after the start");
+        } else {
+            return;
+        }
+        self.pending_catchup = None;
     }
 
     fn forward_window_size(&self, ctx: &egui::Context) {
@@ -3298,6 +3347,7 @@ impl TvApp {
                     start: entry.start,
                     end: entry.end,
                     failed: None,
+                    started: None,
                 });
             }
         }
@@ -3432,9 +3482,9 @@ impl TvApp {
         }
 
         // The wait screen of a catch-up pick takes over the full window, and so
-        // does the guide when open. Skipping the video texture upload in this
-        // branch removes ~5 MB of per-frame memcpy work while the user is
-        // browsing the schedule.
+        // does the guide when open. The video texture was brought up to date
+        // above in every case, so the frame that ends a wait draws the picture
+        // that ended it.
         if self.pending_catchup.is_some() {
             self.paint_wait(ctx);
         } else if self.guide_open {
@@ -3824,6 +3874,8 @@ mod tests {
         events: tokio::sync::mpsc::UnboundedSender<Event>,
         /// Every text the last frame painted.
         painted: Vec<String>,
+        /// Every texture the last frame drew (the video is one).
+        drawn: Vec<egui::TextureId>,
     }
 
     impl Harness {
@@ -3869,10 +3921,19 @@ mod tests {
                 cmds,
                 events,
                 painted: Vec::new(),
+                drawn: Vec::new(),
             };
             harness.frame(&[]);
             harness.frame(&[]);
             harness
+        }
+
+        /// A picture from the player: `w` x `h` pixels land on the frame bus, as
+        /// when mpv renders a frame. The version it gets.
+        fn put_frame(&mut self, w: u32, h: u32) -> u64 {
+            let frames = &self.app.player.frames;
+            frames.write(w, h, vec![0; w as usize * h as usize * 4]);
+            frames.version()
         }
 
         /// One frame in which these events arrive.
@@ -3892,6 +3953,16 @@ mod tests {
                 .iter()
                 .filter_map(|clipped| match &clipped.shape {
                     egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            self.drawn = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    // An image is a textured rectangle, or a mesh when it is rotated.
+                    egui::Shape::Rect(rect) => Some(rect.fill_texture_id),
+                    egui::Shape::Mesh(mesh) => Some(mesh.texture_id),
                     _ => None,
                 })
                 .collect();
@@ -4232,10 +4303,26 @@ mod tests {
         h.press(&[Key::ArrowUp, Key::Enter]);
     }
 
+    /// mpv restarts playback, and then renders the first picture of the
+    /// programme: the way a catch-up wait ends. Checks that it does.
+    fn show_first_picture(h: &mut Harness) {
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.frame(&[]);
+        h.put_frame(4, 2);
+        h.frame(&[]);
+        assert!(
+            h.app.pending_catchup.is_none(),
+            "the first picture ends the wait"
+        );
+    }
+
     #[tokio::test]
     async fn a_catch_up_pick_shows_the_wait_screen_until_the_first_frame() {
         let dir = tempfile::tempdir().unwrap();
         let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        // The channel watched before the pick: its last picture is on screen.
+        h.put_frame(4, 2);
+        h.frame(&[]);
         pick_catch_up(&mut h);
         assert!(h.app.pending_catchup.is_some());
         h.frame(&[]);
@@ -4250,16 +4337,167 @@ mod tests {
         h.frame(&[]);
         assert!(h.app.pending_catchup.is_some());
         assert!(h.app.stream_starting_since.is_some());
+        // Nor is mpv's restart, which comes before it renders anything: the
+        // picture on the bus is still the one of the channel before.
         h.events.send(Event::PlaybackStarted).unwrap();
         h.frame(&[]);
         assert!(
-            h.app.pending_catchup.is_none(),
-            "the first frame ends the wait"
+            h.app.stream_starting_since.is_none(),
+            "the EPG fetching, held back while the stream started, goes on"
         );
         assert!(
-            h.app.stream_starting_since.is_none(),
-            "and the EPG fetching, held back while the stream started, goes on"
+            h.app.pending_catchup.is_some(),
+            "the wait goes on after the restart"
         );
+        assert!(h.painted.iter().any(|t| t == "loading the programme…"));
+        let old = h.app.video_tex.as_ref().expect("the old picture").id();
+        assert!(!h.drawn.contains(&old), "the old picture is not drawn");
+        // The first picture of the programme ends it, and in that very frame
+        // nothing but that picture is drawn.
+        h.put_frame(8, 4);
+        h.frame(&[]);
+        assert!(
+            h.app.pending_catchup.is_none(),
+            "a new picture ends the wait"
+        );
+        assert!(
+            !h.painted.iter().any(|t| t == "loading the programme…"),
+            "{:?}",
+            h.painted
+        );
+        let video = h.app.video_tex.as_ref().expect("the new picture");
+        assert_eq!(video.size(), [8, 4], "its texture holds the new picture");
+        assert!(h.drawn.contains(&video.id()), "and it is what is drawn");
+    }
+
+    #[tokio::test]
+    async fn a_picture_that_was_there_when_the_restart_came_does_not_end_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        // Rendered before the app took the event in: the stream before the pick, or
+        // the new one a moment ahead of its event. Neither is a picture that is new.
+        let before = h.put_frame(4, 2);
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.frame(&[]);
+        assert_eq!(h.app.last_frame_version, before, "it was taken in ...");
+        assert!(
+            h.app.pending_catchup.is_some(),
+            "... and is not newer than the restart"
+        );
+        h.put_frame(4, 2);
+        h.frame(&[]);
+        assert!(h.app.pending_catchup.is_none(), "the next one is");
+    }
+
+    #[tokio::test]
+    async fn the_wait_ends_a_second_after_the_restart_when_no_picture_comes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.frame(&[]);
+        h.frame(&[]);
+        assert!(h.app.pending_catchup.is_some(), "a picture can still come");
+        // The restart's instant moved into the past instead of a sleep.
+        let ago = |ms| Instant::now().checked_sub(Duration::from_millis(ms));
+        let wait = h.app.pending_catchup.as_mut().unwrap();
+        let version = wait.started.expect("the restart is noted").0;
+        wait.started = Some((version, ago(900).unwrap()));
+        h.frame(&[]);
+        assert!(h.app.pending_catchup.is_some(), "not before the second");
+        let log = LogCapture::start();
+        let wait = h.app.pending_catchup.as_mut().unwrap();
+        wait.started = Some((version, ago(1100).unwrap()));
+        h.frame(&[]);
+        assert!(
+            h.app.pending_catchup.is_none(),
+            "audio only, or no video: the wait ends anyway"
+        );
+        let text = log.text();
+        assert!(
+            text.contains("catch-up: no picture 1 s after the start"),
+            "{text}"
+        );
+        assert!(!text.contains("catch-up: first frame"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn esc_between_the_restart_and_the_first_picture_still_brings_the_guide_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.frame(&[]);
+        h.sent();
+        h.press(&[Key::Escape]);
+        let sent = h.sent();
+        assert!(sent.iter().any(|c| matches!(c, Cmd::Stop)), "{sent:?}");
+        assert!(h.app.pending_catchup.is_none());
+        assert!(h.app.guide_open, "back in the guide");
+    }
+
+    #[tokio::test]
+    async fn a_failure_between_the_restart_and_the_first_picture_shows_on_the_wait_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.events
+            .send(Event::EndOfFile {
+                reason: "error".into(),
+            })
+            .unwrap();
+        h.frame(&[]);
+        h.frame(&[]);
+        let said = "Catch-up failed: the stream stopped";
+        assert!(h.painted.iter().any(|t| t == said), "{:?}", h.painted);
+        assert!(h.app.toast.is_none(), "and no toast says it");
+        // A picture that was on its way, or a second without one, does not wipe
+        // what the user has to read.
+        h.put_frame(4, 2);
+        h.frame(&[]);
+        let wait = h.app.pending_catchup.as_mut().expect("the failure stays");
+        let version = wait.started.expect("the restart is noted").0;
+        wait.started = Some((
+            version,
+            Instant::now().checked_sub(Duration::from_secs(2)).unwrap(),
+        ));
+        h.frame(&[]);
+        assert!(h.painted.iter().any(|t| t == said), "{:?}", h.painted);
+        h.press(&[Key::Escape]);
+        assert!(h.app.pending_catchup.is_none());
+        assert!(h.app.guide_open, "Esc brings the guide back from it");
+    }
+
+    #[tokio::test]
+    async fn after_a_cancel_the_next_pick_waits_for_its_own_picture_not_the_splash() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        h.press(&[Key::Escape]);
+        assert!(h.app.video_tex.is_none(), "a stop takes the picture away");
+        // A frame mpv rendered while the stop was on its way: the fence keeps it
+        // off screen, and it is no picture of the next programme either.
+        h.put_frame(4, 2);
+        h.press(&[Key::ArrowUp, Key::Enter]);
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.frame(&[]);
+        assert!(h.app.pending_catchup.is_some(), "the wait goes on");
+        assert!(h.painted.iter().any(|t| t == "loading the programme…"));
+        assert!(
+            !h.painted.iter().any(|t| t == crate::APP_NAME),
+            "not the splash: {:?}",
+            h.painted
+        );
+        assert!(h.app.video_tex.is_none());
+        // Its own first picture.
+        h.put_frame(8, 4);
+        h.frame(&[]);
+        assert!(h.app.pending_catchup.is_none());
+        let video = h.app.video_tex.as_ref().expect("its picture");
+        assert_eq!(video.size(), [8, 4]);
+        assert!(h.drawn.contains(&video.id()));
     }
 
     #[tokio::test]
@@ -4267,11 +4505,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
         pick_catch_up(&mut h);
+        assert!(h.app.stream_starting_since.is_some(), "the load is on");
         h.sent();
         h.press(&[Key::Escape]);
         let sent = h.sent();
         assert!(sent.iter().any(|c| matches!(c, Cmd::Stop)), "{sent:?}");
         assert!(h.app.pending_catchup.is_none());
+        assert!(
+            h.app.stream_starting_since.is_none(),
+            "the stop ends the load, and the EPG fetching goes on"
+        );
         assert!(h.app.guide_open, "back in the guide");
     }
 
@@ -4448,7 +4691,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
         pick_catch_up(&mut h);
-        h.events.send(Event::PlaybackStarted).unwrap();
+        show_first_picture(&mut h);
         h.events.send(Event::Error { msg: "boom".into() }).unwrap();
         h.frame(&[]);
         let toast = |h: &Harness| h.app.toast.as_ref().map(|(t, _, _)| t.clone());
@@ -4480,17 +4723,7 @@ mod tests {
     async fn the_wait_screen_logs_what_the_regression_scenarios_look_for() {
         let dir = tempfile::tempdir().unwrap();
         let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
-        // With one dispatcher registered, tracing works a log line's interest out
-        // from whoever hits it first: another test's thread, which has none, would
-        // silence the line for this one. A second dispatcher stops that.
-        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        let log = LogBuffer::default();
-        let sink = log.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || sink.clone())
-            .with_ansi(false)
-            .finish();
-        let _logging = tracing::subscriber::set_default(subscriber);
+        let log = LogCapture::start();
         // Cancelled, failed, and shown at last.
         pick_catch_up(&mut h);
         h.press(&[Key::Escape]);
@@ -4502,8 +4735,7 @@ mod tests {
             .unwrap();
         h.press(&[Key::Escape]);
         h.press(&[Key::ArrowUp, Key::Enter]);
-        h.events.send(Event::PlaybackStarted).unwrap();
-        h.frame(&[]);
+        show_first_picture(&mut h);
         let text = log.text();
         let count = |what: &str| text.lines().filter(|l| l.contains(what)).count();
         assert_eq!(count("catch-up: waiting for the first frame"), 3, "{text}");
@@ -5057,6 +5289,41 @@ mod tests {
         }
     }
 
+    /// What this thread logs from `start` until the capture is dropped: the one
+    /// way the tests read the log back. Lines of other threads are not captured,
+    /// the subscriber being this thread's.
+    ///
+    /// The second dispatcher is there for the tests that run beside this one.
+    /// With a single dispatcher registered, tracing works a log line's interest
+    /// out from whoever hits the line first, and another test's thread, which
+    /// has no subscriber, would silence the line for this one for good.
+    struct LogCapture {
+        buffer: LogBuffer,
+        _second: tracing::Dispatch,
+        _logging: tracing::subscriber::DefaultGuard,
+    }
+
+    impl LogCapture {
+        fn start() -> Self {
+            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let buffer = LogBuffer::default();
+            let sink = buffer.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || sink.clone())
+                .with_ansi(false)
+                .finish();
+            Self {
+                buffer,
+                _second: second,
+                _logging: tracing::subscriber::set_default(subscriber),
+            }
+        }
+
+        fn text(&self) -> String {
+            self.buffer.text()
+        }
+    }
+
     #[tokio::test]
     async fn the_epg_store_is_logged_once_per_round_not_once_per_fetch() {
         let dir = tempfile::tempdir().unwrap();
@@ -5071,13 +5338,7 @@ mod tests {
         };
         let catalog = Arc::new(CatalogStore::from_catalog(portal, catalog));
         let mut h = Harness::start(dir.path(), catalog, PortalState::Configured, None);
-        let log = LogBuffer::default();
-        let sink = log.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || sink.clone())
-            .with_ansi(false)
-            .finish();
-        let _logging = tracing::subscriber::set_default(subscriber);
+        let log = LogCapture::start();
         // The guide was opened and is closed again: one fetch at a time, four
         // fetches in a row.
         h.app.open_guide();
@@ -5303,38 +5564,6 @@ mod tests {
             .collect();
         ids.sort_unstable();
         ids
-    }
-
-    /// What this thread logs from `start` until the capture is dropped. Lines
-    /// of other threads are not captured: the subscriber is this thread's.
-    /// (With one dispatcher registered, tracing works a log line's interest out
-    /// from whoever hits it first: another test's thread, which has none, would
-    /// silence the line for this one. A second dispatcher stops that.)
-    struct LogCapture {
-        buffer: LogBuffer,
-        _second: tracing::Dispatch,
-        _logging: tracing::subscriber::DefaultGuard,
-    }
-
-    impl LogCapture {
-        fn start() -> Self {
-            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-            let buffer = LogBuffer::default();
-            let sink = buffer.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(move || sink.clone())
-                .with_ansi(false)
-                .finish();
-            Self {
-                buffer,
-                _second: second,
-                _logging: tracing::subscriber::set_default(subscriber),
-            }
-        }
-
-        fn text(&self) -> String {
-            self.buffer.text()
-        }
     }
 
     // R15.1: the check for a complete round is a walk over the guide's channels.

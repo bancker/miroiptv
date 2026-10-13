@@ -1382,11 +1382,23 @@ fn paint_row(
 
 /// One line of text, cut off with "…" at `width`.
 fn single_line(text: &str, font: FontId, color: Color32, width: f32) -> egui::text::LayoutJob {
+    few_rows(text, font, color, width, 1)
+}
+
+/// Text over at most `rows` rows of `width`, cut off with "…" after the last.
+fn few_rows(
+    text: &str,
+    font: FontId,
+    color: Color32,
+    width: f32,
+    rows: usize,
+) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
     job.wrap = egui::text::TextWrapping {
         max_width: width,
-        max_rows: 1,
-        break_anywhere: true,
+        max_rows: rows,
+        // egui's advice for one row; more rows break between words.
+        break_anywhere: rows == 1,
         overflow_character: Some('…'),
     };
     job
@@ -1654,13 +1666,20 @@ pub fn paint_wait_screen(ctx: &egui::Context, info: &WaitInfo, logos: &mut LogoS
                     );
                 }
                 Some(why) => {
-                    p.text(
-                        Pos2::new(left, line),
-                        Align2::LEFT_CENTER,
-                        i18n::tr(info.lang, T::WaitFailed, &[why]),
+                    // The reason can be raw player text: two rows of the card's
+                    // inner width at most, then "…".
+                    let color = Color32::from_rgb(240, 130, 110);
+                    let said = i18n::tr(info.lang, T::WaitFailed, &[why]);
+                    let galley = p.layout_job(few_rows(
+                        &said,
                         FontId::proportional(15.0),
-                        Color32::from_rgb(240, 130, 110),
-                    );
+                        color,
+                        card.width() - 48.0,
+                        2,
+                    ));
+                    // The first row sits where the single line of "loading" does.
+                    let first_row = galley.rows.first().map_or(0.0, |row| row.height());
+                    p.galley(Pos2::new(left, line - first_row / 2.0), galley, color);
                 }
             }
             p.text(
@@ -3496,34 +3515,119 @@ mod tests {
         }
     }
 
+    /// The card of the wait screen in a window `width` x `height`.
+    fn wait_card(width: f32, height: f32) -> Rect {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, height));
+        Rect::from_center_size(screen.center(), Vec2::new(440.0, 230.0))
+    }
+
+    /// The texts among these shapes that stick out of `card`.
+    fn outside_the_card(shapes: &[egui::epaint::ClippedShape], card: Rect) -> Vec<String> {
+        shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => {
+                    let at = t.pos + t.galley.rect.min.to_vec2();
+                    let rect = Rect::from_min_size(at, t.galley.rect.size());
+                    (!card.expand(0.5).contains_rect(rect)).then(|| t.galley.text().to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Where the shape that draws `what` puts it on the screen, and its galley.
+    fn text_drawn(
+        shapes: &[egui::epaint::ClippedShape],
+        what: &str,
+    ) -> (Rect, std::sync::Arc<egui::Galley>) {
+        shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == what => {
+                    let at = t.pos + t.galley.rect.min.to_vec2();
+                    Some((
+                        Rect::from_min_size(at, t.galley.rect.size()),
+                        t.galley.clone(),
+                    ))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{what:?} is not drawn"))
+    }
+
     #[test]
     fn a_long_title_is_cut_off_and_the_wait_screen_fits_the_narrowest_window() {
         let ch = channel(601);
         let title = "Een heel lang programma ".repeat(20);
         let shapes = wait_shapes(&wait_info(&ch, &title, None), 640.0, 360.0);
-        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 360.0));
-        let card = Rect::from_center_size(screen.center(), Vec2::new(440.0, 230.0));
-        let mut as_drawn = None;
-        for shape in &shapes {
-            let egui::Shape::Text(t) = &shape.shape else {
-                continue;
-            };
-            let rect =
-                Rect::from_min_size(t.pos + t.galley.rect.min.to_vec2(), t.galley.rect.size());
-            let text = t.galley.text();
-            assert!(
-                card.expand(0.5).contains_rect(rect),
-                "{text:?} leaves the card"
-            );
-            if text == title {
-                as_drawn = Some(t.galley.rows[0].text());
-            }
-        }
-        let as_drawn = as_drawn.expect("the title is drawn");
+        let outside = outside_the_card(&shapes, wait_card(640.0, 360.0));
+        assert!(outside.is_empty(), "{outside:?} leave the card");
+        let (_, drawn) = text_drawn(&shapes, &title);
+        assert_eq!(drawn.rows.len(), 1, "one line");
+        let as_drawn = drawn.rows[0].text();
         assert!(
             as_drawn.ends_with('…'),
             "it is cut off, and says so: {as_drawn:?}"
         );
         assert!(as_drawn.len() < title.len());
+    }
+
+    #[test]
+    fn a_long_failure_reason_wraps_over_two_rows_and_stays_in_the_card() {
+        let ch = channel(601);
+        // Raw player text behind the longest prefix: 120 characters of reason.
+        let why: String = "mpv error -13: das Format dieser Wiederholung wird nicht \
+                           unterstützt, der Stream des Portals lässt sich nicht öffnen \
+                           oder abspielen"
+            .chars()
+            .take(120)
+            .collect();
+        assert_eq!(why.chars().count(), 120);
+        let info = WaitInfo {
+            lang: Lang::De,
+            ..wait_info(&ch, "Journaal", Some(&why))
+        };
+        let shapes = wait_shapes(&info, 640.0, 360.0);
+        let outside = outside_the_card(&shapes, wait_card(640.0, 360.0));
+        assert!(outside.is_empty(), "{outside:?} leave the card");
+        let said = i18n::tr(Lang::De, T::WaitFailed, &[&why]);
+        let (rect, drawn) = text_drawn(&shapes, &said);
+        assert_eq!(drawn.rows.len(), 2, "the reason takes the second row");
+        assert!(
+            drawn.rows[1].text().ends_with('…'),
+            "and the rest is cut off"
+        );
+        let (hint, _) = text_drawn(&shapes, i18n::t(Lang::De, T::WaitEscBack));
+        assert!(
+            rect.bottom() <= hint.top(),
+            "both rows end above the Esc hint"
+        );
+    }
+
+    #[test]
+    fn a_short_failure_reason_stays_on_one_row_where_the_loading_line_was() {
+        let ch = channel(601);
+        for lang in Lang::ALL {
+            let why = i18n::t(lang, T::WaitStreamEnded);
+            let failed = WaitInfo {
+                lang,
+                ..wait_info(&ch, "Journaal", Some(why))
+            };
+            let shapes = wait_shapes(&failed, 1280.0, 720.0);
+            let (rect, drawn) = text_drawn(&shapes, &i18n::tr(lang, T::WaitFailed, &[why]));
+            assert_eq!(drawn.rows.len(), 1, "{lang:?}");
+            let loading = WaitInfo {
+                lang,
+                ..wait_info(&ch, "Journaal", None)
+            };
+            let shapes = wait_shapes(&loading, 1280.0, 720.0);
+            let (line, _) = text_drawn(&shapes, i18n::t(lang, T::WaitLoading));
+            let (here, there) = (rect.center().y, line.center().y);
+            assert!(
+                (here - there).abs() < 1.0,
+                "{lang:?}: {here} against {there}"
+            );
+        }
     }
 }
