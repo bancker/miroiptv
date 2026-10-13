@@ -69,15 +69,22 @@ impl LogoStore {
     /// The texture of `url`'s logo once it is there. A URL not seen before is
     /// asked for: a logo whose file is kept is read at once, one that has to
     /// be downloaded takes one of two places (the others are asked for in a
-    /// later frame). `None` while loading, and for no logo.
-    pub fn texture(&mut self, ctx: &egui::Context, url: &str) -> Option<&egui::TextureHandle> {
+    /// later frame). The logo of an adult column (`adult`) is never kept as a
+    /// file: like that column's EPG it stays in memory. `None` while loading,
+    /// and for no logo.
+    pub fn texture(
+        &mut self,
+        ctx: &egui::Context,
+        url: &str,
+        adult: bool,
+    ) -> Option<&egui::TextureHandle> {
         match self.slots.get(url) {
             None => {
-                self.request(url);
+                self.request(url, adult);
                 return None;
             }
             Some(Slot::Waiting) => {
-                self.start_waiting(url);
+                self.start_waiting(url, adult);
                 return None;
             }
             Some(_) => {}
@@ -123,28 +130,29 @@ impl LogoStore {
     /// and not looked at again. Only a download takes one of the `AT_ONCE`
     /// places, so the logos kept as files all start in the frame that asks for
     /// them (a warm cache must not appear two by two).
-    fn request(&mut self, url: &str) {
+    fn request(&mut self, url: &str, adult: bool) {
         let file = self.dir.join(file_name(url));
         if file.exists() {
-            self.start(url, file, false);
+            self.start(url, file, false, adult);
         } else if self.loading < AT_ONCE {
-            self.start(url, file, true);
+            self.start(url, file, true, adult);
         } else {
             self.slots.insert(url.to_owned(), Slot::Waiting);
         }
     }
 
     /// A download that waited goes as soon as a place is free.
-    fn start_waiting(&mut self, url: &str) {
+    fn start_waiting(&mut self, url: &str, adult: bool) {
         if self.loading < AT_ONCE {
             let file = self.dir.join(file_name(url));
-            self.start(url, file, true);
+            self.start(url, file, true, adult);
         }
     }
 
     /// Reads or fetches `url`'s logo in the background. `counted`: it holds one
-    /// of the `AT_ONCE` places until it arrives.
-    fn start(&mut self, url: &str, file: PathBuf, counted: bool) {
+    /// of the `AT_ONCE` places until it arrives. `adult`: what is downloaded is
+    /// not kept as a file.
+    fn start(&mut self, url: &str, file: PathBuf, counted: bool, adult: bool) {
         let Some(client) = self.http_client() else {
             self.slots.insert(url.to_owned(), Slot::Missing);
             return;
@@ -156,7 +164,7 @@ impl LogoStore {
         let url = url.to_owned();
         let done = self.done.clone();
         tokio::spawn(async move {
-            let image = load_logo(&client, &url, &file).await;
+            let image = load_logo(&client, &url, &file, adult).await;
             done.lock().push(Arrived {
                 url,
                 image,
@@ -190,10 +198,15 @@ impl LogoStore {
 }
 
 /// The logo from its kept file when that decodes, else from the web (kept as a
-/// file only once it decodes); made small. `None` when there is none to show.
-/// The file work and the decoding run on the blocking pool, off the async
-/// workers.
-async fn load_logo(client: &reqwest::Client, url: &str, file: &Path) -> Option<egui::ColorImage> {
+/// file only once it decodes, and never for an adult column); made small.
+/// `None` when there is none to show. The file work and the decoding run on
+/// the blocking pool, off the async workers.
+async fn load_logo(
+    client: &reqwest::Client,
+    url: &str,
+    file: &Path,
+    adult: bool,
+) -> Option<egui::ColorImage> {
     let host = host_of(url);
     let kept = file.to_path_buf();
     let mut image = blocking(move || read_kept(&kept)).await;
@@ -205,7 +218,14 @@ async fn load_logo(client: &reqwest::Client, url: &str, file: &Path) -> Option<e
             return None;
         };
         let (path, name) = (file.to_path_buf(), host.to_owned());
-        image = blocking(move || keep(&bytes, &path, &name)).await;
+        image = blocking(move || {
+            if adult {
+                decode(&bytes)
+            } else {
+                keep(&bytes, &path, &name)
+            }
+        })
+        .await;
     }
     match &image {
         Some(i) => tracing::info!("logo: {host} ready ({}x{})", i.size[0], i.size[1]),
@@ -369,7 +389,7 @@ mod tests {
     async fn ready(logos: &mut LogoStore, ctx: &egui::Context, url: &str) -> [usize; 2] {
         for _ in 0..400 {
             logos.drain();
-            if let Some(t) = logos.texture(ctx, url) {
+            if let Some(t) = logos.texture(ctx, url, false) {
                 return t.size();
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -411,11 +431,11 @@ mod tests {
 
         let mut logos = LogoStore::new(dir.path().to_path_buf());
         assert!(
-            logos.texture(&ctx, &url).is_none(),
+            logos.texture(&ctx, &url, false).is_none(),
             "asked for, not there yet"
         );
         assert!(logos.is_loading(&url));
-        assert!(logos.texture(&ctx, &gif).is_none());
+        assert!(logos.texture(&ctx, &gif, false).is_none());
         assert_eq!(ready(&mut logos, &ctx, &url).await, [64, 32]);
         settled(&mut logos, &gif).await;
         assert!(
@@ -423,7 +443,7 @@ mod tests {
             "a body that is no PNG is not kept"
         );
         assert!(
-            logos.texture(&ctx, &gif).is_none(),
+            logos.texture(&ctx, &gif, false).is_none(),
             "a GIF shows the name instead"
         );
         // A GIF is asked for once in a session, not again by the `texture` call
@@ -434,8 +454,28 @@ mod tests {
         // A new session reads the file: the server is asked once in all
         // (`expect(1)` is checked when the server goes).
         let mut again = LogoStore::new(dir.path().to_path_buf());
-        again.texture(&ctx, &url);
+        again.texture(&ctx, &url, false);
         assert_eq!(ready(&mut again, &ctx, &url).await, [64, 32]);
+    }
+
+    #[tokio::test]
+    async fn the_logo_of_an_adult_column_shows_but_is_never_kept_as_a_file() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(path("/adult.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(png(64, 32)))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let url = format!("{}/adult.png", server.uri());
+
+        let mut logos = LogoStore::new(dir.path().to_path_buf());
+        logos.texture(&ctx, &url, true);
+        assert_eq!(ready(&mut logos, &ctx, &url).await, [64, 32], "it shows");
+        let kept: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(kept.is_empty(), "nothing is kept: {kept:?}");
     }
 
     #[tokio::test]
@@ -456,7 +496,7 @@ mod tests {
         std::fs::write(&file, b"<html>not a logo</html>").unwrap();
 
         let mut logos = LogoStore::new(dir.path().to_path_buf());
-        logos.texture(&ctx, &url);
+        logos.texture(&ctx, &url, false);
         assert_eq!(ready(&mut logos, &ctx, &url).await, [64, 32]);
         assert_eq!(
             std::fs::read(&file).unwrap(),
@@ -479,7 +519,7 @@ mod tests {
         let mut logos = LogoStore::new(dir.path().to_path_buf());
         // One frame: every column asks.
         for url in &urls {
-            assert!(logos.texture(&ctx, url).is_none());
+            assert!(logos.texture(&ctx, url, false).is_none());
         }
         for url in &urls {
             assert!(logos.is_loading(url), "{url} waits for a later frame");
@@ -505,7 +545,7 @@ mod tests {
 
         let mut logos = LogoStore::new(dir.path().to_path_buf());
         for url in [&a, &b, &c, &kept] {
-            logos.texture(&ctx, url);
+            logos.texture(&ctx, url, false);
         }
         assert!(logos.is_loading(&a) && logos.is_loading(&b));
         assert!(!logos.is_loading(&c), "a third download waits for a place");
@@ -518,7 +558,7 @@ mod tests {
         assert_eq!(ready(&mut logos, &ctx, &a).await, [64, 32]);
         assert_eq!(ready(&mut logos, &ctx, &b).await, [64, 32]);
         // The two places are free again: the third goes now.
-        logos.texture(&ctx, &c);
+        logos.texture(&ctx, &c, false);
         assert!(logos.is_loading(&c));
         assert_eq!(ready(&mut logos, &ctx, &c).await, [64, 32]);
     }
@@ -545,7 +585,7 @@ mod tests {
         let url = format!("{}/old.png?token=secret", server.uri());
 
         let mut logos = LogoStore::new(dir.path().to_path_buf());
-        logos.texture(&ctx, &url);
+        logos.texture(&ctx, &url, false);
         assert_eq!(ready(&mut logos, &ctx, &url).await, [64, 32]);
         let seen = server.received_requests().await.unwrap();
         let second = seen.iter().find(|r| r.url.path() == "/new.png");
@@ -580,12 +620,12 @@ mod tests {
         let four = format!("{}/r1", server.uri());
 
         let mut logos = LogoStore::new(dir.path().to_path_buf());
-        logos.texture(&ctx, &three);
-        logos.texture(&ctx, &four);
+        logos.texture(&ctx, &three, false);
+        logos.texture(&ctx, &four, false);
         assert_eq!(ready(&mut logos, &ctx, &three).await, [64, 32]);
         settled(&mut logos, &four).await;
         assert!(
-            logos.texture(&ctx, &four).is_none(),
+            logos.texture(&ctx, &four, false).is_none(),
             "four redirects are one too many"
         );
     }
@@ -599,9 +639,9 @@ mod tests {
         std::fs::write(dir.path().join(file_name(url)), png(64, 32)).unwrap();
 
         let mut logos = LogoStore::new(dir.path().to_path_buf());
-        logos.texture(&ctx, url);
+        logos.texture(&ctx, url, false);
         ready(&mut logos, &ctx, url).await;
-        let name = logos.texture(&ctx, url).unwrap().name();
+        let name = logos.texture(&ctx, url, false).unwrap().name();
         assert_eq!(name, format!("logo {}", file_name(url)));
         assert!(!name.contains("secret"), "{name}");
     }
@@ -623,7 +663,7 @@ mod tests {
         std::fs::write(&blocked, b"a file, not a folder").unwrap();
 
         let mut logos = LogoStore::new(blocked);
-        logos.texture(&ctx, &url);
+        logos.texture(&ctx, &url, false);
         assert_eq!(ready(&mut logos, &ctx, &url).await, [64, 32]);
     }
 
@@ -633,7 +673,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut logos = LogoStore::new(dir.path().to_path_buf());
         assert!(logos.client.is_none(), "a store nobody asks builds nothing");
-        logos.texture(&ctx, "http://logos.example/a.png");
+        logos.texture(&ctx, "http://logos.example/a.png", false);
         assert!(logos.client.is_some());
     }
 }

@@ -1495,7 +1495,7 @@ fn paint_header(
     let texture = ch
         .logo
         .as_deref()
-        .and_then(|url| logos.texture(ui.ctx(), url))
+        .and_then(|url| logos.texture(ui.ctx(), url, ch.adult))
         .map(|t| (t.id(), t.size_vec2()));
     let p = ui.painter();
     p.rect_filled(rect, 6.0, PANEL);
@@ -3105,6 +3105,52 @@ mod tests {
         (v.filter_wanted, v.filter_had_focus) = (true, true);
         v.opened(time::day_of(now()));
         assert!(!v.filter_wanted && !v.filter_had_focus);
+    }
+
+    #[tokio::test]
+    async fn the_logo_of_an_adult_column_is_drawn_but_never_kept_as_a_file() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let mut logo = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(8, 4))
+            .write_to(&mut logo, image::ImageOutputFormat::Png)
+            .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(logo.into_inner()))
+            .mount(&server)
+            .await;
+        let mut f = Fixture::new(2, &[]);
+        let (plain, adult) = (
+            format!("{}/plain.png", server.uri()),
+            format!("{}/adult.png", server.uri()),
+        );
+        f.channels[0].logo = Some(plain.clone());
+        (f.channels[1].logo, f.channels[1].adult) = (Some(adult.clone()), true);
+        let none = HashSet::new();
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        let d = data(&f, &none, true);
+        let mut drawn = 0;
+        for _ in 0..400 {
+            s.logos.drain();
+            let (_, shapes) = s.run(&mut v, &d, vec![]);
+            // An image is a mesh with a texture of its own (text uses the font's).
+            let is_logo = |s: &egui::epaint::ClippedShape| match &s.shape {
+                egui::Shape::Mesh(m) => m.texture_id != egui::TextureId::default(),
+                _ => false,
+            };
+            drawn = shapes.iter().filter(|s| is_logo(s)).count();
+            if drawn == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(drawn, 2, "both logos are drawn");
+        let kept: Vec<String> = std::fs::read_dir(s._dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let plain_file = crate::guide::logos::file_name(&plain);
+        assert_eq!(kept, [plain_file], "the adult one is not kept");
     }
 
     #[test]
