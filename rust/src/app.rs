@@ -628,6 +628,8 @@ pub struct TvApp {
     epg_cache_retry_after: Option<Instant>,
     /// When the stream that loads now went to the player; its first frame
     /// clears it. EPG fetching waits meanwhile (10 s at most): zapping first.
+    /// A channel of an M3U list that fails while it is set has shown no picture
+    /// of its own yet (see `drain_events` and `stop_for_refused_load`).
     stream_starting_since: Option<Instant>,
     /// A catch-up pick loading behind the wait screen.
     pending_catchup: Option<PendingCatchup>,
@@ -1508,12 +1510,19 @@ impl TvApp {
                             None => self.t(T::StreamErrorRetry).to_owned(),
                         };
                         self.set_toast(text);
-                        // A dead channel of a list shows the empty state, not the
-                        // picture of the channel before: that would look like
-                        // this one, frozen. Frames from now on still show, so a
-                        // load that is on its way already does (as in
-                        // `end_catchup_wait`).
-                        if reason == "error" && self.catalog.kind() == SourceKind::M3u {
+                        // A channel of a list that dies before it shows a picture
+                        // shows the empty state, not the picture of the channel
+                        // before: that would look like this one, frozen. Once it
+                        // has shown its own, that last frame stays, as on Xtream.
+                        // "Before a picture" is `stream_starting_since`, which
+                        // the load sets and the first `PlaybackStarted` clears.
+                        // Frames from now on still show, so a load that is on its
+                        // way already does (as in `end_catchup_wait`).
+                        let no_picture_yet = self.stream_starting_since.is_some();
+                        if reason == "error"
+                            && no_picture_yet
+                            && self.catalog.kind() == SourceKind::M3u
+                        {
                             self.frame_fence.stop();
                             self.frame_fence.load(self.player.frames.version());
                             self.video_tex = None;
@@ -9268,6 +9277,9 @@ https://c.example/twee-nieuws.m3u8\n";
         let dir = tempfile::tempdir().unwrap();
         let mut h = m3u_app_with_a_picture(dir.path());
         h.press(&[Key::ArrowDown]);
+        // It never showed a picture of its own: the one on the screen is the
+        // channel before's.
+        assert!(h.app.stream_starting_since.is_some());
         let dead = Event::EndOfFile {
             reason: "error".into(),
         };
@@ -9287,6 +9299,41 @@ https://c.example/twee-nieuws.m3u8\n";
         h.frame(&[]);
         let video = h.app.video_tex.as_ref().expect("the next picture");
         assert_eq!(video.size(), [12, 6]);
+    }
+
+    #[tokio::test]
+    async fn an_m3u_channel_that_showed_its_own_picture_keeps_its_last_frame_when_it_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app_with_a_picture(dir.path());
+        h.press(&[Key::ArrowDown]);
+        assert!(
+            h.app.stream_starting_since.is_some(),
+            "no picture of its own yet"
+        );
+        // The channel starts and shows a picture of its own.
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.frame(&[]);
+        assert!(
+            h.app.stream_starting_since.is_none(),
+            "its first frame is shown"
+        );
+        h.put_frame(8, 4);
+        h.frame(&[]);
+        let own = h.app.video_tex.as_ref().expect("its own picture");
+        assert_eq!(own.size(), [8, 4]);
+        // It dies later: the app stays on it, and its last frame stays too.
+        let dead = Event::EndOfFile {
+            reason: "error".into(),
+        };
+        h.events.send(dead).unwrap();
+        h.frame(&[]);
+        let named = "stream error on Kanaal Twee - zap up or down to retry";
+        assert!(h.painted.iter().any(|t| t == named), "{:?}", h.painted);
+        for _ in 0..3 {
+            h.frame(&[]);
+        }
+        let kept = h.app.video_tex.as_ref().expect("its last frame stays");
+        assert_eq!(kept.size(), [8, 4]);
     }
 
     #[tokio::test]
