@@ -231,6 +231,7 @@ fn help_rows(lang: Lang, swap_zap_keys: bool) -> [(T, Vec<HelpRow>); 2] {
                 row("d", t(T::HelpDebug)),
                 row("g", t(T::HelpOpenGuide)),
                 row("t", t(T::HelpBorderless)),
+                row(t(T::KeyRightDrag), t(T::HelpRightDrag)),
                 row("?", t(T::HelpThisHelp)),
                 row("Esc", t(T::HelpCloseOverlays)),
             ],
@@ -4123,6 +4124,31 @@ mod tests {
                 assert_eq!(links[0].key, "o");
                 assert_eq!(links[0].action, crate::i18n::t(lang, T::HelpSettings));
             }
+        }
+    }
+
+    #[test]
+    fn the_viewer_help_names_the_right_button_drag_below_the_borderless_key() {
+        for lang in Lang::ALL {
+            let sections = help_rows(lang, false);
+            let viewer = &sections[0].1;
+            let borderless = viewer.iter().position(|r| r.key == "t").expect("the t row");
+            let drag = viewer.get(borderless + 1).expect("a row below the t row");
+            assert_eq!(drag.key, crate::i18n::t(lang, T::KeyRightDrag), "{lang:?}");
+            assert_eq!(
+                drag.action,
+                crate::i18n::t(lang, T::HelpRightDrag),
+                "{lang:?}"
+            );
+            // The keys are monospace, in a column as wide as the widest of them: this
+            // one must not make that column, and so every row, any wider.
+            let widest = viewer
+                .iter()
+                .filter(|r| r.key != drag.key)
+                .map(|r| r.key.chars().count())
+                .max()
+                .unwrap();
+            assert!(drag.key.chars().count() <= widest, "{lang:?}: {}", drag.key);
         }
     }
 

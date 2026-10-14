@@ -187,6 +187,8 @@ texts! {
     HelpDebug => ["debug-info", "debug info", "Debug-Info"],
     HelpOpenGuide => ["gids openen", "open guide", "Programm öffnen"],
     HelpBorderless => ["randloos + altijd bovenop  (aan/uit)", "borderless + always on top  (toggle)", "randlos + immer im Vordergrund  (an/aus)"],
+    KeyRightDrag => ["rechtermuisknop + slepen", "right button + drag", "rechte Maustaste + ziehen"],
+    HelpRightDrag => ["venster verplaatsen (alleen randloos)", "move the window (borderless only)", "Fenster verschieben (nur randlos)"],
     HelpSettings => ["instellingen", "settings", "Einstellungen"],
     HelpThisHelp => ["deze hulp", "this help", "diese Hilfe"],
     HelpCloseOverlays => ["vensters sluiten", "close overlays", "Fenster schließen"],
