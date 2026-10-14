@@ -1,16 +1,21 @@
 //! Credentials never reach the log: portal URLs carry them in the path
-//! (`/live/<user>/<pass>/…`) or in the query (`username=…&password=…`).
+//! (`/live/<user>/<pass>/…`) or in the query (`username=…&password=…`); an M3U
+//! list's address may hold them as `user:pass@` or as a token in its query.
 
 use std::borrow::Cow;
 
 const PATH_KINDS: [&str; 4] = ["/live/", "/movie/", "/series/", "/timeshift/"];
 
-/// `text` with every portal user name and password replaced by `<u>` / `<p>`.
-/// Borrows when there is nothing to hide, the common case for log lines.
+/// `text` with every portal user name and password replaced by `<u>` / `<p>`,
+/// the `user:pass@` of any URL by `<u>:<p>@`, and the query of a list's
+/// address (`.m3u`, `.m3u8`, `get.php`) by `<q>`. Borrows when there is
+/// nothing to hide, the common case for log lines.
 pub fn redact(text: &str) -> Cow<'_, str> {
     let has_path = PATH_KINDS.iter().any(|k| text.contains(k));
     let has_query = text.contains("username=") || text.contains("password=");
-    if !has_path && !has_query {
+    let has_userinfo = text.contains("://") && text.contains('@');
+    let has_list = text.contains(".m3u") || text.contains("get.php");
+    if !has_path && !has_query && !has_userinfo && !has_list {
         return Cow::Borrowed(text);
     }
     let mut out = text.to_string();
@@ -19,11 +24,83 @@ pub fn redact(text: &str) -> Cow<'_, str> {
     }
     out = redact_query(&out, "username=", "<u>");
     out = redact_query(&out, "password=", "<p>");
+    out = redact_userinfo(&out);
+    out = redact_list_query(&out);
     if out == text {
         Cow::Borrowed(text)
     } else {
         Cow::Owned(out)
     }
+}
+
+/// The host of a web address, for a log line that must not hold the address
+/// itself; "file" for anything that is no URL.
+pub fn url_host(address: &str) -> String {
+    reqwest::Url::parse(address.trim())
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "file".to_owned())
+}
+
+/// `scheme://user:pass@host` → `scheme://<u>:<p>@host` (`<u>@` without a
+/// password), for every URL in `s`.
+fn redact_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("://") {
+        let after = i + 3;
+        out.push_str(&rest[..after]);
+        let tail = &rest[after..];
+        let end = tail
+            .find(|c: char| matches!(c, '/' | '?' | '#' | '"' | '\'') || c.is_whitespace())
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        match authority.rfind('@') {
+            Some(at) => {
+                out.push_str(if authority[..at].contains(':') {
+                    "<u>:<p>"
+                } else {
+                    "<u>"
+                });
+                out.push_str(&authority[at..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The query of a list's address (`….m3u?…`, `….m3u8?…`, `…/get.php?…`) →
+/// `?<q>`: a provider's token lives there as often as a password.
+fn redact_list_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(q) = rest.find('?') {
+        let before = &rest[..q];
+        // The last word before the '?'. No byte arithmetic: a space may take
+        // more than one byte.
+        let word = before
+            .rsplit(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '('))
+            .next()
+            .unwrap_or(before);
+        let path = word.to_ascii_lowercase();
+        let tail = &rest[q + 1..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')'))
+            .unwrap_or(tail.len());
+        out.push_str(before);
+        if path.ends_with(".m3u") || path.ends_with(".m3u8") || path.ends_with("get.php") {
+            out.push_str("?<q>");
+        } else {
+            out.push('?');
+            out.push_str(&tail[..end]);
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `…/live/<user>/<pass>/…` → `…/live/<u>/<p>/…` wherever two path segments,
@@ -177,5 +254,98 @@ mod tests {
         ] {
             assert!(matches!(redact(line), Cow::Borrowed(_)), "{line:?}");
         }
+    }
+
+    #[test]
+    fn an_m3u_address_with_a_password_or_token_is_masked() {
+        for (line, want) in [
+            (
+                "m3u: fetch https://bob:s3cr3t@lists.example/tv.m3u failed",
+                "m3u: fetch https://<u>:<p>@lists.example/tv.m3u failed",
+            ),
+            (
+                "loadfile https://lists.example/tv.m3u?token=abc123&x=1",
+                "loadfile https://lists.example/tv.m3u?<q>",
+            ),
+            (
+                "GET http://srv:8080/get.php?username=bob&password=s3cr3t&type=m3u_plus done",
+                "GET http://srv:8080/get.php?<q> done",
+            ),
+            (
+                "[mpv:ffmpeg] Opening 'https://cdn.example/live/index.m3u8?sig=zz' for reading",
+                "[mpv:ffmpeg] Opening 'https://cdn.example/live/index.m3u8?<q>' for reading",
+            ),
+            (
+                "loadfile http://u@cdn.example/x.ts",
+                "loadfile http://<u>@cdn.example/x.ts",
+            ),
+        ] {
+            assert_eq!(redact(line), want, "{line}");
+        }
+    }
+
+    #[test]
+    fn other_queries_and_plain_lines_stay_as_they_are() {
+        // Not a list's address: its query says nothing secret (the old masks
+        // still apply to username= and password=).
+        let line = "GET http://h/player_api.php?action=get_live_streams ok";
+        assert!(matches!(redact(line), Cow::Borrowed(_)));
+        let line = "an @ in a sentence, and https://h/a.ts";
+        assert!(matches!(redact(line), Cow::Borrowed(_)), "{line}");
+    }
+
+    #[test]
+    fn an_address_alone_on_the_line_is_masked_too() {
+        // No space, quote or bracket before it: the whole text before the '?'
+        // is the address.
+        for (line, want) in [
+            (
+                "https://lists.example/tv.m3u?token=abc",
+                "https://lists.example/tv.m3u?<q>",
+            ),
+            (
+                "https://bob:pw@lists.example/tv.m3u",
+                "https://<u>:<p>@lists.example/tv.m3u",
+            ),
+        ] {
+            assert_eq!(redact(line), want, "{line}");
+        }
+    }
+
+    // `char::is_whitespace` also knows spaces of two or three bytes (U+00A0,
+    // U+3000): the scan back to the start of the address must not cut one in
+    // half, and the release build aborts on a panic.
+    #[test]
+    fn a_multi_byte_space_before_an_address_does_not_break_the_mask() {
+        for (line, want) in [
+            (
+                "list\u{a0}https://h/tv.m3u?token=abc",
+                "list\u{a0}https://h/tv.m3u?<q>",
+            ),
+            (
+                "list\u{3000}https://h/tv.m3u8?token=abc",
+                "list\u{3000}https://h/tv.m3u8?<q>",
+            ),
+            (
+                "\u{2003}ok? https://h/a.ts\u{a0}and what.m3u?x=1",
+                "\u{2003}ok? https://h/a.ts\u{a0}and what.m3u?<q>",
+            ),
+        ] {
+            assert_eq!(redact(line), want, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn url_host_names_the_host_or_says_file() {
+        assert_eq!(
+            url_host("https://bob:pw@iptv-org.github.io/iptv/index.m3u"),
+            "iptv-org.github.io"
+        );
+        assert_eq!(
+            url_host(" http://127.0.0.1:18080/m3u/list.m3u "),
+            "127.0.0.1"
+        );
+        assert_eq!(url_host("C:\\lists\\tv.m3u"), "file");
+        assert_eq!(url_host(""), "file");
     }
 }
