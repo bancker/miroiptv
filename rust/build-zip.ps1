@@ -88,6 +88,7 @@ KEYS
   ?                                  all keys
   F11                                fullscreen
   t                                  borderless + always on top
+  right mouse button + drag          move the borderless window
   F5                                 retry the portal fetch
   d                                  debug info
   Esc                                close overlays

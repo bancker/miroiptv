@@ -110,7 +110,11 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 
 ## Window
 - [ ] F11 → fullscreen toggles
-- [ ] `t` (borderless): hold the right mouse button and drag: the window follows; release stops it; nothing moves in full screen or with a border
+- [ ] `t` (borderless): hold the right mouse button and drag: the window follows; release stops it; nothing moves in full screen, maximized (Win+Up) or with a border; a left or middle click does nothing to the window. The debug log has a `window drag: begins` line and a `window drag: ended (reason)` line per drag
+- [ ] Borderless drag with Ctrl + / Ctrl - zoom: the window still follows the cursor one to one
+- [ ] Borderless drag across a second monitor with another scale: the window follows; at most one hop at the crossing
+- [ ] Borderless: F11 while holding the right button goes full screen and the window does not also move; Alt+Tab while holding it stops the drag; flick the cursor out of the window and release outside it: the drag stops
+- [ ] Swapped (left-handed) mouse buttons: the drag is held by the physical left button, and letting go of that one stops it
 - [ ] Drag bottom-right to resize → video scales, no crash
 - [ ] Alt-F4 → clean exit, no crash report
 
