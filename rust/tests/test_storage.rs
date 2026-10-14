@@ -108,3 +108,49 @@ fn the_ini_variable_wins_and_with_neither_the_ini_is_next_to_the_exe() {
         .to_path_buf();
     assert_eq!(default, exe_folder.join("BongoPlayer.ini"));
 }
+
+#[test]
+fn source_1_keeps_the_0_6_1_file_names_and_the_others_carry_their_id() {
+    let root = std::path::PathBuf::from("C:/cfg");
+    let mut storage = Storage::with_root(root.clone());
+    assert_eq!(storage.source(), 1);
+    assert_eq!(storage.favorites_path(), root.join("favorites.json"));
+    assert_eq!(storage.presets_path(), root.join("presets.json"));
+    assert_eq!(storage.last_watched_path(), root.join("last_watched.json"));
+    storage.set_source(2);
+    assert_eq!(storage.favorites_path(), root.join("favorites-2.json"));
+    assert_eq!(storage.presets_path(), root.join("presets-2.json"));
+    assert_eq!(
+        storage.last_watched_path(),
+        root.join("last_watched-2.json")
+    );
+    // Shared by every source.
+    assert_eq!(storage.settings_path(), root.join("settings.json"));
+    assert_eq!(
+        storage.m3u_cache_path(2),
+        root.join("cache").join("m3u-2.m3u")
+    );
+}
+
+#[test]
+fn removing_a_sources_files_leaves_the_other_sources_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut storage = Storage::with_root(dir.path().to_path_buf());
+    std::fs::create_dir_all(storage.cache_dir()).unwrap();
+    for id in [1, 2] {
+        storage.set_source(id);
+        for path in [
+            storage.favorites_path(),
+            storage.presets_path(),
+            storage.last_watched_path(),
+            storage.m3u_cache_path(id),
+        ] {
+            std::fs::write(path, "x").unwrap();
+        }
+    }
+    assert_eq!(storage.remove_source_files(2), 4);
+    assert!(!storage.favorites_path().exists(), "source 2's own");
+    storage.set_source(1);
+    assert!(storage.favorites_path().exists() && storage.m3u_cache_path(1).exists());
+    assert_eq!(storage.remove_source_files(2), 0, "nothing left to remove");
+}

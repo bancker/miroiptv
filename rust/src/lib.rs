@@ -29,6 +29,7 @@ pub mod search;
 pub mod settings;
 pub mod settings_ui;
 pub mod shortcuts;
+pub mod sources;
 pub mod storage;
 pub mod window_drag;
 pub mod zap;

@@ -129,6 +129,8 @@ texts! {
     SearchHint => ["zoek live / film / serie...", "search live / movie / series...", "Live / Film / Serie suchen..."],
     SeriesNotYet => ["series afspelen kan nog niet: {0}", "playing series is not available yet: {0}", "Serien abspielen ist noch nicht möglich: {0}"],
     // Portal setup and the settings' portal section
+    DefaultPortalName => ["Portaal", "Portal", "Portal"],
+    DefaultListName => ["M3U-lijst", "M3U list", "M3U-Liste"],
     PortalSetupTitle => ["Portal instellen", "Set up your portal", "Portal einrichten"],
     PortalSetupIntro => ["Vul je Xtream-gegevens in. Ze worden opgeslagen in BongoPlayer.ini naast de app.", "Enter your Xtream details. They are saved in BongoPlayer.ini next to the app.", "Gib deine Xtream-Daten ein. Sie werden in BongoPlayer.ini neben der App gespeichert."],
     ServerLabel => ["Server (host:poort)", "Server (host:port)", "Server (Host:Port)"],
