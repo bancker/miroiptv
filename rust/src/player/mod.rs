@@ -215,10 +215,12 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
 /// after it, so the next load goes without. `-1` is the playlist index that
 /// mpv 0.38 put before the options; it means none.
 ///
-/// One catch, measured on the vendored libmpv (git db73857, client API 2.5): a
-/// `user-agent` comes back as it was, but a `referrer` comes back as an empty
-/// string, so every load after one that had a referrer sends an empty
-/// `Referer:` header.
+/// The referrer goes as a header field (`http-header-fields`), not as mpv's
+/// `referrer` option. Measured on the vendored libmpv (git db73857, client API
+/// 2.5): after a file, a per-file `referrer` comes back as an empty string and
+/// every later load sends an empty `Referer:`, while a per-file header list
+/// comes back empty and the next load sends none. (The player sets no
+/// `http-header-fields` of its own, so empty is what it was.)
 pub fn loadfile_args(url: &str) -> Vec<String> {
     let (target, headers) = crate::m3u::split_headers(url);
     let mut options = Vec::new();
@@ -226,7 +228,10 @@ pub fn loadfile_args(url: &str) -> Vec<String> {
         options.push(format!("user-agent={}", option_value(agent)));
     }
     if let Some(referrer) = &headers.referrer {
-        options.push(format!("referrer={}", option_value(referrer)));
+        options.push(format!(
+            "http-header-fields={}",
+            option_value(&referrer_field(referrer))
+        ));
     }
     let mut args = vec!["loadfile".to_owned(), target.to_owned()];
     if !options.is_empty() {
@@ -239,6 +244,14 @@ pub fn loadfile_args(url: &str) -> Vec<String> {
 /// colons included: `%<bytes>%<value>`.
 fn option_value(value: &str) -> String {
     format!("%{}%{}", value.len(), value)
+}
+
+/// A referrer as the one entry it is in mpv's `http-header-fields` list. mpv
+/// splits that list at commas, and a backslash in front of a comma keeps it in
+/// the entry. A backslash means nothing anywhere else there (measured on the
+/// vendored libmpv: `\\` stays two backslashes), so only the commas get one.
+fn referrer_field(referrer: &str) -> String {
+    format!("Referer: {}", referrer.replace(',', "\\,"))
 }
 
 /// Downgrade the effective log level for known-benign mpv messages so the
@@ -377,10 +390,12 @@ mod tests {
         let url = crate::m3u::with_headers(
             "https://a.example/1.m3u8".into(),
             Some("Mozilla/5.0 (X11; Linux), like Gecko"),
-            Some("https://www.example.com/a:b"),
+            Some("https://www.example.com/a:b,c"),
         );
         // After mpv 0.38's index (-1: none), each value quoted by its length
-        // in bytes: commas and colons inside it are no separators.
+        // in bytes: commas and colons inside it are no separators. The
+        // referrer is one entry of the `http-header-fields` list, which mpv
+        // splits at commas: the comma in it gets a backslash.
         assert_eq!(
             super::loadfile_args(&url),
             [
@@ -388,8 +403,46 @@ mod tests {
                 "https://a.example/1.m3u8",
                 "replace",
                 "-1",
-                "user-agent=%36%Mozilla/5.0 (X11; Linux), like Gecko,referrer=%27%https://www.example.com/a:b",
+                "user-agent=%36%Mozilla/5.0 (X11; Linux), like Gecko,http-header-fields=%39%Referer: https://www.example.com/a:b\\,c",
             ]
+        );
+    }
+
+    #[test]
+    fn a_referrer_is_a_header_field_not_the_referrer_option() {
+        // libmpv gives a per-file `referrer` back as an empty string, and every
+        // later load then sends an empty `Referer:`. A per-file header list
+        // comes back empty: the next load sends none.
+        let url = crate::m3u::with_headers(
+            "http://a.example/1".into(),
+            None,
+            Some("https://www.example.com/a:b"),
+        );
+        assert_eq!(
+            super::loadfile_args(&url),
+            [
+                "loadfile",
+                "http://a.example/1",
+                "replace",
+                "-1",
+                "http-header-fields=%36%Referer: https://www.example.com/a:b",
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_comma_in_a_referrer_gets_a_backslash() {
+        // In mpv's string lists a backslash means something in front of a comma
+        // only (measured on the vendored libmpv: `\\` stays two backslashes),
+        // so a backslash of the referrer's own is left as it is.
+        let url = crate::m3u::with_headers(
+            "http://a.example/1".into(),
+            None,
+            Some(r"http://r.example/a\b,c\,d"),
+        );
+        assert_eq!(
+            super::loadfile_args(&url)[4],
+            r"http-header-fields=%36%Referer: http://r.example/a\b\,c\\,d"
         );
     }
 
@@ -397,5 +450,18 @@ mod tests {
     fn an_option_value_is_counted_in_bytes() {
         let url = crate::m3u::with_headers("http://a.example/1".into(), Some("Zürich-TV"), None);
         assert_eq!(super::loadfile_args(&url)[4], "user-agent=%10%Zürich-TV");
+    }
+
+    #[test]
+    fn a_referrer_is_counted_in_bytes_with_its_field_name() {
+        let url = crate::m3u::with_headers(
+            "http://a.example/1".into(),
+            None,
+            Some("http://zürich.example/"),
+        );
+        assert_eq!(
+            super::loadfile_args(&url)[4],
+            "http-header-fields=%32%Referer: http://zürich.example/"
+        );
     }
 }
