@@ -2530,6 +2530,9 @@ impl TvApp {
         if f11 {
             let want = !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(want));
+            // The window does not say it is full screen before the next frame:
+            // a move in this one would come after the command and win.
+            self.end_right_drag("F11");
         }
 
         if esc {
@@ -7902,6 +7905,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn f11_ends_a_drag_in_the_frame_that_goes_full_screen() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        start_dragging(&mut h);
+        // F11 and a move of the cursor in one frame. The window does not report
+        // full screen before the next frame, and a move sent after the Fullscreen
+        // command would leave the monitor-sized window at the old window's corner.
+        h.cursor_to(700, 500);
+        h.frame(&[Key::F11]);
+        let told = std::mem::take(&mut h.window_cmds);
+        assert!(
+            told.contains(&egui::ViewportCommand::Fullscreen(true)),
+            "{told:?}"
+        );
+        assert!(
+            !told
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::OuterPosition(_))),
+            "{told:?}"
+        );
+        // The button is still down, the window does not say yet that it is full
+        // screen: a drag begins with a press.
+        assert_the_window_stays_put(&mut h, "after F11");
+    }
+
+    #[tokio::test]
     async fn nothing_moves_in_a_maximized_window() {
         // Win+Up: the first move would restore it, and the window would jump.
         let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
@@ -8047,6 +8075,10 @@ mod tests {
         h.frame(&[]);
         h.focused = true;
         h.frame_with(vec![right_button(false)]);
+        // Ended by F11.
+        start_dragging(&mut h);
+        h.frame(&[Key::F11]);
+        h.frame_with(vec![right_button(false)]);
         // Ended by the border coming back.
         start_dragging(&mut h);
         h.press(&[Key::T]);
@@ -8071,6 +8103,8 @@ mod tests {
                 "maximized",
                 "begins",
                 "focus lost",
+                "begins",
+                "F11",
                 "begins",
                 "border back"
             ],
