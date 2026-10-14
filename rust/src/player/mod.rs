@@ -84,8 +84,23 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                 loop {
                     match cmd_rx.try_recv() {
                         Ok(Cmd::LoadUrl(url)) => {
-                            info!("loadfile {}", crate::redact::redact(&url));
-                            if let Err(e) = mpv.command(&["loadfile", &url]) {
+                            let args = loadfile_args(&url);
+                            let (_, headers) = crate::m3u::split_headers(&url);
+                            let sent: Vec<&str> = [
+                                ("user-agent", headers.user_agent.is_some()),
+                                ("referrer", headers.referrer.is_some()),
+                            ]
+                            .into_iter()
+                            .filter_map(|(name, on)| on.then_some(name))
+                            .collect();
+                            let address = crate::redact::redact(&args[1]);
+                            if sent.is_empty() {
+                                info!("loadfile {}", address);
+                            } else {
+                                info!("loadfile {} ({})", address, sent.join(", "));
+                            }
+                            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                            if let Err(e) = mpv.command(&args) {
                                 warn!("loadfile failed: {}", e);
                                 let _ = evt_tx.send(Event::Error { msg: e.to_string() });
                             }
@@ -192,6 +207,38 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
         evt_rx: parking_lot::Mutex::new(evt_rx),
         frames,
     })
+}
+
+/// The `loadfile` command for `url`. A URL that carries headers
+/// (`url|User-Agent=…`, see `m3u::split_headers`) hands them to mpv as options
+/// of this one file: mpv sets them for its playback and puts the defaults back
+/// after it, so the next load goes without. `-1` is the playlist index that
+/// mpv 0.38 put before the options; it means none.
+///
+/// One catch, measured on the vendored libmpv (git db73857, client API 2.5): a
+/// `user-agent` comes back as it was, but a `referrer` comes back as an empty
+/// string, so every load after one that had a referrer sends an empty
+/// `Referer:` header.
+pub fn loadfile_args(url: &str) -> Vec<String> {
+    let (target, headers) = crate::m3u::split_headers(url);
+    let mut options = Vec::new();
+    if let Some(agent) = &headers.user_agent {
+        options.push(format!("user-agent={}", option_value(agent)));
+    }
+    if let Some(referrer) = &headers.referrer {
+        options.push(format!("referrer={}", option_value(referrer)));
+    }
+    let mut args = vec!["loadfile".to_owned(), target.to_owned()];
+    if !options.is_empty() {
+        args.extend(["replace".to_owned(), "-1".to_owned(), options.join(",")]);
+    }
+    args
+}
+
+/// An option value as mpv's `key=value,…` lists take any text, commas and
+/// colons included: `%<bytes>%<value>`.
+fn option_value(value: &str) -> String {
+    format!("%{}%{}", value.len(), value)
 }
 
 /// Downgrade the effective log level for known-benign mpv messages so the
@@ -315,5 +362,40 @@ mod tests {
             effective_log_level("ffmpeg", "error", "Invalid data found when processing input"),
             "error"
         );
+    }
+
+    #[test]
+    fn a_plain_url_is_a_plain_loadfile() {
+        assert_eq!(
+            super::loadfile_args("http://127.0.0.1:5555/live/0.ts"),
+            ["loadfile", "http://127.0.0.1:5555/live/0.ts"]
+        );
+    }
+
+    #[test]
+    fn headers_become_options_of_that_one_file() {
+        let url = crate::m3u::with_headers(
+            "https://a.example/1.m3u8".into(),
+            Some("Mozilla/5.0 (X11; Linux), like Gecko"),
+            Some("https://www.example.com/a:b"),
+        );
+        // After mpv 0.38's index (-1: none), each value quoted by its length
+        // in bytes: commas and colons inside it are no separators.
+        assert_eq!(
+            super::loadfile_args(&url),
+            [
+                "loadfile",
+                "https://a.example/1.m3u8",
+                "replace",
+                "-1",
+                "user-agent=%36%Mozilla/5.0 (X11; Linux), like Gecko,referrer=%27%https://www.example.com/a:b",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_option_value_is_counted_in_bytes() {
+        let url = crate::m3u::with_headers("http://a.example/1".into(), Some("Zürich-TV"), None);
+        assert_eq!(super::loadfile_args(&url)[4], "user-agent=%10%Zürich-TV");
     }
 }
