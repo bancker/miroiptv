@@ -3,7 +3,8 @@
 //!
 //! Tolerant of what lists in the wild do: a BOM, CRLF line ends, no `#EXTM3U`
 //! header, an `#EXTINF` with no URL after it (dropped), a URL with no `#EXTINF`
-//! (named after its URL), and `#` lines it does not know (skipped).
+//! (named after its URL, the account in it masked), and `#` lines it does not
+//! know (skipped).
 
 use crate::portal::LiveChannel;
 use std::collections::{HashMap, HashSet};
@@ -11,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 /// One channel of a list, as the file has it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct M3uChannel {
-    /// The name after the `#EXTINF`'s comma, else `tvg-name`, else the URL.
+    /// The name after the `#EXTINF`'s comma, else `tvg-name`, else the URL with
+    /// the account in it masked (`redact`); the key of a channel with no other
+    /// name, so two such channels that differ in the account only are numbered.
     pub name: String,
     /// The stream's address, without the headers that came with it.
     pub url: String,
@@ -158,10 +161,13 @@ pub fn parse(text: &str) -> M3uList {
             let (url, piped) = split_headers(line);
             let info = info.take().unwrap_or_default();
             let headers = std::mem::take(&mut pending);
+            // No name at all: the address, with the account masked. The name
+            // reaches the toasts, the search, the favorites and the log, and a
+            // paid provider's address holds user and password.
             let name = [info.name, info.tvg_name.unwrap_or_default()]
                 .into_iter()
                 .find(|n| !n.is_empty())
-                .unwrap_or_else(|| url.to_owned());
+                .unwrap_or_else(|| crate::redact::redact(url).into_owned());
             list.channels.push(M3uChannel {
                 name,
                 url: url.to_owned(),

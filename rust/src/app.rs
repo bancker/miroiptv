@@ -2,7 +2,7 @@ use crate::args::{
     credentials_line, parse_xtream_creds, resolve_creds, CredsError, CredsSource, XtreamCreds,
 };
 use crate::catalog::GuideChannel;
-use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, quality_rank, zap_position, CatalogNotice, CatalogStatus, CatalogStore};
+use crate::catalog::{fallback_variant, quality_label, quality_rank, zap_position, CatalogNotice, CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::{Entry as FavoriteEntry, Favorites};
 use crate::guide::fetch::EpgFetcher;
@@ -341,15 +341,48 @@ pub fn anon_portal() -> Arc<dyn Portal> {
     }))
 }
 
-/// The portal of a saved source and the state the app runs in on it: an
-/// Xtream source with placeholder or unreadable credentials shows the setup
-/// prompt. Says in the log which source it is, never an M3U address.
-pub fn open_source(source: &Source, storage: &Storage) -> OpenedSource {
+/// What the app runs on for Xtream credentials that were looked for
+/// ([`resolve_creds`]): usable ones run the portal, placeholder, missing or
+/// unreadable ones show the setup prompt, on a portal that is never asked
+/// anything. The one place of the words 0.6.1's log has for it, `main` and
+/// [`open_source`] both come through here.
+pub fn open_xtream(resolved: CredsSource) -> OpenedSource {
     let prompt = |state| OpenedSource {
         portal: anon_portal(),
         creds: None,
         state,
     };
+    match resolved {
+        CredsSource::Configured(c, _) => {
+            tracing::info!("portal: xtream <user>@{}:{}", c.host, c.port);
+            OpenedSource {
+                portal: Arc::new(XtreamPortal::new(c.clone())),
+                creds: Some(c),
+                state: PortalState::Configured,
+            }
+        }
+        CredsSource::Placeholder => {
+            tracing::warn!("portal: placeholder credentials - showing the setup prompt");
+            prompt(PortalState::Placeholder)
+        }
+        CredsSource::Missing => {
+            tracing::warn!(
+                "portal: no credentials (--xtream or {}.ini) - showing the setup prompt",
+                crate::APP_ID
+            );
+            prompt(PortalState::Missing)
+        }
+        CredsSource::Invalid(e) => {
+            tracing::warn!("portal: unreadable credentials ({e}) - showing the setup prompt");
+            prompt(PortalState::Missing)
+        }
+    }
+}
+
+/// The portal of a saved source and the state the app runs in on it: an
+/// Xtream source with placeholder or unreadable credentials shows the setup
+/// prompt. Says in the log which source it is, never an M3U address.
+pub fn open_source(source: &Source, storage: &Storage) -> OpenedSource {
     match source.kind {
         SourceKind::M3u => {
             tracing::info!(
@@ -364,31 +397,7 @@ pub fn open_source(source: &Source, storage: &Storage) -> OpenedSource {
                 state: PortalState::Configured,
             }
         }
-        SourceKind::Xtream => match resolve_creds(None, Some(&source.address)) {
-            CredsSource::Configured(c, _) => {
-                tracing::info!("portal: xtream <user>@{}:{}", c.host, c.port);
-                OpenedSource {
-                    portal: Arc::new(XtreamPortal::new(c.clone())),
-                    creds: Some(c),
-                    state: PortalState::Configured,
-                }
-            }
-            CredsSource::Placeholder => {
-                tracing::warn!("portal: placeholder credentials - showing the setup prompt");
-                prompt(PortalState::Placeholder)
-            }
-            CredsSource::Missing => {
-                tracing::warn!(
-                    "portal: no credentials (--xtream or {}.ini) - showing the setup prompt",
-                    crate::APP_ID
-                );
-                prompt(PortalState::Missing)
-            }
-            CredsSource::Invalid(e) => {
-                tracing::warn!("portal: unreadable credentials ({e}) - showing the setup prompt");
-                prompt(PortalState::Missing)
-            }
-        },
+        SourceKind::Xtream => open_xtream(resolve_creds(None, Some(&source.address))),
     }
 }
 
@@ -1499,6 +1508,16 @@ impl TvApp {
                             None => self.t(T::StreamErrorRetry).to_owned(),
                         };
                         self.set_toast(text);
+                        // A dead channel of a list shows the empty state, not the
+                        // picture of the channel before: that would look like
+                        // this one, frozen. Frames from now on still show, so a
+                        // load that is on its way already does (as in
+                        // `end_catchup_wait`).
+                        if reason == "error" && self.catalog.kind() == SourceKind::M3u {
+                            self.frame_fence.stop();
+                            self.frame_fence.load(self.player.frames.version());
+                            self.video_tex = None;
+                        }
                     } else {
                         tracing::debug!("mpv end-file ({}) - toast suppressed", reason);
                     }
@@ -1552,10 +1571,11 @@ impl TvApp {
     /// A player error while an M3U channel is still starting is mpv refusing
     /// the load itself (a list's address or header holds what it cannot take, a
     /// NUL byte): the stream before it was never replaced and would play on
-    /// under the new channel's name. That stream stops, as a dead channel's
-    /// does, and the toast names the channel; the app stays on it. True when
-    /// the error was dealt with so. (M3U only: an Xtream portal's loads go
-    /// through the relay, with nothing in them mpv can refuse.)
+    /// under the new channel's name. That stream stops and its picture goes,
+    /// as a dead channel's does, and the toast names the channel; the app
+    /// stays on it. True when the error was dealt with so. (M3U only: an
+    /// Xtream portal's loads go through the relay, with nothing in them mpv can
+    /// refuse.)
     fn stop_for_refused_load(&mut self) -> bool {
         if self.catalog.kind() != SourceKind::M3u || self.stream_starting_since.is_none() {
             return false;
@@ -1564,6 +1584,12 @@ impl TvApp {
             return false;
         };
         let _ = self.player.cmd_tx.send(Cmd::Stop);
+        // Its picture goes too, and none of its frames comes back: the empty
+        // state, never the channel before under this one's name. The fence stays
+        // shut until the next load narrows it (as after `stop_playback`), so a
+        // frame mpv renders before the stop lands is kept away as well.
+        self.frame_fence.stop();
+        self.video_tex = None;
         // Nothing plays to watch, and a reload would be refused again.
         self.stall_watchdog_armed = false;
         self.stream_starting_since = None;
@@ -1873,15 +1899,10 @@ impl TvApp {
         let name = ch.name.clone();
         // Park the up/down cursor on this channel's entry in the zap list so
         // subsequent zapping continues from the right place; play the exact sid
-        // requested. Its own entry first (on an M3U list two channels may share
-        // a name), else the one that stands for it in the deduped Xtream list
-        // (matched by normalized name).
-        let zap = self.catalog.zap_channels();
-        let key = normalize_channel_name(&name);
-        let idx = zap.iter().position(|c| c.stream_id == sid).or_else(|| {
-            zap.iter()
-                .position(|c| normalize_channel_name(&c.name) == key)
-        });
+        // requested. `zap_position` finds its own entry first (on an M3U list
+        // two channels may share a name), else the one that stands for it in
+        // the deduped Xtream list.
+        let idx = zap_position(&self.catalog.zap_channels(), ch);
         self.zap_to(sid, &name, idx);
     }
 
@@ -9047,11 +9068,13 @@ https://c.example/twee-nieuws.m3u8\n";
     }
 
     #[tokio::test]
-    async fn a_channel_named_after_its_address_leaves_no_password_in_the_log() {
+    async fn a_channel_the_list_names_by_an_address_leaves_no_password_in_the_log() {
         let dir = tempfile::tempdir().unwrap();
-        // The second channel has no name: it is named after its stream URL.
+        // The list's own author named the second channel by an address: a name
+        // from a list is text like any other, and the log masks what it holds.
         let list = "#EXTM3U\n#EXTINF:-1,Eerste\nhttps://a.example/1.m3u8\n\
-                    https://user:secret@c.example/live/2.ts\n";
+                    #EXTINF:-1,https://user:secret@c.example/live/2.ts\n\
+                    https://c.example/2.m3u8\n";
         let mut h = m3u_app(dir.path(), list);
         let log = LogCapture::start_debug();
         h.press(&[Key::ArrowDown]);
@@ -9137,5 +9160,266 @@ https://c.example/twee-nieuws.m3u8\n";
         for secret in ["bob", "geheim", "no at sign"] {
             assert!(!text.contains(secret), "{secret} in the log:\n{text}");
         }
+    }
+
+    #[test]
+    fn open_xtream_is_the_one_place_of_the_log_lines_0_6_1_has_for_the_credentials() {
+        let log = LogCapture::start();
+        let creds = XtreamCreds {
+            username: "bob".into(),
+            password: "geheim".into(),
+            host: "srv.example.net".into(),
+            port: 8080,
+        };
+        let from = crate::args::CredsOrigin::CommandLine;
+        let real = open_xtream(CredsSource::Configured(creds, from));
+        let placeholder = open_xtream(CredsSource::Placeholder);
+        let missing = open_xtream(CredsSource::Missing);
+        let invalid = open_xtream(CredsSource::Invalid(
+            "missing '@' separator in creds".into(),
+        ));
+        // What the app runs on: the portal, or the setup prompt on a portal that
+        // is never asked anything.
+        assert_eq!(real.state, PortalState::Configured);
+        let password = real.creds.as_ref().map(|c| c.password.as_str());
+        assert_eq!(password, Some("geheim"));
+        let prompts = [
+            (&placeholder, PortalState::Placeholder),
+            (&missing, PortalState::Missing),
+            (&invalid, PortalState::Missing),
+        ];
+        for (opened, state) in prompts {
+            assert_eq!(opened.state, state);
+            assert!(opened.creds.is_none());
+        }
+        for opened in [&real, &placeholder, &missing, &invalid] {
+            assert_eq!(opened.portal.kind(), SourceKind::Xtream);
+        }
+        // The words of 0.6.1's log, in the order they were said.
+        let text = log.text();
+        let said: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.split_once("bongo_player::app: "))
+            .map(|(_, message)| message)
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "portal: xtream <user>@srv.example.net:8080",
+                "portal: placeholder credentials - showing the setup prompt",
+                "portal: no credentials (--xtream or BongoPlayer.ini) - showing the setup prompt",
+                "portal: unreadable credentials (missing '@' separator in creds) - showing the setup prompt",
+            ],
+            "{text}"
+        );
+    }
+
+    // ---- the picture of the channel before ----
+
+    /// An app on `TEST_LIST`, on its second channel, whose picture (4 x 2) is on
+    /// the screen.
+    fn m3u_app_with_a_picture(root: &std::path::Path) -> Harness {
+        let mut h = m3u_app(root, TEST_LIST);
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        h.press(&[Key::ArrowDown]);
+        h.put_frame(4, 2);
+        h.frame(&[]);
+        assert!(h.app.video_tex.is_some(), "the picture is on the screen");
+        h.sent();
+        h
+    }
+
+    /// Frames go by with the picture of the channel before still on the bus,
+    /// and none of it comes back: the empty state shows instead.
+    fn the_old_picture_stays_away(h: &mut Harness) {
+        for _ in 0..3 {
+            h.frame(&[]);
+        }
+        assert!(h.app.video_tex.is_none(), "the old picture came back");
+        assert!(
+            h.painted.iter().any(|t| t == crate::APP_NAME),
+            "the empty state shows: {:?}",
+            h.painted
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_m3u_load_takes_the_picture_of_the_channel_before_off_the_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app_with_a_picture(dir.path());
+        h.press(&[Key::ArrowDown]);
+        let refused = Event::Error {
+            msg: "mpv error -4: an argument holds a NUL byte".into(),
+        };
+        h.events.send(refused).unwrap();
+        h.frame(&[]);
+        assert!(h.app.video_tex.is_none(), "the picture goes at once");
+        the_old_picture_stays_away(&mut h);
+        // The next load shows its own pictures.
+        h.press(&[Key::ArrowUp]);
+        h.put_frame(8, 4);
+        h.frame(&[]);
+        let video = h.app.video_tex.as_ref().expect("the new picture");
+        assert_eq!(video.size(), [8, 4]);
+    }
+
+    #[tokio::test]
+    async fn a_dead_m3u_channel_takes_the_picture_of_the_channel_before_off_the_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app_with_a_picture(dir.path());
+        h.press(&[Key::ArrowDown]);
+        let dead = Event::EndOfFile {
+            reason: "error".into(),
+        };
+        h.events.send(dead).unwrap();
+        h.frame(&[]);
+        assert!(h.app.video_tex.is_none(), "the picture goes at once");
+        the_old_picture_stays_away(&mut h);
+        // A load that was on its way already: its first picture is newer than
+        // the error, and shows.
+        h.put_frame(8, 4);
+        h.frame(&[]);
+        let video = h.app.video_tex.as_ref().expect("the new picture");
+        assert_eq!(video.size(), [8, 4]);
+        // So does the load of the channel the user zaps to next.
+        h.press(&[Key::ArrowUp]);
+        h.put_frame(12, 6);
+        h.frame(&[]);
+        let video = h.app.video_tex.as_ref().expect("the next picture");
+        assert_eq!(video.size(), [12, 6]);
+    }
+
+    #[tokio::test]
+    async fn an_xtream_dead_channel_leaves_the_last_picture_on_the_screen_as_it_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        h.put_frame(4, 2);
+        h.frame(&[]);
+        h.press(&[Key::ArrowDown]);
+        assert!(h.app.video_tex.is_some());
+        for event in [
+            Event::EndOfFile {
+                reason: "error".into(),
+            },
+            Event::Error { msg: "boom".into() },
+        ] {
+            h.events.send(event).unwrap();
+            h.frame(&[]);
+            h.frame(&[]);
+            assert!(h.app.video_tex.is_some(), "the picture stays");
+        }
+    }
+
+    // ---- a channel with no name ----
+
+    #[tokio::test]
+    async fn a_channel_with_no_name_is_shown_by_its_masked_address_and_plays_from_the_real_one() {
+        let dir = tempfile::tempdir().unwrap();
+        // The second channel has no name: the list reader names it after its
+        // address, with the account masked.
+        let list = "#EXTM3U\n#EXTINF:-1,Eerste\nhttps://a.example/1.m3u8\n\
+                    https://user:secret@c.example/live/2.ts\n";
+        let mut h = m3u_app(dir.path(), list);
+        let log = LogCapture::start_debug();
+        let masked = "https://<u>:<p>@c.example/live/2.ts";
+        let nothing_secret = |h: &Harness| {
+            let seen = h.painted.iter().any(|t| t.contains("secret"));
+            assert!(!seen, "the account is on the screen: {:?}", h.painted);
+        };
+        h.sent();
+        h.press(&[Key::ArrowDown]);
+        assert_eq!(h.app.current_name.as_deref(), Some(masked));
+        let zap_toast = format!("[TV] {masked}");
+        assert!(h.painted.contains(&zap_toast), "{:?}", h.painted);
+        nothing_secret(&h);
+        // mpv gets the real address: the account is what the server wants.
+        let real = "https://user:secret@c.example/live/2.ts";
+        assert_eq!(loads(h.sent()), [real]);
+        // The error names the channel as the zap toast did.
+        let dead = Event::EndOfFile {
+            reason: "error".into(),
+        };
+        h.events.send(dead).unwrap();
+        h.frame(&[]);
+        let named = format!("stream error on {masked} - zap up or down to retry");
+        assert!(h.painted.contains(&named), "{:?}", h.painted);
+        nothing_secret(&h);
+        // A favorite keeps the name that shows.
+        h.frame_with(vec![egui::Event::Text("*".into())]);
+        let saved = std::fs::read_to_string(dir.path().join("favorites.json")).unwrap();
+        assert!(saved.contains(masked), "{saved}");
+        assert!(!saved.contains("secret"), "the account is saved: {saved}");
+        // The search finds it by that name.
+        h.frame_with(vec![key_press(Key::F), egui::Event::Text("f".into())]);
+        h.frame(&[]);
+        h.type_text("c.example");
+        h.frame(&[]);
+        assert!(
+            h.painted.iter().any(|t| t.contains(masked)),
+            "{:?}",
+            h.painted
+        );
+        nothing_secret(&h);
+        let text = log.text();
+        assert!(
+            !text.contains("secret"),
+            "the account is in the log:\n{text}"
+        );
+    }
+
+    // ---- the news on a list ----
+
+    #[tokio::test]
+    async fn n_on_an_m3u_source_lists_the_channel_a_rule_names_and_plays_it_live_and_straight() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(TEST_LIST))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("m3u-2.m3u");
+        let portal = M3uPortal::new(2, &format!("{}/tv.m3u", server.uri()), cache);
+        let store = Arc::new(CatalogStore::new(Arc::new(portal)));
+        store.spawn_fetch();
+        wait_until("the list", || store.is_loaded()).await;
+        let relay = Relay::start(crate::relay::RelayConfig::default()).unwrap();
+        let mut h = Harness::start_with(
+            dir.path(),
+            store,
+            PortalState::Configured,
+            None,
+            None,
+            Sources::default(),
+            Some(relay),
+        );
+        // A rule that names a channel of the list. The list has no catch-up and
+        // no guide: nothing for the news to fetch.
+        h.app.settings.news_rules = Some(vec![NewsRule {
+            label: "EEN".into(),
+            ..news_rule("Kanaal Een")
+        }]);
+        let asked = server.received_requests().await.unwrap().len();
+        assert_eq!(asked, 1, "the list, and nothing else yet");
+        h.press(&[Key::N]);
+        let slot = h.app.news_picker_slot.clone();
+        wait_until("the news list", || slot.lock().is_some()).await;
+        h.frame(&[]);
+        h.frame(&[]);
+        let picker = h.app.news_picker.as_ref().expect("the list popped up");
+        assert_eq!(picker.items.len(), 1);
+        assert!(picker.items[0].live, "no catch-up: the channel itself");
+        assert!(h.painted.iter().any(|t| t == "EEN"), "{:?}", h.painted);
+        h.sent();
+        h.press(&[Key::Enter]);
+        let straight = ["https://a.example/een.m3u8"];
+        assert_eq!(loads(h.sent()), straight, "live, not through the relay");
+        assert_eq!(h.app.current_name.as_deref(), Some("EEN - Live"));
+        assert!(h.app.current_live, "the stall watchdog watches it");
+        // Up and down go on from the channel the news put on.
+        h.press(&[Key::ArrowDown]);
+        let twee = "https://b.example/twee.m3u8|User-Agent=Bongo%2F1.0&Referer=https%3A%2F%2Fwww.example.com%2F";
+        assert_eq!(loads(h.sent()), [twee]);
+        let after = server.received_requests().await.unwrap().len();
+        assert_eq!(after, asked, "the news asked the server for nothing");
     }
 }

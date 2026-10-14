@@ -100,6 +100,61 @@ fn broken_lines_are_dropped_or_named_after_their_url() {
 }
 
 #[test]
+fn a_channel_with_no_name_is_named_after_its_url_without_the_accounts_secrets() {
+    // A paid provider's list holds the account in every stream URL. The name
+    // reaches the toasts, the search, the favorites and the log.
+    for (line, name) in [
+        ("http://h/bob/S3CR3T/123", "http://h/<u>/<p>/123"),
+        (
+            "http://bob:S3CR3T@h/stream/1.ts",
+            "http://<u>:<p>@h/stream/1.ts",
+        ),
+        (
+            "http://h/live/bob/S3CR3T/1.ts",
+            "http://h/live/<u>/<p>/1.ts",
+        ),
+        (
+            "http://h/stream/1.m3u8?token=S3CR3T",
+            "http://h/stream/1.m3u8?<q>",
+        ),
+        // Nothing to hide: the URL as it is.
+        ("rtmp://a.example/live/3", "rtmp://a.example/live/3"),
+    ] {
+        let c = one(&format!("{line}\n"));
+        assert_eq!(c.name, name, "{line}");
+        assert!(!c.name.contains("S3CR3T"), "{}", c.name);
+        assert_eq!(c.url, line, "it still plays from its own address");
+    }
+    // A name the list gives is the list's own, and so is a tvg-name.
+    let c = one("#EXTINF:-1,Een\nhttp://h/bob/S3CR3T/1\n");
+    assert_eq!(c.name, "Een");
+    let c = one("#EXTINF:-1 tvg-name=\"Twee\",\nhttp://h/bob/S3CR3T/2\n");
+    assert_eq!(c.name, "Twee");
+}
+
+#[test]
+fn a_nameless_channel_is_masked_in_the_catalog_and_keeps_its_real_address_to_play() {
+    let playlist = read("http://h/bob/S3CR3T/123\nhttp://h/amy/OTHER/123\n").expect("a list");
+    // Both read "http://h/<u>/<p>/123" now; their keys, and so their ids, are
+    // told apart by a number, as for any two channels of one name.
+    let names: Vec<&str> = playlist.live.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["http://h/<u>/<p>/123"; 2]);
+    let (first, second) = (&playlist.live[0], &playlist.live[1]);
+    assert_eq!(first.stream_id, stream_id("http://h/<u>/<p>/123"));
+    assert_eq!(second.stream_id, stream_id("http://h/<u>/<p>/123#2"));
+    assert_eq!(playlist.streams.len(), 2);
+    // What plays is the address as the list wrote it.
+    assert_eq!(
+        playlist.streams[&first.stream_id].url,
+        "http://h/bob/S3CR3T/123"
+    );
+    assert_eq!(
+        playlist.streams[&second.stream_id].url,
+        "http://h/amy/OTHER/123"
+    );
+}
+
+#[test]
 fn the_header_keeps_the_guide_url_for_round_two() {
     assert_eq!(
         parse(LIST).epg_url.as_deref(),

@@ -2,12 +2,11 @@
 // live debug console; logs always also go to the file under %APPDATA%.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use bongo_player::app::{anon_portal, open_source, PortalState, TvApp};
-use bongo_player::args::{ini_path, resolve_creds, Cli, CredsSource, XtreamCreds};
+use bongo_player::app::{open_source, open_xtream, OpenedSource, TvApp};
+use bongo_player::args::{ini_path, resolve_creds, Cli, CredsSource};
 use bongo_player::catalog::CatalogStore;
 use bongo_player::legacy;
 use bongo_player::player;
-use bongo_player::portal::{xtream::XtreamPortal, Portal};
 use bongo_player::relay::{Relay, RelayConfig};
 use bongo_player::settings::Settings;
 use bongo_player::sources::Sources;
@@ -199,42 +198,28 @@ fn main() -> anyhow::Result<()> {
     // which writes BongoPlayer.ini.
     let sources = Sources::load(&ini_path());
     let mut storage = storage;
-    let (portal, portal_state, creds, creds_from_cli): (
-        Arc<dyn Portal>,
-        PortalState,
-        Option<XtreamCreds>,
-        bool,
-    ) = match (resolve_creds(cli.xtream.as_deref(), None), sources.active()) {
-        (CredsSource::Configured(c, _), _) => {
-            tracing::info!("portal: xtream <user>@{}:{}", c.host, c.port);
-            // The settings tell the user that what they save there does not
-            // count while this --xtream is given.
-            tracing::info!("portal: from --xtream, which beats {APP_ID}.ini on every start");
-            // Its favorites and presets are source 1's, as in 0.6.1.
-            storage.set_source(1);
-            let portal: Arc<dyn Portal> = Arc::new(XtreamPortal::new(c.clone()));
-            (portal, PortalState::Configured, Some(c), true)
-        }
-        (_, Some(source)) => {
-            storage.set_source(source.id);
-            let opened = open_source(source, &storage);
-            (opened.portal, opened.state, opened.creds, false)
-        }
-        (CredsSource::Placeholder, None) => {
-            tracing::warn!("portal: placeholder credentials - showing the setup prompt");
-            (anon_portal(), PortalState::Placeholder, None, false)
-        }
-        (CredsSource::Invalid(e), None) => {
-            tracing::warn!("portal: unreadable credentials ({e}) - showing the setup prompt");
-            (anon_portal(), PortalState::Missing, None, false)
-        }
-        (CredsSource::Missing, None) => {
-            tracing::warn!(
-                "portal: no credentials (--xtream or {APP_ID}.ini) - showing the setup prompt"
-            );
-            (anon_portal(), PortalState::Missing, None, false)
-        }
-    };
+    let (opened, creds_from_cli) =
+        match (resolve_creds(cli.xtream.as_deref(), None), sources.active()) {
+            (resolved @ CredsSource::Configured(..), _) => {
+                let opened = open_xtream(resolved);
+                // The settings tell the user that what they save there does not
+                // count while this --xtream is given.
+                tracing::info!("portal: from --xtream, which beats {APP_ID}.ini on every start");
+                // Its favorites and presets are source 1's, as in 0.6.1.
+                storage.set_source(1);
+                (opened, true)
+            }
+            (_, Some(source)) => {
+                storage.set_source(source.id);
+                (open_source(source, &storage), false)
+            }
+            (resolved, None) => (open_xtream(resolved), false),
+        };
+    let OpenedSource {
+        portal,
+        creds,
+        state: portal_state,
+    } = opened;
     let catalog = Arc::new(CatalogStore::new(portal));
 
     // Local relay for live HLS (see relay/mod.rs). Loopback only; if it can't
