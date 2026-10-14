@@ -27,7 +27,7 @@ use crate::settings_ui::{
 };
 use crate::shortcuts;
 use crate::storage::Storage;
-use crate::window_drag::{self, RightDrag, ScreenPos};
+use crate::window_drag::{self, Mouse, RightDrag};
 use crate::zap::ZapPacer;
 use egui::{Color32, ColorImage, Key, TextureHandle, TextureOptions};
 use parking_lot::Mutex;
@@ -545,9 +545,10 @@ pub struct TvApp {
     borderless: bool,
     /// The borderless window is being moved with the right mouse button.
     right_drag: Option<RightDrag>,
-    /// Where the cursor is on the screen. The real one is Windows' own; a test
-    /// puts its own here.
-    cursor_source: fn() -> Option<ScreenPos>,
+    /// What the drag asks Windows about the mouse: where the cursor is, whether
+    /// the buttons are swapped, whether a button is down. The real thing is
+    /// Windows' own; a test puts its own here.
+    mouse: Mouse,
     /// `?` toggles a centered help overlay listing every hotkey.
     show_help: bool,
 
@@ -772,7 +773,7 @@ impl TvApp {
             pending_catchup: None,
             borderless: false,
             right_drag: None,
-            cursor_source: window_drag::cursor_pos,
+            mouse: Mouse::WINDOWS,
             show_help: false,
             current_url: None,
             current_live: false,
@@ -2628,7 +2629,16 @@ impl TvApp {
         if self.right_drag.is_none() && !pressed {
             return;
         }
-        let Some(cursor) = (self.cursor_source)() else {
+        // A release that egui never hears of (another window took the mouse
+        // capture) would glue the window to the cursor: while a drag runs, and
+        // only then, ask Windows whether the button is still down.
+        if let Some(button) = self.right_drag.as_ref().map(RightDrag::button) {
+            if !(self.mouse.key_down)(button) {
+                self.end_right_drag("button up per Win32");
+                return;
+            }
+        }
+        let Some(cursor) = (self.mouse.cursor)() else {
             return;
         };
         // egui's own scale, the UI zoom in it: the window's rect and the
@@ -2640,7 +2650,9 @@ impl TvApp {
                 let Some(window) = window else {
                     return;
                 };
-                let drag = RightDrag::begin(cursor, window.min, pixels_per_point);
+                // The swap is read here, once per drag.
+                let button = window_drag::button_to_poll((self.mouse.buttons_swapped)());
+                let drag = RightDrag::begin(cursor, window.min, pixels_per_point, button);
                 tracing::debug!(
                     "window drag: begins ({drag:?}, {pixels_per_point} pixels to a point)"
                 );
@@ -3808,6 +3820,7 @@ impl TvApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::window_drag::{ScreenPos, VK_LBUTTON, VK_RBUTTON};
 
     #[test]
     fn an_old_last_watched_file_has_an_unknown_adult_flag() {
@@ -4222,11 +4235,42 @@ mod tests {
         /// would be the developer's.
         static CURSOR: std::cell::Cell<Option<ScreenPos>> = const { std::cell::Cell::new(None) };
         static CURSOR_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// Which physical buttons Windows says are down (left, right) and whether
+        /// they are swapped, and how often the app asked about each. A right-handed
+        /// mouse with the right button down, until a test says otherwise.
+        static PHYSICAL: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, true)) };
+        static SWAPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static KEY_POLLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static SWAP_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     fn fake_cursor() -> Option<ScreenPos> {
         CURSOR_READS.set(CURSOR_READS.get() + 1);
         CURSOR.get()
+    }
+
+    fn fake_buttons_swapped() -> bool {
+        SWAP_READS.set(SWAP_READS.get() + 1);
+        SWAPPED.get()
+    }
+
+    fn fake_key_down(vkey: i32) -> bool {
+        KEY_POLLS.set(KEY_POLLS.get() + 1);
+        let (left, right) = PHYSICAL.get();
+        match vkey {
+            VK_LBUTTON => left,
+            VK_RBUTTON => right,
+            _ => false,
+        }
+    }
+
+    /// The mouse of the app under test, in place of Windows' own.
+    fn fake_mouse() -> Mouse {
+        Mouse {
+            cursor: fake_cursor,
+            buttons_swapped: fake_buttons_swapped,
+            key_down: fake_key_down,
+        }
     }
 
     impl Harness {
@@ -4278,10 +4322,15 @@ mod tests {
                 window_cmds: Vec::new(),
                 repaint_in: Duration::MAX,
             };
-            // The cursor is the test's: nowhere, and never asked yet.
-            harness.app.cursor_source = fake_cursor;
+            // The mouse is the test's: the cursor nowhere, the right button of a
+            // right-handed mouse down, and nothing asked yet.
+            harness.app.mouse = fake_mouse();
             CURSOR.set(None);
             CURSOR_READS.set(0);
+            PHYSICAL.set((false, true));
+            SWAPPED.set(false);
+            KEY_POLLS.set(0);
+            SWAP_READS.set(0);
             harness.frame(&[]);
             harness.frame(&[]);
             // The cache file, which the app reads on a thread of its own once its
@@ -4396,6 +4445,17 @@ mod tests {
         /// The cursor goes to this pixel of the screen.
         fn cursor_to(&mut self, x: i32, y: i32) {
             CURSOR.set(Some((x, y)));
+        }
+
+        /// What Windows says about the physical buttons: whether the left and the
+        /// right one are down. egui is told nothing.
+        fn physical_buttons(&mut self, left: bool, right: bool) {
+            PHYSICAL.set((left, right));
+        }
+
+        /// Whether Windows says the buttons are swapped (a left-handed mouse).
+        fn buttons_swapped(&mut self, swapped: bool) {
+            SWAPPED.set(swapped);
         }
 
         /// Presses Tab until the keyboard is on the widget with this id: whether
@@ -7853,6 +7913,11 @@ mod tests {
         let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
         assert_eq!(moved, NO_MOVES, "with a border");
         assert_eq!(CURSOR_READS.get(), 0, "the cursor was not even asked for");
+        assert_eq!(
+            (KEY_POLLS.get(), SWAP_READS.get()),
+            (0, 0),
+            "nor the buttons"
+        );
         // The very same gesture moves the window once the border is gone ...
         h.press(&[Key::T]);
         let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
@@ -7990,6 +8055,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_release_egui_never_saw_still_ends_the_drag() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        start_dragging(&mut h);
+        // The button is let go where egui does not hear of it (another window took
+        // the mouse capture): Windows says it is up, egui says it is down.
+        h.physical_buttons(false, false);
+        assert_the_window_stays_put(&mut h, "Windows says the button is up");
+        // Down again, with no press egui saw: a drag begins with a press.
+        h.physical_buttons(false, true);
+        assert_the_window_stays_put(&mut h, "down again, no new press");
+    }
+
+    #[tokio::test]
+    async fn the_drag_watches_the_physical_button_that_is_the_right_one() {
+        // Swapped buttons (the left-handed setting) make the physical left button
+        // the right one for egui. (swapped, left down, right down, the window moves)
+        for (swapped, left, right, moves) in [
+            (false, false, true, true),
+            (false, true, false, false),
+            (true, true, false, true),
+            (true, false, true, false),
+        ] {
+            let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+            h.buttons_swapped(swapped);
+            h.physical_buttons(left, right);
+            let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
+            let want = if moves {
+                vec![egui::pos2(400.0, 250.0)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                moved, want,
+                "swapped: {swapped}, left down: {left}, right down: {right}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_zoomed_ui_does_not_scale_the_drag() {
         let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
         // The UI zoom (Ctrl +) doubles the size of a point: it is two pixels now,
@@ -8014,6 +8118,11 @@ mod tests {
             h.frame(&[]);
         }
         assert_eq!(CURSOR_READS.get(), 0, "idle: the cursor is not asked for");
+        assert_eq!(
+            (KEY_POLLS.get(), SWAP_READS.get()),
+            (0, 0),
+            "idle: nor the buttons"
+        );
         assert!(h.repaint_in > Duration::ZERO, "idle: {:?}", h.repaint_in);
         // The button down: the cursor is read, and the next frame is asked for at
         // once, the cursor moving or standing still.
@@ -8027,6 +8136,13 @@ mod tests {
             h.frame(&[]);
         }
         assert!(CURSOR_READS.get() >= 8, "reads: {}", CURSOR_READS.get());
+        // Whether the buttons are swapped is read once, when the drag begins; the
+        // button is asked about once in each frame after that.
+        assert_eq!(
+            (KEY_POLLS.get(), SWAP_READS.get()),
+            (8, 1),
+            "dragging: button polls, swap reads"
+        );
         assert_eq!(h.repaint_in, Duration::ZERO, "dragging");
         // Let go: back to idle, with no more reads.
         h.frame_with(vec![right_button(false)]);
@@ -8036,6 +8152,11 @@ mod tests {
         let reads = CURSOR_READS.get();
         h.frame(&[]);
         assert_eq!(CURSOR_READS.get(), reads, "after the release");
+        assert_eq!(
+            (KEY_POLLS.get(), SWAP_READS.get()),
+            (8, 1),
+            "after the release: no more asking"
+        );
         assert!(h.repaint_in > Duration::ZERO, "after: {:?}", h.repaint_in);
     }
 
@@ -8075,6 +8196,12 @@ mod tests {
         h.frame(&[]);
         h.focused = true;
         h.frame_with(vec![right_button(false)]);
+        // Ended by Windows saying the button is up, which egui never heard.
+        start_dragging(&mut h);
+        h.physical_buttons(false, false);
+        h.frame(&[]);
+        h.physical_buttons(false, true);
+        h.frame_with(vec![right_button(false)]);
         // Ended by F11.
         start_dragging(&mut h);
         h.frame(&[Key::F11]);
@@ -8103,6 +8230,8 @@ mod tests {
                 "maximized",
                 "begins",
                 "focus lost",
+                "begins",
+                "button up per Win32",
                 "begins",
                 "F11",
                 "begins",
