@@ -1,8 +1,9 @@
 use crate::news::{resolve_channels, NewsRule};
 use crate::portal::xtream::{stream_ref, StreamKind};
-use crate::portal::{Catalog as PortalCatalog, LiveChannel, Movie, Portal, Series};
+use crate::portal::{Catalog as PortalCatalog, LiveChannel, Movie, Portal, PortalError, Series};
 use crate::search::{rank, ItemKind, SearchItem};
-use parking_lot::RwLock;
+use crate::sources::SourceKind;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -587,6 +588,15 @@ pub enum CatalogStatus {
     Failed(String),
 }
 
+/// What the app should tell the user after a fetch of an M3U list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogNotice {
+    /// The fresh list did not come; the saved one stays.
+    NotUpdated,
+    /// What came is no channel list; what showed stays.
+    NotAList,
+}
+
 pub struct CatalogStore {
     inner: Arc<RwLock<Option<StoredCatalog>>>,
     portal: Arc<dyn Portal>,
@@ -595,6 +605,8 @@ pub struct CatalogStore {
     adult_unlocked: AtomicBool,
     /// How many times `inner` was replaced (see [`CatalogStore::revision`]).
     revision: Arc<AtomicU64>,
+    /// What the last fetch has to tell the user, until the app takes it.
+    notice: Arc<Mutex<Option<CatalogNotice>>>,
 }
 
 /// Puts a catalog in its slot and counts it. The count moves after the catalog
@@ -612,6 +624,7 @@ impl CatalogStore {
             status: Arc::new(RwLock::new(CatalogStatus::Idle)),
             adult_unlocked: AtomicBool::new(false),
             revision: Arc::new(AtomicU64::new(0)),
+            notice: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -633,6 +646,16 @@ impl CatalogStore {
         self.revision.load(Ordering::Acquire)
     }
 
+    /// What kind of source this catalog is of.
+    pub fn kind(&self) -> SourceKind {
+        self.portal.kind()
+    }
+
+    /// The last fetch's notice, once: the app shows it as a toast.
+    pub fn take_notice(&self) -> Option<CatalogNotice> {
+        self.notice.lock().take()
+    }
+
     pub fn set_adult_unlocked(&self, on: bool) {
         self.adult_unlocked.store(on, Ordering::Relaxed);
     }
@@ -648,6 +671,10 @@ impl CatalogStore {
 
     /// Whether a stream URL plays adult content, whatever the lock state.
     pub fn is_adult_url(&self, url: &str) -> bool {
+        // An M3U list has no adult content: only Xtream portals flag it.
+        if self.kind() == SourceKind::M3u {
+            return false;
+        }
         let Some((kind, id)) = stream_ref(url) else {
             return false;
         };
@@ -679,16 +706,33 @@ impl CatalogStore {
 
     /// Spawn an async fetch on the current tokio runtime. Non-blocking.
     /// Safe to call repeatedly: subsequent calls trigger a re-fetch.
+    ///
+    /// An M3U source with nothing showing yet shows its saved list first
+    /// ([`Portal::saved_catalog`]); a fresh list that did not come, or is no
+    /// list, leaves what shows in place and a [`CatalogNotice`] to take.
     pub fn spawn_fetch(self: &Arc<Self>) {
         let inner = self.inner.clone();
         let revision = self.revision.clone();
         let portal = self.portal.clone();
         let status = self.status.clone();
+        let notice = self.notice.clone();
         *status.write() = CatalogStatus::Connecting;
 
         tokio::spawn(async move {
             let t0 = Instant::now();
-            *status.write() = CatalogStatus::Fetching;
+            // An M3U source shows its saved list at once, while the fresh one
+            // comes (a refetch has one showing already).
+            let mut showing_saved = false;
+            if inner.read().is_none() {
+                if let Some(saved) = portal.saved_catalog().await {
+                    put_catalog(&inner, &revision, StoredCatalog::new(saved));
+                    *status.write() = CatalogStatus::Loaded;
+                    showing_saved = true;
+                }
+            }
+            if !showing_saved {
+                *status.write() = CatalogStatus::Fetching;
+            }
             info!("catalog: starting fetch");
 
             match portal.fetch_catalog().await {
@@ -719,10 +763,24 @@ impl CatalogStore {
                     put_catalog(&inner, &revision, stored);
                     *status.write() = CatalogStatus::Loaded;
                 }
+                // The same list as the one that shows: it stays as it is.
+                Err(PortalError::Unchanged) => *status.write() = CatalogStatus::Loaded,
                 Err(e) => {
                     let msg = format!("{}", e);
                     warn!("catalog: fetch failed after {} ms: {}", t0.elapsed().as_millis(), msg);
-                    *status.write() = CatalogStatus::Failed(msg);
+                    // An M3U source keeps the list it shows, and says why it did
+                    // not change. An Xtream portal's refetch stays as it was.
+                    let keep = portal.kind() == SourceKind::M3u && inner.read().is_some();
+                    if matches!(e, PortalError::NotAList) {
+                        *notice.lock() = Some(CatalogNotice::NotAList);
+                    } else if keep {
+                        *notice.lock() = Some(CatalogNotice::NotUpdated);
+                    }
+                    *status.write() = if keep {
+                        CatalogStatus::Loaded
+                    } else {
+                        CatalogStatus::Failed(msg)
+                    };
                 }
             }
         });
@@ -750,13 +808,24 @@ impl CatalogStore {
             .unwrap_or_default()
     }
 
-    /// Deduplicated channel list for up/down zapping: one entry per distinct
-    /// channel, highest-quality live variant. See [`dedupe_zap`].
+    /// Channel list for up/down zapping. An Xtream portal's is deduplicated: one
+    /// entry per distinct channel, highest-quality live variant (see
+    /// [`dedupe_zap`]). An M3U list's is every entry, in the file's order.
     pub fn zap_channels(&self) -> Vec<LiveChannel> {
+        // An M3U list zaps in its own order, every entry: merging variants is
+        // made for the Xtream portal's names.
+        let merge = self.kind() == SourceKind::Xtream;
         self.inner
             .read()
             .as_ref()
-            .map(|c| dedupe_zap(c.live.iter().filter(|x| self.shows_live(x))))
+            .map(|c| {
+                let shown = c.live.iter().filter(|x| self.shows_live(x));
+                if merge {
+                    dedupe_zap(shown)
+                } else {
+                    shown.cloned().collect()
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -784,6 +853,10 @@ impl CatalogStore {
     /// when the catalog isn't loaded, `sid` is unknown or hidden (adult while
     /// locked); hidden variants of a shown channel are no rungs either.
     pub fn quality_nav(&self, sid: i64) -> QualityNav {
+        // An M3U list's entries are channels of their own, not qualities of one.
+        if self.kind() == SourceKind::M3u {
+            return QualityNav::default();
+        }
         let g = self.inner.read();
         let Some(c) = g.as_ref() else {
             return QualityNav::default();
