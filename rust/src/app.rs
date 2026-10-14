@@ -27,6 +27,7 @@ use crate::settings_ui::{
 };
 use crate::shortcuts;
 use crate::storage::Storage;
+use crate::window_drag::{self, RightDrag, ScreenPos};
 use crate::zap::ZapPacer;
 use egui::{Color32, ColorImage, Key, TextureHandle, TextureOptions};
 use parking_lot::Mutex;
@@ -541,6 +542,11 @@ pub struct TvApp {
     pending_catchup: Option<PendingCatchup>,
     /// Tracks borderless+always-on-top toggle (`t` key).
     borderless: bool,
+    /// The borderless window is being moved with the right mouse button.
+    right_drag: Option<RightDrag>,
+    /// Where the cursor is on the screen. The real one is Windows' own; a test
+    /// puts its own here.
+    cursor_source: fn() -> Option<ScreenPos>,
     /// `?` toggles a centered help overlay listing every hotkey.
     show_help: bool,
 
@@ -764,6 +770,8 @@ impl TvApp {
             stream_starting_since: None,
             pending_catchup: None,
             borderless: false,
+            right_drag: None,
+            cursor_source: window_drag::cursor_pos,
             show_help: false,
             current_url: None,
             current_live: false,
@@ -2576,6 +2584,57 @@ impl TvApp {
         }
     }
 
+    /// Moves the borderless window while the right mouse button is held down
+    /// (see `window_drag`). Idle it reads the input and nothing else: no Win32
+    /// call, no command, no repaint.
+    fn follow_right_drag(&mut self, ctx: &egui::Context) {
+        if !self.borderless {
+            self.right_drag = None;
+            return;
+        }
+        let (pressed, down, full_screen, focused, window) = ctx.input(|i| {
+            (
+                i.pointer.button_pressed(egui::PointerButton::Secondary),
+                i.pointer.button_down(egui::PointerButton::Secondary),
+                i.viewport().fullscreen.unwrap_or(false),
+                i.focused,
+                i.viewport().outer_rect,
+            )
+        });
+        // A drag ends with the button, in full screen, and with the focus: the
+        // release of a window that lost it never comes.
+        if !down || full_screen || !focused {
+            self.right_drag = None;
+            return;
+        }
+        // Only a press begins a drag, never a button that is down already.
+        if self.right_drag.is_none() && !pressed {
+            return;
+        }
+        let Some(cursor) = (self.cursor_source)() else {
+            return;
+        };
+        // egui's own scale, the UI zoom in it: the window's rect and the
+        // `OuterPosition` command are both in points of it.
+        let pixels_per_point = ctx.pixels_per_point();
+        let drag = match &mut self.right_drag {
+            Some(drag) => drag,
+            None => {
+                let Some(window) = window else {
+                    return;
+                };
+                self.right_drag
+                    .insert(RightDrag::begin(cursor, window.min, pixels_per_point))
+            }
+        };
+        if let Some(to) = drag.follow(cursor, pixels_per_point) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(to));
+        }
+        // The window follows the cursor frame by frame, not at the 30 per second
+        // of the rest of the time.
+        ctx.request_repaint();
+    }
+
     /// The video texture follows the bus. This runs before the frame is painted,
     /// so the frame that ends a catch-up wait draws the picture that ended it.
     fn update_video_texture(&mut self, ctx: &egui::Context) {
@@ -3654,6 +3713,9 @@ impl TvApp {
                 self.handle_keys(ctx);
             }
         }
+        // The right button moves the borderless window, over the video, the guide
+        // and every overlay alike.
+        self.follow_right_drag(ctx);
 
         // The wait screen of a catch-up pick takes over the full window, and so
         // does the guide when open. The video texture was brought up to date
@@ -4090,6 +4152,29 @@ mod tests {
         painted: Vec<String>,
         /// Every texture the last frame drew (the video is one).
         drawn: Vec<egui::TextureId>,
+        /// What the window tells egui about itself in every frame: where it is,
+        /// the scale of its screen, whether it is full screen. Unknown until a
+        /// test says.
+        viewport: egui::ViewportInfo,
+        /// The window has the keyboard focus.
+        focused: bool,
+        /// What the app told the window since `moved` last looked.
+        window_cmds: Vec<egui::ViewportCommand>,
+        /// How soon the last frame asked for the next one.
+        repaint_in: Duration,
+    }
+
+    thread_local! {
+        /// Where the cursor is on the screen for the app under test (`None`:
+        /// Windows will not say), and how often the app asked. The real cursor
+        /// would be the developer's.
+        static CURSOR: std::cell::Cell<Option<ScreenPos>> = const { std::cell::Cell::new(None) };
+        static CURSOR_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    fn fake_cursor() -> Option<ScreenPos> {
+        CURSOR_READS.set(CURSOR_READS.get() + 1);
+        CURSOR.get()
     }
 
     impl Harness {
@@ -4136,7 +4221,15 @@ mod tests {
                 events,
                 painted: Vec::new(),
                 drawn: Vec::new(),
+                viewport: egui::ViewportInfo::default(),
+                focused: true,
+                window_cmds: Vec::new(),
+                repaint_in: Duration::MAX,
             };
+            // The cursor is the test's: nowhere, and never asked yet.
+            harness.app.cursor_source = fake_cursor;
+            CURSOR.set(None);
+            CURSOR_READS.set(0);
             harness.frame(&[]);
             harness.frame(&[]);
             // The cache file, which the app reads on a thread of its own once its
@@ -4173,12 +4266,19 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1280.0, 720.0),
                 )),
+                viewports: std::iter::once((egui::ViewportId::ROOT, self.viewport.clone()))
+                    .collect(),
                 events,
                 modifiers,
+                focused: self.focused,
                 ..Default::default()
             };
             let app = &mut self.app;
             let output = self.ctx.run(raw, |ctx| app.update_ui(ctx));
+            if let Some(window) = output.viewport_output.get(&egui::ViewportId::ROOT) {
+                self.window_cmds.extend(window.commands.iter().cloned());
+                self.repaint_in = window.repaint_delay;
+            }
             self.painted = output
                 .shapes
                 .iter()
@@ -4227,6 +4327,23 @@ mod tests {
                 sent.push(cmd);
             }
             sent
+        }
+
+        /// Where the app moved the window (the `OuterPosition` commands, in
+        /// points) since the last call.
+        fn moved(&mut self) -> Vec<egui::Pos2> {
+            std::mem::take(&mut self.window_cmds)
+                .into_iter()
+                .filter_map(|cmd| match cmd {
+                    egui::ViewportCommand::OuterPosition(to) => Some(to),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The cursor goes to this pixel of the screen.
+        fn cursor_to(&mut self, x: i32, y: i32) {
+            CURSOR.set(Some((x, y)));
         }
 
         /// Presses Tab until the keyboard is on the widget with this id: whether
@@ -7500,5 +7617,313 @@ mod tests {
             "{:?}",
             h.painted
         );
+    }
+
+    // ---- the right mouse button moves the borderless window ----
+
+    /// The right mouse button going down or up.
+    fn right_button(pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: egui::pos2(640.0, 360.0),
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// The app has not moved the window.
+    const NO_MOVES: [egui::Pos2; 0] = [];
+
+    /// A window of 1280 x 720 points with its outer corner at `corner`.
+    fn window_rect(corner: egui::Pos2) -> egui::Rect {
+        egui::Rect::from_min_size(corner, egui::vec2(1280.0, 720.0))
+    }
+
+    /// The app, with its window at (`x`, `y`) points on a screen of `scale`
+    /// pixels to a point, and the border still on.
+    fn app_with_window(x: f32, y: f32, scale: f32) -> (tempfile::TempDir, Harness) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        h.viewport.outer_rect = Some(window_rect(egui::pos2(x, y)));
+        h.viewport.native_pixels_per_point = Some(scale);
+        h.frame(&[]);
+        (dir, h)
+    }
+
+    /// `app_with_window` with the border off (the `t` key).
+    fn borderless_app_with_window(x: f32, y: f32, scale: f32) -> (tempfile::TempDir, Harness) {
+        let (dir, mut h) = app_with_window(x, y, scale);
+        h.press(&[Key::T]);
+        assert!(h.app.borderless, "the t key took the border off");
+        (dir, h)
+    }
+
+    /// The right button goes down with the cursor at `from`, the cursor goes on to
+    /// `to` a frame later, and the button goes up: where the app moved the window.
+    fn drag_with_the_right_button(
+        h: &mut Harness,
+        from: ScreenPos,
+        to: ScreenPos,
+    ) -> Vec<egui::Pos2> {
+        h.cursor_to(from.0, from.1);
+        h.frame_with(vec![right_button(true)]);
+        h.cursor_to(to.0, to.1);
+        h.frame(&[]);
+        h.frame_with(vec![right_button(false)]);
+        h.moved()
+    }
+
+    /// A drag under way in a borderless window at (300, 200) points, scale 1: the
+    /// button went down at pixel (500, 400), the cursor went on to (600, 450), the
+    /// window moved to (400, 250), and the button is still down.
+    fn start_dragging(h: &mut Harness) {
+        h.cursor_to(500, 400);
+        h.frame_with(vec![right_button(true)]);
+        h.cursor_to(600, 450);
+        h.frame(&[]);
+        assert_eq!(
+            h.moved(),
+            [egui::pos2(400.0, 250.0)],
+            "the drag is under way"
+        );
+    }
+
+    /// The cursor goes on moving, two frames' worth, and the window stays where it
+    /// is (two, so that a drag that began in the first would show in the second).
+    fn assert_the_window_stays_put(h: &mut Harness, why: &str) {
+        for (x, y) in [(700, 500), (800, 600)] {
+            h.cursor_to(x, y);
+            h.frame(&[]);
+            assert_eq!(h.moved(), NO_MOVES, "{why}, the cursor at ({x}, {y})");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_right_button_moves_the_borderless_window_as_far_as_the_cursor_moves_on_the_screen()
+    {
+        // The cursor moves 100 pixels right and 50 down, then 60 left and 30 up
+        // of where it began. (scale, the window's first place, its second)
+        for (scale, first, second) in [
+            (1.0, egui::pos2(400.0, 250.0), egui::pos2(240.0, 170.0)),
+            (
+                1.5,
+                egui::pos2(300.0 + 100.0 / 1.5, 200.0 + 50.0 / 1.5),
+                egui::pos2(300.0 - 60.0 / 1.5, 200.0 - 30.0 / 1.5),
+            ),
+        ] {
+            let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, scale);
+            h.cursor_to(500, 400);
+            h.frame_with(vec![right_button(true)]);
+            assert_eq!(
+                h.moved(),
+                NO_MOVES,
+                "scale {scale}: the press moves nothing"
+            );
+            for (cursor, goes_to) in [((600, 450), first), ((440, 370), second)] {
+                h.cursor_to(cursor.0, cursor.1);
+                h.frame(&[]);
+                let moved = h.moved();
+                assert_eq!(
+                    moved.len(),
+                    1,
+                    "scale {scale}, cursor {cursor:?}: {moved:?}"
+                );
+                assert!(
+                    (moved[0] - goes_to).length() < 0.01,
+                    "scale {scale}, cursor {cursor:?}: {:?}, not {goes_to:?}",
+                    moved[0]
+                );
+                // The cursor stands still, the button stays down: nothing more.
+                h.frame(&[]);
+                h.frame(&[]);
+                assert_eq!(
+                    h.moved(),
+                    NO_MOVES,
+                    "scale {scale}: the cursor did not move"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_window_keeps_up_with_the_cursor_though_the_pointer_in_it_shifts_as_it_moves() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        // The window moves at once when told to, but reports its place (`outer_rect`)
+        // a frame late: `stale` is where it was a frame ago.
+        let mut really = egui::pos2(300.0, 200.0);
+        let mut stale = really;
+        // The pointer in the window is the cursor on the screen minus the window's
+        // corner: it changes whenever the window moves, so a drag that went by it
+        // would chase its own tail, and one that went by the window's place in
+        // every frame would be a frame behind.
+        let pointer = |really: egui::Pos2, x: i32, y: i32| {
+            egui::Event::PointerMoved(egui::pos2(x as f32, y as f32) - really.to_vec2())
+        };
+        h.cursor_to(500, 400);
+        h.viewport.outer_rect = Some(window_rect(stale));
+        h.frame_with(vec![pointer(really, 500, 400), right_button(true)]);
+        for (x, y) in [
+            (520, 410),
+            (560, 420),
+            (560, 420),
+            (640, 480),
+            (640, 480),
+            (600, 430),
+        ] {
+            h.cursor_to(x, y);
+            h.viewport.outer_rect = Some(window_rect(stale));
+            h.frame_with(vec![pointer(really, x, y)]);
+            stale = really;
+            if let Some(&to) = h.moved().last() {
+                really = to;
+            }
+            assert_eq!(
+                really,
+                egui::pos2(300.0 + (x - 500) as f32, 200.0 + (y - 400) as f32),
+                "the cursor at ({x}, {y})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_window_with_a_border_is_not_moved_by_the_right_button() {
+        let (_dir, mut h) = app_with_window(300.0, 200.0, 1.0);
+        let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
+        assert_eq!(moved, NO_MOVES, "with a border");
+        assert_eq!(CURSOR_READS.get(), 0, "the cursor was not even asked for");
+        // The very same gesture moves the window once the border is gone ...
+        h.press(&[Key::T]);
+        let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
+        assert_eq!(moved, [egui::pos2(400.0, 250.0)], "borderless");
+        // ... and no more once it is back.
+        h.press(&[Key::T]);
+        let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
+        assert_eq!(moved, NO_MOVES, "with the border back");
+    }
+
+    #[tokio::test]
+    async fn letting_go_of_the_right_button_ends_the_drag() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
+        assert_eq!(moved, [egui::pos2(400.0, 250.0)]);
+        // The button is up and the cursor goes on: the window stays.
+        h.cursor_to(900, 700);
+        h.frame(&[]);
+        h.frame(&[]);
+        assert_eq!(h.moved(), NO_MOVES, "after the release");
+        // The next press begins a drag of its own, from where the cursor is now.
+        h.frame_with(vec![right_button(true)]);
+        h.cursor_to(950, 720);
+        h.frame(&[]);
+        assert_eq!(h.moved(), [egui::pos2(350.0, 220.0)], "a new drag");
+    }
+
+    #[tokio::test]
+    async fn nothing_moves_in_full_screen() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        h.viewport.fullscreen = Some(true);
+        h.frame(&[]);
+        let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
+        assert_eq!(moved, NO_MOVES, "in full screen");
+        h.viewport.fullscreen = Some(false);
+        h.frame(&[]);
+        let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
+        assert_eq!(moved, [egui::pos2(400.0, 250.0)], "out of full screen");
+    }
+
+    #[tokio::test]
+    async fn a_drag_ends_when_the_window_goes_full_screen_and_stays_ended() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        start_dragging(&mut h);
+        h.viewport.fullscreen = Some(true);
+        assert_the_window_stays_put(&mut h, "in full screen");
+        // Out of it, the button still down: a drag begins with a press.
+        h.viewport.fullscreen = Some(false);
+        assert_the_window_stays_put(&mut h, "out of full screen, no new press");
+    }
+
+    #[tokio::test]
+    async fn a_drag_ends_when_the_window_loses_the_focus_and_stays_ended() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        start_dragging(&mut h);
+        // The release goes to whatever has the focus now, egui never sees it.
+        h.focused = false;
+        assert_the_window_stays_put(&mut h, "without the focus");
+        h.focused = true;
+        assert_the_window_stays_put(&mut h, "focus back, no new press");
+    }
+
+    #[tokio::test]
+    async fn a_drag_ends_when_the_border_comes_back_and_stays_ended() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        start_dragging(&mut h);
+        h.press(&[Key::T]);
+        assert_the_window_stays_put(&mut h, "with the border back");
+        // Borderless again, the button still down: a drag begins with a press.
+        h.press(&[Key::T]);
+        assert_the_window_stays_put(&mut h, "borderless again, no new press");
+    }
+
+    #[tokio::test]
+    async fn a_cursor_windows_will_not_give_leaves_the_window_where_it_is() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        start_dragging(&mut h);
+        CURSOR.set(None);
+        h.frame(&[]);
+        assert_eq!(h.moved(), NO_MOVES, "no cursor");
+        // It is back, a little further: the drag goes on from where it began.
+        h.cursor_to(650, 480);
+        h.frame(&[]);
+        assert_eq!(h.moved(), [egui::pos2(450.0, 280.0)]);
+    }
+
+    #[tokio::test]
+    async fn a_zoomed_ui_does_not_scale_the_drag() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        // The UI zoom (Ctrl +) doubles the size of a point: it is two pixels now,
+        // and the window, at pixel (600, 400), is at point (300, 200) still.
+        h.ctx.set_zoom_factor(2.0);
+        h.frame(&[]);
+        assert_eq!(h.ctx.pixels_per_point(), 2.0);
+        // The cursor's 100 pixels right and 50 down are 50 and 25 points.
+        let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
+        assert_eq!(moved, [egui::pos2(350.0, 225.0)]);
+    }
+
+    #[tokio::test]
+    async fn a_drag_costs_cursor_reads_and_quick_frames_only_while_it_lasts() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        // Borderless but no button: the app's own pace, and the cursor is not asked.
+        for _ in 0..12 {
+            h.frame(&[]);
+        }
+        h.frame_with(vec![egui::Event::PointerMoved(egui::pos2(100.0, 100.0))]);
+        for _ in 0..12 {
+            h.frame(&[]);
+        }
+        assert_eq!(CURSOR_READS.get(), 0, "idle: the cursor is not asked for");
+        assert!(h.repaint_in > Duration::ZERO, "idle: {:?}", h.repaint_in);
+        // The button down: the cursor is read, and the next frame is asked for at
+        // once, the cursor moving or standing still.
+        h.cursor_to(500, 400);
+        h.frame_with(vec![right_button(true)]);
+        for i in 0..4 {
+            h.cursor_to(510 + i, 400);
+            h.frame(&[]);
+        }
+        for _ in 0..4 {
+            h.frame(&[]);
+        }
+        assert!(CURSOR_READS.get() >= 8, "reads: {}", CURSOR_READS.get());
+        assert_eq!(h.repaint_in, Duration::ZERO, "dragging");
+        // Let go: back to idle, with no more reads.
+        h.frame_with(vec![right_button(false)]);
+        for _ in 0..12 {
+            h.frame(&[]);
+        }
+        let reads = CURSOR_READS.get();
+        h.frame(&[]);
+        assert_eq!(CURSOR_READS.get(), reads, "after the release");
+        assert!(h.repaint_in > Duration::ZERO, "after: {:?}", h.repaint_in);
     }
 }
