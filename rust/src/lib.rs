@@ -16,6 +16,7 @@ pub mod guide;
 pub mod guide_ui;
 pub mod i18n;
 pub mod legacy;
+pub mod m3u;
 pub mod news;
 pub mod pin;
 pub mod playback_health;
