@@ -2593,21 +2593,25 @@ impl TvApp {
             self.end_right_drag("border back");
             return;
         }
-        let (pressed, down, full_screen, focused, window) = ctx.input(|i| {
+        let (pressed, down, full_screen, maximized, focused, window) = ctx.input(|i| {
             (
                 i.pointer.button_pressed(egui::PointerButton::Secondary),
                 i.pointer.button_down(egui::PointerButton::Secondary),
                 i.viewport().fullscreen.unwrap_or(false),
+                i.viewport().maximized.unwrap_or(false),
                 i.focused,
                 i.viewport().outer_rect,
             )
         });
-        // A drag ends with the button, in full screen, and with the focus: the
+        // A drag ends with the button, in full screen, maximized (the first move
+        // would restore the window and it would jump) and with the focus: the
         // release of a window that lost it never comes.
         let ends = if !down {
             Some("released")
         } else if full_screen {
             Some("full screen")
+        } else if maximized {
+            Some("maximized")
         } else if !focused {
             Some("focus lost")
         } else {
@@ -7898,6 +7902,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nothing_moves_in_a_maximized_window() {
+        // Win+Up: the first move would restore it, and the window would jump.
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        h.viewport.maximized = Some(true);
+        h.frame(&[]);
+        let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
+        assert_eq!(moved, NO_MOVES, "maximized");
+        h.viewport.maximized = Some(false);
+        h.frame(&[]);
+        let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
+        assert_eq!(moved, [egui::pos2(400.0, 250.0)], "restored");
+    }
+
+    #[tokio::test]
+    async fn a_drag_ends_when_the_window_is_maximized_and_stays_ended() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        start_dragging(&mut h);
+        h.viewport.maximized = Some(true);
+        assert_the_window_stays_put(&mut h, "maximized");
+        // Restored, the button still down: a drag begins with a press.
+        h.viewport.maximized = Some(false);
+        assert_the_window_stays_put(&mut h, "restored, no new press");
+    }
+
+    #[tokio::test]
     async fn a_drag_ends_when_the_window_loses_the_focus_and_stays_ended() {
         let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
         start_dragging(&mut h);
@@ -8006,6 +8035,12 @@ mod tests {
         h.frame(&[]);
         h.viewport.fullscreen = Some(false);
         h.frame_with(vec![right_button(false)]);
+        // Ended by the window being maximized.
+        start_dragging(&mut h);
+        h.viewport.maximized = Some(true);
+        h.frame(&[]);
+        h.viewport.maximized = Some(false);
+        h.frame_with(vec![right_button(false)]);
         // Ended by the focus going.
         start_dragging(&mut h);
         h.focused = false;
@@ -8032,6 +8067,8 @@ mod tests {
                 "released",
                 "begins",
                 "full screen",
+                "begins",
+                "maximized",
                 "begins",
                 "focus lost",
                 "begins",
