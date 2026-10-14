@@ -2590,7 +2590,7 @@ impl TvApp {
     /// call, no command, no repaint.
     fn follow_right_drag(&mut self, ctx: &egui::Context) {
         if !self.borderless {
-            self.right_drag = None;
+            self.end_right_drag("border back");
             return;
         }
         let (pressed, down, full_screen, focused, window) = ctx.input(|i| {
@@ -2604,8 +2604,17 @@ impl TvApp {
         });
         // A drag ends with the button, in full screen, and with the focus: the
         // release of a window that lost it never comes.
-        if !down || full_screen || !focused {
-            self.right_drag = None;
+        let ends = if !down {
+            Some("released")
+        } else if full_screen {
+            Some("full screen")
+        } else if !focused {
+            Some("focus lost")
+        } else {
+            None
+        };
+        if let Some(why) = ends {
+            self.end_right_drag(why);
             return;
         }
         // Only a press begins a drag, never a button that is down already.
@@ -2624,8 +2633,11 @@ impl TvApp {
                 let Some(window) = window else {
                     return;
                 };
-                self.right_drag
-                    .insert(RightDrag::begin(cursor, window.min, pixels_per_point))
+                let drag = RightDrag::begin(cursor, window.min, pixels_per_point);
+                tracing::debug!(
+                    "window drag: begins ({drag:?}, {pixels_per_point} pixels to a point)"
+                );
+                self.right_drag.insert(drag)
             }
         };
         if let Some(to) = drag.follow(cursor, pixels_per_point) {
@@ -2634,6 +2646,13 @@ impl TvApp {
         // The window follows the cursor frame by frame, not at the 30 per second
         // of the rest of the time.
         ctx.request_repaint();
+    }
+
+    /// Ends the drag of the window, if one runs, and says why in the log.
+    fn end_right_drag(&mut self, why: &str) {
+        if self.right_drag.take().is_some() {
+            tracing::debug!("window drag: ended ({why})");
+        }
     }
 
     /// The video texture follows the bus. This runs before the frame is painted,
@@ -6353,12 +6372,22 @@ mod tests {
 
     impl LogCapture {
         fn start() -> Self {
+            Self::start_at(tracing::Level::INFO)
+        }
+
+        /// With the debug lines too.
+        fn start_debug() -> Self {
+            Self::start_at(tracing::Level::DEBUG)
+        }
+
+        fn start_at(level: tracing::Level) -> Self {
             let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
             let buffer = LogBuffer::default();
             let sink = buffer.clone();
             let subscriber = tracing_subscriber::fmt()
                 .with_writer(move || sink.clone())
                 .with_ansi(false)
+                .with_max_level(level)
                 .finish();
             Self {
                 buffer,
@@ -7951,5 +7980,64 @@ mod tests {
         h.frame(&[]);
         assert_eq!(CURSOR_READS.get(), reads, "after the release");
         assert!(h.repaint_in > Duration::ZERO, "after: {:?}", h.repaint_in);
+    }
+
+    #[test]
+    fn a_drag_says_in_the_log_when_it_begins_and_why_it_ends_and_never_per_frame() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        let log = LogCapture::start_debug();
+        // Idle frames say nothing.
+        for _ in 0..6 {
+            h.frame(&[]);
+        }
+        // A drag of many frames, ended by the release.
+        h.cursor_to(500, 400);
+        h.frame_with(vec![right_button(true)]);
+        h.cursor_to(600, 450);
+        for _ in 0..6 {
+            h.frame(&[]);
+        }
+        h.frame_with(vec![right_button(false)]);
+        // The moves are not what this test is about.
+        h.moved();
+        // Ended by full screen.
+        start_dragging(&mut h);
+        h.viewport.fullscreen = Some(true);
+        h.frame(&[]);
+        h.viewport.fullscreen = Some(false);
+        h.frame_with(vec![right_button(false)]);
+        // Ended by the focus going.
+        start_dragging(&mut h);
+        h.focused = false;
+        h.frame(&[]);
+        h.focused = true;
+        h.frame_with(vec![right_button(false)]);
+        // Ended by the border coming back.
+        start_dragging(&mut h);
+        h.press(&[Key::T]);
+        let text = log.text();
+        let said: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("window drag"))
+            .map(|line| match line.rsplit_once("ended (") {
+                Some((_, why)) => why.trim_end_matches(')'),
+                None if line.contains("begins") => "begins",
+                None => line,
+            })
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "begins",
+                "released",
+                "begins",
+                "full screen",
+                "begins",
+                "focus lost",
+                "begins",
+                "border back"
+            ],
+            "{text}"
+        );
     }
 }
