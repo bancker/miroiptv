@@ -110,6 +110,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 
 ## Window
 - [ ] F11 → fullscreen toggles
+- [ ] `t` (borderless): hold the right mouse button and drag: the window follows; release stops it; nothing moves in full screen or with a border
 - [ ] Drag bottom-right to resize → video scales, no crash
 - [ ] Alt-F4 → clean exit, no crash report
 
