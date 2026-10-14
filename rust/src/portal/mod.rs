@@ -1,7 +1,9 @@
+pub mod m3u;
 pub mod types;
 pub mod xtream;
 
 use crate::epg::Epg;
+use crate::sources::SourceKind;
 use thiserror::Error;
 pub use types::*;
 
@@ -17,10 +19,28 @@ pub enum PortalError {
     /// mean it is busy).
     #[error("http status {0}")]
     Status(u16),
+    /// An M3U list that is the same as the saved one: nothing to replace.
+    #[error("the list has not changed")]
+    Unchanged,
+    /// What came is no M3U list: an HTML page, or no stream in it.
+    #[error("not a channel list")]
+    NotAList,
+    /// An M3U file that cannot be read: its path and the system's words.
+    #[error("cannot read {0}")]
+    File(String),
 }
 
 #[async_trait::async_trait]
 pub trait Portal: Send + Sync {
+    /// What kind of source this is.
+    fn kind(&self) -> SourceKind {
+        SourceKind::Xtream
+    }
+    /// A catalog to show at once while `fetch_catalog` is under way: an M3U
+    /// source's saved list. None for a portal that keeps none.
+    async fn saved_catalog(&self) -> Option<Catalog> {
+        None
+    }
     async fn fetch_catalog(&self) -> Result<Catalog, PortalError>;
     /// Short "now + next few entries" EPG. Cheap, for the strip overlay
     /// and zap-toast enrichment.
