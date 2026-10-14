@@ -1,0 +1,305 @@
+# Bronnen: M3U-lijsten naast Xtream (ronde 1)
+
+**Datum:** 14 oktober 2026
+**Status:** ontwerp, goedgekeurd in drie delen in het gesprek van 14 okt 2026. Het document zelf moet de gebruiker nog lezen.
+**Basis:** Bongo Player 0.6.1 (`main`, 7885d4f)
+
+## 1. Doel
+
+Bongo Player kent nu één soort bron: een Xtream-portaal (`--xtream user:pass@host:port`, of het portaal in
+`BongoPlayer.ini`). Daarnaast komen M3U-lijsten, voor twee groepen gebruikers:
+
+- **De gebruiker zelf.** Hij wil gratis zenders, zoals de openbare lijst van iptv-org
+  (`https://iptv-org.github.io/iptv/index.m3u`), naast zijn eigen portaal.
+- **Kopers van het latere product.** Veel aanbieders leveren alleen een M3U-link. Zonder M3U kunnen
+  die klanten Bongo niet gebruiken.
+
+De lijst van iptv-org, opgehaald op 13 oktober 2026, ziet er zo uit:
+
+| Kenmerk | Waarde |
+|---|---|
+| Omvang | 2,55 MB, 11.262 zenders |
+| Gegevens per zender | `#EXTINF` met `tvg-id`, `tvg-logo` en `group-title` (soms meer groepen met `;`), gevolgd door de naam en daarna de URL |
+| Soort stream | 97% HLS (`.m3u8`): 8.906 https en 2.347 http. Een handvol is rtmp, srt of mmsh |
+| Extra headers | 1.511 zenders hebben `#EXTVLCOPT`-regels voor de User-Agent of Referer |
+| EPG | De kop wijst met `x-tvg-url` naar één XMLTV-bestand (`guide.xml.gz`) |
+| Groepen | 183 groepen (General, News, Movies, Kids, …), geen volwassenengroepen |
+
+## 2. Beslissingen van de gebruiker
+
+| Vraag | Keuze |
+|---|---|
+| Waarvoor? | Beide: gratis zenders voor hemzelf en M3U-klanten van het product |
+| Hoe gaan bronnen samen? | **Eén bron tegelijk**, te kiezen in de instellingen, zoals in IPTV Smarters en MyTVOnline |
+| Wat komt eerst? | **Ronde 1 is alleen de zenders.** De gids (XMLTV) komt in ronde 2, met een eigen ontwerp |
+| Pincode bij M3U? | **Niets vergrendelen.** Alleen Xtream-portalen kennen volwassen inhoud (vlag `is_adult`) |
+| Aanpak | **A: M3U als tweede soort portaal.** Het levert dezelfde zenderlijst aan, zonder films, series en gids |
+
+## 3. Ontwerp
+
+### 3.1 Bronnen en instellingen
+
+**Het paneel**
+- Het paneel "Portaal" in de instellingen (`o`) heet voortaan **"Bronnen"**. Het toont een lijst met
+  namen, met de actieve bron gemarkeerd.
+- Je kunt een bron **toevoegen, wijzigen, verwijderen en actief maken**.
+
+**Soorten bronnen**
+
+| Soort | Velden |
+|---|---|
+| Xtream | server, gebruiker, wachtwoord, zoals nu (met dezelfde verbindingstest) |
+| M3U | een URL (`http`/`https`) of een pad naar een bestand op schijf |
+
+Elke bron heeft ook een naam die de gebruiker zelf kiest.
+
+**Wisselen en starten**
+- Een andere bron actief maken laadt de zenderlijst van die bron.
+- Bij het opstarten opent de app de bron die als laatste actief was.
+
+**Een M3U-link die eigenlijk een Xtream-portaal is**
+- Herkenning: een M3U-adres van de vorm `…/get.php?username=…&password=…`.
+- De app meldt dat en stelt voor er een Xtream-bron van te maken. Daarmee krijg je films, series,
+  de gids en terugkijken.
+- De gebruiker kiest. Zegt hij nee, dan blijft het een M3U-bron.
+
+**Wachtwoorden en logs**
+- Een M3U-adres kan een gebruiker en wachtwoord bevatten. Het wordt daarom behandeld als
+  inloggegevens:
+  - het staat alleen in `BongoPlayer.ini`;
+  - het komt nooit in een logregel of foutmelding (`redact.rs` maskeert ook de query van een
+    M3U-adres);
+  - het komt nooit in een bestandsnaam.
+
+**Eerste start en eerste bron**
+- **Eerste start na de update:** het huidige portaal (`portal=…` in de ini) wordt automatisch
+  bron 1, met de naam "Portaal" (NL), "Portal" (EN) of "Portal" (DE). Er hoeft niets opnieuw te
+  worden ingevoerd.
+- **Eerste start zonder bron:** het bestaande startscherm vraagt zoals nu om een Xtream-portaal. Het
+  krijgt één regel die zegt dat een M3U-lijst toevoegen kan via de instellingen (`o` → Bronnen).
+  Het formulier zelf verandert niet.
+
+### 3.2 Opslag
+
+**`BongoPlayer.ini`**
+- De ini bewaart alle bronnen (naam, soort, adres) en welke bron actief is.
+- De bestaande regel `portal=user:pass@host:port` blijft voor de eerste Xtream-bron staan. Zo
+  start een terugstap naar 0.6.1 nog steeds op het portaal.
+- Wegschrijven gebeurt zoals nu: eerst een tijdelijk bestand, dat daarna het oude vervangt.
+
+**Gegevens per bron**
+- Favorieten, presets en de laatst gekeken zender worden per bron bewaard. Een bron krijgt bij het
+  aanmaken een korte, vaste id. Die hangt niet af van het adres, zodat favorieten blijven als je het
+  adres wijzigt.
+- De bestaande `favorites.json`, `presets.json` en `last_watched.json` horen bij bron 1.
+- `settings.json` (taal, nieuwsregels, pincode) blijft voor alle bronnen samen.
+
+**Bewaarde lijsten**
+- De laatst opgehaalde lijst van een M3U-bron staat in `config\cache\m3u-<bron-id>.m3u`. In de
+  bestandsnaam staat geen adres.
+- Een verwijderde bron neemt zijn cachebestand en zijn eigen gegevens mee.
+
+**De credentialscan**
+- `rust/e2e/check-staged.sh` controleert nu alle gebruikers, wachtwoorden en M3U-adressen uit de ini,
+  niet alleen de eerste regel met een `@`.
+
+### 3.3 Laden
+
+**Een M3U-bron met een URL**
+- De app toont meteen de bewaarde lijst uit `config\cache\`.
+- Daarna haalt hij op de achtergrond de nieuwe lijst op, met dezelfde HTTP-client en User-Agent als
+  het portaal en een time-out. Is die anders, dan vervangt hij de oude, en de cache wordt bijgewerkt.
+- Opstarten en het hervatten van de laatste zender wachten nooit op de download: hervatten gebruikt
+  het adres uit de bewaarde lijst.
+
+**Een M3U-bron met een bestand**
+- De app leest het bestand direct, op een eigen thread. Er is geen cache nodig.
+
+**Als het misgaat**
+- Mislukt de download, dan blijft de bewaarde lijst staan, met een korte melding: "Zenderlijst niet
+  bijgewerkt" (NL, EN, DE).
+- Zonder bewaarde lijst toont de app dezelfde lege toestand en melding als bij een onbereikbaar
+  portaal.
+
+**Opnieuw ophalen**
+- F5 haalt de lijst opnieuw op, zoals nu bij de catalogus van het portaal.
+- De gids en andere onderdelen die de catalogusversie volgen, volgen ook de M3U-lijst.
+
+### 3.4 Inlezen
+
+**Algemeen**
+- Het inlezen gebeurt op een eigen thread en is tolerant. Het accepteert een BOM, CRLF en een
+  ontbrekende `#EXTM3U`-kop.
+- **Kapotte regels:**
+  - een `#EXTINF` zonder URL wordt overgeslagen;
+  - een URL zonder `#EXTINF` wordt een zender met de URL als naam;
+  - onbekende `#`-regels worden genegeerd.
+
+**Kop**
+- `x-tvg-url`, of `url-tvg`, wordt bewaard voor ronde 2. In ronde 1 doet de app er niets mee.
+
+**`#EXTINF`**
+- De naam is de tekst na de laatste komma buiten aanhalingstekens.
+- De kenmerken zijn `tvg-id`, `tvg-name`, `tvg-logo` en `group-title`. Een groep kan meer namen
+  bevatten, gescheiden door `;`.
+- Waarden staan tussen dubbele aanhalingstekens. Onbekende kenmerken worden genegeerd.
+
+**`#EXTVLCOPT`**
+- `http-user-agent` en `http-referrer` gelden voor de eerstvolgende zender.
+
+### 3.5 De zenderlijst
+
+**Volgorde en zappen**
+- De volgorde is die van het bestand.
+- Er worden geen varianten samengevoegd. De samenvoeging op basis van kwaliteit in `catalog.rs` is
+  gemaakt voor de naamgeving van het Xtream-portaal en blijft alleen voor Xtream.
+- ↑/↓ zapt door de lijst, met `zap.rs` voor het tempo, zoals nu.
+- Zoeken (`f`), favorieten (`*`, Shift+F), presets (cijfers) en het nieuws (`n`, op naam) werken zoals
+  nu over de zenders van de actieve bron.
+
+**Vaste sleutels**
+- Elke zender krijgt een vaste sleutel:
+  - de `tvg-id`, als die er is en uniek is in de lijst;
+  - anders de naam;
+  - een volgende zender met dezelfde sleutel krijgt "#2", "#3", enzovoort, in de volgorde van het
+    bestand.
+- De `stream_id` (i64) die de rest van de app gebruikt, is een stabiele hash van die sleutel.
+  Favorieten en presets blijven daardoor staan als de aanbieder de volgorde of de adressen van zijn
+  lijst verandert.
+- Voor die hash gebruik je een vaste functie: de eerste 8 bytes van SHA-256, via `ring`, dat al een
+  afhankelijkheid is, teruggebracht tot een positieve i64. Gebruik niet `DefaultHasher`: die belooft
+  niet dezelfde uitkomst over Rust-versies heen.
+
+**De gids**
+- `GuideChannel`s zijn er voor een M3U-bron niet: de lijst kent geen terugkijken.
+- `g` toont een melding in NL, EN en DE: "Voor deze bron is er nog geen gids".
+
+### 3.6 Afspelen
+
+**Een M3U-zender**
+- De zender gaat rechtstreeks naar mpv, niet via de relay. De relay is er voor het Xtream-portaal
+  (één sessie per account, de weigeringen 407/503/509) en blijft alleen voor Xtream.
+- Heeft de zender een User-Agent of Referer, dan geeft de app die alleen voor die ene load aan mpv
+  mee, als opties per bestand. De volgende load gebruikt weer de standaard.
+
+**Bewaking en fouten**
+- De bewaking blijft gewoon werken: de controle op een bevroren beeld (`playback_health.rs`, zoals
+  bij live) en het automatisch herladen bij een onverwacht einde (`ReloadBudget`).
+- **Een dode zender** (404, time-out, of alleen in het eigen land te zien):
+  - de bestaande foutmelding met de naam van de zender;
+  - de app blijft op die zender staan en springt niet vanzelf door.
+- RTMP, SRT en MMS worden doorgegeven aan mpv en werken als de meegeleverde libmpv ze kent.
+
+### 3.7 Wat een M3U-bron in ronde 1 niet heeft
+
+- **Films en series als aparte soort.** In een M3U zijn dat gewoon zenders in hun groep.
+- **De gids, de EPG in de zapmelding en terugkijken.** De zapmelding toont alleen de naam.
+- **Logo's.** Die staan nu alleen in de gids en komen in ronde 2.
+- **De pincode.** Die doet niets bij een M3U-bron (beslissing 2).
+- **Meer bronnen tegelijk** (beslissing 2).
+
+### 3.8 Prestaties
+
+Snelheid gaat voor alles. De grenzen:
+
+| Onderwerp | Grens |
+|---|---|
+| Opstarten en zappen | Niet trager dan 0.6.1. Dat wordt gemeten met de startmeting tegen 0.6.1, met een Xtream-bron en met een actieve M3U-bron van ongeveer 11.000 zenders |
+| Inlezen | 11.000 zenders in minder dan 100 ms (release), op een eigen thread. De UI-thread doet alleen het overzetten |
+| Geheugen | Minder dan 10 MB extra voor een lijst van 11.000 zenders. Daarvan worden alleen de velden bewaard die ronde 1 gebruikt, plus `tvg-id`, `tvg-logo` en de `x-tvg-url` voor ronde 2 |
+| Per frame | Geen werk dat meegroeit met de lijst. Zoeken blijft gebonden aan de toetsaanslagen, zoals nu |
+
+## 4. Foutafhandeling
+
+| Situatie | Wat de gebruiker ziet |
+|---|---|
+| Download mislukt, wel een bewaarde lijst | De oude lijst, plus de melding "Zenderlijst niet bijgewerkt" |
+| Download mislukt, geen bewaarde lijst | De lege toestand en de melding, zoals bij een onbereikbaar portaal |
+| Geen M3U (bijvoorbeeld HTML of een lege lijst) | De melding "Dit is geen zenderlijst", zonder de lijst te vervangen |
+| Bestand niet gevonden of niet leesbaar | Een melding met het pad, maar zonder inloggegevens |
+| Dode zender | De bestaande foutmelding; de app blijft op de zender staan |
+| Ongeldige invoer in de instellingen | Opslaan kan niet, met een melding bij het veld. Dat geldt voor een lege naam en een adres dat geen http(s)-URL of bestaand bestand is |
+
+## 5. Privacy en beveiliging
+
+- Inloggegevens, ook die in een M3U-adres, staan alleen in `BongoPlayer.ini`. Ze komen nooit in
+  logs, foutmeldingen, cachebestandsnamen of de zapmelding.
+- De cache bevat de lijst zoals de aanbieder hem levert. Een M3U van een betaalde aanbieder kan in
+  de stream-URL's zelf gebruikersnamen bevatten. Daarom staat de cache onder `config\`, net als de
+  andere gegevens van de gebruiker. Hij komt niet naast de exe en gaat nooit mee in een zip.
+
+## 6. Testen
+
+**Unit-tests**
+- Het inlezen:
+  - kenmerken, ook meer groepen in één veld;
+  - de headers via `#EXTVLCOPT`;
+  - een BOM, CRLF, een ontbrekende kop en kapotte regels;
+  - de `x-tvg-url`.
+- De sleutels: een unieke `tvg-id`, en dubbele namen die "#2" krijgen.
+- Het herkennen van een Xtream-link.
+- De bronnen in de ini: lezen, schrijven, de overgang van `portal=` en het laten staan van die regel.
+- `redact` op een M3U-adres met een wachtwoord.
+
+De testlijst is zelfgemaakt in het formaat van iptv-org, zonder echte adressen.
+
+**App-tests** (`app::tests::Harness`, zonder venster)
+- Wisselen van bron, waarbij de bewaarde lijst vóór de download verschijnt.
+- Een mislukte download, waarbij de oude lijst blijft staan.
+- Zappen en zoeken in een M3U-lijst.
+- Afspelen:
+  - een `LoadUrl` rechtstreeks naar de URL van de zender, niet via de relay;
+  - met de User-Agent en Referer van die zender;
+  - de volgende load zonder die headers.
+- Een dode zender geeft de melding.
+- `g` meldt dat er nog geen gids is.
+- Favorieten en presets worden per bron bewaard.
+- De pincode doet niets bij een M3U-bron.
+
+**Prestatietest**
+- 11.000 zenders inlezen binnen de grens uit §3.8. In debug geldt een ruimere grens, met de
+  release-meting in het verslag.
+
+**Nepserver en venstertests** (alleen met toestemming van de gebruiker)
+- `mock_portal.py` krijgt met `MOCK_M3U=1` een lijst van ongeveer 20 zenders op de eigen
+  HLS-segmenten:
+  - één zender speelt alleen met de juiste User-Agent;
+  - één zender is dood (404).
+- Nieuwe scenario's:
+  - een M3U-bron toevoegen via `o`;
+  - van bron wisselen;
+  - zappen en zoeken;
+  - de zender met de User-Agent;
+  - de dode zender.
+- De hele regressieset (nu 101 scenario's) moet daarna weer slagen. Scenario's van deel 1 die Tabs
+  tellen in het oude paneel "Portaal", worden aangepast waar het paneel verandert.
+
+**Startmeting** tegen 0.6.1, zie §3.8.
+
+## 7. Documentatie
+
+- **`docs/VALIDATION.md`** krijgt een sectie "Bronnen (M3U)" met de handmatige controles.
+- **`CLAUDE.md`**:
+  - `portal/m3u.rs` als tweede `Portal`;
+  - de relay alleen voor Xtream;
+  - opslag per bron;
+  - M3U-adressen gelden als inloggegevens.
+- **`rust/README.md`**: bronnen en M3U.
+
+## 8. Ronde 2 (buiten dit ontwerp)
+
+- XMLTV via `x-tvg-url` (of een eigen URL): nu en straks in de zapmelding, en de gids (`g`) voor
+  M3U-zenders.
+- Logo's uit `tvg-logo`.
+
+Ronde 2 krijgt een eigen ontwerp. Het XMLTV-bestand van iptv-org is groot, en een kleine
+geheugenvoetafdruk vraagt een eigen aanpak.
+
+## 9. Risico's
+
+| Risico | Gevolg en maatregel |
+|---|---|
+| Het paneel "Portaal" wordt "Bronnen" | e2e-scenario's van deel 1 tellen Tabs. Het Xtream-formulier blijft zo veel mogelijk gelijk, en het formulier van het startscherm verandert niet: het krijgt alleen een tekstregel. Scenario's worden waar nodig aangepast |
+| De LGPL-build van libmpv (het licentieproject) | Kan protocollen als SRT of RTMP laten vallen. Dat is acceptabel: ze zijn zeldzaam en het is "best effort" |
+| Willekeurige servers | Ze gedragen zich anders dan het portaal: trage of dode streams, en vaak een eigen User-Agent. Daarom zijn er de headers per zender en de foutmelding zonder doorspringen |
+| Zappen door 11.000 zenders | Kan traag aanvoelen. `zap.rs` regelt het tempo al, en favorieten en presets zijn de snelle weg |
