@@ -124,7 +124,7 @@ impl Mpv {
     }
 
     pub fn command(&self, args: &[&str]) -> Result<(), MpvError> {
-        let cstrs: Vec<CString> = args.iter().map(|a| CString::new(*a).unwrap()).collect();
+        let cstrs = c_strings(args)?;
         let mut ptrs: Vec<*const std::os::raw::c_char> = cstrs.iter().map(|c| c.as_ptr()).collect();
         ptrs.push(ptr::null());
         check(unsafe { sys::mpv_command(self.handle, ptrs.as_mut_ptr()) })
@@ -172,4 +172,85 @@ pub fn check(rc: i32) -> Result<(), MpvError> {
         }
     };
     Err(MpvError::Code(rc, msg))
+}
+
+/// mpv's `MPV_ERROR_INVALID_PARAMETER`: its catch-all for a parameter that is
+/// invalid (client.h: "used if there is no better error code").
+const MPV_ERROR_INVALID_PARAMETER: i32 = -4;
+
+/// The arguments of a command as C strings. An argument with a NUL byte in it
+/// can be none, and that is an error, not a panic: a list's URL can hold a NUL
+/// (a raw one, or `%00` in a header), and the release build aborts on a panic.
+/// The error does not repeat the argument: it may hold credentials.
+fn c_strings(args: &[&str]) -> Result<Vec<CString>, MpvError> {
+    args.iter()
+        .map(|arg| {
+            CString::new(*arg).map_err(|_| {
+                MpvError::Code(
+                    MPV_ERROR_INVALID_PARAMETER,
+                    "an argument holds a NUL byte".into(),
+                )
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// mpv's `MPV_ERROR_INVALID_PARAMETER`.
+    const INVALID_PARAMETER: i32 = -4;
+
+    /// An `Mpv` with nothing behind it. `command` has to refuse an argument
+    /// with a NUL in it before it calls libmpv, so these tests never reach it.
+    fn handleless() -> Mpv {
+        Mpv {
+            handle: ptr::null_mut(),
+        }
+    }
+
+    #[test]
+    fn a_nul_in_an_argument_is_an_error_not_a_panic() {
+        // A raw NUL byte in a list's URL: from_utf8_lossy keeps it.
+        let err = handleless()
+            .command(&["loadfile", "http://user:secret@a.example/\0x"])
+            .unwrap_err();
+        assert!(
+            matches!(err, MpvError::Code(INVALID_PARAMETER, _)),
+            "{err:?}"
+        );
+        // The argument may hold credentials: the error does not repeat it.
+        assert!(!err.to_string().contains("secret"), "{err}");
+    }
+
+    #[test]
+    fn a_percent_00_in_a_lists_header_value_is_refused_cleanly() {
+        // `%00` in a Kodi-style header decodes to a NUL byte in the option.
+        for url in [
+            "http://a.example/1|User-Agent=a%00b",
+            "http://a.example/1|Referer=a%00b",
+        ] {
+            let args = crate::player::loadfile_args(url);
+            assert!(args.iter().any(|a| a.contains('\0')), "{args:?}");
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let err = handleless().command(&args).unwrap_err();
+            assert!(
+                matches!(err, MpvError::Code(INVALID_PARAMETER, _)),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arguments_without_a_nul_become_the_same_c_strings() {
+        let c = c_strings(&["loadfile", "http://a.example/1", "user-agent=%2%é"]).unwrap();
+        let bytes: Vec<&[u8]> = c.iter().map(|s| s.to_bytes()).collect();
+        let expected: [&[u8]; 3] = [
+            b"loadfile",
+            b"http://a.example/1",
+            "user-agent=%2%é".as_bytes(),
+        ];
+        assert_eq!(bytes, expected);
+    }
 }
