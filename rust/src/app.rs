@@ -7929,6 +7929,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_left_and_the_middle_button_do_not_drag_the_window() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        for button in [egui::PointerButton::Primary, egui::PointerButton::Middle] {
+            let event = |pressed| egui::Event::PointerButton {
+                pos: egui::pos2(640.0, 360.0),
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            h.cursor_to(500, 400);
+            h.frame_with(vec![event(true)]);
+            h.cursor_to(600, 450);
+            h.frame(&[]);
+            h.frame_with(vec![event(false)]);
+            assert_eq!(h.moved(), NO_MOVES, "{button:?}");
+        }
+        assert_eq!(CURSOR_READS.get(), 0, "the cursor was not even asked for");
+        // The right button, in the same place, does.
+        let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
+        assert_eq!(moved, [egui::pos2(400.0, 250.0)], "the right button");
+    }
+
+    #[tokio::test]
+    async fn a_press_while_the_window_does_not_know_its_place_begins_no_drag() {
+        let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
+        h.viewport.outer_rect = None;
+        h.frame(&[]);
+        let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
+        assert_eq!(moved, NO_MOVES, "no place");
+        h.viewport.outer_rect = Some(window_rect(egui::pos2(300.0, 200.0)));
+        h.frame(&[]);
+        let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));
+        assert_eq!(moved, [egui::pos2(400.0, 250.0)], "place known");
+    }
+
+    #[tokio::test]
     async fn letting_go_of_the_right_button_ends_the_drag() {
         let (_dir, mut h) = borderless_app_with_window(300.0, 200.0, 1.0);
         let moved = drag_with_the_right_button(&mut h, (500, 400), (600, 450));

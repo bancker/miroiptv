@@ -233,6 +233,32 @@ mod tests {
     }
 
     #[test]
+    fn the_window_comes_back_to_the_pixel_it_started_at_whatever_the_scale() {
+        // egui hands the window's place over as pixels / scale in f32, and winit
+        // turns what we send back into pixels with round(scale * point). A scale
+        // that is not exactly representable (1.1, 1.25) must not lose a pixel on
+        // the way there and back, or the window would creep with every drag.
+        for scale in [1.0_f32, 1.1, 1.25, 1.375, 1.5, 1.75, 2.0, 3.0] {
+            for px in -4000..4000 {
+                let py = px / 2 + 7;
+                for (dx, dy) in [(-37, 11), (100, 50)] {
+                    let window = pos2(px as f32 / scale, py as f32 / scale);
+                    let mut drag = RightDrag::begin((500, 400), window, scale, VK_RBUTTON);
+                    let to = drag
+                        .follow((500 + dx, 400 + dy), scale)
+                        .expect("the cursor moved");
+                    let pixels = ((to.x * scale).round() as i32, (to.y * scale).round() as i32);
+                    assert_eq!(
+                        pixels,
+                        (px + dx, py + dy),
+                        "scale {scale}, window pixel ({px}, {py}), cursor moved ({dx}, {dy})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_key_is_down_when_bit_15_of_its_state_is_set_and_only_then() {
         assert!(is_down(0x8000_u16 as i16));
         assert!(
