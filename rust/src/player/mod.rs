@@ -14,6 +14,7 @@ use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
 pub enum Cmd {
+    /// Load this URL; it may carry its headers: `url|User-Agent=…&Referer=…` (`loadfile_args`).
     LoadUrl(String),
     Pause(bool),
     /// Stop playing; nothing is loaded afterwards.

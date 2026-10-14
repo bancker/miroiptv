@@ -1,6 +1,8 @@
-use crate::args::{credentials_line, parse_xtream_creds, CredsError, XtreamCreds};
+use crate::args::{
+    credentials_line, parse_xtream_creds, resolve_creds, CredsError, CredsSource, XtreamCreds,
+};
 use crate::catalog::GuideChannel;
-use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, quality_rank, zap_position, CatalogStatus, CatalogStore};
+use crate::catalog::{fallback_variant, normalize_channel_name, quality_label, quality_rank, zap_position, CatalogNotice, CatalogStatus, CatalogStore};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::{Entry as FavoriteEntry, Favorites};
 use crate::guide::fetch::EpgFetcher;
@@ -16,6 +18,7 @@ use crate::pin::{PinGate, PinHash};
 use crate::playback_health::{PlaybackHealth, ReloadBudget};
 use crate::relay::Relay;
 use crate::player::{Cmd, Event, FrameFence, PlayerHandle, RgbaFrame};
+use crate::portal::m3u::M3uPortal;
 use crate::presets::Presets;
 use crate::portal::xtream::ConnCheck;
 use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};
@@ -26,6 +29,7 @@ use crate::settings_ui::{
     SettingsView,
 };
 use crate::shortcuts;
+use crate::sources::{Source, SourceKind, Sources};
 use crate::storage::Storage;
 use crate::window_drag::{self, Mouse, RightDrag};
 use crate::zap::ZapPacer;
@@ -78,9 +82,14 @@ fn resume_decision(flag: Option<bool>, catalog_says_adult: Option<bool>) -> Resu
     }
 }
 
-/// What the catalog says about a stream URL: `None` while it is not loaded. A
-/// catalog that knows nothing is not one that says "not adult".
+/// What the catalog says about a stream URL: `None` while it is not loaded (an
+/// M3U list says "not adult" at once). A catalog that knows nothing is not one
+/// that says "not adult".
 fn catalog_says_adult(catalog: &CatalogStore, url: &str) -> Option<bool> {
+    // An M3U list has no adult content: that is known before it has loaded.
+    if catalog.kind() == SourceKind::M3u {
+        return Some(false);
+    }
     catalog.is_loaded().then(|| catalog.is_adult_url(url))
 }
 
@@ -314,6 +323,75 @@ pub enum PortalState {
     Placeholder,
 }
 
+/// What the app runs on for a saved source.
+pub struct OpenedSource {
+    pub portal: Arc<dyn Portal>,
+    /// The Xtream credentials; none for an M3U list.
+    pub creds: Option<XtreamCreds>,
+    pub state: PortalState,
+}
+
+/// A portal that is never asked anything: what runs while the setup prompt shows.
+pub fn anon_portal() -> Arc<dyn Portal> {
+    Arc::new(XtreamPortal::new(XtreamCreds {
+        username: "anon".into(),
+        password: "anon".into(),
+        host: "127.0.0.1".into(),
+        port: 1,
+    }))
+}
+
+/// The portal of a saved source and the state the app runs in on it: an
+/// Xtream source with placeholder or unreadable credentials shows the setup
+/// prompt. Says in the log which source it is, never an M3U address.
+pub fn open_source(source: &Source, storage: &Storage) -> OpenedSource {
+    let prompt = |state| OpenedSource {
+        portal: anon_portal(),
+        creds: None,
+        state,
+    };
+    match source.kind {
+        SourceKind::M3u => {
+            tracing::info!(
+                "source: m3u {} ({})",
+                source.id,
+                crate::redact::url_host(&source.address)
+            );
+            let cache = storage.m3u_cache_path(source.id);
+            OpenedSource {
+                portal: Arc::new(M3uPortal::new(source.id, &source.address, cache)),
+                creds: None,
+                state: PortalState::Configured,
+            }
+        }
+        SourceKind::Xtream => match resolve_creds(None, Some(&source.address)) {
+            CredsSource::Configured(c, _) => {
+                tracing::info!("portal: xtream <user>@{}:{}", c.host, c.port);
+                OpenedSource {
+                    portal: Arc::new(XtreamPortal::new(c.clone())),
+                    creds: Some(c),
+                    state: PortalState::Configured,
+                }
+            }
+            CredsSource::Placeholder => {
+                tracing::warn!("portal: placeholder credentials - showing the setup prompt");
+                prompt(PortalState::Placeholder)
+            }
+            CredsSource::Missing => {
+                tracing::warn!(
+                    "portal: no credentials (--xtream or {}.ini) - showing the setup prompt",
+                    crate::APP_ID
+                );
+                prompt(PortalState::Missing)
+            }
+            CredsSource::Invalid(e) => {
+                tracing::warn!("portal: unreadable credentials ({e}) - showing the setup prompt");
+                prompt(PortalState::Missing)
+            }
+        },
+    }
+}
+
 /// One pickable past news broadcast.
 #[derive(Clone)]
 struct NewsItem {
@@ -453,6 +531,9 @@ pub struct TvApp {
     /// They came from `--xtream`, which beats the ini on every start: the
     /// settings say that what is saved there only counts without it.
     creds_from_command_line: bool,
+    /// The saved sources (`BongoPlayer.ini`), and the one in use unless the
+    /// portal of `--xtream` runs.
+    sources: Sources,
 
     video_tex: Option<TextureHandle>,
     last_frame_version: u64,
@@ -672,6 +753,7 @@ impl TvApp {
         portal_state: PortalState,
         initial_url: Option<String>,
         relay: Option<Relay>,
+        sources: Sources,
         creds: Option<XtreamCreds>,
         creds_from_command_line: bool,
         settings: Settings,
@@ -695,6 +777,7 @@ impl TvApp {
             portal_state,
             initial_url,
             relay,
+            sources,
             creds,
             creds_from_command_line,
             settings,
@@ -710,6 +793,7 @@ impl TvApp {
         portal_state: PortalState,
         initial_url: Option<String>,
         relay: Option<Relay>,
+        sources: Sources,
         creds: Option<XtreamCreds>,
         creds_from_command_line: bool,
         settings: Settings,
@@ -730,6 +814,7 @@ impl TvApp {
             portal_state,
             creds,
             creds_from_command_line,
+            sources,
             video_tex: None,
             last_frame_version: 0,
             current_idx: None,
@@ -866,6 +951,11 @@ impl TvApp {
         let Some(url) = self.current_url.clone() else {
             return;
         };
+        // A resume before an M3U list was read could not tell the channel's id
+        // (only the list knows it), and up/down would go from the list's end.
+        if self.current_stream_id.is_none() && self.current_live {
+            self.current_stream_id = self.catalog.portal().live_stream_id(&url);
+        }
         let adult = self.catalog.is_adult_url(&url);
         let record = LastWatched {
             url,
@@ -1068,12 +1158,20 @@ impl TvApp {
                 }
             }
             SettingsAction::ResetPin(password) => {
+                // The portal password in use; on an M3U source, the first
+                // saved portal's.
+                let first_saved = self
+                    .sources
+                    .first_xtream()
+                    .and_then(|s| parse_xtream_creds(&s.address).ok())
+                    .map(|c| c.password);
                 let actual = self
                     .creds
                     .as_ref()
-                    .map(|c| c.password.as_str())
-                    .unwrap_or("");
-                if crate::pin::portal_password_ok(&password, actual) {
+                    .map(|c| c.password.clone())
+                    .or(first_saved)
+                    .unwrap_or_default();
+                if crate::pin::portal_password_ok(&password, &actual) {
                     self.settings.pin = None;
                     self.save_settings();
                     // Whoever proved the portal password need not wait out an
@@ -1187,7 +1285,7 @@ impl TvApp {
     /// shortcuts so the "what we're watching" label stays up ~30s.
     fn set_toast_for(&mut self, s: impl Into<String>, secs: u64) {
         let s = s.into();
-        tracing::debug!("toast: {}", s);
+        tracing::debug!("toast: {}", crate::redact::redact(&s));
         self.toast = Some((s, Instant::now(), Duration::from_secs(secs)));
     }
 
@@ -1233,10 +1331,13 @@ impl TvApp {
         // URL stays the current/last-watched one (the relay port changes
         // between runs). Catch-up (and HLS VOD) comes from one portal request
         // there instead of mpv's two, each a playlist generation of seconds.
+        // Only the Xtream portal's: an M3U source's streams come from servers
+        // of every kind, with no session rule, and carry their own headers.
         let hls = url.split('?').next().is_some_and(|p| p.ends_with(".m3u8"));
+        let via_relay = self.catalog.kind() == SourceKind::Xtream;
         let play = match &self.relay {
-            Some(relay) if watchdog => relay.local_url(&url),
-            Some(relay) if hls => relay.vod_url(&url),
+            Some(relay) if via_relay && watchdog => relay.local_url(&url),
+            Some(relay) if via_relay && hls => relay.vod_url(&url),
             _ => url.clone(),
         };
         // After a stop: what is on the bus now is the stopped stream's. Read
@@ -1367,8 +1468,10 @@ impl TvApp {
                         }
                     }
                     // The portal refused this variant to the account: play
-                    // another one of the channel rather than an error.
-                    if reason == "error" && live {
+                    // another one of the channel rather than an error. Only an
+                    // Xtream portal refuses variants; an M3U source has none, and
+                    // its streams skip the relay that sees the refusal.
+                    if reason == "error" && live && self.catalog.kind() == SourceKind::Xtream {
                         let sid = self
                             .current_url
                             .as_deref()
@@ -1389,7 +1492,13 @@ impl TvApp {
                         self.stall_watchdog_armed = false;
                     }
                     if reason == "error" || (reason == "eof" && live) {
-                        self.set_toast(self.t(T::StreamErrorRetry));
+                        // Named: on an M3U list many channels are dead or only
+                        // seen in their own country, and the app stays on it.
+                        let text = match self.current_name.clone() {
+                            Some(name) => self.tr(T::StreamErrorOn, &[&name]),
+                            None => self.t(T::StreamErrorRetry).to_owned(),
+                        };
+                        self.set_toast(text);
                     } else {
                         tracing::debug!("mpv end-file ({}) - toast suppressed", reason);
                     }
@@ -1400,7 +1509,11 @@ impl TvApp {
                         Some(wait) => {
                             wait.failed.get_or_insert(msg);
                         }
-                        None => self.set_toast(self.tr(T::ErrorMsg, &[&msg])),
+                        None => {
+                            if !self.stop_for_refused_load() {
+                                self.set_toast(self.tr(T::ErrorMsg, &[&msg]));
+                            }
+                        }
                     }
                 }
                 Event::PropertyChanged { name, value } => {
@@ -1434,6 +1547,28 @@ impl TvApp {
                 }
             }
         }
+    }
+
+    /// A player error while an M3U channel is still starting is mpv refusing
+    /// the load itself (a list's address or header holds what it cannot take, a
+    /// NUL byte): the stream before it was never replaced and would play on
+    /// under the new channel's name. That stream stops, as a dead channel's
+    /// does, and the toast names the channel; the app stays on it. True when
+    /// the error was dealt with so. (M3U only: an Xtream portal's loads go
+    /// through the relay, with nothing in them mpv can refuse.)
+    fn stop_for_refused_load(&mut self) -> bool {
+        if self.catalog.kind() != SourceKind::M3u || self.stream_starting_since.is_none() {
+            return false;
+        }
+        let Some(name) = self.current_name.clone() else {
+            return false;
+        };
+        let _ = self.player.cmd_tx.send(Cmd::Stop);
+        // Nothing plays to watch, and a reload would be refused again.
+        self.stall_watchdog_armed = false;
+        self.stream_starting_since = None;
+        self.set_toast(self.tr(T::StreamErrorOn, &[&name]));
+        true
     }
 
     fn drain_epg(&mut self) {
@@ -1522,6 +1657,11 @@ impl TvApp {
     }
 
     fn kick_epg_fetch(&mut self, stream_id: i64) {
+        // An M3U list has no EPG in round 1: the zap toast shows the name
+        // alone, and nobody is asked anything.
+        if self.catalog.kind() == SourceKind::M3u {
+            return;
+        }
         // The guide's store has this channel fresh: no request to the portal.
         if let Some(epg) = self.fresh_guide_epg(stream_id) {
             tracing::info!("epg for sid={} from the guide's store", stream_id);
@@ -1615,12 +1755,13 @@ impl TvApp {
             return;
         }
         let url = self.catalog.portal().live_stream_url(sid);
+        // A channel of an M3U list that has no name is named after its address.
         tracing::info!(
             "zap: -> {} (stream_id={}, idx={:?}, prev={:?})",
-            name,
+            crate::redact::redact(name),
             sid,
             idx,
-            self.current_name
+            self.current_name.as_deref().map(crate::redact::redact)
         );
         self.load_url(url, true);
         self.current_idx = idx;
@@ -1652,7 +1793,13 @@ impl TvApp {
     /// Where the playing channel sits in `zap`, also when it was resumed at
     /// startup rather than zapped to (else arrow up lands on the list's end).
     fn zap_index_of_current(&self, zap: &[LiveChannel]) -> Option<usize> {
-        let nav = self.catalog.quality_nav(self.current_stream_id?);
+        let sid = self.current_stream_id?;
+        // Its own entry first: on an M3U list that is the only way to it. In
+        // the deduped Xtream list an entry stands for every variant.
+        if let Some(i) = zap.iter().position(|c| c.stream_id == sid) {
+            return Some(i);
+        }
+        let nav = self.catalog.quality_nav(sid);
         zap_position(zap, nav.ladder.first()?)
     }
 
@@ -1697,11 +1844,16 @@ impl TvApp {
             }
             return;
         }
+        // The list may have changed under the index (an M3U list's fresh copy, a
+        // refetch): an index whose entry is not what plays is found again.
+        let current_idx = self
+            .current_idx
+            .filter(|&i| zap.get(i).map(|c| c.stream_id) == self.current_stream_id);
         let from = self
             .zap_pacer
             .waiting()
             .map(|t| t.2)
-            .or(self.current_idx)
+            .or(current_idx)
             .or_else(|| self.zap_index_of_current(&zap));
         if let Some(i) = shortcuts::next_live_idx(from, zap.len(), delta) {
             let name = zap[i].name.clone();
@@ -1719,15 +1871,17 @@ impl TvApp {
             return;
         };
         let name = ch.name.clone();
-        // Park the up/down cursor on this channel's entry in the deduped zap
-        // list (matched by normalized name) so subsequent zapping continues
-        // from the right place; play the exact sid requested.
+        // Park the up/down cursor on this channel's entry in the zap list so
+        // subsequent zapping continues from the right place; play the exact sid
+        // requested. Its own entry first (on an M3U list two channels may share
+        // a name), else the one that stands for it in the deduped Xtream list
+        // (matched by normalized name).
+        let zap = self.catalog.zap_channels();
         let key = normalize_channel_name(&name);
-        let idx = self
-            .catalog
-            .zap_channels()
-            .iter()
-            .position(|c| normalize_channel_name(&c.name) == key);
+        let idx = zap.iter().position(|c| c.stream_id == sid).or_else(|| {
+            zap.iter()
+                .position(|c| normalize_channel_name(&c.name) == key)
+        });
         self.zap_to(sid, &name, idx);
     }
 
@@ -2291,6 +2445,18 @@ impl TvApp {
         };
     }
 
+    /// What the last fetch of the M3U list has to tell, as a toast: it was not
+    /// updated, or what came was no channel list.
+    fn show_catalog_notice(&mut self) {
+        if let Some(notice) = self.catalog.take_notice() {
+            let key = match notice {
+                CatalogNotice::NotUpdated => T::ListNotUpdated,
+                CatalogNotice::NotAList => T::NotAChannelList,
+            };
+            self.set_toast(self.t(key));
+        }
+    }
+
     /// Keep credentials that logged in: write BongoPlayer.ini (`line` is what
     /// goes in it), then rebuild the catalog live and start fetching - no
     /// restart needed. When the ini cannot be written nothing changes and the
@@ -2552,7 +2718,11 @@ impl TvApp {
             match self.portal_state {
                 PortalState::Configured => {
                     self.catalog.spawn_fetch();
-                    self.set_toast(self.t(T::RetryingPortal));
+                    let key = match self.catalog.kind() {
+                        SourceKind::Xtream => T::RetryingPortal,
+                        SourceKind::M3u => T::FetchingList,
+                    };
+                    self.set_toast(self.t(key));
                 }
                 PortalState::Missing | PortalState::Placeholder => {
                     self.set_toast(self.t(T::NoPortalOpenSettings));
@@ -3203,8 +3373,12 @@ impl TvApp {
                     );
                 }
                 CatalogStatus::Failed(e) => {
+                    let headline = match self.catalog.kind() {
+                        SourceKind::Xtream => T::PortalFetchFailed,
+                        SourceKind::M3u => T::ListFetchFailed,
+                    };
                     ui.label(
-                        egui::RichText::new(self.t(T::PortalFetchFailed))
+                        egui::RichText::new(self.t(headline))
                             .color(Color32::from_rgb(255, 120, 120))
                             .size(20.0),
                     );
@@ -3249,6 +3423,11 @@ impl TvApp {
     /// `g`: the guide opens as it was left (in Nu & straks: on now). From now on
     /// its EPG is fetched in the background.
     fn open_guide(&mut self) {
+        // Round 1 reads no XMLTV guide: an M3U source has none yet.
+        if self.catalog.kind() == SourceKind::M3u {
+            self.set_toast(self.t(T::NoGuideForSource));
+            return;
+        }
         if !self.catalog.is_loaded() {
             self.set_toast(self.t(T::GuideCatalogLoading));
             return;
@@ -3701,6 +3880,7 @@ impl TvApp {
         self.drain_epg();
         self.drain_news_picker();
         self.drain_conn_check();
+        self.show_catalog_notice();
         self.refresh_guide_channels();
         self.tick_epg();
         self.read_epg_cache();
@@ -3835,12 +4015,58 @@ mod tests {
 
     /// A portal that is never asked anything: the catalog only needs one to exist.
     fn idle_portal() -> Arc<dyn Portal> {
-        Arc::new(XtreamPortal::new(XtreamCreds {
+        Arc::new(XtreamPortal::new(test_creds()))
+    }
+
+    /// The Xtream credentials of the tests' portal (`idle_portal`).
+    fn test_creds() -> XtreamCreds {
+        XtreamCreds {
             username: "u".into(),
             password: "p".into(),
             host: "h".into(),
             port: 80,
-        }))
+        }
+    }
+
+    /// Three channels: Kanaal Een; Kanaal Twee, whose server wants its own
+    /// User-Agent and Referer; and a second Kanaal Twee on another server.
+    const TEST_LIST: &str = "#EXTM3U\n\
+#EXTINF:-1 tvg-id=\"Een.nl\" group-title=\"Algemeen\",Kanaal Een\n\
+https://a.example/een.m3u8\n\
+#EXTINF:-1 group-title=\"Algemeen\",Kanaal Twee\n\
+#EXTVLCOPT:http-user-agent=Bongo/1.0\n\
+#EXTVLCOPT:http-referrer=https://www.example.com/\n\
+https://b.example/twee.m3u8\n\
+#EXTINF:-1 group-title=\"Nieuws\",Kanaal Twee\n\
+https://c.example/twee-nieuws.m3u8\n";
+
+    /// The app on an M3U source whose list is `text`, read already.
+    fn m3u_app(root: &std::path::Path, text: &str) -> Harness {
+        m3u_app_with(root, text, None)
+    }
+
+    fn m3u_app_with(root: &std::path::Path, text: &str, relay: Option<Relay>) -> Harness {
+        let (portal, catalog) = M3uPortal::from_text(text).expect("a list");
+        let store = Arc::new(CatalogStore::from_catalog(Arc::new(portal), catalog));
+        Harness::start_with(
+            root,
+            store,
+            PortalState::Configured,
+            None,
+            None,
+            Sources::default(),
+            relay,
+        )
+    }
+
+    /// The URLs among the player commands.
+    fn loads(sent: Vec<Cmd>) -> Vec<String> {
+        sent.into_iter()
+            .filter_map(|c| match c {
+                Cmd::LoadUrl(u) => Some(u),
+                _ => None,
+            })
+            .collect()
     }
 
     /// 3 is a normal channel, 901 and 902 carry the portal's adult flag (the
@@ -4274,13 +4500,37 @@ mod tests {
     }
 
     impl Harness {
-        /// The app as `main` starts it, with `root` as its config folder and
-        /// two quiet frames drawn, so the widgets exist before the first key.
+        /// The app as `main` starts it on the tests' Xtream portal (u:p@h:80
+        /// when configured); see `start_with`.
         fn start(
             root: &std::path::Path,
             catalog: Arc<CatalogStore>,
             state: PortalState,
             initial_url: Option<&str>,
+        ) -> Self {
+            let creds = (state == PortalState::Configured).then(test_creds);
+            Self::start_with(
+                root,
+                catalog,
+                state,
+                initial_url,
+                creds,
+                Sources::default(),
+                None,
+            )
+        }
+
+        /// The app as `main` starts it, with these Xtream credentials (none for
+        /// an M3U source), saved sources and relay, `root` as its config folder,
+        /// and two quiet frames drawn, so the widgets exist before the first key.
+        fn start_with(
+            root: &std::path::Path,
+            catalog: Arc<CatalogStore>,
+            state: PortalState,
+            initial_url: Option<&str>,
+            creds: Option<XtreamCreds>,
+            sources: Sources,
+            relay: Option<Relay>,
         ) -> Self {
             let (cmd_tx, cmds) = tokio::sync::mpsc::unbounded_channel();
             let (events, evt_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -4293,19 +4543,14 @@ mod tests {
                 language: Some("en".into()),
                 ..Settings::default()
             };
-            let creds = (state == PortalState::Configured).then(|| XtreamCreds {
-                username: "u".into(),
-                password: "p".into(),
-                host: "h".into(),
-                port: 80,
-            });
             let app = TvApp::start(
                 player,
                 catalog,
                 Storage::with_root(root.to_path_buf()),
                 state,
                 initial_url.map(str::to_owned),
-                None,
+                relay,
+                sources,
                 creds,
                 false,
                 settings,
@@ -5827,7 +6072,9 @@ mod tests {
             })
             .unwrap();
         h.frame(&[]);
-        let retry = "stream error - zap up or down to retry";
+        // A stream error names what played, a catch-up too (its label is the
+        // channel and the programme).
+        let retry = "stream error on TEST 03 - Journaal -1 - zap up or down to retry";
         assert_eq!(toast(&h).as_deref(), Some(retry));
         assert!(h.app.pending_catchup.is_none());
     }
@@ -8275,5 +8522,620 @@ mod tests {
             ],
             "{text}"
         );
+    }
+
+    // ---- an M3U source ----
+
+    #[tokio::test]
+    async fn an_m3u_channel_plays_straight_from_its_server_with_its_headers_and_the_next_one_without(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Relay::start(crate::relay::RelayConfig::default()).unwrap();
+        let mut h = m3u_app_with(dir.path(), TEST_LIST, Some(relay));
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        h.sent();
+        h.press(&[Key::ArrowDown]); // the second channel: Kanaal Twee, with headers
+        h.press(&[Key::ArrowDown]); // the third: Kanaal Twee on another server, none
+        assert_eq!(
+            loads(h.sent()),
+            [
+                "https://b.example/twee.m3u8|User-Agent=Bongo%2F1.0&Referer=https%3A%2F%2Fwww.example.com%2F",
+                "https://c.example/twee-nieuws.m3u8",
+            ],
+            "straight from the servers, not through the relay"
+        );
+        assert!(h.app.current_live, "the stall watchdog watches it");
+    }
+
+    #[tokio::test]
+    async fn an_xtream_live_channel_still_goes_through_the_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Relay::start(crate::relay::RelayConfig::default()).unwrap();
+        let mut h = Harness::start_with(
+            dir.path(),
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            Sources::default(),
+            Some(relay),
+        );
+        h.sent();
+        h.press(&[Key::ArrowDown]);
+        let loads = loads(h.sent());
+        assert_eq!(loads.len(), 1, "{loads:?}");
+        assert!(loads[0].starts_with("http://127.0.0.1:"), "{loads:?}");
+    }
+
+    #[tokio::test]
+    async fn an_m3u_list_is_searched_and_zapped_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), TEST_LIST);
+        let zap: Vec<String> = h
+            .app
+            .catalog
+            .zap_channels()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(
+            zap,
+            ["Kanaal Een", "Kanaal Twee", "Kanaal Twee"],
+            "nothing merged"
+        );
+        h.frame_with(vec![key_press(Key::F), egui::Event::Text("f".into())]);
+        h.frame(&[]);
+        h.type_text("een");
+        h.sent();
+        h.press(&[Key::Enter]);
+        assert_eq!(loads(h.sent()), ["https://a.example/een.m3u8"]);
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal Een"));
+    }
+
+    #[tokio::test]
+    async fn a_dead_m3u_channel_names_itself_and_the_app_stays_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), TEST_LIST);
+        h.press(&[Key::ArrowDown]);
+        h.sent();
+        h.events
+            .send(Event::EndOfFile {
+                reason: "error".into(),
+            })
+            .unwrap();
+        h.frame(&[]);
+        assert!(
+            h.painted
+                .iter()
+                .any(|t| t == "stream error on Kanaal Twee - zap up or down to retry"),
+            "{:?}",
+            h.painted
+        );
+        for _ in 0..5 {
+            h.frame(&[]);
+        }
+        assert!(loads(h.sent()).is_empty(), "it stays on the channel");
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal Twee"));
+    }
+
+    #[tokio::test]
+    async fn g_on_an_m3u_source_says_there_is_no_guide_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), TEST_LIST);
+        h.frame_with(vec![key_press(Key::G), egui::Event::Text("g".into())]);
+        h.frame(&[]);
+        assert!(!h.app.guide_open);
+        assert!(
+            h.painted
+                .iter()
+                .any(|t| t == "this source has no guide yet"),
+            "{:?}",
+            h.painted
+        );
+    }
+
+    #[tokio::test]
+    async fn unlocking_changes_nothing_on_an_m3u_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), TEST_LIST);
+        let before = h.app.catalog.zap_channels().len();
+        h.app.catalog.set_adult_unlocked(true);
+        assert_eq!(h.app.catalog.zap_channels().len(), before);
+        h.press(&[Key::ArrowDown]);
+        assert!(!h.app.playing_adult());
+        // Known before any list has loaded: a resume never waits for one.
+        let store = CatalogStore::new(Arc::new(M3uPortal::from_text(TEST_LIST).unwrap().0));
+        assert_eq!(
+            catalog_says_adult(&store, "http://h/live/u/p/3.m3u8"),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn up_after_a_resume_continues_from_the_resumed_m3u_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lijst.m3u");
+        std::fs::write(&file, TEST_LIST).unwrap();
+        // What the last start played: Kanaal Twee, headers and all.
+        let (known, catalog) = M3uPortal::from_text(TEST_LIST).unwrap();
+        let twee = known.live_stream_url(catalog.live[1].stream_id);
+        let een = known.live_stream_url(catalog.live[0].stream_id);
+        let record = LastWatched {
+            url: twee.clone(),
+            live: true,
+            adult: Some(false),
+        };
+        record.save(&Storage::with_root(dir.path().to_path_buf()).last_watched_path());
+        // A list not read yet: the resume cannot know the channel's id.
+        let portal = M3uPortal::new(1, &file.display().to_string(), dir.path().join("m3u-1.m3u"));
+        let store = Arc::new(CatalogStore::new(Arc::new(portal)));
+        let mut h = Harness::start_with(
+            dir.path(),
+            store.clone(),
+            PortalState::Configured,
+            None,
+            None,
+            Sources::default(),
+            None,
+        );
+        assert_eq!(loads(h.sent()), [twee], "the resume plays at once");
+        assert_eq!(h.app.current_stream_id, None);
+        store.spawn_fetch();
+        wait_until("the list", || store.is_loaded()).await;
+        h.frame(&[]);
+        h.press(&[Key::ArrowUp]);
+        assert_eq!(loads(h.sent()), [een], "Kanaal Een, the one before Twee");
+    }
+
+    #[tokio::test]
+    async fn zapping_after_the_list_changed_under_it_goes_on_from_the_channel_that_plays() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), TEST_LIST);
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        // Kanaal Twee, at 1.
+        h.press(&[Key::ArrowDown]);
+        // The fresh copy of the list puts a new channel first: Twee is at 2 now.
+        let fresh = format!(
+            "#EXTM3U\n#EXTINF:-1,Nieuw\nhttps://n.example/nieuw.m3u8\n{}",
+            &TEST_LIST["#EXTM3U\n".len()..]
+        );
+        let (portal, catalog) = M3uPortal::from_text(&fresh).unwrap();
+        h.app.catalog = Arc::new(CatalogStore::from_catalog(Arc::new(portal), catalog));
+        h.sent();
+        h.press(&[Key::ArrowDown]);
+        assert_eq!(
+            loads(h.sent()),
+            ["https://c.example/twee-nieuws.m3u8"],
+            "the one after Twee, not the one after place 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_says_the_list_was_not_updated_and_keeps_it() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("m3u-2.m3u");
+        std::fs::write(&cache, TEST_LIST).unwrap();
+        let portal = M3uPortal::new(2, &format!("{}/tv.m3u", server.uri()), cache);
+        let store = Arc::new(CatalogStore::new(Arc::new(portal)));
+        store.spawn_fetch();
+        let mut h = Harness::start_with(
+            dir.path(),
+            store.clone(),
+            PortalState::Configured,
+            None,
+            None,
+            Sources::default(),
+            None,
+        );
+        let said = |h: &Harness| h.painted.iter().any(|t| t == "channel list not updated");
+        for _ in 0..400 {
+            h.frame(&[]);
+            if said(&h) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(said(&h), "{:?}", h.painted);
+        assert_eq!(
+            h.app.catalog.zap_channels().len(),
+            3,
+            "the saved list stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_m3u_list_that_never_came_shows_the_empty_state_in_the_lists_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("weg.m3u");
+        let portal = M3uPortal::new(
+            2,
+            &missing.display().to_string(),
+            dir.path().join("m3u-2.m3u"),
+        );
+        let store = Arc::new(CatalogStore::new(Arc::new(portal)));
+        store.spawn_fetch();
+        wait_until("the failed read", || {
+            matches!(store.status(), CatalogStatus::Failed(_))
+        })
+        .await;
+        let mut h = Harness::start_with(
+            dir.path(),
+            store,
+            PortalState::Configured,
+            None,
+            None,
+            Sources::default(),
+            None,
+        );
+        h.frame(&[]);
+        assert!(
+            h.painted
+                .iter()
+                .any(|t| t == "fetching the channel list failed"),
+            "{:?}",
+            h.painted
+        );
+        assert!(
+            h.painted.iter().any(|t| t.contains("weg.m3u")),
+            "{:?}",
+            h.painted
+        );
+    }
+
+    #[tokio::test]
+    async fn f5_on_an_m3u_source_fetches_the_list_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), TEST_LIST);
+        h.press(&[Key::F5]);
+        assert!(
+            h.painted
+                .iter()
+                .any(|t| t == "fetching the channel list..."),
+            "{:?}",
+            h.painted
+        );
+    }
+
+    #[test]
+    fn the_pin_reset_takes_the_first_saved_portals_password_on_an_m3u_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let (portal, catalog) = M3uPortal::from_text(TEST_LIST).unwrap();
+        let store = Arc::new(CatalogStore::from_catalog(Arc::new(portal), catalog));
+        let sources = Sources::parse(
+            "source=1;xtream;;u:geheim@h:80\nsource=2;m3u;Gratis;https://a.example/tv.m3u\nactive=2\n",
+        );
+        let mut h = Harness::start_with(
+            dir.path(),
+            store,
+            PortalState::Configured,
+            None,
+            None,
+            sources,
+            None,
+        );
+        h.app.settings.pin = Some(PinHash::new("1234").unwrap());
+        h.app
+            .apply_settings_action(SettingsAction::ResetPin("fout".into()));
+        assert_eq!(h.app.adult_note, Some(T::WrongPortalPassword));
+        h.app
+            .apply_settings_action(SettingsAction::ResetPin("geheim".into()));
+        assert!(h.app.settings.pin.is_none());
+    }
+
+    #[test]
+    fn the_pin_reset_has_no_password_to_check_when_no_portal_is_saved_either() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), TEST_LIST);
+        h.app.settings.pin = Some(PinHash::new("1234").unwrap());
+        // An empty password must not match the empty "password" of no portal.
+        h.app
+            .apply_settings_action(SettingsAction::ResetPin(String::new()));
+        assert_eq!(h.app.adult_note, Some(T::WrongPortalPassword));
+        assert!(h.app.settings.pin.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_html_page_instead_of_a_list_says_it_is_no_channel_list_and_keeps_the_saved_one() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string("<html><body>Please log in</body></html>"),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("m3u-2.m3u");
+        std::fs::write(&cache, TEST_LIST).unwrap();
+        let portal = M3uPortal::new(2, &format!("{}/tv.m3u", server.uri()), cache);
+        let store = Arc::new(CatalogStore::new(Arc::new(portal)));
+        store.spawn_fetch();
+        let mut h = Harness::start_with(
+            dir.path(),
+            store,
+            PortalState::Configured,
+            None,
+            None,
+            Sources::default(),
+            None,
+        );
+        let said = |h: &Harness| h.painted.iter().any(|t| t == "this is not a channel list");
+        for _ in 0..400 {
+            h.frame(&[]);
+            if said(&h) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(said(&h), "{:?}", h.painted);
+        assert_eq!(
+            h.app.catalog.zap_channels().len(),
+            3,
+            "the saved list stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_m3u_zap_asks_for_no_epg_and_the_guide_never_starts_fetching() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), TEST_LIST);
+        h.press(&[Key::ArrowDown]);
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal Twee"));
+        assert_eq!(h.app.epg_fetch_pending_for, None, "no request for the zap");
+        h.frame_with(vec![key_press(Key::G), egui::Event::Text("g".into())]);
+        h.frame(&[]);
+        assert!(!h.app.guide_fetching, "and the guide asked for nothing");
+        assert!(h.app.epg_fetcher.in_flight().is_empty());
+    }
+
+    #[tokio::test]
+    async fn plus_and_minus_on_an_m3u_source_say_there_is_no_other_quality() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), TEST_LIST);
+        h.press(&[Key::ArrowDown]);
+        h.sent();
+        for key in ["+", "-"] {
+            h.frame_with(vec![egui::Event::Text(key.into())]);
+            h.frame(&[]);
+            assert!(
+                h.painted.iter().any(|t| t == "quality: no other variant"),
+                "{key}: {:?}",
+                h.painted
+            );
+        }
+        assert!(loads(h.sent()).is_empty(), "nothing else loads");
+    }
+
+    #[tokio::test]
+    async fn a_load_mpv_refuses_stops_the_stream_before_it_and_names_the_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), TEST_LIST);
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        h.press(&[Key::ArrowDown]);
+        h.sent();
+        // mpv could not take the load (a NUL byte in a header of the list): the
+        // stream before it was never replaced, and plays on.
+        let error = |msg: &str| Event::Error { msg: msg.into() };
+        h.events
+            .send(error("mpv error -4: an argument holds a NUL byte"))
+            .unwrap();
+        h.frame(&[]);
+        let named = "stream error on Kanaal Twee - zap up or down to retry";
+        assert!(h.painted.iter().any(|t| t == named), "{:?}", h.painted);
+        assert!(
+            h.sent().iter().any(|c| matches!(c, Cmd::Stop)),
+            "the stream before it stops"
+        );
+        assert!(!h.app.stall_watchdog_armed, "and no reload is tried");
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal Twee"));
+        // Zapping goes on from the channel it stays on.
+        h.press(&[Key::ArrowDown]);
+        assert_eq!(loads(h.sent()), ["https://c.example/twee-nieuws.m3u8"]);
+        // An error once a picture has come is the player's own words again.
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.frame(&[]);
+        h.events.send(error("boom")).unwrap();
+        h.frame(&[]);
+        assert!(
+            h.painted.iter().any(|t| t == "error: boom"),
+            "{:?}",
+            h.painted
+        );
+        assert!(!h.sent().iter().any(|c| matches!(c, Cmd::Stop)));
+    }
+
+    #[tokio::test]
+    async fn an_xtream_portal_shows_a_player_error_as_it_did_and_stops_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        h.press(&[Key::ArrowDown]);
+        h.sent();
+        h.events.send(Event::Error { msg: "boom".into() }).unwrap();
+        h.frame(&[]);
+        assert!(
+            h.painted.iter().any(|t| t == "error: boom"),
+            "{:?}",
+            h.painted
+        );
+        assert!(!h.sent().iter().any(|c| matches!(c, Cmd::Stop)));
+    }
+
+    /// NPO 1 in three qualities, RTL 4 in two, and NOS. The zap list holds the
+    /// best of each: NPO 1 FHD (3), RTL 4 HD (5) and NOS (6).
+    fn variants_catalog() -> Arc<CatalogStore> {
+        let ch = |stream_id: i64, name: &str| LiveChannel {
+            stream_id,
+            name: name.into(),
+            category_id: None,
+            epg_channel_id: None,
+            tv_archive: 0,
+            tv_archive_duration: 0,
+            is_adult: false,
+            stream_icon: None,
+        };
+        let catalog = crate::portal::Catalog {
+            live: vec![
+                ch(1, "NL | NPO 1 SD"),
+                ch(2, "NL | NPO 1 HD"),
+                ch(3, "NL | NPO 1 FHD"),
+                ch(4, "NL | RTL 4"),
+                ch(5, "NL | RTL 4 HD"),
+                ch(6, "NL | NOS Journaal"),
+            ],
+            ..Default::default()
+        };
+        Arc::new(CatalogStore::from_catalog(idle_portal(), catalog))
+    }
+
+    #[tokio::test]
+    async fn an_xtream_portal_zaps_on_from_the_channel_after_a_quality_switch_or_a_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(
+            dir.path(),
+            variants_catalog(),
+            PortalState::Configured,
+            None,
+        );
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        let urls = |ids: &[i64]| ids.iter().map(|&id| live_url(id)).collect::<Vec<_>>();
+        h.sent();
+        h.app.zap_by_id(3);
+        assert_eq!(loads(h.sent()), urls(&[3]), "NPO 1 FHD, at 0");
+        // A quality down: the variant that plays is no entry of the zap list.
+        h.frame_with(vec![egui::Event::Text("-".into())]);
+        assert_eq!(loads(h.sent()), urls(&[2]), "NPO 1 HD");
+        h.press(&[Key::ArrowDown]);
+        assert_eq!(
+            loads(h.sent()),
+            urls(&[5]),
+            "RTL 4, the channel after NPO 1"
+        );
+        h.press(&[Key::ArrowUp]);
+        assert_eq!(loads(h.sent()), urls(&[3]), "and back to NPO 1");
+        // A variant played by its own id (a favorite, a preset): the same.
+        h.app.zap_by_id(1);
+        assert_eq!(loads(h.sent()), urls(&[1]), "NPO 1 SD");
+        h.press(&[Key::ArrowUp]);
+        assert_eq!(
+            loads(h.sent()),
+            urls(&[6]),
+            "NOS, the one before NPO 1 (wrapped)"
+        );
+        h.press(&[Key::ArrowDown]);
+        assert_eq!(loads(h.sent()), urls(&[3]), "NPO 1 again");
+    }
+
+    #[tokio::test]
+    async fn an_xtream_resume_of_a_variant_zaps_on_from_its_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        write_last_watched(dir.path(), &live_url(2), true, Some(false));
+        let mut h = Harness::start(
+            dir.path(),
+            variants_catalog(),
+            PortalState::Configured,
+            None,
+        );
+        assert_eq!(loads(h.sent()), [live_url(2)], "NPO 1 HD resumes");
+        assert_eq!(h.app.current_stream_id, Some(2));
+        h.press(&[Key::ArrowDown]);
+        assert_eq!(loads(h.sent()), [live_url(5)], "RTL 4, the one after NPO 1");
+    }
+
+    #[tokio::test]
+    async fn a_channel_named_after_its_address_leaves_no_password_in_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        // The second channel has no name: it is named after its stream URL.
+        let list = "#EXTM3U\n#EXTINF:-1,Eerste\nhttps://a.example/1.m3u8\n\
+                    https://user:secret@c.example/live/2.ts\n";
+        let mut h = m3u_app(dir.path(), list);
+        let log = LogCapture::start_debug();
+        h.press(&[Key::ArrowDown]);
+        assert_eq!(
+            h.app.current_name.as_deref(),
+            Some("https://user:secret@c.example/live/2.ts")
+        );
+        let text = log.text();
+        assert!(text.contains("zap: -> https://<u>:<p>@c.example"), "{text}");
+        assert!(
+            text.contains("toast: [TV] https://<u>:<p>@c.example"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("secret"),
+            "the password is in the log:\n{text}"
+        );
+    }
+
+    #[test]
+    fn open_source_opens_an_m3u_list_and_logs_its_id_and_host_never_its_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::with_root(dir.path().to_path_buf());
+        let source = |id, address: &str| Source {
+            id,
+            kind: SourceKind::M3u,
+            name: String::new(),
+            address: address.into(),
+        };
+        let log = LogCapture::start();
+        let web = open_source(
+            &source(2, "https://user:secret@lists.example/tv.m3u?token=abc123"),
+            &storage,
+        );
+        let file = open_source(&source(3, r"C:\lijsten\gratis.m3u"), &storage);
+        for opened in [&web, &file] {
+            assert_eq!(opened.state, PortalState::Configured);
+            assert!(opened.creds.is_none(), "no Xtream credentials");
+            assert_eq!(opened.portal.kind(), SourceKind::M3u);
+        }
+        let text = log.text();
+        assert!(text.contains("source: m3u 2 (lists.example)"), "{text}");
+        assert!(text.contains("source: m3u 3 (file)"), "{text}");
+        for secret in ["secret", "abc123", "tv.m3u", "lijsten", "gratis"] {
+            assert!(!text.contains(secret), "{secret} in the log:\n{text}");
+        }
+    }
+
+    #[test]
+    fn open_source_opens_an_xtream_portal_or_the_setup_prompt_and_logs_no_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::with_root(dir.path().to_path_buf());
+        let source = |address: &str| Source {
+            id: 1,
+            kind: SourceKind::Xtream,
+            name: String::new(),
+            address: address.into(),
+        };
+        let log = LogCapture::start();
+        let real = open_source(&source("bob:geheim@srv.example.net:8080"), &storage);
+        assert_eq!(real.state, PortalState::Configured);
+        assert_eq!(real.portal.kind(), SourceKind::Xtream);
+        let creds = real.creds.expect("its credentials");
+        assert_eq!(
+            (creds.username.as_str(), creds.password.as_str()),
+            ("bob", "geheim")
+        );
+        assert_eq!((creds.host.as_str(), creds.port), ("srv.example.net", 8080));
+        // The stand-in values of the zip's run.bat, and something unreadable:
+        // the setup prompt, on a portal that is never asked anything.
+        let placeholder = open_source(&source("user:pass@host.example.com:80"), &storage);
+        let unreadable = open_source(&source("no at sign here"), &storage);
+        assert_eq!(placeholder.state, PortalState::Placeholder);
+        assert_eq!(unreadable.state, PortalState::Missing);
+        for prompt in [&placeholder, &unreadable] {
+            assert!(prompt.creds.is_none());
+        }
+        let text = log.text();
+        assert!(
+            text.contains("portal: xtream <user>@srv.example.net:8080"),
+            "{text}"
+        );
+        for secret in ["bob", "geheim", "no at sign"] {
+            assert!(!text.contains(secret), "{secret} in the log:\n{text}");
+        }
     }
 }
