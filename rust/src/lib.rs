@@ -9,6 +9,7 @@ pub const LOG_TARGET: &str = module_path!();
 
 pub mod app;
 pub mod args;
+pub mod bad_streams;
 pub mod catalog;
 pub mod epg;
 pub mod favorites;
