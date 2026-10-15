@@ -10,14 +10,14 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-15-zenderlijst-design.md`
 
-**Where:** the main checkout `C:\Dropbox\Sources\tv`, branch `feat/zenderlijst`, which the controller rebases on the finished `feat/m3u-bronnen` and checks out there before Task 1. The M3U branch got commits after this plan was written (docs, an early exit in `catalog::guide_channels_of`, review fixes in app.rs and settings_ui.rs). This plan names functions and types, never line numbers. When a function it names reads differently from what a step shows around the change, keep the step's meaning, make the change there, and say so in your report.
+**Where:** the main checkout `C:\Dropbox\Sources\tv`, branch `feat/zenderlijst`, which the controller rebases on the finished `feat/m3u-bronnen` and checks out there before Task 1. The M3U branch got commits after this plan was written (docs, an early exit in `catalog::guide_channels_of`, and a fix wave and a residual round up to the M3U branch's final head: `Cmd::LoadWithHeaders` and `player::loadfile_command`, `split_headers` skipping empty values, `Portal::retire`, `Sources::keep` returning `Option` and never giving a list id 1, the `zap_to` empty-address guard, the eof-before-picture frame drop, test-only `Debug` on the source types, the tests' `loads`/`zapped` taking both load kinds, and `list_server`; then a played channel that keeps its own last frame when its reloads run out, the NUL check reading only the first KB, and `Cmd`, `XtreamCreds`, `XtreamPortal` and `LastWatched` deriving `Debug` in tests only). This plan names functions and types, never line numbers. When a function it names reads differently from what a step shows around the change, keep the step's meaning, make the change there, and say so in your report.
 
 ## Global Constraints
 
 - **Performance is binding.** Startup and zapping are not slower than 0.6.1: the A/B script (`rust/e2e/measure-startup.ps1 -Baseline`) against the 0.6.1 release exe, at least 10 runs each, median and minimum within ±10 %, with an Xtream source, and with an active M3U source of about 11,000 channels (`-M3u`). The groups and their order are worked out in 20 ms or less for 11,000 channels in a release build, and keep less than 1 MB: positions, never copies of channels. A zap press copies no channel list. A closed list costs nothing per frame: no work, no memory. No network, except one check per confirmed suspect (M3U only); no new thread. The only new work at startup is reading one small file when an M3U catalog loads.
 - **Dependencies:** no new crates. `serde`, `serde_json`, `chrono` and `parking_lot` are direct dependencies already; `tempfile` is a dev-dependency.
 - **Texts:** no UI text outside `i18n.rs`; every key has NL, EN and DE; log lines stay English.
-- **Credentials:** an M3U address is a credential. The marks file holds stream ids and unix times only: no names, no URLs. Log lines name a channel by its name (through `crate::redact::redact`) and its stream id, as the zap line does; never a URL, also not the address the check before a mark asks (`Check` has no `Debug`).
+- **Credentials:** an M3U address is a credential. The marks file holds stream ids and unix times only: no names, no URLs. Log lines name a channel by its name (through `crate::redact::redact`) and its stream id, as the zap line does; never a URL, also not the address the check before a mark asks (`Check` has no `Debug`). `Cmd`, `XtreamCreds`, `CredsSource`, `XtreamPortal` and `LastWatched` derive `Debug` in the crate's own tests only, and the integration tests (`rust/tests/`) link the lib without them: code there never formats one with `{:?}`, nor compares one with `assert_eq!` or takes one out of `unwrap_err`.
 - **The catalog is the only filter.** Zapping, the channel list and the search read the adult lock and the defect marks through `CatalogStore`, never from a copy of their own.
 - **Defect marks are an M3U source's alone.** An Xtream portal never reads, writes or applies them, and never checks an address.
 - **Release profile** is `panic = "abort"`: nothing may rely on catching a panic.
@@ -79,7 +79,7 @@ The spec is the authority. These settle what it leaves open, one line each: what
 13. **A start that comes due for the channel that plays loads nothing** (flipped away and back, ↓↓↑): "plays" means current and not ended with an error (`stall_watchdog_armed`), so a failed channel flipped back to is tried again. On the main screen too: a second load would only re-buffer it.
 14. **The list's preview reuses the app's one `ZapPacer`:** a move in the list is a press of it; Esc, g and ←/→ cancel a waiting start; Enter cancels it and plays the selection now unless it plays.
 15. **←/→ stop at the first and the last group** (no wrap, as the rows); a group change drops a waiting start: the selection left that channel.
-16. **The groups are built when the list opens**, and again while it is open when the catalog, the marks or the favorites change (`favorites_revision`). A closed list keeps only its last group's key. §5 asks for "once per version" and for a closed list without memory; keeping groups between opens would keep the catalog's old channel list alive after a refresh.
+16. **The groups are built when the list opens**, and again while it is open when the catalog, the marks or the favorites change (`favorites_revision`). A closed list keeps only its last group's key. §5 asks for "once per version" and for a closed list without memory; keeping groups between opens would keep the catalog's old channel list alive after a refresh. `favorites_revision` is insurance: no path changes the favorites while the list is open.
 17. **Group names** are the trimmed `;`-parts of `group-title`, empty parts dropped, spelled as the file has them: names that differ in case are two groups, sorted next to each other. A channel in one group twice counts once.
 18. **Natural order:** Unicode lower case, a run of ASCII digits by its value, digits before letters; equal names keep the file's order.
 19. **Favorieten, Zonder groep and Defecte zenders show only when they hold channels;** Alle zenders always (it is empty when every channel is marked: "geen zenders in deze groep", and Enter only closes).
@@ -91,9 +91,11 @@ The spec is the authority. These settle what it leaves open, one line each: what
 25. **While the list is open no other hotkey works** (§3.1), and opening it closes the favorites list (its rows take clicks).
 26. **`T::NoGuideForSource` goes; `T::HelpOpenGuide` names the list.** `g` while an M3U catalog loads shows the guide's existing `T::GuideCatalogLoading`.
 27. **e2e:** `M-list` replaces `M-guide` (its toast is gone); `M-defect` goes M3U DOOD → M3U UA → Down and expects M3U REF, since DOOD sits between UA and REF in the mock's file order; the check finds `/m3uplay/dead.m3u8` 404, so the mark comes as before.
-28. **The check before a mark (the user, 2026-10-15: "Ja, met controle"):** a suspect that the 2-minute rule confirms is not marked at once. Its address is asked once, in the background: one GET with the channel's own User-Agent and Referer (the `|…` split `loadfile_args` uses), 5 s for the connection and the headers, the status only (the body is never read). A status of 400 or more after redirects, no connection (DNS, refused, TLS) or no answer in time marks it; 2xx or 3xx drops the suspicion. At most one check per suspect and 4 in flight; a renewal of a marked channel needs none; another source (switch, save) drops the running checks and ignores their answers. On the app's tokio runtime, the client built on the first check, the answers through a slot `update_ui` drains (as the logos'). Why: a Wi-Fi drop of under 2 minutes would mark every channel tried during it.
-29. **An address the check cannot ask** (no http or https, or no HTTP client) is marked by the 2-minute rule alone, as before the check: it cannot be protected, and a dead rtmp or udp entry would otherwise stay in the zap ring.
-30. **A channel that names no User-Agent is asked as mpv asks it**, with libmpv's default `libmpv` (pinned by an ignored smoke test against the vendored libmpv), so the server answers the check as it answered the player. The check hands no `Referer` of its own on through a redirect: that would give a tokenized address to another server. A delete never touches the source in use, so only a switch or a save drops checks.
+28. **The check before a mark (the user, 2026-10-15: "Ja, met controle"):** a suspect that the 2-minute rule confirms is not marked at once. Its address is asked once, in the background: one GET with the channel's own User-Agent and Referer (the `|…` split `loadfile_args` uses), 5 s for the connection and the headers, the status only (the body is never read). A status of 400 or more after redirects, no connection (DNS, refused, a failed TLS handshake) or no answer in time marks it; 2xx or 3xx drops the suspicion. At most one check per suspect and 4 in flight; a renewal of a marked channel needs none; another source (switch, save) drops the running checks and ignores their answers. On the app's tokio runtime, the client built on the first check, the answers through a slot `update_ui` drains (as the logos'). Why: a Wi-Fi drop of under 2 minutes would mark every channel tried during it.
+28b. **A check never asks the server of the stream that plays now.** That stream is the channel whose first picture confirms the suspect. A paid list served by an Xtream portal gives every channel one account, and the portal allows one session per account. Either the newest wins, so the check's GET takes the playing channel's session (an eof, a reload, a visible "herverbinden"), or the portal refuses it with a 4xx, which would mark a live channel. Such a suspect is not marked and its suspicion goes. The log says `m3u: <name> (stream_id <id>) not checked (the server of what plays), not marked`. "The same server" is the same scheme, host (any letter case) and port, the scheme's default port filled in (`stream_check::same_server`).
+29. **An address the check cannot ask** (no http or https, or no HTTP client) is not marked: the spec marks a confirmed suspect only when the check finds it dead too (§4.2), and its error falls to the safe side. Its suspicion goes; the log says `m3u: <name> (stream_id <id>) not checked (<what>), not marked`.
+30. **A channel that names no User-Agent is asked as mpv asks it**, with libmpv's default `libmpv` (pinned by an ignored smoke test against the vendored libmpv), so the server answers the check as it answered the player. It takes a certificate and header bytes as mpv does: no certificate check, header values as bytes. The check hands no `Referer` of its own on through a redirect: that would give a tokenized address to another server. A delete never touches the source in use, so only a switch or a save drops checks.
+31. **`bad_streams.rs` keeps a `write_atomic` of its own**, as each file kind of the app does (args.rs, settings.rs, sources.rs, guide/cache.rs, portal/m3u.rs): one shared helper is a cleanup of its own.
 
 ## Review Focus
 
@@ -106,21 +108,23 @@ The six inputs the spec implies but its test list does not exercise, most likely
 5. **Untidy `group-title`s and twin names** (`" Kinderen ; ;Kinderen"`, `Nieuws` next to `nieuws`, two channels called "Een"): parts trimmed, empty ones dropped, a channel once per group, twins in file order. → Task 6, `untidy_group_titles_are_read_as_people_mean_them` and `channels_of_one_name_keep_the_files_order`.
 6. **A check that answers late, up to its 5 s, while the list is open:** the list keeps working (keys, groups), nothing waits for the answer, and the channel moves to "Defecte zenders" in the frame the answer is taken in. → Task 8, `a_channel_marked_while_the_list_is_open_moves_to_broken_channels` (its address answers half a second late).
 
+Not a finding: the search row's `" · "` before the defect label (Task 5) is punctuation, as the search's own hardcoded `[LIVE]` tag is; the label itself is `T::DefectLabel`.
+
 ## File structure
 
 | File | Responsibility |
 |---|---|
 | `rust/src/bad_streams.rs` (new) | suspicions, confirmation within 2 minutes, marks, renewal, clearing, 7-day expiry, the marks file |
-| `rust/src/stream_check.rs` (new) | the check before a mark: one GET of a confirmed suspect's address, 4 at a time, the answers in a slot |
+| `rust/src/stream_check.rs` (new) | the check before a mark: one GET of a confirmed suspect's address, 4 at a time, the answers in a slot; `same_server` |
 | `rust/src/channel_list.rs` (new) | the list's groups (`ChannelGroups`), natural order, the selection (`Cursor`); no egui |
 | `rust/src/channel_list_ui.rs` (new) | draws the list, reads its keys and the mouse, returns `ListAction`s |
 | `rust/src/catalog.rs` | the shared channel list, `ZapRing`/`ZapFrom`, the defect filter, `channel_groups` |
 | `rust/src/storage.rs` | `bad_streams_path`; `remove_source_files` takes the marks along |
 | `rust/src/app.rs` | zapping through the ring, the failure and picture hooks, the checks' verdicts, the labels, `g` on M3U, the list's actions |
-| `rust/src/guide_ui.rs` | `single_line` and `play_mark` shared with the list (visibility, a colour) |
+| `rust/src/guide_ui.rs` | `single_line`, `play_mark` and `CLICK` shared with the list (visibility, a colour) |
 | `rust/src/i18n.rs` | the new texts; `NoGuideForSource` goes |
 | `rust/src/lib.rs` | the four new modules |
-| `rust/tests/test_bad_streams.rs`, `test_stream_check.rs`, `test_zap_ring.rs`, `test_channel_list.rs` (new); `test_storage.rs`, `test_mpv_smoke.rs` | tests |
+| `rust/tests/test_bad_streams.rs`, `test_stream_check.rs`, `test_zap_ring.rs`, `test_channel_list.rs` (new); `test_storage.rs`, `test_mpv_smoke.rs`, `test_catalog_m3u.rs` | tests |
 | `rust/e2e/regression.ps1`, `run-scenario.ps1`, `README.md` | `M-list`, `M-defect` |
 | `CLAUDE.md`, `rust/README.md`, `docs/VALIDATION.md`, `rust/build-zip.ps1` | docs |
 
@@ -177,8 +181,8 @@ A pure module that keeps the suspicions of this session and the marks of one sou
 
 - [ ] **Step 1: The baseline**
 
-Run: `ct`
-Expected: everything passes. Note the number of passing tests for your report: every later task compares with it.
+Run: `ct`, then `cc`.
+Expected: everything passes, and clippy shows the 2 old warnings. Note the passing tests and the warnings for your report: every later task compares with them.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -429,6 +433,8 @@ fn nothing_to_expire_writes_no_file() {
     assert!(!marks_file(dir.path()).exists());
 }
 ```
+
+Run `rustfmt --edition 2021 tests/test_bad_streams.rs` once written.
 
 In `rust/tests/test_storage.rs`:
 
@@ -710,7 +716,7 @@ In `rust/src/storage.rs`:
     }
 ```
 
-2. In `remove_source_files`, add `self.source_file("bad_streams", id),` to the array (after `self.source_file("last_watched", id),`), and make its doc comment say "Removes source `id`'s favorites, presets, last channel, defect marks and saved list; how many of them there were."
+2. In `remove_source_files`, add `self.source_file("bad_streams", id),` to the array (after `self.source_file("last_watched", id),`), and make its doc comment say "Removes source `id`'s favorites, presets, last channel, defect marks and saved list, with the temp file of that list; how many of them there were."
 
 - [ ] **Step 5: Run them to see them pass**
 
@@ -742,7 +748,7 @@ The catalog keeps its live channels in one `Arc<Vec<LiveChannel>>`. What up/down
 
 **Files:**
 - Modify: `rust/src/catalog.rs`
-- Test: `rust/tests/test_zap_ring.rs` (new)
+- Test: `rust/tests/test_zap_ring.rs` (new), `rust/tests/test_catalog_m3u.rs` (its timing test times a press of the ring)
 
 **Interfaces:**
 - Consumes: `crate::shortcuts::next_live_idx(current: Option<usize>, len: usize, delta: i32) -> Option<usize>`; in catalog.rs: `adult_live`, `normalize_channel_name`, `variant_score`, `StoredCatalog`, `CatalogStore::{adult_unlocked, kind, shows_live}`.
@@ -982,6 +988,8 @@ fn the_xtream_ring_follows_the_lock() {
 }
 ```
 
+Run `rustfmt --edition 2021 tests/test_zap_ring.rs` once written.
+
 - [ ] **Step 2: Run them to see them fail**
 
 Run: `ct --test test_zap_ring`
@@ -1066,6 +1074,8 @@ impl StoredCatalog {
 ```
 
 Keep `impl std::ops::Deref for StoredCatalog` as it is. Every `c.live` in this file now reads the `Arc<Vec<LiveChannel>>`: `c.live.iter()` and `&c.live` passed as a slice (`quality_ladder(&c.live, …)`) work through it unchanged. A `for` loop does not look through the `Arc`: in `search_items`, `for x in &c.live {` becomes `for x in c.live.iter() {`.
+
+In the module's test `a_stored_catalog_knows_its_adult_channels_by_the_portals_flag_alone`, the comment `// The rest of the catalog reads through it.` above `assert_eq!(stored.live.len(), 4);` becomes `` // Its live channels are kept apart, in `live`. ``
 
 - [ ] **Step 4: Deduplication on positions, and the ring**
 
@@ -1343,31 +1353,56 @@ impl ZapRing {
     }
 ```
 
-- [ ] **Step 6: Run the tests to see them pass**
+- [ ] **Step 6: The M3U timing test times a press of the ring**
+
+The ignored `an_eleven_thousand_channel_m3u_catalog_timed` in `rust/tests/test_catalog_m3u.rs` times `zap_channels()` as the cost of an up/down press, and spec §5 cites that measurement. A press now asks `zap_ring()`, so the test times that too. Check the file with `fmt tests/test_catalog_m3u.rs` before and after: no output either time.
+
+1. Its doc comment's "(the zap list: every key repeat clones the whole list)" becomes "(the zap ring, an `Arc`: nothing is copied; `zap_channels` is a copy, for tests and tools)", so the comment reads:
+
+```rust
+/// Timed by hand: what an M3U catalog of iptv-org's size costs where it is
+/// stored (the guide's merge, once for every catalog put: the saved list and
+/// the fresh one) and per up/down press (the zap ring, an `Arc`: nothing is
+/// copied; `zap_channels` is a copy, for tests and tools).
+/// `cargo test --release --test test_catalog_m3u -- --ignored --nocapture`
+```
+
+2. After its `print_timing("zap_channels", 100, …);` call, at the end of the test, add:
+
+```rust
+    print_timing("zap_ring (a press)", 100, || {
+        assert_eq!(
+            std::hint::black_box(store.zap_ring()).map(|r| r.len()),
+            Some(11_262)
+        );
+    });
+```
+
+- [ ] **Step 7: Run the tests to see them pass**
 
 Run: `ct --test test_zap_ring --test test_catalog_m3u --test test_catalog_adult --test test_guide_channels`
-Expected: all pass. The old ones go through `zap_channels`, now a copy of the ring, and must come out as before.
+Expected: all pass. The old ones go through `zap_channels`, now a copy of the ring, and must come out as before. The timing test is ignored: it builds here, and Task 10 runs it in a release build.
 
 Run: `ct --lib catalog::`
 Expected: all pass (the module's own tests, `dedupe_zap` among them).
 
-- [ ] **Step 7: Format, lint, full suite**
+- [ ] **Step 8: Format, lint, full suite**
 
-- Run `fmt tests/test_zap_ring.rs`. Expected: no output.
+- Run `fmt tests/test_zap_ring.rs tests/test_catalog_m3u.rs`. Expected: no output.
 - Check the hunk count of `catalog.rs`: the same as before.
 - Run `cc`. Expected: only the 2 old warnings.
 - Run `ct`. Expected: everything passes.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 Message: `feat(rust): the zap ring: positions in one shared channel list, once per catalog, lock and marks; the catalog's defect filter`, followed by the two attribution lines.
-Files: `rust/src/catalog.rs`, `rust/tests/test_zap_ring.rs`.
+Files: `rust/src/catalog.rs`, `rust/tests/test_zap_ring.rs`, `rust/tests/test_catalog_m3u.rs`.
 
 ---
 
 ### Task 3: App: zapping through the ring
 
-Up/down and every pick by id go through the ring: a press copies no channel list (it used to clone every channel of an M3U list, and deduplicate ~13,000 Xtream channels). A marked channel that plays zaps on from its place in the file. A start that comes due for the channel that plays already loads nothing.
+Up/down and every pick by id go through the ring: a press copies no channel list (it used to clone every channel of an M3U list, and deduplicate ~13,000 Xtream channels). A marked channel that plays zaps on from its place in the file. A start that comes due for the channel that plays already loads nothing. A flip to a channel that a fresh copy of the list dropped leaves no toast of it.
 
 **Files:**
 - Modify: `rust/src/app.rs`
@@ -1381,7 +1416,7 @@ Up/down and every pick by id go through the ring: a press copies no channel list
   // tests: const RING: &str (Kanaal A..D in file order), fn m3u_sid(name: &str) -> i64,
   //        fn ring_url(letter: char) -> String
   ```
-  `zap_index_of_current` goes; `app.rs` no longer imports `zap_position` or `crate::shortcuts`.
+  `zap_index_of_current` goes; `app.rs` no longer imports `zap_position`, `crate::shortcuts` or, outside its tests, `LiveChannel`. `zap_to` keeps its signature; a target with no address takes the flip's toast of it down.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1469,6 +1504,32 @@ In `rust/src/app.rs`'s `mod tests`, after the section `// ---- an M3U source ---
         assert_eq!(loads(h.sent()), [live_url(3)]);
         assert_eq!(h.app.current_idx, Some(0));
     }
+
+    #[tokio::test]
+    async fn a_flip_to_a_channel_the_fresh_list_dropped_leaves_no_toast_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), RING);
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        h.app.zap_by_id(m3u_sid("Kanaal A"));
+        // A lone press: B at once. The held key then flips on to C, which waits.
+        h.frame(&[Key::ArrowDown]);
+        h.frame(&[Key::ArrowDown]);
+        let toast = |h: &Harness| h.app.toast.as_ref().map(|(t, _, _)| t.clone());
+        assert_eq!(toast(&h).as_deref(), Some("[TV] Kanaal C"), "the flip");
+        // The fresh copy of the list has no Kanaal C.
+        let fresh = RING.replace("#EXTINF:-1,Kanaal C\nhttps://c.example/c.m3u8\n", "");
+        let (portal, catalog) = M3uPortal::from_text(&fresh).unwrap();
+        h.app.catalog = Arc::new(CatalogStore::from_catalog(Arc::new(portal), catalog));
+        h.sent();
+        std::thread::sleep(Duration::from_millis(350));
+        h.frame(&[]);
+        assert!(loads(h.sent()).is_empty(), "C has no address now");
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal B"));
+        // No toast names the channel that vanished.
+        let named = |t: &String| t.contains("Kanaal C");
+        assert!(toast(&h).filter(named).is_none(), "{:?}", toast(&h));
+        assert!(!h.painted.iter().any(named), "{:?}", h.painted);
+    }
 ```
 
 (`h.frame(&[Key::ArrowDown])` twice in a row: the harness never lets a key go, so egui marks the second press a repeat, as a held key.)
@@ -1479,13 +1540,14 @@ Run: `ct --lib app::tests::`
 Expected:
 - `a_defect_channel_that_plays_zaps_on_from_its_place_in_the_file` fails: the old code steps from the list's start for a channel that is not in it, so Up from B lands on D.
 - `flipping_away_and_back_to_the_channel_that_plays_loads_nothing` fails: B loads a second time.
+- `a_flip_to_a_channel_the_fresh_list_dropped_leaves_no_toast_of_it` fails: `zap_to` drops C, which has no address now, but the flip's "[TV] Kanaal C" stays up over B.
 - `zapping_skips_a_defect_channel_both_ways` passes already (Task 2's `zap_channels` leaves B out) and guards the change; `a_hidden_channel_is_not_played_by_its_id` passes before and after.
 
 - [ ] **Step 3: Zapping through the ring**
 
 In `rust/src/app.rs`:
 
-1. Imports: add `ZapFrom` to the `use crate::catalog::{…}` list and remove `zap_position` from it; remove `use crate::shortcuts;`.
+1. Imports: add `ZapFrom` to the `use crate::catalog::{…}` list and remove `zap_position` from it; remove `use crate::shortcuts;`; take `LiveChannel` out of `use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};` (its one use outside the tests was `zap_index_of_current`) and add `use crate::portal::LiveChannel;` to `mod tests`, under `use super::*;`.
 
 2. The field `zap_pacer` becomes:
 
@@ -1602,10 +1664,29 @@ In `rust/src/app.rs`:
         }
 ```
 
+8. In `zap_to`, the guard for a target with no address, `if url.is_empty() { … }` with the comment above it, becomes:
+
+```rust
+        // An M3U list has no address for an id it does not hold: a target the
+        // zap pacer held while a fresh list dropped it. What plays stays, and so
+        // would the flip's toast that named the target, over the channel that
+        // plays on: it goes.
+        if url.is_empty() {
+            tracing::warn!("zap: stream_id={} has no address - not loaded", sid);
+            let flip = format!("[TV] {}", name);
+            if self.toast.as_ref().is_some_and(|t| t.0 == flip) {
+                self.toast = None;
+            }
+            return;
+        }
+```
+
+Only that toast goes: one set since the flip (a stream error, a lock) stays.
+
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `ct --lib app::tests::`
-Expected: all pass, the old zapping tests among them (`an_xtream_portal_zaps_on_from_the_channel_after_a_quality_switch_or_a_variant`, `an_xtream_resume_of_a_variant_zaps_on_from_its_channel`, `up_after_a_resume_continues_from_the_resumed_m3u_channel`, `zapping_after_the_list_changed_under_it_goes_on_from_the_channel_that_plays`). If one fails, the ring's `step` or `position_of` differs from the old `zap_index_of_current`/`zap_position` rule: fix the app code, not the test, and say so in your report.
+Expected: all pass, the old zapping tests among them (`an_xtream_portal_zaps_on_from_the_channel_after_a_quality_switch_or_a_variant`, `an_xtream_resume_of_a_variant_zaps_on_from_its_channel`, `up_after_a_resume_continues_from_the_resumed_m3u_channel`, `zapping_after_the_list_changed_under_it_goes_on_from_the_channel_that_plays`, and `a_channel_the_list_no_longer_has_loads_nothing_and_is_not_the_last_channel`, which goes through the guard item 8 changed). If one fails, the ring's `step` or `position_of` differs from the old `zap_index_of_current`/`zap_position` rule: fix the app code, not the test, and say so in your report.
 
 - [ ] **Step 5: Format, lint, full suite**
 
@@ -1615,14 +1696,14 @@ Expected: all pass, the old zapping tests among them (`an_xtream_portal_zaps_on_
 
 - [ ] **Step 6: Commit**
 
-Message: `feat(rust): zap through the ring: no list copied per press, a defect channel zaps on from its place, a flip back to the channel that plays loads nothing`, followed by the two attribution lines.
+Message: `feat(rust): zap through the ring: no list copied per press, a defect channel zaps on from its place, a flip back to the channel that plays loads nothing, a flip to one the list dropped leaves no toast`, followed by the two attribution lines.
 Files: `rust/src/app.rs`.
 
 ---
 
 ### Task 4: The check before a mark
 
-A confirmed suspect is not marked at once: its address is asked once more (spec §4.2, ruling 28). One GET with the channel's own headers, at most 5 s for the connection and the headers, the status only; the body is never read (a live stream never ends). A small checker owns the HTTP client (built on the first check), runs at most 4 checks at once and one per channel, and keeps the answers in a slot the app drains once per frame. It knows nothing of the marks: Task 5 wires it.
+A confirmed suspect is not marked at once: its address is asked once more (spec §4.2, ruling 28). One GET with the channel's own headers, at most 5 s for the connection and the headers, the status only; the body is never read (a live stream never ends). A small checker owns the HTTP client (built on the first check), runs at most 4 checks at once and one per channel, and keeps the answers in a slot the app drains once per frame. It knows nothing of the marks: Task 5 wires it. A pure `same_server` says whether two addresses are on one server, so the app never asks the server of what plays (ruling 28b).
 
 **Files:**
 - Create: `rust/src/stream_check.rs`
@@ -1630,7 +1711,7 @@ A confirmed suspect is not marked at once: its address is asked once more (spec 
 - Test: `rust/tests/test_stream_check.rs` (new), `rust/tests/test_mpv_smoke.rs` (mpv's User-Agent pinned)
 
 **Interfaces:**
-- Consumes: `crate::m3u::split_headers(url) -> (&str, Headers { user_agent, referrer })`, the split `player::loadfile_args` hands to mpv; `crate::m3u::with_headers` (tests).
+- Consumes: `crate::m3u::split_headers(url) -> (&str, Headers { user_agent, referrer })`, the split `player::loadfile_args` hands to mpv; `crate::m3u::with_headers` (tests); reqwest's `ClientBuilder::danger_accept_invalid_certs`, `header::HeaderValue::from_bytes` and `Url` (the `url` crate's, handed on by reqwest).
 - Produces:
   ```rust
   // stream_check.rs
@@ -1653,10 +1734,12 @@ A confirmed suspect is not marked at once: its address is asked once more (spec 
       pub fn checking(&self, stream_id: i64) -> bool;
       pub fn in_flight(&self) -> usize;
   }
-  pub fn http_client() -> reqwest::Result<reqwest::Client>;
-  pub async fn ask(client: &reqwest::Client, url: &str) -> Answer;
+  pub fn http_client() -> reqwest::Result<reqwest::Client>;  // no certificate check, as mpv's tls-verify=no
+  pub async fn ask(client: &reqwest::Client, url: &str) -> Answer;  // header values as bytes
+  pub fn same_server(a: &str, b: &str) -> bool;  // scheme, host (any case), port with its default; no path, query or `|…`
   ```
-  Log line (warn, once): `m3u: no HTTP client for the defect check (<error>) - marks go by the two-minute rule`.
+  `Answer::is_dead` is false for `Answers` and `Unchecked`: an address the check cannot ask is not marked (ruling 29).
+  Log line (warn, once): `m3u: no HTTP client for the defect check (<error>) - no channel is marked`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1664,11 +1747,12 @@ Create `rust/tests/test_stream_check.rs`:
 
 ```rust
 //! The check before a defect mark (stream_check.rs): one GET of a confirmed
-//! suspect's address, with its own headers, the status only.
+//! suspect's address, with its own headers, the status only; and which
+//! addresses are on one server.
 
 use bongo_player::m3u::with_headers;
 use bongo_player::stream_check::{
-    ask, http_client, Answer, Check, Checked, StreamChecker, AT_ONCE, MPV_USER_AGENT,
+    ask, http_client, same_server, Answer, Check, Checked, StreamChecker, AT_ONCE, MPV_USER_AGENT,
 };
 use std::time::Duration;
 use wiremock::matchers::{any, header, method, path};
@@ -1804,6 +1888,22 @@ async fn without_a_user_agent_of_its_own_the_check_sends_mpvs() {
 }
 
 #[tokio::test]
+async fn a_user_agent_that_is_not_ascii_is_sent_as_its_bytes() {
+    let server = answering(200, Duration::ZERO).await;
+    // mpv hands a "Zürich-TV" User-Agent to the server as its UTF-8 bytes.
+    let url = with_headers(
+        format!("{}/zurich.m3u8", server.uri()),
+        Some("Zürich-TV"),
+        None,
+    );
+    let client = http_client().unwrap();
+    assert_eq!(ask(&client, &url).await, Answer::Answers(200));
+    let asked = server.received_requests().await.unwrap();
+    let agent = asked[0].headers.get("user-agent").map(|v| v.as_bytes());
+    assert_eq!(agent, Some("Zürich-TV".as_bytes()));
+}
+
+#[tokio::test]
 async fn a_redirect_hands_the_address_on_to_nobody() {
     let server = MockServer::start().await;
     Mock::given(path("/a"))
@@ -1833,9 +1933,9 @@ fn what_the_log_says_of_an_answer_names_no_address() {
     assert_eq!(Answer::ConnectFailed.kind(), "connect failed");
     assert_eq!(Answer::TimedOut.kind(), "timeout");
     assert_eq!(Answer::Failed.kind(), "request failed");
-    assert_eq!(Answer::Unchecked.kind(), "no check for this address");
+    assert_eq!(Answer::Unchecked.kind(), "an address it cannot ask");
     assert!(!Answer::Answers(302).is_dead());
-    assert!(Answer::Unchecked.is_dead(), "the two-minute rule alone");
+    assert!(!Answer::Unchecked.is_dead(), "no check, no mark");
 }
 
 #[tokio::test]
@@ -1895,7 +1995,73 @@ async fn an_address_that_is_no_web_address_is_not_asked() {
     let got = answers(&mut checker, 1).await;
     assert_eq!(got[0].answer, Answer::Unchecked);
 }
+
+// ---- one server or two (the app never asks the server of what plays) ----
+
+#[test]
+fn the_same_host_and_port_with_another_path_is_the_same_server() {
+    assert!(same_server(
+        "http://tv.example:8080/live/1.m3u8",
+        "http://tv.example:8080/live/2.ts?token=abc"
+    ));
+}
+
+#[test]
+fn another_port_is_another_server() {
+    assert!(!same_server(
+        "http://tv.example:8080/1.m3u8",
+        "http://tv.example:8081/1.m3u8"
+    ));
+}
+
+#[test]
+fn a_default_port_written_out_is_the_port_left_out() {
+    assert!(same_server(
+        "http://tv.example:80/1.m3u8",
+        "http://tv.example/2.m3u8"
+    ));
+    assert!(same_server(
+        "https://tv.example/1.m3u8",
+        "https://tv.example:443/2.m3u8"
+    ));
+}
+
+#[test]
+fn the_letter_case_of_the_host_does_not_count() {
+    assert!(same_server(
+        "http://TV.Example/1.m3u8",
+        "http://tv.example/2.m3u8"
+    ));
+}
+
+#[test]
+fn the_headers_after_a_pipe_do_not_count() {
+    // Right after the port: read as part of the address, they would make an
+    // address that cannot be read.
+    let headed = with_headers(
+        "http://tv.example:8080".into(),
+        Some("Bongo/1.0"),
+        Some("https://www.example.com/"),
+    );
+    assert!(same_server(&headed, "http://tv.example:8080/live/2.m3u8"));
+}
+
+#[test]
+fn http_and_https_on_one_host_are_two_servers() {
+    assert!(!same_server(
+        "http://tv.example/1.m3u8",
+        "https://tv.example/1.m3u8"
+    ));
+}
+
+#[test]
+fn an_address_that_cannot_be_read_is_no_server() {
+    assert!(!same_server("tv.example/1.m3u8", "tv.example/1.m3u8"));
+    assert!(!same_server("http://tv.example/1.m3u8", ""));
+}
 ```
+
+Run `rustfmt --edition 2021 tests/test_stream_check.rs` once written.
 
 In `rust/tests/test_mpv_smoke.rs`, add:
 
@@ -1926,15 +2092,19 @@ Create `rust/src/stream_check.rs`:
 //! The check before a defect mark (spec 2026-10-15 §4.2). An M3U channel that
 //! failed before its first picture, and that another channel's picture then
 //! confirmed, is not marked at once: its address is asked once more. One GET
-//! with the channel's own headers, the status only, a short limit. A dead answer
-//! (a status of 400 or more after redirects, no connection, no answer in time)
-//! marks it; a live one (2xx, 3xx) drops the suspicion, so a Wi-Fi drop of
-//! under two minutes marks no good channel. At most one check per channel and
-//! [`AT_ONCE`] at a time, on the app's tokio runtime; the answers wait in a slot
-//! the app drains once per frame. An address never reaches a log line or a
-//! `Debug` print: a paid list's addresses hold credentials.
+//! with the channel's own headers, the status only, a short limit, and as mpv
+//! asks: no certificate check, header values as bytes. A dead answer (a status
+//! of 400 or more after redirects, no connection, no answer in time) marks it;
+//! a live one (2xx, 3xx) drops the suspicion, so a Wi-Fi drop of under two
+//! minutes marks no good channel. An address it cannot ask is not marked
+//! either: no check, no mark. At most one check per channel and [`AT_ONCE`] at
+//! a time, on the app's tokio runtime; the answers wait in a slot the app
+//! drains once per frame. The app never asks the server of the stream that
+//! plays ([`same_server`]). An address never reaches a log line or a `Debug`
+//! print: a paid list's addresses hold credentials.
 
 use parking_lot::Mutex;
+use reqwest::header::HeaderValue;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1957,21 +2127,24 @@ pub enum Answer {
     Answers(u16),
     /// A status of 400 or more after the redirects.
     Status(u16),
-    /// No connection: refused, a name that does not resolve, TLS.
+    /// No connection: refused, a name that does not resolve, a failed TLS
+    /// handshake.
     ConnectFailed,
     /// No headers within [`CHECK_TIMEOUT`].
     TimedOut,
-    /// The request failed otherwise (an address or a header it cannot send).
+    /// The request failed otherwise (an address it cannot send).
     Failed,
-    /// Not asked: no http(s) address, or no HTTP client. The two-minute rule
-    /// alone decides, as before there was a check.
+    /// Not asked: no http(s) address, or no HTTP client. No mark then (spec
+    /// §4.2). Nor is an address asked with a header value that cannot be sent
+    /// (a control character).
     Unchecked,
 }
 
 impl Answer {
-    /// Whether the channel gets the mark.
+    /// Whether the channel gets the mark: not when it answers again, and not
+    /// when it was not asked.
     pub fn is_dead(self) -> bool {
-        !matches!(self, Answer::Answers(_))
+        !matches!(self, Answer::Answers(_) | Answer::Unchecked)
     }
 
     /// What the log says of it, never the address: "http 404", "connect
@@ -1982,7 +2155,7 @@ impl Answer {
             Answer::ConnectFailed => "connect failed".to_owned(),
             Answer::TimedOut => "timeout".to_owned(),
             Answer::Failed => "request failed".to_owned(),
-            Answer::Unchecked => "no check for this address".to_owned(),
+            Answer::Unchecked => "an address it cannot ask".to_owned(),
         }
     }
 }
@@ -2142,7 +2315,7 @@ impl StreamChecker {
                 Err(e) => {
                     self.client_failed = true;
                     tracing::warn!(
-                        "m3u: no HTTP client for the defect check ({e}) - marks go by the two-minute rule"
+                        "m3u: no HTTP client for the defect check ({e}) - no channel is marked"
                     );
                 }
             }
@@ -2153,28 +2326,39 @@ impl StreamChecker {
 
 /// The check's HTTP client: [`CHECK_TIMEOUT`] for the connection and the
 /// headers (the body is never read, so the limit ends there), redirects
-/// followed, and no `Referer` of its own on a redirect: that would hand a
-/// tokenized address on to another server.
+/// followed, no `Referer` of its own on a redirect (that would hand a
+/// tokenized address on to another server), and no certificate check.
 pub fn http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(CHECK_TIMEOUT)
         .timeout(CHECK_TIMEOUT)
         .referer(false)
+        // As mpv, which runs with tls-verify=no; the M3U maturity round turns
+        // verification on for both, with one ini escape for both.
+        .danger_accept_invalid_certs(true)
         .build()
 }
 
 /// Asks `url` once, with the headers its `|…` suffix names
 /// ([`crate::m3u::split_headers`], as `player::loadfile_args` hands them to
-/// mpv), and mpv's own User-Agent when it names none. Only the status counts:
-/// the body (a live stream never ends) is not read.
+/// mpv), and mpv's own User-Agent when it names none. The header values go as
+/// their bytes, as mpv sends them, so a "Zürich-TV" User-Agent is no error; a
+/// value that still cannot be sent (a control character) is not asked. Only
+/// the status counts: the body (a live stream never ends) is not read.
 pub async fn ask(client: &reqwest::Client, url: &str) -> Answer {
     let (address, headers) = crate::m3u::split_headers(url);
     let agent = headers.user_agent.as_deref().unwrap_or(MPV_USER_AGENT);
+    let Ok(agent) = HeaderValue::from_bytes(agent.as_bytes()) else {
+        return Answer::Unchecked;
+    };
     let mut request = client
         .get(address)
         .header(reqwest::header::USER_AGENT, agent);
     if let Some(referrer) = &headers.referrer {
-        request = request.header(reqwest::header::REFERER, referrer.as_str());
+        let Ok(referrer) = HeaderValue::from_bytes(referrer.as_bytes()) else {
+            return Answer::Unchecked;
+        };
+        request = request.header(reqwest::header::REFERER, referrer);
     }
     match request.send().await {
         Ok(response) => {
@@ -2190,16 +2374,41 @@ pub async fn ask(client: &reqwest::Client, url: &str) -> Answer {
         Err(_) => Answer::Failed,
     }
 }
+
+/// Whether addresses `a` and `b` are on one server: the same scheme, host (in
+/// any letter case) and port, the scheme's default port filled in (http 80,
+/// https 443). The path, the query and the headers after a Kodi `|` do not
+/// count. An address that cannot be read is on no server, so never on the
+/// same one. The app asks no address on the server of the stream that plays:
+/// a paid list's portal allows one session per account (ruling 28b).
+pub fn same_server(a: &str, b: &str) -> bool {
+    match (server_of(a), server_of(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The scheme, the host in lower case and the port of `url` (the scheme's
+/// default when it names none).
+fn server_of(url: &str) -> Option<(String, String, Option<u16>)> {
+    let address = url.split('|').next().unwrap_or(url);
+    let parsed = reqwest::Url::parse(address).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let port = parsed.port_or_known_default();
+    Some((parsed.scheme().to_owned(), host, port))
+}
 ```
 
-The response is dropped unread: the connection closes, nothing of a live stream is downloaded.
+The response is dropped unread: the connection closes, nothing of a live stream is downloaded. `reqwest::Url` is the `url` crate's `Url`, which reqwest hands on: no new dependency.
+
+Run `rustfmt --edition 2021 src/stream_check.rs` once written.
 
 In `rust/src/lib.rs`, add `pub mod stream_check;` after `pub mod storage;`.
 
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `ct --test test_stream_check`
-Expected: all 12 pass. `a_closed_port_is_a_failed_connection` takes about 2 s on Windows (it retries a refused connection twice).
+Expected: all 20 pass. `a_closed_port_is_a_failed_connection` takes about 2 s on Windows (it retries a refused connection twice).
 
 Run once: `ct --test test_mpv_smoke -- --ignored the_defect_check_sends_mpvs_own_user_agent`
 Expected: it passes. When it fails, set `MPV_USER_AGENT` to what it says mpv sends and run it again; say so in your report. When libmpv cannot be loaded there, say that instead and leave the constant.
@@ -2219,7 +2428,7 @@ Files: `rust/src/stream_check.rs`, `rust/src/lib.rs`, `rust/tests/test_stream_ch
 
 ### Task 5: App: defect marks
 
-The app keeps the M3U source's marks (`BadStreams`), read when its catalog loads, and feeds them at the two moments that count: a start that ends without a first picture, and a first picture. A suspect that a first picture confirms is not marked at once: its address is checked first (Task 4), and the answer, taken in once per frame, decides. Every change goes to the catalog's filter at once. The search and the favorites list name a marked channel. An Xtream portal never touches any of it.
+The app keeps the M3U source's marks (`BadStreams`), read when its catalog loads, and feeds them at the two moments that count: a start that ends without a first picture, and a first picture. A suspect that a first picture confirms is not marked at once: its address is checked first (Task 4), and the answer, taken in once per frame, decides; one on the server of what plays is never asked, nor marked (ruling 28b). Every change goes to the catalog's filter at once. The search and the favorites list name a marked channel. An Xtream portal never touches any of it.
 
 **Files:**
 - Modify: `rust/src/app.rs`, `rust/src/i18n.rs`
@@ -2229,8 +2438,8 @@ The app keeps the M3U source's marks (`BadStreams`), read when its catalog loads
   - Task 1: `BadStreams::{load, marks, failed, first_picture, mark, expire}`, `Failure`, `Picture { confirmed, cleared }`, `Confirmed { stream_id, name, failed_unix }`, `Storage::bad_streams_path`;
   - Task 2: `CatalogStore::{set_defect, is_defect, live_name}`;
   - Task 3: `TvApp::plays`, the tests' `RING`, `m3u_sid`, `ring_url`;
-  - Task 4: `StreamChecker::{new, start, drain, forget, reset, checking, in_flight}`, `Check`, `Checked`, `Answer::{is_dead, kind}`;
-  - existing in `app.rs`: `drain_events` (the `PlaybackStarted`, `EndOfFile` and `Error` arms), `stop_for_refused_load`, `check_stall`, `load_url_with`, `stop_playback`, `install_portal`, `paint_search`, `paint_favs`, `handle_keys` (F5); the tests' `Harness`, `m3u_app`, `loads`, `live_url`, `loaded_catalog`, `two_sources`, `write_last_watched`, `wait_until`, `f_pressed`, `shift_f_pressed`, `LogCapture`, `ENV_LOCK`.
+  - Task 4: `StreamChecker::{new, start, drain, forget, reset, checking, in_flight}`, `Check`, `Checked`, `Answer::{is_dead, kind, Unchecked}`, `same_server`;
+  - existing in `app.rs`: `drain_events` (the `PlaybackStarted`, `EndOfFile` and `Error` arms), `stop_for_refused_load` (renamed here to `stop_failed_start`), `check_stall`, `load_url_with`, `stop_playback`, `install_portal`, `paint_search`, `paint_favs`, `handle_keys` (F5), the field `current_url`; the tests' `Harness`, `m3u_app`, `loads`, `live_url`, `loaded_catalog`, `two_sources`, `write_last_watched`, `wait_until`, `list_server`, `f_pressed`, `shift_f_pressed`, `LogCapture`, `ENV_LOCK`.
 - Produces (`app.rs`):
   ```rust
   // TvApp fields
@@ -2242,16 +2451,15 @@ The app keeps the M3U source's marks (`BadStreams`), read when its catalog loads
   fn refresh_defects(&mut self);           // per frame in update_ui
   fn expire_defects(&mut self);            // also on F5
   fn note_start_failure(&mut self);
-  fn note_first_picture(&mut self);        // confirmed suspects go to the check
+  fn note_first_picture(&mut self);        // confirmed suspects go to the check, none on the server of what plays
   fn drain_stream_checks(&mut self);       // per frame in update_ui: the checks' verdicts
   fn stop_failed_start(&mut self) -> bool; // was stop_for_refused_load; the watchdog uses it too
   // tests: fn start_fails(h), fn picture_comes(h), fn now_unix() -> i64,
   //        fn write_marks(root, &[(i64, i64)]), fn marks_in(root) -> HashMap<i64, i64>,
-  //        async fn answering(status: u16, delay: Duration) -> wiremock::MockServer,
   //        fn ring_with_b_at(server: &wiremock::MockServer) -> String,
   //        async fn checks_answered(h: &mut Harness)
   ```
-  i18n key: `DefectLabel`. Log lines: Ruling 9, and `m3u: no picture ~<n>s after the start - given up`.
+  i18n key: `DefectLabel`. Log lines: Ruling 9; `m3u: <name> (stream_id <id>) not checked (<what>), not marked` (rulings 28b, 29); and `m3u: no picture ~<n>s after the start - given up`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2299,19 +2507,9 @@ In `rust/src/app.rs`'s `mod tests`, after the section `// ---- zapping through t
             .clone()
     }
 
-    /// A server whose every answer is `status`, after `delay`: what a channel's
-    /// address answers the check before a mark.
-    async fn answering(status: u16, delay: Duration) -> wiremock::MockServer {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::any())
-            .respond_with(wiremock::ResponseTemplate::new(status).set_delay(delay))
-            .mount(&server)
-            .await;
-        server
-    }
-
-    /// `RING` with Kanaal B at `server`, so the check asks it and no other
-    /// machine.
+    /// `RING` with Kanaal B at `server` (a `list_server`, whose every answer to
+    /// a GET is what a channel's address answers the check before a mark), so
+    /// the check asks it and no other machine.
     fn ring_with_b_at(server: &wiremock::MockServer) -> String {
         RING.replace(
             "https://b.example/b.m3u8",
@@ -2334,7 +2532,7 @@ In `rust/src/app.rs`'s `mod tests`, after the section `// ---- zapping through t
 
     #[tokio::test]
     async fn a_dead_channel_followed_by_one_that_plays_is_marked_once_its_address_fails_too() {
-        let server = answering(404, Duration::from_millis(200)).await;
+        let server = list_server(404, "", Duration::from_millis(200)).await;
         let dir = tempfile::tempdir().unwrap();
         let mut h = m3u_app(dir.path(), &ring_with_b_at(&server));
         h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
@@ -2364,7 +2562,7 @@ In `rust/src/app.rs`'s `mod tests`, after the section `// ---- zapping through t
 
     #[tokio::test]
     async fn a_dead_channel_whose_address_answers_again_is_not_marked() {
-        let server = answering(200, Duration::ZERO).await;
+        let server = list_server(200, "", Duration::ZERO).await;
         let dir = tempfile::tempdir().unwrap();
         let mut h = m3u_app(dir.path(), &ring_with_b_at(&server));
         let log = LogCapture::start();
@@ -2383,8 +2581,46 @@ In `rust/src/app.rs`'s `mod tests`, after the section `// ---- zapping through t
     }
 
     #[tokio::test]
+    async fn a_suspect_on_the_server_of_what_plays_is_not_asked_and_one_on_another_port_is() {
+        // B and C on one server, D on another port of that host. Both would
+        // answer 404, so a check of B would mark it.
+        let here = list_server(404, "", Duration::ZERO).await;
+        let other_port = list_server(404, "", Duration::ZERO).await;
+        let at = |server: &wiremock::MockServer, file: &str| format!("{}/{file}", server.uri());
+        let list = RING
+            .replace("https://b.example/b.m3u8", &at(&here, "b.m3u8"))
+            .replace("https://c.example/c.m3u8", &at(&here, "c.m3u8"))
+            .replace("https://d.example/d.m3u8", &at(&other_port, "d.m3u8"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), &list);
+        let log = LogCapture::start();
+        let (b, d) = (m3u_sid("Kanaal B"), m3u_sid("Kanaal D"));
+        h.app.zap_by_id(b);
+        start_fails(&mut h);
+        h.app.zap_by_id(d);
+        start_fails(&mut h);
+        // C plays: its picture confirms B and D.
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        picture_comes(&mut h);
+        assert!(!h.app.stream_checks.checking(b), "C's server");
+        assert!(h.app.stream_checks.checking(d), "another port");
+        let suspects = h.app.bad_streams.as_ref().map(|bad| bad.suspects());
+        assert_eq!(suspects, Some(0), "B is no suspect any more");
+        checks_answered(&mut h).await;
+        assert!(!h.app.catalog.is_defect(b), "not marked");
+        assert!(h.app.catalog.is_defect(d), "asked, and dead");
+        let asked = here.received_requests().await.unwrap();
+        assert!(asked.is_empty(), "nothing asked C's server");
+        let text = log.text();
+        let said = "not checked (the server of what plays), not marked";
+        let line = format!("m3u: Kanaal B (stream_id {b}) {said}");
+        assert!(text.contains(&line), "{text}");
+        assert!(!text.contains(&here.uri()), "no address:\n{text}");
+    }
+
+    #[tokio::test]
     async fn a_switch_of_source_during_a_check_leaves_no_mark() {
-        let server = answering(404, Duration::from_millis(400)).await;
+        let server = list_server(404, "", Duration::from_millis(400)).await;
         let dir = tempfile::tempdir().unwrap();
         let list = ring_with_b_at(&server);
         let (twee, drie) = (dir.path().join("twee.m3u"), dir.path().join("drie.m3u"));
@@ -2397,17 +2633,21 @@ In `rust/src/app.rs`'s `mod tests`, after the section `// ---- zapping through t
         ));
         let portal = M3uPortal::new(2, &twee.display().to_string(), dir.path().join("m3u-2.m3u"));
         let store = Arc::new(CatalogStore::new(Arc::new(portal)));
-        store.spawn_fetch();
-        wait_until("list 2", || store.is_loaded()).await;
         let mut h = Harness::start_with(
             dir.path(),
-            store,
+            store.clone(),
             PortalState::Configured,
             None,
             None,
             sources,
             None,
         );
+        // Source 2's files, as main starts the app on it. Set before its list
+        // loads, which is when its marks are read (as `downloading` does).
+        h.app.storage.set_source(2);
+        store.spawn_fetch();
+        wait_until("list 2", || store.is_loaded()).await;
+        h.frame(&[]);
         let b = m3u_sid("Kanaal B");
         h.app.zap_by_id(b);
         start_fails(&mut h);
@@ -2431,6 +2671,7 @@ In `rust/src/app.rs`'s `mod tests`, after the section `// ---- zapping through t
         assert!(!h.app.catalog.is_defect(b), "no mark from the old source's check");
         assert!(!dir.path().join("bad_streams-3.json").exists());
         assert!(!dir.path().join("bad_streams.json").exists());
+        assert!(!dir.path().join("bad_streams-2.json").exists());
     }
 
     #[tokio::test]
@@ -2444,6 +2685,9 @@ In `rust/src/app.rs`'s `mod tests`, after the section `// ---- zapping through t
         start_fails(&mut h);
         assert!(!h.app.catalog.is_defect(m3u_sid("Kanaal B")));
         assert!(!h.app.catalog.is_defect(m3u_sid("Kanaal C")));
+        let suspects = h.app.bad_streams.as_ref().map(|bad| bad.suspects());
+        assert_eq!(suspects, Some(2), "two suspects, neither confirmed");
+        assert_eq!(h.app.stream_checks.in_flight(), 0, "nothing asked");
         assert!(!dir.path().join("bad_streams.json").exists());
     }
 
@@ -2462,14 +2706,17 @@ In `rust/src/app.rs`'s `mod tests`, after the section `// ---- zapping through t
             .unwrap();
         h.frame(&[]);
         start_fails(&mut h);
+        let suspects = |h: &Harness| h.app.bad_streams.as_ref().map(|bad| bad.suspects());
+        assert_eq!(suspects(&h), Some(0), "a stream that dropped: no suspect");
         h.app.zap_by_id(m3u_sid("Kanaal C"));
         picture_comes(&mut h);
+        assert!(!h.app.stream_checks.checking(b), "nothing confirmed, nothing asked");
         assert!(!h.app.catalog.is_defect(b));
     }
 
     #[tokio::test]
     async fn the_reload_budget_spent_on_a_start_without_a_picture_makes_a_suspect() {
-        let server = answering(404, Duration::ZERO).await;
+        let server = list_server(404, "", Duration::ZERO).await;
         let dir = tempfile::tempdir().unwrap();
         let mut h = m3u_app(dir.path(), &ring_with_b_at(&server));
         let b = m3u_sid("Kanaal B");
@@ -2496,7 +2743,7 @@ In `rust/src/app.rs`'s `mod tests`, after the section `// ---- zapping through t
 
     #[tokio::test]
     async fn a_refused_load_makes_a_suspect() {
-        let server = answering(404, Duration::ZERO).await;
+        let server = list_server(404, "", Duration::ZERO).await;
         let dir = tempfile::tempdir().unwrap();
         let mut h = m3u_app(dir.path(), &ring_with_b_at(&server));
         let b = m3u_sid("Kanaal B");
@@ -2514,7 +2761,7 @@ In `rust/src/app.rs`'s `mod tests`, after the section `// ---- zapping through t
 
     #[tokio::test]
     async fn the_stall_watchdog_gives_up_an_m3u_start_without_a_picture() {
-        let server = answering(404, Duration::ZERO).await;
+        let server = list_server(404, "", Duration::ZERO).await;
         let dir = tempfile::tempdir().unwrap();
         let mut h = m3u_app(dir.path(), &ring_with_b_at(&server));
         let b = m3u_sid("Kanaal B");
@@ -2651,7 +2898,7 @@ In `rust/src/app.rs`'s `mod tests`, after the section `// ---- zapping through t
 
     #[tokio::test]
     async fn the_marks_survive_a_restart_and_old_ones_expire() {
-        let server = answering(404, Duration::ZERO).await;
+        let server = list_server(404, "", Duration::ZERO).await;
         let dir = tempfile::tempdir().unwrap();
         let b = m3u_sid("Kanaal B");
         {
@@ -2739,7 +2986,7 @@ In `rust/src/i18n.rs`, under `// Sources: an M3U list`, add:
 
 In `rust/src/app.rs`:
 
-1. Imports: add `use crate::bad_streams::{BadStreams, Failure};` and `use crate::stream_check::{Check, StreamChecker};` inside the import block.
+1. Imports: add `use crate::bad_streams::{BadStreams, Failure};` and `use crate::stream_check::{same_server, Answer, Check, StreamChecker};` inside the import block.
 
 2. Fields, after `stream_starting_since`:
 
@@ -2792,7 +3039,7 @@ and in `TvApp::start`'s struct literal, after `stream_starting_since: None,`: `c
 
 7. In the `Event::Error` arm, `self.stop_for_refused_load()` becomes `self.stop_failed_start()`.
 
-8. Replace `fn stop_for_refused_load` with:
+8. In the doc of the field `stream_starting_since`, `stop_for_refused_load` becomes `stop_failed_start`. Replace `fn stop_for_refused_load` with:
 
 ```rust
     /// The start of an M3U channel that cannot go on: mpv refused the load (a
@@ -2906,7 +3153,8 @@ and in `TvApp::start`'s struct literal, after `stream_starting_since: None,`: `c
     /// A first picture (spec §4.2, §4.4): the suspects that failed within two
     /// minutes before it are confirmed (the connection works), and their
     /// addresses are asked once more before any of them is marked
-    /// (`drain_stream_checks` takes the answers in). What plays loses its own
+    /// (`drain_stream_checks` takes the answers in). One on the server of what
+    /// plays is not asked (ruling 28b), so not marked. What plays loses its own
     /// suspicion, its mark and its check.
     fn note_first_picture(&mut self) {
         let Some(bad) = self.bad_streams.as_mut() else {
@@ -2929,6 +3177,18 @@ and in `TvApp::start`'s struct literal, after `stream_starting_since: None,`: `c
         }
         for confirmed in seen.confirmed {
             let url = self.catalog.portal().live_stream_url(confirmed.stream_id);
+            // Never the server of what plays (ruling 28b): on a paid list one
+            // account serves every channel, and its portal allows one session.
+            // The check would take the session of what plays, or be refused and
+            // mark a channel that works. No check, no mark: the suspicion goes.
+            if same_server(self.current_url.as_deref().unwrap_or(""), &url) {
+                tracing::info!(
+                    "m3u: {} (stream_id {}) not checked (the server of what plays), not marked",
+                    crate::redact::redact(&confirmed.name),
+                    confirmed.stream_id
+                );
+                continue;
+            }
             self.stream_checks.start(Check {
                 stream_id: confirmed.stream_id,
                 name: confirmed.name,
@@ -2941,8 +3201,9 @@ and in `TvApp::start`'s struct literal, after `stream_starting_since: None,`: `c
     /// The verdicts of the checks before a mark (spec §4.2): an address that
     /// answers with a status of 400 or more, does not connect or does not
     /// answer in time gets the mark, with the time of its failure; one that
-    /// answers again is no suspect any more. The log names the channel and what
-    /// its address did, never the address. Nothing while no check runs.
+    /// answers again, or that could not be asked, is no suspect any more. The
+    /// log names the channel and what its address did, never the address.
+    /// Nothing while no check runs.
     fn drain_stream_checks(&mut self) {
         if self.stream_checks.in_flight() == 0 {
             return;
@@ -2950,6 +3211,16 @@ and in `TvApp::start`'s struct literal, after `stream_starting_since: None,`: `c
         for checked in self.stream_checks.drain() {
             let shown = crate::redact::redact(&checked.name).into_owned();
             let sid = checked.stream_id;
+            if checked.answer == Answer::Unchecked {
+                // No check, no mark (spec §4.2, ruling 29).
+                tracing::info!(
+                    "m3u: {} (stream_id {}) not checked ({}), not marked",
+                    shown,
+                    sid,
+                    checked.answer.kind()
+                );
+                continue;
+            }
             if !checked.answer.is_dead() {
                 tracing::info!("m3u: {} (stream_id {}) answers again, not marked", shown, sid);
                 continue;
@@ -3061,7 +3332,7 @@ and make the loop:
 - [ ] **Step 5: Run the tests to see them pass**
 
 Run: `ct --lib app::tests::`
-Expected: all pass, the old M3U ones among them (`a_dead_m3u_channel_names_itself_and_the_app_stays_on_it`, `a_load_mpv_refuses_stops_the_stream_before_it_and_names_the_channel`, `a_dead_m3u_channel_takes_the_picture_of_the_channel_before_off_the_screen`, `an_m3u_channel_that_showed_its_own_picture_keeps_its_last_frame_when_it_errors`).
+Expected: all pass, the old M3U ones among them (`a_dead_m3u_channel_names_itself_and_the_app_stays_on_it`, `a_load_mpv_refuses_stops_the_stream_before_it_and_names_the_channel`, `a_dead_m3u_channel_takes_the_picture_of_the_channel_before_off_the_screen`, `an_m3u_channel_that_showed_its_own_picture_keeps_its_last_frame_when_it_errors`, `an_m3u_channel_that_keeps_ending_before_its_first_picture_takes_the_one_before_off` (the eof arm the hook of item 6 sits after), `a_refused_m3u_load_takes_the_picture_of_the_channel_before_off_the_screen` (the refused load, now `stop_failed_start`)).
 
 - [ ] **Step 6: Format, lint, full suite**
 
@@ -3471,6 +3742,8 @@ fn eleven_thousand_channels_are_grouped_within_the_budget() {
 }
 ```
 
+Run `rustfmt --edition 2021 tests/test_channel_list.rs` once written.
+
 - [ ] **Step 2: Run them to see them fail**
 
 Run: `ct --test test_channel_list`
@@ -3871,7 +4144,7 @@ A view in the guide's pattern: `ChannelListView::show` draws the list over the p
 **Files:**
 - Create: `rust/src/channel_list_ui.rs`
 - Modify: `rust/src/lib.rs` (`pub mod channel_list_ui;` after `pub mod channel_list;`)
-- Modify: `rust/src/guide_ui.rs` (`single_line` and `play_mark` shared)
+- Modify: `rust/src/guide_ui.rs` (`single_line`, `play_mark` and `CLICK` shared)
 - Modify: `rust/src/i18n.rs`
 
 **Interfaces:**
@@ -3904,12 +4177,13 @@ A view in the guide's pattern: `ChannelListView::show` draws the list over the p
   // guide_ui.rs
   pub(crate) fn single_line(text: &str, font: FontId, color: Color32, width: f32) -> egui::text::LayoutJob;
   pub(crate) fn play_mark(p: &egui::Painter, center: Pos2, color: Color32);
+  pub(crate) const CLICK: Sense;   // a click target the keyboard never reaches
   ```
   i18n keys: `ChannelListTitle`, `ListAllChannels`, `ListNoGroup`, `ListDefect`, `ListEmptyGroup`, `ChannelListFooter`, `AgoJustNow`, `AgoMinutes`, `AgoHour`, `AgoHours`, `AgoDay`, `AgoDays`.
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `rust/src/channel_list_ui.rs` holding only its test module for now (Step 3 writes the code above it):
+Create `rust/src/channel_list_ui.rs` holding only its test module for now (Step 4 writes the code above it):
 
 ```rust
 #[cfg(test)]
@@ -4372,6 +4646,7 @@ In `rust/src/i18n.rs`, after the block under `// Sources: an M3U list`, add:
 The footer names the keys in words, as the guide's and the news picker's footers do.
 
 In `rust/src/guide_ui.rs` (check it with `fmt src/guide_ui.rs` before and after):
+- `const CLICK: Sense = Sense {` becomes `pub(crate) const CLICK: Sense = Sense {`, and its doc "A click target the keyboard never reaches: the guide's keys are its own, and a focused widget would take Enter or Space for a click." becomes "A click target the keyboard never reaches: the guide's keys are its own (the channel list's too), and a focused widget would take Enter or Space for a click."
 - `fn single_line(` becomes `pub(crate) fn single_line(`.
 - `play_mark` takes its colour: its doc becomes "▶: a past programme that can be watched back (the guide); the channel that plays (the channel list)."; its signature `pub(crate) fn play_mark(p: &egui::Painter, center: Pos2, color: Color32)`; `REPLAY_BLUE` in its body becomes `color`; and its call in `paint_row` becomes `Playable::Replay => play_mark(p, Pos2::new(row.right() - 14.0, row.center().y), REPLAY_BLUE),`.
 
@@ -4387,7 +4662,7 @@ Above the test module in `rust/src/channel_list_ui.rs`, write:
 //! app.rs as [`ListAction`]s, as guide_ui.rs does.
 
 use crate::channel_list::{ChannelGroups, Cursor, GroupKey};
-use crate::guide_ui::{play_mark, single_line};
+use crate::guide_ui::{play_mark, single_line, CLICK};
 use crate::i18n::{self, Lang, T};
 use egui::{Align2, Color32, FontId, Key, Pos2, Rect, Sense, Stroke, Vec2};
 use std::collections::HashMap;
@@ -4432,6 +4707,8 @@ const MAX_W: f32 = 940.0;
 /// Room left under the list: the toast ("streamfout op …") shows there.
 const TOAST_ROOM: f32 = 64.0;
 
+// The list's colours: tokens of its own, as the guide has its own; some have
+// the guide's values (the selected and the hovered row, the accent, the green).
 const PANEL: Color32 = Color32::from_rgb(18, 18, 24);
 const ROW_SELECTED: Color32 = Color32::from_rgb(40, 55, 80);
 const ROW_HOVER: Color32 = Color32::from_rgb(30, 30, 38);
@@ -4439,14 +4716,6 @@ const GROUP_OPEN: Color32 = Color32::from_rgb(34, 34, 46);
 const ACCENT: Color32 = Color32::from_rgb(255, 80, 140);
 const PLAYING: Color32 = Color32::from_rgb(120, 230, 100);
 const BROKEN: Color32 = Color32::from_rgb(230, 120, 110);
-
-/// A click target the keyboard never reaches: the list's keys are its own, and
-/// a focused widget would take Enter for a click.
-const CLICK: Sense = Sense {
-    click: true,
-    drag: false,
-    focusable: false,
-};
 
 /// Where the parts of the list go in a window `screen`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -4707,9 +4976,10 @@ impl ChannelListView {
             };
             let row = Layout::row(layout.groups, k);
             let response = ui.interact(row, egui::Id::new(("__list_group__", g)), CLICK);
+            // The open group has a fill of its own; the selected row's
+            // background, with the accent bar, is the channel column's alone.
             if g == self.cursor.group {
                 p.rect_filled(row, 4.0, GROUP_OPEN);
-                p.rect_filled(Rect::from_min_size(row.min, Vec2::new(3.0, row.height())), 0.0, ACCENT);
             } else if response.hovered() {
                 p.rect_filled(row, 4.0, ROW_HOVER);
             }
@@ -4745,6 +5015,7 @@ impl ChannelListView {
             };
             let row = Layout::row(layout.rows, k);
             let response = ui.interact(row, egui::Id::new(("__list_row__", g, r)), CLICK);
+            // The selected row's background: painted here, once.
             if r == self.cursor.row {
                 p.rect_filled(row, 4.0, ROW_SELECTED);
                 p.rect_filled(Rect::from_min_size(row.min, Vec2::new(3.0, row.height())), 0.0, ACCENT);
@@ -4852,7 +5123,7 @@ Run `rustfmt --edition 2021 src/channel_list_ui.rs` once written: some lines abo
 
 - [ ] **Step 5: Run the tests to see them pass**
 
-Run: `ct --lib channel_list_ui:: guide_ui::`
+Run: `ct --lib -- channel_list_ui:: guide_ui::`
 Expected: all pass, the guide's own tests too (its play mark keeps its colour).
 
 - [ ] **Step 6: Format, lint, full suite**
@@ -4878,10 +5149,10 @@ Files: `rust/src/channel_list_ui.rs`, `rust/src/lib.rs`, `rust/src/guide_ui.rs`,
 **Interfaces:**
 - Consumes:
   - Task 3: `TvApp::{plays, zap_to}`, `zap_pacer: ZapPacer<(i64, String, Option<usize>)>`, the tests' `m3u_sid`, `ring_url`;
-  - Task 5: the tests' `start_fails`, `picture_comes`, `answering`, `checks_answered`;
+  - Task 5: the tests' `start_fails`, `picture_comes`, `checks_answered`;
   - Task 6: `CatalogStore::channel_groups`, `GroupKey`, `ChannelGroups::{rows, find, channel, channel_count, group_count}`;
   - Task 7: `ChannelListView::{new, show, replace_groups, group_key, cursor, groups}`, `ListAction`, `ListData`, `channel_list_ui::Layout::{of, row}`;
-  - existing in `app.rs`: `open_guide`, `close_guide`, `handle_keys` (its `g` spends the key before `open_guide`), `update_ui`, `zap_to`, `toggle_favorite_current`, `paint_favs`, `use_data_of`, `close_panels_under_settings`, `install_portal`; the tests' `Harness`, `m3u_app`, `loads`, `key_press`, `click_at`, `guide_catalog`, `f_pressed`, `shift_f_pressed`, `wait_until`, `LogCapture`.
+  - existing in `app.rs`: `open_guide`, `close_guide`, `handle_keys` (its `g` spends the key before `open_guide`), `update_ui`, `zap_to`, `toggle_favorite_current`, `paint_favs`, `use_data_of`, `close_panels_under_settings`, `install_portal`; the tests' `Harness`, `m3u_app`, `loads`, `key_press`, `click_at`, `guide_catalog`, `f_pressed`, `shift_f_pressed`, `wait_until`, `list_server`, `LogCapture`.
 - Produces (`app.rs`):
   ```rust
   // TvApp fields
@@ -5183,7 +5454,7 @@ In `rust/src/app.rs`'s `mod tests`:
     async fn a_channel_marked_while_the_list_is_open_moves_to_broken_channels() {
         // B's address answers 404, half a second late: the mark lands while the
         // list is open.
-        let server = answering(404, Duration::from_millis(500)).await;
+        let server = list_server(404, "", Duration::from_millis(500)).await;
         let dir = tempfile::tempdir().unwrap();
         let text = LISTED.replace(
             "https://b.example/b.m3u8",
@@ -5323,7 +5594,7 @@ and in `TvApp::start`'s struct literal, after `guide_view: …,`: `channel_list:
 - in `paint_favs`, in `if let Some(id) = remove_id { … }`, after `self.favorites.remove(id);`: `self.favorites_revision += 1;`
 - in `use_data_of`, after the line that loads `self.favorites`: `self.favorites_revision += 1;`
 
-4. In `zap_to`, the line `self.set_toast(format!("[TV] {}", name));` becomes:
+4. In `zap_to`, the line near its end `self.set_toast(format!("[TV] {}", name));` (not the guard Task 3 gave it) becomes:
 
 ```rust
         // While the channel list is open its play mark shows what plays (spec §3.5).
@@ -5544,8 +5815,10 @@ In `rust/e2e/regression.ps1`'s `Group-M`, replace the scenario `M-guide` and its
 
 ```powershell
     # g on an M3U source: the channel list, A-Z (M3U 01 first). DOWN starts M3U 02 at once, with no zap toast while
-    # the list is open; ENTER closes it, and M3U 02 plays on.
-    Scn 'M-list' @{ MockEnv = $M; NoPortal = $true; ConfigDir = (IniDir 'm-list' $onlyList); Seconds = 14; Keys = 'SLEEP:1500;g;SLEEP:800;DOWN;SLEEP:2500;ENTER;SLEEP:1500'; Expect = 'channel list: opened \(21 channels, 2 groups\)', 'zap: -> M3U 02', 'loadfile http://127\.0\.0\.1:18080/m3uplay/2\.m3u8', 'channel list: closed'; Forbid = 'toast: \[TV\] M3U 02', 'guide: opened', 'zap: -> M3U (0[13-9]|1\d|UA|DOOD|REF)' }
+    # the list is open; ENTER closes it, and M3U 02 plays on. Its last channel would be resumed on a re-run, so its
+    # -Before makes the folder anew.
+    $dl = IniDir 'm-list' $onlyList
+    Scn 'M-list' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $dl; Seconds = 14; Keys = 'SLEEP:1500;g;SLEEP:800;DOWN;SLEEP:2500;ENTER;SLEEP:1500'; Expect = 'channel list: opened \(21 channels, 2 groups\)', 'zap: -> M3U 02', 'loadfile http://127\.0\.0\.1:18080/m3uplay/2\.m3u8', 'channel list: closed'; Forbid = 'toast: \[TV\] M3U 02', 'guide: opened', 'zap: -> M3U (0[13-9]|1\d|UA|DOOD|REF)' } -Before { $null = IniDir 'm-list' $onlyList }
 ```
 
 and after the scenario `M-dead`, add:
@@ -5562,15 +5835,19 @@ and after the scenario `M-dead`, add:
 
 In the header's group list, `M  M3U sources (MOCK_M3U)` becomes `M  M3U sources and the channel list (MOCK_M3U)`.
 
+In the comment above `function Group-M`, "M-zap, M-add, M-switch and M-getphp change what is in their folder" becomes "M-zap, M-add, M-switch, M-getphp, M-list and M-defect change what is in their folder".
+
 - [ ] **Step 2: The harness's view of the log**
 
 In `rust/e2e/run-scenario.ps1`, add `channel list: |` to the alternatives of the app-log filter that prints the log lines (after `guide: opened|`). It only changes what the output shows; `-Expect` and `-Forbid` read every line already.
 
 - [ ] **Step 3: The README**
 
-In `rust/e2e/README.md`, in "## Regression set", after the sentence on `M-restart`, add:
+In `rust/e2e/README.md`, in "## Regression set", after the sentence that ends "run the two together.", add:
 
 > `M-list` opens the channel list with `g` and starts M3U 02 from it. `M-defect` makes M3U DOOD fail, plays M3U UA (which confirms DOOD; the check before the mark finds `/m3uplay/dead.m3u8` 404 and marks it) and zaps down past DOOD to M3U REF; its check reads `bad_streams.json` in its folder, and its `-Before` makes the folder anew for a re-run, as the marks change it.
+
+In the sentence after it, "`M-zap`, `M-add`, `M-switch` and `M-getphp` change what is in their folder" becomes "`M-zap`, `M-add`, `M-switch`, `M-getphp`, `M-list` and `M-defect` change what is in their folder".
 
 - [ ] **Step 4: Dry run**
 
@@ -5604,7 +5881,7 @@ Files: `rust/e2e/regression.ps1`, `rust/e2e/run-scenario.ps1`, `rust/e2e/README.
 2. After the `zap.rs` bullet, add:
 
    > - **`bad_streams.rs`** — defect marks of an M3U source. A channel whose start ends without a first picture (an mpv error, a refused load, the reload budget, the stall watchdog; `TvApp::note_start_failure`) is a suspect; another channel's first picture within 2 minutes confirms it (`note_first_picture`), else the suspicion lapses. A confirmed suspect is marked only when the check of its address (`stream_check.rs`) finds it dead too (`drain_stream_checks`), so a Wi-Fi drop of any length marks no good channel. Its own picture clears it. A channel that showed a picture since it was picked is never a suspect (`current_showed_picture`). Marks last 7 days, per source in `bad_streams.json` / `bad_streams-<id>.json` (stream ids and unix times only), read when the source's catalog loads (`refresh_defects`); app.rs hands every change to the catalog.
-   > - **`stream_check.rs`** — the check before a defect mark: one GET of a confirmed suspect's address with the channel's own User-Agent and Referer (libmpv's `libmpv` when it names none), 5 s for the connection and the headers, the status only. 400 or more, no connection or no answer in time marks it; 2xx/3xx drops the suspicion; a non-http address goes by the 2-minute rule alone. At most one check per channel and 4 at once (`StreamChecker`), on the tokio runtime with a client built on the first check; the answers come through a slot `update_ui` drains. A switch or save of the source drops the running checks. The address never reaches the log (`Check` has no `Debug`). This is the only network the defect marks use.
+   > - **`stream_check.rs`** — the check before a defect mark: one GET of a confirmed suspect's address with the channel's own User-Agent and Referer (libmpv's `libmpv` when it names none), as mpv asks it (no certificate check, header values as bytes), 5 s for the connection and the headers, the status only. 400 or more, no connection or no answer in time marks it; 2xx/3xx drops the suspicion; an address the check cannot ask is not marked. It never asks the server of the stream that plays (`same_server`: scheme, host, port): on a paid list one account serves every channel and its portal allows one session, so such a suspect is not marked. At most one check per channel and 4 at once (`StreamChecker`), on the tokio runtime with a client built on the first check; the answers come through a slot `update_ui` drains. A switch or save of the source drops the running checks. The address never reaches the log (`Check` has no `Debug`). This is the only network the defect marks use.
    > - **`channel_list.rs` / `channel_list_ui.rs`** — `g` on an M3U source: the channel list over the running picture. `channel_list.rs` builds the groups (`ChannelGroups::build`: All channels, Favorites, the list's `group-title`s A–Z by `natural_cmp`, No group, Defect channels) as positions in the catalog's channels (`CatalogStore::channel_groups`), and keeps the selection (`Cursor`); `channel_list_ui.rs` draws the rows on screen only and returns `ListAction`s. A move starts the channel behind the list through the app's one `ZapPacer`; Enter closes and plays, Esc/g close. The groups are built when the list opens and again while it is open when the catalog, the marks or the favorites change; a closed list holds nothing.
 
 3. In the `zap.rs` bullet, add: "The channel list's moves are presses of the same pacer. A start that comes due for the channel that plays loads nothing (`TvApp::plays`)."
@@ -5613,6 +5890,7 @@ Files: `rust/e2e/regression.ps1`, `rust/e2e/run-scenario.ps1`, `rust/e2e/README.
 
 5. In "Gotchas worth knowing":
    - At the end of the gotcha "The catalog is the only adult filter", add: "It is the only defect filter too: zapping, the channel list and the search read `CatalogStore::{zap_ring, channel_groups, is_defect}`, never a copy of the marks of their own."
+   - The gotcha "A new M3U channel never shows the picture of the one before it": the M3U branch's last commits rewrote it, so edit it as it reads at this branch's base, keeping its words where they still hold. Afterwards it names `app.rs::stop_failed_start` (where it named `stop_for_refused_load`) and the arm of `Event::EndOfFile` for an error or an eof that the reloads did not get past, and among the starts that leave the screen black it counts one the stall watchdog gives up.
    - Add:
 
    > - **An M3U start the stall watchdog would reload is given up instead.** A channel of an M3U list that showed no picture since it was picked stops with "streamfout op …" when the watchdog fires (`stop_failed_start`, as for a load mpv refuses) and becomes a suspect; a reload would only start the 25 s wait over. One that showed a picture is reloaded as before, and Xtream is unchanged.
@@ -5623,9 +5901,12 @@ In the list under "## Where the app keeps its data", after the item on favorites
 
 ```markdown
 - Defect marks of an M3U source (channels that did not start, see `g`'s
-  channel list): `bad_streams.json` in the config folder for source 1,
-  `bad_streams-<id>.json` for another. They hold stream ids and times only,
-  last 7 days, and go with their source.
+  channel list): `bad_streams-<id>.json` in the config folder
+  (`bad_streams.json` for a list an older ini has as source 1). They hold
+  stream ids and times only, last 7 days, and go with their source. A channel
+  is marked only when a check of its address finds it dead too, and that check
+  never asks the server of the channel that plays: on a paid list one account
+  serves every channel, and its portal allows one session.
 ```
 
 - [ ] **Step 3: docs/VALIDATION.md**
@@ -5642,7 +5923,8 @@ In "## Bronnen (M3U)", the item that says `g` says "voor deze bron is er nog gee
 - [ ] While the list is open no "[TV] …" toast shows, but "streamfout op …" does; f, o, ?, n and * do nothing
 - [ ] After closing, Up/Down zap on from the channel that plays, in the M3U file's order
 - [ ] On an Xtream portal `g` is the guide, as before
-- [ ] A dead channel, then within 2 minutes one that plays: after the check of its address (a second or so) the dead one shows in "Defecte zenders" with how long ago it failed, zapping skips it, `f` and Shift+F show it with "defect"; the log says `m3u: <naam> (stream_id <id>) failed before its first picture` and `… marked defect (http 404)` (or `connect failed`, `timeout`), never an address; `bad_streams.json` (or `bad_streams-<id>.json`) in `%APPDATA%\BongoPlayer\config\` holds its id and time, no name and no address
+- [ ] A dead channel, then within 2 minutes one that plays from another server: after the check of its address (a second or so) the dead one shows in "Defecte zenders" with how long ago it failed, zapping skips it, `f` and Shift+F show it with "defect"; the log says `m3u: <naam> (stream_id <id>) failed before its first picture` and `… marked defect (http 404)` (or `connect failed`, `timeout`), never an address; `bad_streams-<id>.json` (or `bad_streams.json` for a list that is source 1) in `%APPDATA%\BongoPlayer\config\` holds its id and time, no name and no address
+- [ ] A dead channel, then within 2 minutes one that plays from the same server (a paid list: one account for every channel): the dead one is not marked and its server is not asked; the log says `… not checked (the server of what plays), not marked`
 - [ ] Pull the network cable, zap through a few channels (they fail), wait more than 2 minutes, plug it back and zap: nothing is marked
 - [ ] Pull the cable for less than 2 minutes, zap through a few good channels (they fail), plug it back and zap to one that plays: none of them is marked; the log says `… answers again, not marked` for each
 - [ ] A marked channel played by a preset, the search, a favorite or the list plays; once it shows a picture its mark is gone (`… plays again, mark cleared`); while it plays, Up/Down go on from its place in the file
@@ -5664,15 +5946,18 @@ In `rust/build-zip.ps1`'s README text, the key line of `g` becomes:
 
 - Run `ct`. Expected: all pass. Report the total and how many are new since Task 1's baseline.
 - Run `cc`. Expected: the 2 old warnings only.
-- Run `fmt src/bad_streams.rs src/stream_check.rs src/channel_list.rs src/channel_list_ui.rs src/storage.rs src/i18n.rs tests/test_bad_streams.rs tests/test_stream_check.rs tests/test_zap_ring.rs tests/test_channel_list.rs tests/test_storage.rs tests/test_mpv_smoke.rs`. Expected: no output.
+- Run `fmt src/bad_streams.rs src/stream_check.rs src/channel_list.rs src/channel_list_ui.rs src/storage.rs src/i18n.rs tests/test_bad_streams.rs tests/test_stream_check.rs tests/test_zap_ring.rs tests/test_channel_list.rs tests/test_storage.rs tests/test_mpv_smoke.rs tests/test_catalog_m3u.rs`. Expected: no output.
 - `guide_ui.rs`: what `fmt src/guide_ui.rs` showed before Task 7, nothing more.
 - The hunk counts of `app.rs` and `catalog.rs`: the counts noted before Tasks 2 and 3.
 - Run `bash rust/e2e/test-check-staged.sh`. Expected: every case `ok`.
 
-- [ ] **Step 6: The grouping in a release build**
+- [ ] **Step 6: The grouping and a zap press in a release build**
 
 Run: `cd /c/Dropbox/Sources/tv/rust && CARGO_TARGET_DIR='C:\Users\brnck\AppData\Local\Temp\claude\C--Dropbox-Sources-tv\7bade0af-c82f-473e-9f05-1727a9a2ac83\scratchpad\tgt' cargo test -j 4 --release --test test_channel_list eleven_thousand -- --nocapture`
 Expected: it passes and prints `grouping: 11000 channels, <n> groups, <t> ms, <k> KB kept`. The spec's budget is 20 ms and under 1 MB. Write the line in your report. Over 20 ms: report it and change nothing; the controller decides.
+
+Run: `cd /c/Dropbox/Sources/tv/rust && CARGO_TARGET_DIR='C:\Users\brnck\AppData\Local\Temp\claude\C--Dropbox-Sources-tv\7bade0af-c82f-473e-9f05-1727a9a2ac83\scratchpad\tgt' cargo test -j 4 --release --test test_catalog_m3u an_eleven_thousand -- --ignored --nocapture`
+Expected: it passes and prints three lines, `guide_channels_of: …`, `zap_channels: …` and `zap_ring (a press): …` (first, best and mean, in ms). Write the three lines in your report: `zap_ring` is what a press costs now, `zap_channels` the copy a press made before.
 
 - [ ] **Step 7: The release build**
 
