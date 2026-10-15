@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 pub struct Storage {
     root: PathBuf,
-    /// The source whose favorites, presets and last channel are in use.
+    /// The source whose favorites, presets, last channel and defect marks are
+    /// in use.
     source: SourceId,
 }
 
@@ -36,7 +37,8 @@ impl Storage {
         Ok(self.root.clone())
     }
 
-    /// From now on the favorites, presets and last channel are source `id`'s.
+    /// From now on the favorites, presets, last channel and defect marks are
+    /// source `id`'s.
     pub fn set_source(&mut self, id: SourceId) {
         self.source = id;
     }

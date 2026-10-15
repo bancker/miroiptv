@@ -92,18 +92,10 @@ impl BadStreams {
                     tracing::warn!("m3u: defect marks of version {} not read", file.version);
                     HashMap::new()
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "m3u: defect marks unreadable ({e}) - none until the next change"
-                    );
-                    HashMap::new()
-                }
+                Err(e) => unreadable(&e),
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(e) => {
-                tracing::warn!("m3u: defect marks unreadable ({e}) - none until the next change");
-                HashMap::new()
-            }
+            Err(e) => unreadable(&e),
         };
         Self {
             path,
@@ -112,7 +104,9 @@ impl BadStreams {
         }
     }
 
-    /// When each marked channel failed: stream id → unix seconds.
+    /// When each marked channel failed: stream id → unix seconds. A time can lie
+    /// after now (a clock that was wrong) until [`BadStreams::expire`] takes it
+    /// as now: an age counted from it is clamped at 0.
     pub fn marks(&self) -> &HashMap<i64, i64> {
         &self.marks
     }
@@ -129,6 +123,7 @@ impl BadStreams {
     /// Channel `stream_id` (`name`, for the log) failed before its first
     /// picture at `now` (`now_unix`). A marked one is marked anew at once and
     /// the file written; another one is a suspect, counted from this failure.
+    #[must_use = "a renewal and a first suspicion are logged differently"]
     pub fn failed(&mut self, stream_id: i64, name: &str, now: Instant, now_unix: i64) -> Failure {
         // Suspicions too old to be confirmed would only lapse: they go now.
         self.suspects.retain(|s| {
@@ -154,6 +149,7 @@ impl BadStreams {
     /// the caller to check their addresses and [`BadStreams::mark`] the dead
     /// ones. Older ones lapse. The channel's own suspicion goes, and so does its
     /// mark (the file is written then).
+    #[must_use = "the confirmed suspects go to the check"]
     pub fn first_picture(&mut self, stream_id: Option<i64>, now: Instant) -> Picture {
         let mut picture = Picture::default();
         for s in std::mem::take(&mut self.suspects) {
@@ -188,14 +184,24 @@ impl BadStreams {
         self.save();
     }
 
-    /// Marks older than [`KEEP_SECS`] at `now_unix` go; how many went. Writes
-    /// the file when any did.
+    /// Marks older than [`KEEP_SECS`] at `now_unix` go; how many went. A mark
+    /// dated later than `now_unix` (the clock was wrong when it was set, or has
+    /// stepped back since) is taken as `now_unix`, as the guide's cache takes a
+    /// fetch time from the future: left as it is, its age would be negative and
+    /// it would not expire until the clock passed that time plus seven days.
+    /// Writes the file when any mark went or moved.
     pub fn expire(&mut self, now_unix: i64) -> usize {
         let before = self.marks.len();
-        self.marks
-            .retain(|_, at| now_unix.saturating_sub(*at) <= KEEP_SECS);
+        let mut moved = false;
+        self.marks.retain(|_, at| {
+            if *at > now_unix {
+                *at = now_unix;
+                moved = true;
+            }
+            now_unix.saturating_sub(*at) <= KEEP_SECS
+        });
         let gone = before - self.marks.len();
-        if gone > 0 {
+        if gone > 0 || moved {
             self.save();
         }
         gone
@@ -214,6 +220,13 @@ impl BadStreams {
             tracing::warn!("m3u: defect marks not written ({e})");
         }
     }
+}
+
+/// No marks, for a file that cannot be read or parsed: the log says so, once per
+/// load, and the next change writes the file anew.
+fn unreadable(error: &dyn std::fmt::Display) -> HashMap<i64, i64> {
+    tracing::warn!("m3u: defect marks unreadable ({error}) - none until the next change");
+    HashMap::new()
 }
 
 /// `bytes` to `path` through a temp file beside it, so a write that fails

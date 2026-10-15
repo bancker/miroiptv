@@ -153,8 +153,10 @@ fn removing_a_sources_files_leaves_the_other_sources_alone() {
     }
     assert_eq!(storage.remove_source_files(2), 5, "its marks go too");
     assert!(!storage.favorites_path().exists(), "source 2's own");
+    assert!(!storage.bad_streams_path().exists(), "source 2's own marks");
     storage.set_source(1);
     assert!(storage.favorites_path().exists() && storage.m3u_cache_path(1).exists());
+    assert!(storage.bad_streams_path().exists(), "source 1's marks stay");
     assert_eq!(storage.remove_source_files(2), 0, "nothing left to remove");
 }
 
