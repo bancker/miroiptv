@@ -56,8 +56,9 @@ pub struct M3uPortal {
     cache: PathBuf,
     client: reqwest::Client,
     lookup: RwLock<Arc<Lookup>>,
-    /// The saved list was read and is what shows: a download that is the same
-    /// brings nothing new.
+    /// The saved list is what shows: it was read at the start, or the list that
+    /// shows was saved. A download that is the same brings nothing new. A list
+    /// that could not be saved clears it: the file then holds an older one.
     saved_shown: AtomicBool,
     /// More than this is no list ([`MAX_LIST_BYTES`]; a test makes it small).
     max_bytes: u64,
@@ -211,21 +212,26 @@ fn read_list(bytes: &[u8]) -> Option<Playlist> {
 }
 
 /// A downloaded list: `Unchanged` when it is the saved one and that one shows
-/// (`check_saved`), else read and, once read, kept at `cache`. A list that
-/// cannot be kept still plays; the next start then has none to show at once.
+/// (`check_saved`), else read and, once read, kept at `cache`; whether it was.
+/// A list that cannot be kept still plays; the next start then has none to
+/// show at once.
 fn read_download(
     bytes: &[u8],
     cache: &Path,
     check_saved: bool,
-) -> Result<(Playlist, usize), PortalError> {
+) -> Result<(Playlist, usize, bool), PortalError> {
     if check_saved && std::fs::read(cache).is_ok_and(|saved| saved == bytes) {
         return Err(PortalError::Unchanged);
     }
     let playlist = read_list(bytes).ok_or(PortalError::NotAList)?;
-    if let Err(e) = write_atomic(cache, bytes) {
-        tracing::warn!("m3u: list not saved: {}", e);
-    }
-    Ok((playlist, bytes.len()))
+    let saved = match write_atomic(cache, bytes) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("m3u: list not saved: {}", e);
+            false
+        }
+    };
+    Ok((playlist, bytes.len(), saved))
 }
 
 /// A list in a file of source `id`, `max` bytes at most. The error names the
@@ -308,15 +314,19 @@ impl Portal for M3uPortal {
             },
             Address::File(path) => {
                 let (path, max, id) = (path.clone(), self.max_bytes, self.id);
+                // A list in a file is not saved: there is no copy to be in step.
                 tokio::task::spawn_blocking(move || read_file(&path, max, id))
                     .await
                     .unwrap_or_else(|e| Err(reader_lost(e)))
+                    .map(|(playlist, size)| (playlist, size, false))
             }
         };
         match read {
-            Ok((playlist, size)) => {
+            Ok((playlist, size, saved)) => {
                 let channels = playlist.live.len();
                 let catalog = self.install(playlist);
+                // The saved file holds what shows now only if it was saved.
+                self.saved_shown.store(saved, Ordering::Release);
                 tracing::info!(
                     "m3u: list of source {} read ({} channels, {} KB) in {} ms",
                     self.id,

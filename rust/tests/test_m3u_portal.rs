@@ -89,6 +89,56 @@ async fn the_saved_list_shows_first_and_the_same_download_is_nothing_new() {
 }
 
 #[tokio::test]
+async fn a_first_list_once_saved_makes_the_same_download_nothing_new() {
+    let server = serving(LIST, 200).await;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("m3u-2.m3u");
+    let portal = M3uPortal::new(2, &format!("{}/tv.m3u", server.uri()), cache.clone());
+    // Nothing saved yet: the first download shows, and is saved.
+    assert!(portal.saved_catalog().await.is_none());
+    assert_eq!(names(&portal.fetch_catalog().await.unwrap()).len(), 2);
+    assert!(cache.exists());
+    // F5 brings the same bytes: what shows stays as it is.
+    assert!(matches!(
+        portal.fetch_catalog().await,
+        Err(PortalError::Unchanged)
+    ));
+}
+
+#[tokio::test]
+async fn after_a_list_that_could_not_be_saved_the_old_file_is_no_longer_what_shows() {
+    let server = serving(LIST, 200).await;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("m3u-2.m3u");
+    std::fs::write(&cache, LIST).unwrap();
+    let portal = M3uPortal::new(2, &format!("{}/tv.m3u", server.uri()), cache.clone());
+    portal.saved_catalog().await.expect("the saved list");
+    // A directory on the temp file's name: no list can be saved from now on.
+    std::fs::create_dir(cache.with_extension("m3u.tmp")).unwrap();
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/tv.m3u"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(OTHER))
+        .mount(&server)
+        .await;
+    assert_eq!(
+        names(&portal.fetch_catalog().await.unwrap()),
+        ["Kanaal Drie"]
+    );
+    assert_eq!(std::fs::read_to_string(&cache).unwrap(), LIST, "not saved");
+    // The old list comes again: it is the saved file, but not what shows.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/tv.m3u"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(LIST))
+        .mount(&server)
+        .await;
+    let fresh = portal.fetch_catalog().await;
+    let read = fresh.map(|c| names(&c).len());
+    assert!(matches!(read, Ok(2)), "{read:?}");
+}
+
+#[tokio::test]
 async fn a_refused_download_keeps_the_saved_file() {
     let server = serving("Service Unavailable", 503).await;
     let dir = tempfile::tempdir().unwrap();
