@@ -252,15 +252,16 @@ impl Sources {
     /// changes its name and address, and keeps its kind. The command line's
     /// portal goes into the first Xtream source. A new one, or a command-line
     /// portal with no Xtream source to go into, is added with an id of its own
-    /// (see `new_id`). Names lose `;`, CR and LF; both lose the spaces around
-    /// them.
+    /// (see `new_id`); `None`, and nothing kept, when no id is left for it (a
+    /// hand-edited ini holds the highest there is). Names lose `;`, CR and LF;
+    /// both lose the spaces around them.
     pub fn keep(
         &mut self,
         editing: Editing,
         kind: SourceKind,
         name: &str,
         address: &str,
-    ) -> SourceId {
+    ) -> Option<SourceId> {
         let target = match editing {
             Editing::Saved(id) => self.list.iter().position(|s| s.id == id),
             Editing::CommandLine => self.list.iter().position(|s| s.kind == SourceKind::Xtream),
@@ -273,17 +274,17 @@ impl Sources {
                 let source = &mut self.list[i];
                 source.name = name;
                 source.address = address;
-                source.id
+                Some(source.id)
             }
             None => {
-                let id = self.new_id(kind);
+                let id = self.new_id(kind)?;
                 self.list.push(Source {
                     id,
                     kind,
                     name,
                     address,
                 });
-                id
+                Some(id)
             }
         }
     }
@@ -292,13 +293,14 @@ impl Sources {
     /// (`favorites.json` and the rest), which are the portal's: an M3U list
     /// never gets 1, but 1 + the highest id, 2 at least. A portal gets 1 when
     /// no portal is saved and 1 is free, else 1 + the highest. An ini that
-    /// holds a list as source 1 already is read as it is.
-    fn new_id(&self, kind: SourceKind) -> SourceId {
+    /// holds a list as source 1 already is read as it is. `None` past the
+    /// highest id there is: adding one would wrap to 0, which is no id.
+    fn new_id(&self, kind: SourceKind) -> Option<SourceId> {
         let highest = self.list.iter().map(|s| s.id).max().unwrap_or(0);
         match kind {
-            SourceKind::M3u => highest.max(1) + 1,
-            SourceKind::Xtream if self.first_xtream().is_none() && self.get(1).is_none() => 1,
-            SourceKind::Xtream => highest + 1,
+            SourceKind::M3u => highest.max(1).checked_add(1),
+            SourceKind::Xtream if self.first_xtream().is_none() && self.get(1).is_none() => Some(1),
+            SourceKind::Xtream => highest.checked_add(1),
         }
     }
 

@@ -2680,6 +2680,16 @@ impl TvApp {
         }
     }
 
+    /// A new source of `kind` gets no number: the ini holds the highest there
+    /// is (`Sources::keep`). Nothing is kept, and the toast says so.
+    fn no_id_left(&mut self, kind: SourceKind) {
+        tracing::warn!(
+            "settings: no number left for a new {} source - not saved",
+            kind.code()
+        );
+        self.set_toast(self.t(T::SaveFailed));
+    }
+
     /// Writes `sources` to the ini; on failure says so in a toast and gives the
     /// state to show in place of a test's verdict.
     fn write_sources(&mut self, sources: &Sources) -> Result<(), ConnState> {
@@ -2703,7 +2713,10 @@ impl TvApp {
         }
         let name = self.stored_name(SourceKind::Xtream, &keep.name);
         let mut sources = self.sources.clone();
-        let id = sources.keep(keep.editing, SourceKind::Xtream, &name, &keep.line);
+        let Some(id) = sources.keep(keep.editing, SourceKind::Xtream, &name, &keep.line) else {
+            self.no_id_left(SourceKind::Xtream);
+            return Err(ConnState::Idle);
+        };
         let activate = self.save_activates(keep.editing, id);
         if activate {
             sources.set_active(id);
@@ -2784,7 +2797,10 @@ impl TvApp {
             _ => None,
         };
         let mut sources = self.sources.clone();
-        let id = sources.keep(draft.editing, SourceKind::M3u, &name, &draft.address);
+        let Some(id) = sources.keep(draft.editing, SourceKind::M3u, &name, &draft.address) else {
+            self.no_id_left(SourceKind::M3u);
+            return;
+        };
         let activate = self.save_activates(draft.editing, id);
         if activate {
             sources.set_active(id);
@@ -10545,6 +10561,44 @@ https://c.example/twee-nieuws.m3u8\n";
         }
         std::env::remove_var("BONGO_INI");
         assert_eq!(h.app.sources, before);
+        assert!(!ini.exists(), "nothing was written");
+    }
+
+    #[test]
+    fn a_source_with_no_number_left_for_it_is_not_kept() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("test.ini");
+        std::env::set_var("BONGO_INI", &ini);
+        // A hand-edited ini holds the highest number there is.
+        let sources = Sources::parse(
+            "source=1;xtream;;u:p@h:80\nsource=4294967295;m3u;Groot;https://a.example/tv.m3u\nactive=1\n",
+        );
+        let mut h = Harness::start_with(
+            dir.path(),
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            sources.clone(),
+            None,
+        );
+        let list = list_draft(Editing::New, "Nog een", "https://b.example/tv.m3u");
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(list));
+        assert_eq!(toast_text(&h), "Settings could not be saved");
+        h.app.toast = None;
+        let portal = KeepXtream {
+            creds: other_creds(),
+            line: "u2:p2@127.0.0.1:1".into(),
+            editing: Editing::New,
+            name: "Nog een".into(),
+        };
+        let kept = h.app.keep_xtream(portal);
+        std::env::remove_var("BONGO_INI");
+        assert!(kept.is_err());
+        assert_eq!(toast_text(&h), "Settings could not be saved");
+        assert_eq!(h.app.sources, sources, "nothing was kept");
         assert!(!ini.exists(), "nothing was written");
     }
 

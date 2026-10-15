@@ -67,8 +67,14 @@ fn one_default_portal_is_written_as_0_6_1_wrote_it() {
 #[test]
 fn sources_and_the_one_in_use_go_round() {
     let mut s = Sources::default();
-    assert_eq!(s.keep(Editing::New, SourceKind::Xtream, "", "u:p@h:80"), 1);
-    assert_eq!(s.keep(Editing::New, SourceKind::M3u, "Gratis", IPTV_ORG), 2);
+    assert_eq!(
+        s.keep(Editing::New, SourceKind::Xtream, "", "u:p@h:80"),
+        Some(1)
+    );
+    assert_eq!(
+        s.keep(Editing::New, SourceKind::M3u, "Gratis", IPTV_ORG),
+        Some(2)
+    );
     assert!(s.set_active(2));
     let text = s.to_text();
     assert_eq!(
@@ -90,12 +96,14 @@ fn with_source_lines_the_portal_line_is_only_a_copy() {
 #[test]
 fn the_portal_line_is_the_first_xtream_source_so_0_6_1_starts_on_it() {
     let mut s = Sources::default();
-    let list = s.keep(
-        Editing::New,
-        SourceKind::M3u,
-        "Gratis",
-        "https://bob:pw@lists.example/tv.m3u",
-    );
+    let list = s
+        .keep(
+            Editing::New,
+            SourceKind::M3u,
+            "Gratis",
+            "https://bob:pw@lists.example/tv.m3u",
+        )
+        .unwrap();
     s.keep(
         Editing::New,
         SourceKind::Xtream,
@@ -147,15 +155,21 @@ fn keep_changes_a_saved_one_adds_a_new_one_and_numbers_from_the_highest() {
     // A list never gets 1: source 1 keeps 0.6.1's files, which are the portal's.
     let first = s.keep(Editing::New, SourceKind::M3u, "A", "http://a.example/1");
     let second = s.keep(Editing::New, SourceKind::M3u, "B", "http://b.example/2");
-    assert_eq!((first, second), (2, 3));
+    assert_eq!((first, second), (Some(2), Some(3)));
     // The first portal takes 1, which is free; the next one numbers from the
     // highest.
-    assert_eq!(s.keep(Editing::New, SourceKind::Xtream, "C", "u:p@h:80"), 1);
-    assert_eq!(s.keep(Editing::New, SourceKind::Xtream, "D", "v:q@h:80"), 4);
+    assert_eq!(
+        s.keep(Editing::New, SourceKind::Xtream, "C", "u:p@h:80"),
+        Some(1)
+    );
+    assert_eq!(
+        s.keep(Editing::New, SourceKind::Xtream, "D", "v:q@h:80"),
+        Some(4)
+    );
     assert_eq!(s.remove(2).map(|g| g.name), Some("A".into()));
     assert_eq!(
         s.keep(Editing::New, SourceKind::M3u, "E", "http://e.example/5"),
-        5
+        Some(5)
     );
     // A saved one changes in place, its kind stays.
     assert_eq!(
@@ -165,7 +179,7 @@ fn keep_changes_a_saved_one_adds_a_new_one_and_numbers_from_the_highest() {
             "B2",
             "http://b.example/3"
         ),
-        3
+        Some(3)
     );
     assert_eq!(
         s.get(3).map(row),
@@ -174,7 +188,7 @@ fn keep_changes_a_saved_one_adds_a_new_one_and_numbers_from_the_highest() {
     // The command line's portal is the first Xtream source...
     assert_eq!(
         s.keep(Editing::CommandLine, SourceKind::Xtream, "", "x:y@h:81"),
-        1
+        Some(1)
     );
     assert_eq!(s.get(1).map(|c| c.address.as_str()), Some("x:y@h:81"));
     // ...and a new one when there is none: source 1, lists or not.
@@ -182,7 +196,7 @@ fn keep_changes_a_saved_one_adds_a_new_one_and_numbers_from_the_highest() {
         let mut none = Sources::parse(ini);
         assert_eq!(
             none.keep(Editing::CommandLine, SourceKind::Xtream, "", "x:y@h:81"),
-            1,
+            Some(1),
             "{ini:?}"
         );
     }
@@ -197,22 +211,49 @@ fn a_list_saved_as_source_1_before_stays_source_1() {
         rows(s.list()),
         rows(&[m3u(1, "Lijst", "http://a.example/1")])
     );
-    assert_eq!(s.keep(Editing::New, SourceKind::Xtream, "", "u:p@h:80"), 2);
+    assert_eq!(
+        s.keep(Editing::New, SourceKind::Xtream, "", "u:p@h:80"),
+        Some(2)
+    );
     assert_eq!(
         s.keep(Editing::New, SourceKind::M3u, "", "http://b.example/2"),
-        3
+        Some(3)
+    );
+}
+
+#[test]
+fn a_new_source_past_the_highest_number_there_is_is_refused() {
+    // A hand-edited ini: 1 + the highest would wrap to 0, which no source has.
+    let mut s = Sources::parse(
+        "source=1;xtream;;u:p@h:80\nsource=4294967295;m3u;Groot;http://a.example/1\nactive=1\n",
+    );
+    let before = s.clone();
+    for (kind, address) in [
+        (SourceKind::M3u, "http://b.example/2"),
+        (SourceKind::Xtream, "u2:p2@h:80"),
+    ] {
+        let id = s.keep(Editing::New, kind, "Nog een", address);
+        assert_eq!(id, None, "{kind:?}");
+    }
+    assert_eq!(content(&s), content(&before), "nothing was added");
+    // A saved one still changes.
+    assert_eq!(
+        s.keep(Editing::Saved(1), SourceKind::Xtream, "", "u3:p3@h:80"),
+        Some(1)
     );
 }
 
 #[test]
 fn names_lose_semicolons_and_line_breaks_addresses_their_spaces() {
     let mut s = Sources::default();
-    let id = s.keep(
-        Editing::New,
-        SourceKind::M3u,
-        " A;B\r\nC ",
-        " http://a.example/1 \n",
-    );
+    let id = s
+        .keep(
+            Editing::New,
+            SourceKind::M3u,
+            " A;B\r\nC ",
+            " http://a.example/1 \n",
+        )
+        .unwrap();
     assert_eq!(
         s.get(id).map(row),
         Some(row(&m3u(id, "A,BC", "http://a.example/1")))
@@ -223,12 +264,14 @@ fn names_lose_semicolons_and_line_breaks_addresses_their_spaces() {
 fn a_password_with_semicolons_and_at_signs_goes_round() {
     let mut s = Sources::default();
     s.keep(Editing::New, SourceKind::M3u, "M", "http://a.example/1");
-    let id = s.keep(
-        Editing::New,
-        SourceKind::Xtream,
-        "X",
-        "bob:p;a@ss=w:rd@srv.example.net:8080",
-    );
+    let id = s
+        .keep(
+            Editing::New,
+            SourceKind::Xtream,
+            "X",
+            "bob:p;a@ss=w:rd@srv.example.net:8080",
+        )
+        .unwrap();
     let back = Sources::parse(&s.to_text());
     assert_eq!(
         back.get(id).map(|x| x.address.as_str()),

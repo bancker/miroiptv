@@ -416,7 +416,7 @@ impl SourceForm {
                 credentials_line(&self.portal.user, &self.portal.pass, &self.portal.host)
             }
             SourceKind::M3u => {
-                let address = without_newlines(&self.address).trim().to_owned();
+                let address = typed_address(&self.address);
                 if is_web_address(&address) {
                     address
                 } else if std::path::Path::new(&address).is_file() {
@@ -441,7 +441,7 @@ impl SourceForm {
         self.problem = None;
         self.xtream_offer = None;
         if self.kind == SourceKind::M3u && !self.address_is_as_saved(saved) {
-            if let Some(line) = crate::m3u::xtream_link(&self.address) {
+            if let Some(line) = crate::m3u::xtream_link(&typed_address(&self.address)) {
                 self.xtream_offer = Some(line);
                 return;
             }
@@ -454,7 +454,7 @@ impl SourceForm {
         match self.editing {
             Editing::Saved(id) => saved
                 .get(id)
-                .is_some_and(|s| s.address == without_newlines(&self.address).trim()),
+                .is_some_and(|s| s.address == typed_address(&self.address)),
             _ => false,
         }
     }
@@ -469,6 +469,19 @@ impl SourceForm {
             Err(problem) => self.problem = Some(problem),
         }
     }
+}
+
+/// An M3U address as typed or pasted, without line breaks and the spaces around
+/// it, and without the one pair of quotes Explorer's "Copy as path" puts around
+/// a path.
+fn typed_address(address: &str) -> String {
+    let address = without_newlines(address);
+    let address = address.trim();
+    let unquoted = address
+        .strip_prefix('"')
+        .and_then(|a| a.strip_suffix('"'))
+        .unwrap_or(address);
+    unquoted.to_owned()
 }
 
 /// The path of a file as an absolute one. A relative path means the folder the
@@ -3670,6 +3683,38 @@ mod tests {
         assert_eq!(list(&here).draft().unwrap().address, here);
         let url = "https://lists.example/tv.m3u";
         assert_eq!(list(url).draft().unwrap().address, url);
+    }
+
+    #[test]
+    fn a_path_copied_as_path_in_explorer_loses_its_quotes() {
+        // Explorer's "Copy as path" (Ctrl+Shift+C) puts a path in quotes.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mijn lijst.m3u");
+        std::fs::write(&file, "#EXTM3U\n").unwrap();
+        let path = file.display().to_string();
+        let list = |address: &str| SourceForm {
+            name: "Lijst".into(),
+            address: address.into(),
+            ..SourceForm::blank(Editing::New, SourceKind::M3u, Lang::En)
+        };
+        for pasted in [format!("\"{path}\""), format!("  \"{path}\" \r\n")] {
+            let draft = list(&pasted).draft();
+            assert_eq!(draft.map(|d| d.address), Ok(path.clone()), "{pasted:?}");
+        }
+        let url = "https://lists.example/tv.m3u";
+        let draft = list(&format!("\"{url}\"")).draft();
+        assert_eq!(draft.map(|d| d.address), Ok(url.to_owned()));
+        // One pair only: what is left of two is no path.
+        assert_eq!(
+            list(&format!("\"\"{path}\"\"")).draft().err(),
+            Some(T::SourceAddressInvalid)
+        );
+        // A portal's link in quotes still gets the question.
+        let mut form = list("\"http://srv.example:8080/get.php?username=u&password=p\"");
+        let mut actions = Vec::new();
+        form.save(&mut actions, &Sources::default());
+        assert_eq!(form.xtream_offer.as_deref(), Some("u:p@srv.example:8080"));
+        assert!(actions.is_empty(), "the question comes first");
     }
 
     /// The text in the open dialog's first field.
