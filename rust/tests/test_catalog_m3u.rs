@@ -9,10 +9,11 @@ use std::time::Duration;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// Not in alphabetical order: RTL 4 comes first.
 const LIST: &str = "#EXTM3U\n\
+#EXTINF:-1,NL | RTL 4\nhttps://a.example/rtl4.m3u8\n\
 #EXTINF:-1,NL | NPO 1\nhttps://a.example/npo1.m3u8\n\
-#EXTINF:-1,NL | NPO 1 HD\nhttps://a.example/npo1hd.m3u8\n\
-#EXTINF:-1,NL | RTL 4\nhttps://a.example/rtl4.m3u8\n";
+#EXTINF:-1,NL | NPO 1 HD\nhttps://a.example/npo1hd.m3u8\n";
 
 const OTHER: &str = "#EXTM3U\n#EXTINF:-1,Kanaal Drie\nhttps://c.example/drie.m3u8\n";
 
@@ -63,14 +64,15 @@ async fn server(status: u16, body: &str, delay_ms: u64) -> MockServer {
 fn an_m3u_list_zaps_in_file_order_and_merges_nothing() {
     let store = store_of(LIST);
     assert_eq!(store.kind(), SourceKind::M3u);
-    // An Xtream catalog would merge NPO 1 and NPO 1 HD into one entry.
-    assert_eq!(names(&store), ["NL | NPO 1", "NL | NPO 1 HD", "NL | RTL 4"]);
+    // Up and down go as the file has them, not by name; and an Xtream catalog
+    // would merge NPO 1 and NPO 1 HD into one entry.
+    assert_eq!(names(&store), ["NL | RTL 4", "NL | NPO 1", "NL | NPO 1 HD"]);
 }
 
 #[test]
 fn an_m3u_channel_has_no_quality_ladder_and_is_never_adult() {
     let store = store_of(LIST);
-    let npo1 = store.zap_channels()[0].stream_id;
+    let npo1 = store.zap_channels()[1].stream_id;
     assert!(store.quality_nav(npo1).ladder.is_empty());
     assert!(!store.is_adult_url("http://h/live/u/p/3.m3u8"));
     store.set_adult_unlocked(true);
