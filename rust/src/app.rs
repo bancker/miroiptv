@@ -2598,8 +2598,10 @@ impl TvApp {
         self.adult_note = None;
         // Whatever waited for the old portal's catalog, or was told by it, means
         // nothing to the new one: a 0.5 resume would play the old portal's URL
-        // through it, an old stream id would be another channel.
+        // through it, an old stream id would be another channel, a catch-up
+        // pick a programme of a channel it may not have.
         self.pending_resume = None;
+        self.pending_catchup = None;
         self.current_stream_id = None;
         self.playing_resumed = false;
         self.catalog_noted = true;
@@ -2619,6 +2621,8 @@ impl TvApp {
         self.favorites = Favorites::load(&self.storage.favorites_path()).unwrap_or_default();
         self.presets = Presets::load(&self.storage.presets_path()).unwrap_or_default();
         self.stop_playback();
+        // A catch-up pick of the other source's waits no longer: it stopped.
+        self.pending_catchup = None;
         // The resumed stream gets the new catalog's first word, as at a start.
         self.catalog_noted = false;
         if self.portal_state != PortalState::Configured {
@@ -10924,6 +10928,47 @@ https://c.example/twee-nieuws.m3u8\n";
              source=2;m3u;Lijst;https://a.example/tv.m3u\n\
              active=1\n"
         );
+    }
+
+    #[tokio::test]
+    async fn a_switch_ends_the_wait_for_a_catch_up_pick_of_the_portal_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start_with(
+            dir.path(),
+            guide_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            Sources::parse("portal=u:p@h:80\n"),
+            None,
+        );
+        pick_catch_up(&mut h);
+        assert!(h.app.pending_catchup.is_some(), "the wait screen shows");
+        // The login of a Save of the portal in use comes in meanwhile: a new
+        // catalog, in which the programme waited for is no programme.
+        let keep = KeepXtream {
+            creds: other_creds(),
+            line: "u2:p2@127.0.0.1:1".into(),
+            editing: Editing::Saved(1),
+            name: String::new(),
+        };
+        {
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+            assert!(h.app.keep_xtream(keep).is_ok());
+            std::env::remove_var("BONGO_INI");
+        }
+        assert!(h.app.pending_catchup.is_none(), "the old portal's wait");
+        h.frame(&[]);
+        let waits = h.painted.iter().any(|t| t == "loading the programme…");
+        assert!(!waits, "{:?}", h.painted);
+        // Another source's data, as a switch takes it: the same.
+        let other = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(other.path(), guide_catalog(), PortalState::Configured, None);
+        pick_catch_up(&mut h);
+        assert!(h.app.pending_catchup.is_some());
+        h.app.use_data_of(2);
+        assert!(h.app.pending_catchup.is_none(), "source 1's wait");
     }
 
     #[tokio::test]
