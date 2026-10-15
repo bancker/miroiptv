@@ -154,3 +154,26 @@ fn removing_a_sources_files_leaves_the_other_sources_alone() {
     assert!(storage.favorites_path().exists() && storage.m3u_cache_path(1).exists());
     assert_eq!(storage.remove_source_files(2), 0, "nothing left to remove");
 }
+
+#[test]
+fn a_saved_list_goes_with_the_temp_file_a_cut_off_write_of_it_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut storage = Storage::with_root(dir.path().to_path_buf());
+    std::fs::create_dir_all(storage.cache_dir()).unwrap();
+    let list = storage.m3u_cache_path(2);
+    // The name the list's write uses first (portal::m3u), stream URLs and all.
+    let temp = list.with_extension("m3u.tmp");
+    for path in [&list, &temp] {
+        std::fs::write(path, "x").unwrap();
+    }
+    assert_eq!(storage.remove_source_files(2), 2);
+    assert!(!list.exists() && !temp.exists());
+    // Another address for the list: both go, the source's favorites stay.
+    storage.set_source(2);
+    for path in [&list, &temp, &storage.favorites_path()] {
+        std::fs::write(path, "x").unwrap();
+    }
+    storage.remove_saved_list(2);
+    assert!(!list.exists() && !temp.exists());
+    assert!(storage.favorites_path().exists());
+}

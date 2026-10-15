@@ -41,6 +41,11 @@ pub trait Portal: Send + Sync {
     async fn saved_catalog(&self) -> Option<Catalog> {
         None
     }
+    /// The app no longer runs on this portal: its source was switched away
+    /// from, saved with another address or deleted. A fetch still under way
+    /// writes nothing for it any more (an M3U source's saved list). Once this
+    /// returns, no such write is left to come.
+    fn retire(&self) {}
     async fn fetch_catalog(&self) -> Result<Catalog, PortalError>;
     /// Short "now + next few entries" EPG. Cheap, for the strip overlay
     /// and zap-toast enrichment.

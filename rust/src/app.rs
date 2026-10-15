@@ -2572,6 +2572,9 @@ impl TvApp {
         creds: Option<XtreamCreds>,
         state: PortalState,
     ) {
+        // What the old portal still has under way writes nothing for it now:
+        // its source may be deleted next, and its number given to another.
+        self.catalog.portal().retire();
         self.creds = creds;
         self.catalog = Arc::new(CatalogStore::new(portal));
         self.catalog_generation += 1;
@@ -2815,7 +2818,12 @@ impl TvApp {
             return;
         };
         if old_address.is_some_and(|old| old != source.address) {
-            let _ = std::fs::remove_file(self.storage.m3u_cache_path(id));
+            // The list in use: a download of the old address still under way
+            // must not save its list again once it is dropped.
+            if activate {
+                self.catalog.portal().retire();
+            }
+            self.storage.remove_saved_list(id);
         }
         self.set_toast(self.tr(T::SourceSaved, &[&source.display_name(self.lang)]));
         if activate {
@@ -10160,6 +10168,155 @@ https://c.example/twee-nieuws.m3u8\n";
             Some(new.display().to_string())
         );
         std::env::remove_var("BONGO_INI");
+    }
+
+    /// A server that answers every GET with `status` and `body`, `delay` later.
+    async fn list_server(status: u16, body: &str, delay: Duration) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(status)
+                    .set_body_string(body)
+                    .set_delay(delay),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Waits (2 s at most) until `server` was asked something.
+    async fn until_asked(server: &wiremock::MockServer) {
+        for _ in 0..400 {
+            if server
+                .received_requests()
+                .await
+                .is_some_and(|r| !r.is_empty())
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the server was never asked");
+    }
+
+    /// The app on M3U source 2 of `ini`, whose download from `server` is under
+    /// way (the catalog it runs on is returned too).
+    async fn downloading(
+        dir: &std::path::Path,
+        ini: &str,
+        server: &wiremock::MockServer,
+    ) -> (Harness, Arc<CatalogStore>) {
+        let sources = Sources::parse(ini);
+        let storage = Storage::with_root(dir.to_path_buf());
+        let list = sources.get(2).cloned().expect("source 2");
+        let store = Arc::new(CatalogStore::new(open_source(&list, &storage).portal));
+        store.spawn_fetch();
+        let mut h = Harness::start_with(
+            dir,
+            store.clone(),
+            PortalState::Configured,
+            None,
+            None,
+            sources,
+            None,
+        );
+        h.app.storage.set_source(2);
+        until_asked(server).await;
+        (h, store)
+    }
+
+    #[tokio::test]
+    async fn a_download_under_way_never_brings_back_the_list_of_a_source_deleted_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let slow = list_server(200, TEST_LIST, Duration::from_millis(400)).await;
+        let file = dir.path().join("lijst.m3u");
+        std::fs::write(&file, TEST_LIST).unwrap();
+        let ini = format!(
+            "source=1;m3u;Bestand;{}\nsource=2;m3u;Lijst;{}/tv.m3u\nactive=2\n",
+            file.display(),
+            slow.uri()
+        );
+        let (mut h, old) = downloading(dir.path(), &ini, &slow).await;
+        {
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+            h.app
+                .apply_settings_action(SettingsAction::ActivateSource(1));
+            h.app.apply_settings_action(SettingsAction::DeleteSource(2));
+            std::env::remove_var("BONGO_INI");
+        }
+        wait_until("the old download", || old.is_loaded()).await;
+        let saved = Storage::with_root(dir.path().to_path_buf()).m3u_cache_path(2);
+        assert!(!saved.exists(), "the deleted source's list came back");
+        // The next list added is source 2 again, and shows none of the old one.
+        let refusing = list_server(503, "", Duration::ZERO).await;
+        {
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+            let address = format!("{}/nieuw.m3u", refusing.uri());
+            let list = list_draft(Editing::New, "Nieuw", &address);
+            h.app
+                .apply_settings_action(SettingsAction::SaveSource(list));
+            h.app
+                .apply_settings_action(SettingsAction::ActivateSource(2));
+            std::env::remove_var("BONGO_INI");
+        }
+        assert_eq!(h.app.sources.get(2).map(|s| s.name.as_str()), Some("Nieuw"));
+        wait_until("the new list's download", || {
+            matches!(h.app.catalog.status(), CatalogStatus::Failed(_))
+        })
+        .await;
+        assert!(!h.app.catalog.is_loaded(), "a list shows");
+    }
+
+    #[tokio::test]
+    async fn a_download_under_way_never_brings_back_the_list_of_an_address_saved_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let slow = list_server(200, TEST_LIST, Duration::from_millis(400)).await;
+        let refusing = list_server(503, "", Duration::ZERO).await;
+        let ini = format!("source=2;m3u;Lijst;{}/tv.m3u\nactive=2\n", slow.uri());
+        let (mut h, old) = downloading(dir.path(), &ini, &slow).await;
+        {
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+            let address = format!("{}/ander.m3u", refusing.uri());
+            let list = list_draft(Editing::Saved(2), "Lijst", &address);
+            h.app
+                .apply_settings_action(SettingsAction::SaveSource(list));
+            std::env::remove_var("BONGO_INI");
+        }
+        wait_until("the old download", || old.is_loaded()).await;
+        let saved = Storage::with_root(dir.path().to_path_buf()).m3u_cache_path(2);
+        assert!(!saved.exists(), "the old address's list came back");
+        wait_until("the new address's download", || {
+            matches!(h.app.catalog.status(), CatalogStatus::Failed(_))
+        })
+        .await;
+        assert!(!h.app.catalog.is_loaded(), "a list shows");
+    }
+
+    #[test]
+    fn a_file_of_a_deleted_source_that_cannot_be_removed_is_named_in_the_log() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let mut h = portal_and_list(dir.path());
+        let mut two = Storage::with_root(dir.path().to_path_buf());
+        two.set_source(2);
+        // A folder where source 2's favorites would be: no file to remove.
+        std::fs::create_dir(two.favorites_path()).unwrap();
+        let log = LogCapture::start();
+        h.app.apply_settings_action(SettingsAction::DeleteSource(2));
+        std::env::remove_var("BONGO_INI");
+        let text = log.text();
+        let named = format!("storage: {} not removed: ", two.favorites_path().display());
+        assert!(text.contains(&named), "{text}");
+        // The files that were not there are no failure.
+        assert!(!text.contains("presets-2.json"), "{text}");
+        assert!(
+            text.contains("settings: source 2 deleted (0 files)"),
+            "{text}"
+        );
     }
 
     #[test]

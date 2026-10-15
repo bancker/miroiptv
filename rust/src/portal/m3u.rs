@@ -12,7 +12,7 @@ use super::{Catalog, Episode, Portal, PortalError};
 use crate::epg::Epg;
 use crate::m3u::{self, Playlist, Stream};
 use crate::sources::{SourceId, SourceKind};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -62,6 +62,10 @@ pub struct M3uPortal {
     saved_shown: AtomicBool,
     /// More than this is no list ([`MAX_LIST_BYTES`]; a test makes it small).
     max_bytes: u64,
+    /// Set by `Portal::retire`: a download that is still under way then saves
+    /// nothing. A list is saved while this is held, so a retire waits for a
+    /// save that has begun, and no save begins after it.
+    retired: Arc<Mutex<bool>>,
 }
 
 impl M3uPortal {
@@ -86,6 +90,7 @@ impl M3uPortal {
             lookup: RwLock::new(Arc::new(Lookup::default())),
             saved_shown: AtomicBool::new(false),
             max_bytes: MAX_LIST_BYTES,
+            retired: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -211,19 +216,31 @@ fn read_list(bytes: &[u8]) -> Option<Playlist> {
     m3u::read(&String::from_utf8_lossy(bytes))
 }
 
-/// A downloaded list: `Unchanged` when it is the saved one and that one shows
-/// (`check_saved`), else read and, once read, kept at `cache`; whether it was.
-/// A list that cannot be kept still plays; the next start then has none to
-/// show at once.
+/// A downloaded list of source `id`: `Unchanged` when it is the saved one and
+/// that one shows (`check_saved`), else read and, once read, kept at `cache`
+/// unless the source is `retired`; whether it was. A list that cannot be kept
+/// still plays; the next start then has none to show at once.
 fn read_download(
     bytes: &[u8],
+    id: SourceId,
     cache: &Path,
+    retired: &Mutex<bool>,
     check_saved: bool,
 ) -> Result<(Playlist, usize, bool), PortalError> {
     if check_saved && std::fs::read(cache).is_ok_and(|saved| saved == bytes) {
         return Err(PortalError::Unchanged);
     }
     let playlist = read_list(bytes).ok_or(PortalError::NotAList)?;
+    // Held while the list is written: a retire waits for that write, and once
+    // it has come no other write begins (the app may drop the file then).
+    let retired = retired.lock();
+    if *retired {
+        tracing::info!(
+            "m3u: list of source {} not saved - the source is no longer in use",
+            id
+        );
+        return Ok((playlist, bytes.len(), false));
+    }
     let saved = match write_atomic(cache, bytes) {
         Ok(()) => true,
         Err(e) => {
@@ -231,6 +248,7 @@ fn read_download(
             false
         }
     };
+    drop(retired);
     Ok((playlist, bytes.len(), saved))
 }
 
@@ -273,6 +291,10 @@ impl Portal for M3uPortal {
         SourceKind::M3u
     }
 
+    fn retire(&self) {
+        *self.retired.lock() = true;
+    }
+
     async fn saved_catalog(&self) -> Option<Catalog> {
         if !matches!(self.address, Address::Url(_)) {
             return None;
@@ -304,11 +326,13 @@ impl Portal for M3uPortal {
         let read = match &self.address {
             Address::Url(url) => match self.download(url).await {
                 Ok(bytes) => {
-                    let cache = self.cache.clone();
+                    let (id, cache, retired) = (self.id, self.cache.clone(), self.retired.clone());
                     let check_saved = self.saved_shown.load(Ordering::Acquire);
-                    tokio::task::spawn_blocking(move || read_download(&bytes, &cache, check_saved))
-                        .await
-                        .unwrap_or_else(|e| Err(reader_lost(e)))
+                    tokio::task::spawn_blocking(move || {
+                        read_download(&bytes, id, &cache, &retired, check_saved)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(reader_lost(e)))
                 }
                 Err(e) => Err(e),
             },

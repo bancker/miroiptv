@@ -80,17 +80,45 @@ impl Storage {
         self.cache_dir().join(format!("m3u-{id}.m3u"))
     }
 
-    /// Removes source `id`'s favorites, presets, last channel and saved list;
-    /// how many of them there were.
+    /// Where a write of M3U source `id`'s saved list puts it first
+    /// (`portal::m3u`); a write that was cut off leaves it, stream URLs and all.
+    fn m3u_temp_path(&self, id: SourceId) -> PathBuf {
+        self.m3u_cache_path(id).with_extension("m3u.tmp")
+    }
+
+    /// Removes source `id`'s favorites, presets, last channel and saved list,
+    /// with the temp file of that list; how many of them there were.
     pub fn remove_source_files(&self, id: SourceId) -> usize {
         [
             self.source_file("favorites", id),
             self.source_file("presets", id),
             self.source_file("last_watched", id),
             self.m3u_cache_path(id),
+            self.m3u_temp_path(id),
         ]
         .iter()
-        .filter(|path| std::fs::remove_file(path).is_ok())
+        .filter(|path| remove_file(path))
         .count()
+    }
+
+    /// Removes M3U source `id`'s saved list and its temp file: another address
+    /// makes them another list's.
+    pub fn remove_saved_list(&self, id: SourceId) {
+        for path in [self.m3u_cache_path(id), self.m3u_temp_path(id)] {
+            remove_file(&path);
+        }
+    }
+}
+
+/// Removes the file at `path`; whether it was there. A failure other than its
+/// not being there is logged: the paths here name a source by its id only.
+fn remove_file(path: &Path) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::warn!("storage: {} not removed: {}", path.display(), e);
+            false
+        }
     }
 }
