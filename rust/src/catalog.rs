@@ -1,3 +1,4 @@
+use crate::channel_list::ChannelGroups;
 use crate::news::{resolve_channels, NewsRule};
 use crate::portal::xtream::{stream_ref, StreamKind};
 use crate::portal::{Catalog as PortalCatalog, LiveChannel, Movie, Portal, PortalError, Series};
@@ -39,6 +40,13 @@ pub fn normalize_channel_name(name: &str) -> String {
 /// locked, and on this portal the flag is reliable.
 fn adult_live(c: &LiveChannel) -> bool {
     c.is_adult
+}
+
+/// Does this live channel show? Unlocked, all do; locked, the adult ones do
+/// not. The one place that says so: `shows_live`, the zap ring and the channel
+/// list's groups all ask it, so the lists cannot differ about the lock.
+fn live_shows(unlocked: bool, c: &LiveChannel) -> bool {
+    unlocked || !adult_live(c)
 }
 
 fn adult_movie(m: &Movie) -> bool {
@@ -136,7 +144,8 @@ pub fn guide_channels_of(live: &[LiveChannel]) -> Vec<GuideChannel> {
 
 /// A loaded catalog plus what the app asks of it while it draws, worked out once
 /// where the catalog is stored: a lookup by stream id is one probe of a set, not
-/// a scan of ~13,000 channels. Reads as the catalog itself (`Deref`).
+/// a scan of ~13,000 channels. Reads as the catalog (`Deref`), except `live`,
+/// which has a field of its own.
 struct StoredCatalog {
     /// The films and series; its `live` is empty (see `live`).
     catalog: PortalCatalog,
@@ -538,8 +547,7 @@ impl ZapRing {
         defect: &HashMap<i64, i64>,
         defect_revision: u64,
     ) -> Self {
-        let shows =
-            |c: &LiveChannel| (unlocked || !adult_live(c)) && !defect.contains_key(&c.stream_id);
+        let shows = |c: &LiveChannel| live_shows(unlocked, c) && !defect.contains_key(&c.stream_id);
         let entries = live.iter().enumerate().filter(|(_, c)| shows(c));
         let order: Vec<usize> = match kind {
             SourceKind::Xtream => dedupe(entries),
@@ -624,7 +632,7 @@ impl ZapRing {
             return Place::At(pos);
         }
         let channel = &self.live[file];
-        if !self.unlocked && adult_live(channel) {
+        if !live_shows(self.unlocked, channel) {
             return Place::Unknown;
         }
         if self.file_order {
@@ -856,7 +864,7 @@ impl CatalogStore {
 
     /// May this live channel show now?
     fn shows_live(&self, c: &LiveChannel) -> bool {
-        self.adult_unlocked() || !adult_live(c)
+        live_shows(self.adult_unlocked(), c)
     }
 
     /// Whether a stream URL plays adult content, whatever the lock state.
@@ -1066,6 +1074,23 @@ impl CatalogStore {
     /// How many times the marks were set: 0 until the first `set_defect`.
     pub fn defect_revision(&self) -> u64 {
         self.defect_revision.load(Ordering::Acquire)
+    }
+
+    /// The channel list's groups ([`ChannelGroups::build`]) of the channels that
+    /// show (the adult ones while locked do not), the defect ones in their own
+    /// group, with `favorites` as the source's favorites. One read lock to take
+    /// the channels (an `Arc`), the work outside it; `None` until a catalog has
+    /// loaded.
+    pub fn channel_groups(&self, favorites: &HashSet<i64>) -> Option<ChannelGroups> {
+        let live = self.inner.read().as_ref()?.live.clone();
+        let unlocked = self.adult_unlocked();
+        let defect = self.defect_marks();
+        Some(ChannelGroups::build(
+            live,
+            |c| live_shows(unlocked, c),
+            &defect,
+            favorites,
+        ))
     }
 
     /// The guide's columns ([`guide_channels_of`]), without the adult ones while
