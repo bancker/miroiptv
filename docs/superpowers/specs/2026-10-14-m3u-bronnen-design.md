@@ -350,7 +350,8 @@ laatste komma"). Ze gaan voor:
   scherm zwart (de lege toestand). Zo ook een zender die steeds eindigt (eof) voordat hij een beeld toont,
   zodra het automatisch herladen opgeeft; zolang dat herladen loopt, blijft alles zoals het was. Het beeld
   van de zender ervoor blijft dus niet bevroren onder de nieuwe naam staan. Heeft de zender al gespeeld,
-  dan blijft zijn eigen laatste beeld staan. Xtream houdt het gedrag van 0.6.1.
+  dan blijft zijn eigen laatste beeld staan, ook als zijn herladen daarna mislukt. Xtream houdt het gedrag
+  van 0.6.1.
 - De vraag of een `…/get.php?username=…&password=…`-link een Xtream-bron moet worden, komt alleen bij een
   `http://`-link: de Xtream-client spreekt alleen gewoon HTTP, dus een `https://`-link zou een bron worden
   die nooit verbindt. Een `https://`-link blijft een M3U-lijst, zonder vraag. De vraag hoort bij het adres:

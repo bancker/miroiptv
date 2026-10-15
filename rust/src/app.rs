@@ -649,9 +649,15 @@ pub struct TvApp {
     epg_cache_retry_after: Option<Instant>,
     /// When the stream that loads now went to the player; its first frame
     /// clears it. EPG fetching waits meanwhile (10 s at most): zapping first.
-    /// A channel of an M3U list that fails while it is set has shown no picture
-    /// of its own yet (see `drain_events` and `stop_for_refused_load`).
+    /// A channel of an M3U list that fails while it is set, and has not played
+    /// since it was picked (`current_has_played`), has shown no picture of its
+    /// own (see `drain_events` and `stop_for_refused_load`).
     stream_starting_since: Option<Instant>,
+    /// The stream that plays has shown a picture since it was picked: its
+    /// first `PlaybackStarted` sets this, and any load but a reload of it
+    /// clears it. A reload sets `stream_starting_since` again, but the picture
+    /// on the screen is still its own.
+    current_has_played: bool,
     /// A catch-up pick loading behind the wait screen.
     pending_catchup: Option<PendingCatchup>,
     /// Tracks borderless+always-on-top toggle (`t` key).
@@ -887,6 +893,7 @@ impl TvApp {
             epg_cache_write_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             epg_cache_retry_after: None,
             stream_starting_since: None,
+            current_has_played: false,
             pending_catchup: None,
             borderless: false,
             right_drag: None,
@@ -1367,9 +1374,11 @@ impl TvApp {
             adult_hint
         };
         self.current_adult_hint = adult_hint == Some(true);
-        // Another stream is a pick, which the catalog's first word leaves alone.
+        // Another stream is a pick, which the catalog's first word leaves alone,
+        // and which has shown nothing yet.
         if !reload {
             self.playing_resumed = false;
+            self.current_has_played = false;
         }
         // Live goes through the local relay: one continuous stream for mpv
         // that rides out portal refusals instead of dying on them. The portal
@@ -1465,6 +1474,7 @@ impl TvApp {
                     // this point (startup/zap) is shown live but not tallied.
                     self.health.mark_started();
                     self.stream_starting_since = None;
+                    self.current_has_played = true;
                     // mpv restarts before it renders the first picture of the new
                     // file, and the bus still holds the last one of the stream
                     // before. A catch-up wait goes on until a newer picture is
@@ -1555,12 +1565,16 @@ impl TvApp {
                         // (an error, or an end the reloads above did not get past)
                         // shows the empty state, not the picture of the channel
                         // before: that would look like this one, frozen. Once it
-                        // has shown its own, that last frame stays, as on Xtream.
-                        // "Before a picture" is `stream_starting_since`, which
-                        // the load sets and the first `PlaybackStarted` clears.
-                        // Frames from now on still show, so a load that is on its
-                        // way already does (as in `end_catchup_wait`).
-                        let no_picture_yet = self.stream_starting_since.is_some();
+                        // has shown its own, that last frame stays, as on Xtream,
+                        // also when its reloads fail. "Before a picture" is
+                        // `stream_starting_since`, which every load sets and the
+                        // first `PlaybackStarted` clears, while the channel has not
+                        // played since it was picked (`current_has_played`; a
+                        // reload sets `stream_starting_since` again). Frames from
+                        // now on still show, so a load that is on its way already
+                        // does (as in `end_catchup_wait`).
+                        let no_picture_yet =
+                            self.stream_starting_since.is_some() && !self.current_has_played;
                         if no_picture_yet && self.catalog.kind() == SourceKind::M3u {
                             self.frame_fence.stop();
                             self.frame_fence.load(self.player.frames.version());
@@ -9841,6 +9855,36 @@ https://c.example/twee-nieuws.m3u8\n";
         the_old_picture_stays_away(&mut h);
         let named = "stream error on Kanaal Twee - zap up or down to retry";
         assert!(h.painted.iter().any(|t| t == named), "{:?}", h.painted);
+    }
+
+    #[tokio::test]
+    async fn an_m3u_channel_that_has_played_keeps_its_own_last_frame_when_its_reloads_fail() {
+        // Its reloads end before a new picture: up to the eof that ends them, or
+        // with an error. Each case: how the stream ends, and how many loads that
+        // makes (the zap and its reloads).
+        for (ends, loaded) in [(&["eof"; 4][..], 4), (&["eof", "error"][..], 2)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut h = m3u_app_with_a_picture(dir.path());
+            h.press(&[Key::ArrowDown]);
+            // The channel shows a picture of its own.
+            h.events.send(Event::PlaybackStarted).unwrap();
+            h.frame(&[]);
+            h.put_frame(8, 4);
+            h.frame(&[]);
+            for reason in ends {
+                let end = Event::EndOfFile {
+                    reason: (*reason).into(),
+                };
+                h.events.send(end).unwrap();
+                h.frame(&[]);
+            }
+            assert_eq!(loads(h.sent()).len(), loaded, "{ends:?}");
+            for _ in 0..3 {
+                h.frame(&[]);
+            }
+            let shown = h.app.video_tex.as_ref().map(|t| t.size());
+            assert_eq!(shown, Some([8, 4]), "{ends:?}: its own last frame stays");
+        }
     }
 
     #[tokio::test]
