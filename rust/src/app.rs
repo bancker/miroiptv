@@ -29,7 +29,7 @@ use crate::settings_ui::{
     SettingsView,
 };
 use crate::shortcuts;
-use crate::sources::{Source, SourceKind, Sources};
+use crate::sources::{Editing, Source, SourceDraft, SourceId, SourceKind, Sources};
 use crate::storage::Storage;
 use crate::window_drag::{self, Mouse, RightDrag};
 use crate::zap::ZapPacer;
@@ -313,13 +313,18 @@ fn paint_help_row(ui: &mut egui::Ui, row: &HelpRow) -> bool {
     response.clicked()
 }
 
+/// Whether the app has a source to run on, or shows the setup prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortalState {
-    /// `--xtream user:pass@host:port` was given with non-placeholder values.
+    /// A source runs: the portal of `--xtream` (non-placeholder values), or
+    /// the source in use in `BongoPlayer.ini`: an M3U list, or Xtream
+    /// credentials that are no placeholder.
     Configured,
-    /// No `--xtream` argument given at all.
+    /// Nothing to run: neither `--xtream` nor a source in the ini gives
+    /// credentials, or the ones they give cannot be read.
     Missing,
-    /// `--xtream` was given but with the placeholder template values.
+    /// The credentials found, on the command line or in the ini, are the
+    /// placeholder template's.
     Placeholder,
 }
 
@@ -520,12 +525,21 @@ fn keep_news_result(fetched: NewsStamp, now: NewsStamp) -> bool {
     fetched == now
 }
 
+/// What to keep when a credentials test logs in: the credentials, the line as
+/// typed (what the ini gets), which source they are for and its name. No
+/// `Debug` on purpose: it holds a password.
+struct KeepXtream {
+    creds: XtreamCreds,
+    line: String,
+    editing: Editing,
+    name: String,
+}
+
 /// A finished credentials test, on its way from its background task to the UI.
 struct ConnResult {
     check: ConnCheck,
-    /// What to keep if the login worked (a Save): the credentials as parsed and
-    /// as typed. `None` for a plain test.
-    keep: Option<(XtreamCreds, String)>,
+    /// What to keep if the login worked (a Save); `None` for a plain test.
+    keep: Option<KeepXtream>,
 }
 
 pub struct TvApp {
@@ -534,14 +548,17 @@ pub struct TvApp {
     favorites: Favorites,
     storage: Storage,
     portal_state: PortalState,
-    /// Portal credentials in use: the settings screen shows them and the PIN
-    /// reset checks the password against them.
+    /// The Xtream credentials of the source in use (the portal of `--xtream`
+    /// included): the settings screen shows them and the PIN reset checks the
+    /// password against them first. None on an M3U list and while the setup
+    /// prompt shows; the PIN reset then asks the first saved Xtream source.
     creds: Option<XtreamCreds>,
     /// They came from `--xtream`, which beats the ini on every start: the
     /// settings say that what is saved there only counts without it.
     creds_from_command_line: bool,
     /// The saved sources (`BongoPlayer.ini`), and the one in use unless the
-    /// portal of `--xtream` runs.
+    /// portal of `--xtream` runs. Kept in step with the ini by every save,
+    /// switch and delete (`write_sources`).
     sources: Sources,
 
     video_tex: Option<TextureHandle>,
@@ -1134,8 +1151,13 @@ impl TvApp {
                 self.save_settings();
                 tracing::info!("settings: zap keys {}", if on { "reversed" } else { "normal" });
             }
-            SettingsAction::TestConnection(s) => self.start_conn_check(s, false),
-            SettingsAction::SavePortal(s) => self.start_conn_check(s, true),
+            SettingsAction::TestConnection(s) => self.start_conn_check(s, None),
+            SettingsAction::SavePortal(s) => {
+                self.start_conn_check(s, Some((Editing::CommandLine, String::new())))
+            }
+            SettingsAction::SaveSource(draft) => self.save_source(draft),
+            SettingsAction::ActivateSource(id) => self.activate_source(id),
+            SettingsAction::DeleteSource(id) => self.delete_source(id),
             SettingsAction::Unlock(pin) => {
                 if self.pin_attempt(&pin) {
                     self.set_adult_visible(true);
@@ -2426,7 +2448,7 @@ impl TvApp {
             });
         if let Some(s) = submit {
             // Saving tests first: only credentials that log in are kept.
-            self.start_conn_check(s, true);
+            self.start_conn_check(s, Some((Editing::CommandLine, String::new())));
         }
     }
 
@@ -2436,9 +2458,10 @@ impl TvApp {
         credentials_line(&self.cfg_user, &self.cfg_pass, &self.cfg_host)
     }
 
-    /// Test credentials in the background; with `save`, store and connect
-    /// them once the login works. A failed test changes nothing.
-    fn start_conn_check(&mut self, creds_str: String, save: bool) {
+    /// Test credentials in the background; with `save` (which source, under
+    /// which name), keep them once the login works (see `keep_xtream`). A
+    /// failed test changes nothing.
+    fn start_conn_check(&mut self, creds_str: String, save: Option<(Editing, String)>) {
         let creds = match parse_xtream_creds(&creds_str) {
             Ok(c) => c,
             Err(e) => {
@@ -2451,26 +2474,30 @@ impl TvApp {
         tokio::spawn(async move {
             let portal = XtreamPortal::new(creds);
             let check = portal.check().await;
-            let keep = save.then_some((portal.creds, creds_str));
+            let keep = save.map(|(editing, name)| KeepXtream {
+                creds: portal.creds,
+                line: creds_str,
+                editing,
+                name,
+            });
             *slot.lock() = Some(ConnResult { check, keep });
         });
     }
 
     /// When a credentials test has finished: say how it went and, if it was
-    /// to save and the login worked, save and connect. Whether the channel
-    /// count came does not matter: a login that works is all a save needs.
+    /// to save and the login worked, keep the credentials (`keep_xtream`).
+    /// Whether the channel count came does not matter: a login that works is
+    /// all a save needs.
     fn drain_conn_check(&mut self) {
         let Some(ConnResult { check, keep }) = self.conn_slot.lock().take() else {
             return;
         };
         tracing::info!("settings: connection check {:?}", check);
         self.conn_state = match (check, keep) {
-            (check @ ConnCheck::Ok { .. }, Some((creds, line))) => {
-                match self.apply_creds(creds, &line) {
-                    Ok(()) => ConnState::Done(check),
-                    Err(failed) => failed,
-                }
-            }
+            (check @ ConnCheck::Ok { .. }, Some(keep)) => match self.keep_xtream(keep) {
+                Ok(()) => ConnState::Done(check),
+                Err(failed) => failed,
+            },
             (check, _) => ConnState::Done(check),
         };
     }
@@ -2487,24 +2514,16 @@ impl TvApp {
         }
     }
 
-    /// Keep credentials that logged in: write BongoPlayer.ini (`line` is what
-    /// goes in it), then rebuild the catalog live and start fetching - no
-    /// restart needed. When the ini cannot be written nothing changes and the
-    /// failure comes back, to show in place of the test's verdict.
-    fn apply_creds(&mut self, creds: XtreamCreds, line: &str) -> Result<(), ConnState> {
-        let path = crate::args::ini_path();
-        if let Err(e) = crate::args::write_ini_creds(&path, line) {
-            let (path, error) = (path.display().to_string(), e.to_string());
-            self.set_toast(self.tr(T::CannotWrite, &[&path, &error]));
-            return Err(ConnState::WriteFailed { path, error });
-        }
-        tracing::info!("settings: portal saved to {} - connecting", path.display());
-        // The new catalog starts locked, so a save locks like Lock does: asked of
-        // the old catalog, the only one that knows this stream, before it goes.
-        let playing_adult = self.playing_adult();
-        self.creds = Some(creds.clone());
-        self.creds_from_command_line = false;
-        let portal: Arc<dyn Portal> = Arc::new(XtreamPortal::new(creds));
+    /// Runs the app on `portal` from now on: a new catalog, locked, fetched at
+    /// once when `state` is usable; whatever belonged to the old one is
+    /// forgotten.
+    fn install_portal(
+        &mut self,
+        portal: Arc<dyn Portal>,
+        creds: Option<XtreamCreds>,
+        state: PortalState,
+    ) {
+        self.creds = creds;
         self.catalog = Arc::new(CatalogStore::new(portal));
         self.catalog_generation += 1;
         // Another portal: its stream ids mean other channels, so the old lists'
@@ -2532,13 +2551,261 @@ impl TvApp {
         self.current_stream_id = None;
         self.playing_resumed = false;
         self.catalog_noted = true;
-        if playing_adult {
+        self.portal_state = state;
+        if state == PortalState::Configured {
+            self.catalog.spawn_fetch();
+        }
+    }
+
+    /// Source `id`'s favorites, presets and last channel from now on. What
+    /// plays is the other source's: it stops, and this source's last channel
+    /// resumes, as at a start (which resumes only on a source that can run: the
+    /// last stream of one that shows the setup prompt has its credentials in
+    /// its address).
+    fn use_data_of(&mut self, id: SourceId) {
+        self.storage.set_source(id);
+        self.favorites = Favorites::load(&self.storage.favorites_path()).unwrap_or_default();
+        self.presets = Presets::load(&self.storage.presets_path()).unwrap_or_default();
+        self.stop_playback();
+        // The resumed stream gets the new catalog's first word, as at a start.
+        self.catalog_noted = false;
+        if self.portal_state != PortalState::Configured {
+            return;
+        }
+        if let Some(lw) = LastWatched::load(&self.storage.last_watched_path()) {
+            self.resume(lw);
+        }
+    }
+
+    /// The name a source is saved under: none when it is its kind's default
+    /// in the UI language (it then shows in whichever language is chosen).
+    fn stored_name(&self, kind: SourceKind, name: &str) -> String {
+        let name = name.trim();
+        if name == kind.default_name(self.lang) {
+            String::new()
+        } else {
+            name.to_owned()
+        }
+    }
+
+    /// Whether saved source `id` is the one in use. The portal of `--xtream` is
+    /// a row of its own: while it runs no saved source is in use.
+    fn in_use(&self, id: SourceId) -> bool {
+        !self.creds_from_command_line && self.sources.active_id() == Some(id)
+    }
+
+    /// Whether a save of a `kind` source as `editing` has a source to go to. A
+    /// saved one must be there and of that kind (`Sources::keep` would add a
+    /// new source for an id it does not know, and keeps the kind a source has);
+    /// the command line's portal is an Xtream one. Says in the log when not.
+    fn can_keep(&self, editing: Editing, kind: SourceKind) -> bool {
+        let fits = match editing {
+            Editing::Saved(id) => self.sources.get(id).is_some_and(|s| s.kind == kind),
+            Editing::CommandLine => kind == SourceKind::Xtream,
+            Editing::New => true,
+        };
+        if !fits {
+            tracing::warn!(
+                "settings: a {} source cannot be saved as {:?}",
+                kind.code(),
+                editing
+            );
+        }
+        fits
+    }
+
+    /// Whether a save of `editing`, kept as source `id`, puts that source in
+    /// use: the command line's portal always did (Save in 0.6.1 kept and used
+    /// it); a saved source when it is the one in use; a new one when nothing
+    /// usable is in use.
+    fn save_activates(&self, editing: Editing, id: SourceId) -> bool {
+        match editing {
+            Editing::CommandLine => true,
+            Editing::Saved(_) => self.in_use(id),
+            Editing::New => {
+                !self.creds_from_command_line
+                    && (self.sources.active_id().is_none()
+                        || self.portal_state != PortalState::Configured)
+            }
+        }
+    }
+
+    /// Writes `sources` to the ini; on failure says so in a toast and gives the
+    /// state to show in place of a test's verdict.
+    fn write_sources(&mut self, sources: &Sources) -> Result<(), ConnState> {
+        let path = crate::args::ini_path();
+        sources.save(&path).map_err(|e| {
+            let (path, error) = (path.display().to_string(), e.to_string());
+            self.set_toast(self.tr(T::CannotWrite, &[&path, &error]));
+            ConnState::WriteFailed { path, error }
+        })
+    }
+
+    /// Keeps Xtream credentials that logged in, as `keep.editing` says (the
+    /// setup prompt's and the command line's go into the first saved Xtream
+    /// source), and uses them at once when `save_activates` says so. The ini is
+    /// written first: when that fails nothing changes, and the failure comes
+    /// back to show in place of the test's verdict. So does a source that is
+    /// gone by the time the test is over (`ConnState::Idle`: nothing to show).
+    fn keep_xtream(&mut self, keep: KeepXtream) -> Result<(), ConnState> {
+        if !self.can_keep(keep.editing, SourceKind::Xtream) {
+            return Err(ConnState::Idle);
+        }
+        let name = self.stored_name(SourceKind::Xtream, &keep.name);
+        let mut sources = self.sources.clone();
+        let id = sources.keep(keep.editing, SourceKind::Xtream, &name, &keep.line);
+        let activate = self.save_activates(keep.editing, id);
+        if activate {
+            sources.set_active(id);
+        }
+        self.write_sources(&sources)?;
+        self.sources = sources;
+        if !activate {
+            tracing::info!("settings: source {} saved (xtream)", id);
+            let shown = self.sources.get(id).map(|s| s.display_name(self.lang));
+            self.set_toast(self.tr(T::SourceSaved, &[&shown.unwrap_or_default()]));
+            return Ok(());
+        }
+        tracing::info!(
+            "settings: portal saved to {} - connecting",
+            crate::args::ini_path().display()
+        );
+        // The new catalog starts locked, so a save locks like Lock does: asked of
+        // the old catalog, the only one that knows this stream, before it goes.
+        let playing_adult = self.playing_adult();
+        self.creds_from_command_line = false;
+        let portal: Arc<dyn Portal> = Arc::new(XtreamPortal::new(keep.creds.clone()));
+        self.install_portal(portal, Some(keep.creds), PortalState::Configured);
+        if self.storage.source() != id {
+            self.use_data_of(id);
+        } else if playing_adult {
             self.stop_playback();
         }
-        self.catalog.spawn_fetch();
-        self.portal_state = PortalState::Configured;
         self.set_toast(self.t(T::ConnectingPortal));
         Ok(())
+    }
+
+    /// A Save in the sources section. An Xtream source is tested first and
+    /// kept only if it logs in; an M3U source is kept as it is.
+    fn save_source(&mut self, draft: SourceDraft) {
+        match draft.kind {
+            SourceKind::Xtream => {
+                // No test for a save that has no source to go to.
+                if self.can_keep(draft.editing, SourceKind::Xtream) {
+                    self.start_conn_check(draft.address, Some((draft.editing, draft.name)));
+                }
+            }
+            SourceKind::M3u => {
+                // The command line's portal is an Xtream one: a list saved from
+                // its form is a new source.
+                let editing = match draft.editing {
+                    Editing::CommandLine => Editing::New,
+                    other => other,
+                };
+                self.save_m3u(SourceDraft { editing, ..draft });
+            }
+        }
+    }
+
+    /// Keeps an M3U source and, when `save_activates` says so, uses it at once:
+    /// its list is read again, and a changed address drops the old one's
+    /// saved list. An address with nothing in it is not kept (it would be
+    /// dropped again when the ini is read).
+    fn save_m3u(&mut self, draft: SourceDraft) {
+        if !self.can_keep(draft.editing, SourceKind::M3u) {
+            return;
+        }
+        if crate::args::without_newlines(&draft.address)
+            .trim()
+            .is_empty()
+        {
+            tracing::warn!("settings: a list is not saved without an address");
+            return;
+        }
+        let name = self.stored_name(SourceKind::M3u, &draft.name);
+        let old_address = match draft.editing {
+            Editing::Saved(id) => self.sources.get(id).map(|s| s.address.clone()),
+            _ => None,
+        };
+        let mut sources = self.sources.clone();
+        let id = sources.keep(draft.editing, SourceKind::M3u, &name, &draft.address);
+        let activate = self.save_activates(draft.editing, id);
+        if activate {
+            sources.set_active(id);
+        }
+        if self.write_sources(&sources).is_err() {
+            return;
+        }
+        self.sources = sources;
+        tracing::info!("settings: source {} saved (m3u)", id);
+        let Some(source) = self.sources.get(id).cloned() else {
+            return;
+        };
+        if old_address.is_some_and(|old| old != source.address) {
+            let _ = std::fs::remove_file(self.storage.m3u_cache_path(id));
+        }
+        self.set_toast(self.tr(T::SourceSaved, &[&source.display_name(self.lang)]));
+        if activate {
+            let data_changed = self.storage.source() != id;
+            self.creds_from_command_line = false;
+            let opened = open_source(&source, &self.storage);
+            self.install_portal(opened.portal, opened.creds, opened.state);
+            if data_changed {
+                self.use_data_of(id);
+            }
+        }
+    }
+
+    /// Puts saved source `id` in use, as a start on it would: its portal, its
+    /// favorites and presets, its last channel. The ini says so for the next
+    /// start and is written first: when that fails nothing changes, so what
+    /// runs is always what the next start opens. Nothing to do for the source
+    /// that is in use already.
+    fn activate_source(&mut self, id: SourceId) {
+        let Some(source) = self.sources.get(id).cloned() else {
+            return;
+        };
+        if self.in_use(id) {
+            return;
+        }
+        let mut sources = self.sources.clone();
+        sources.set_active(id);
+        if self.write_sources(&sources).is_err() {
+            return;
+        }
+        self.sources = sources;
+        self.creds_from_command_line = false;
+        tracing::info!("source: active {} ({})", id, source.kind.code());
+        let opened = open_source(&source, &self.storage);
+        self.install_portal(opened.portal, opened.creds, opened.state);
+        self.use_data_of(id);
+        self.set_toast(self.tr(T::SourceInUse, &[&source.display_name(self.lang)]));
+    }
+
+    /// Removes saved source `id`, with its favorites, presets, last channel and
+    /// saved list. Never the source in use (the settings offer no Delete for
+    /// it), and never the files whose data is in use (the command line's
+    /// portal uses source 1's).
+    fn delete_source(&mut self, id: SourceId) {
+        if self.in_use(id) {
+            tracing::warn!("settings: source {} is in use - not deleted", id);
+            return;
+        }
+        let mut sources = self.sources.clone();
+        let Some(gone) = sources.remove(id) else {
+            return;
+        };
+        if self.write_sources(&sources).is_err() {
+            return;
+        }
+        self.sources = sources;
+        let files = if self.storage.source() == id {
+            0
+        } else {
+            self.storage.remove_source_files(id)
+        };
+        tracing::info!("settings: source {} deleted ({} files)", id, files);
+        self.set_toast(self.tr(T::SourceDeleted, &[&gone.display_name(self.lang)]));
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -4055,6 +4322,17 @@ mod tests {
             password: "p".into(),
             host: "h".into(),
             port: 80,
+        }
+    }
+
+    /// What a Save of these credentials on the command line's portal keeps:
+    /// the first saved portal, under its default name.
+    fn portal_save(creds: XtreamCreds, line: &str) -> KeepXtream {
+        KeepXtream {
+            creds,
+            line: line.to_owned(),
+            editing: Editing::CommandLine,
+            name: String::new(),
         }
     }
 
@@ -6578,7 +6856,7 @@ https://c.example/twee-nieuws.m3u8\n";
             host: "127.0.0.1".into(),
             port: 1,
         };
-        let saved = h.app.apply_creds(creds, "u2:p2@127.0.0.1:1");
+        let saved = h.app.keep_xtream(portal_save(creds, "u2:p2@127.0.0.1:1"));
         std::env::remove_var("BONGO_INI");
         assert!(saved.is_ok());
         assert!(
@@ -6603,7 +6881,7 @@ https://c.example/twee-nieuws.m3u8\n";
             host: "127.0.0.1".into(),
             port: 1,
         };
-        let saved = h.app.apply_creds(creds, "u2:p2@127.0.0.1:1");
+        let saved = h.app.keep_xtream(portal_save(creds, "u2:p2@127.0.0.1:1"));
         std::env::remove_var("BONGO_INI");
         assert!(saved.is_ok());
         assert!(
@@ -6862,7 +7140,7 @@ https://c.example/twee-nieuws.m3u8\n";
             host: "127.0.0.1".into(),
             port: 1,
         };
-        let saved = h.app.apply_creds(creds, "u2:p2@127.0.0.1:1");
+        let saved = h.app.keep_xtream(portal_save(creds, "u2:p2@127.0.0.1:1"));
         std::env::remove_var("BONGO_INI");
         assert!(saved.is_ok());
         assert!(h.app.epg_fetcher.in_flight().is_empty());
@@ -7316,7 +7594,7 @@ https://c.example/twee-nieuws.m3u8\n";
             host: "127.0.0.1".into(),
             port: 1,
         };
-        let saved = h.app.apply_creds(creds, "u2:p2@127.0.0.1:1");
+        let saved = h.app.keep_xtream(portal_save(creds, "u2:p2@127.0.0.1:1"));
         std::env::remove_var("BONGO_INI");
         assert!(saved.is_ok());
         assert!(
@@ -7593,7 +7871,7 @@ https://c.example/twee-nieuws.m3u8\n";
                 host: "127.0.0.1".into(),
                 port: 1,
             };
-            let saved = h.app.apply_creds(creds, "u2:p2@127.0.0.1:1");
+            let saved = h.app.keep_xtream(portal_save(creds, "u2:p2@127.0.0.1:1"));
             std::env::remove_var("BONGO_INI");
             saved
         };
@@ -7820,7 +8098,7 @@ https://c.example/twee-nieuws.m3u8\n";
                 host: "127.0.0.1".into(),
                 port: 1,
             };
-            let saved = h.app.apply_creds(creds, "u2:p2@127.0.0.1:1");
+            let saved = h.app.keep_xtream(portal_save(creds, "u2:p2@127.0.0.1:1"));
             std::env::remove_var("BONGO_INI");
             assert!(saved.is_ok());
         }
@@ -7880,7 +8158,7 @@ https://c.example/twee-nieuws.m3u8\n";
                 host: "127.0.0.1".into(),
                 port: 1,
             };
-            let saved = h.app.apply_creds(creds, "u2:p2@127.0.0.1:1");
+            let saved = h.app.keep_xtream(portal_save(creds, "u2:p2@127.0.0.1:1"));
             std::env::remove_var("BONGO_INI");
             assert!(saved.is_ok());
         }
@@ -9468,5 +9746,1062 @@ https://c.example/twee-nieuws.m3u8\n";
         assert_eq!(loads(h.sent()), [twee]);
         let after = server.received_requests().await.unwrap().len();
         assert_eq!(after, asked, "the news asked the server for nothing");
+    }
+
+    // ---- using, saving and deleting sources ----
+
+    /// Source 1, the tests' Xtream portal, in use and playing TEST 03; source 2,
+    /// the M3U list TEST_LIST in a file, whose last channel was Kanaal Een
+    /// (returned). Nothing in it writes the ini; a test that then does points
+    /// `BONGO_INI` into `dir` and holds ENV_LOCK for that.
+    fn two_sources(dir: &std::path::Path) -> (Harness, String) {
+        let file = dir.join("lijst.m3u");
+        std::fs::write(&file, TEST_LIST).unwrap();
+        let sources = Sources::parse(&format!(
+            "source=1;xtream;;u:p@h:80\nsource=2;m3u;Lijst;{}\nactive=1\n",
+            file.display()
+        ));
+        let (known, catalog) = M3uPortal::from_text(TEST_LIST).unwrap();
+        let een = known.live_stream_url(catalog.live[0].stream_id);
+        let mut two = Storage::with_root(dir.to_path_buf());
+        two.set_source(2);
+        let record = LastWatched {
+            url: een.clone(),
+            live: true,
+            adult: Some(false),
+        };
+        record.save(&two.last_watched_path());
+        let mut h = Harness::start_with(
+            dir,
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            sources,
+            None,
+        );
+        h.app.zap_by_id(3);
+        h.sent();
+        (h, een)
+    }
+
+    #[tokio::test]
+    async fn switching_stops_the_old_stream_and_resumes_the_new_sources_last_channel() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let (mut h, een) = two_sources(dir.path());
+        h.app
+            .apply_settings_action(SettingsAction::ActivateSource(2));
+        let sent = h.sent();
+        assert!(matches!(sent.first(), Some(Cmd::Stop)), "{sent:?}");
+        assert_eq!(loads(sent), [een], "source 2's last channel");
+        assert_eq!(h.app.catalog.kind(), SourceKind::M3u);
+        assert_eq!(h.app.storage.source(), 2);
+        assert_eq!(h.app.creds, None);
+        std::env::remove_var("BONGO_INI");
+    }
+
+    #[tokio::test]
+    async fn the_next_start_opens_the_source_that_was_in_use() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("test.ini");
+        std::env::set_var("BONGO_INI", &ini);
+        let (mut h, _) = two_sources(dir.path());
+        h.app
+            .apply_settings_action(SettingsAction::ActivateSource(2));
+        std::env::remove_var("BONGO_INI");
+        // What main reads at the next start.
+        let saved = Sources::load(&ini);
+        assert_eq!(saved.active_id(), Some(2));
+        let opened = open_source(
+            saved.active().unwrap(),
+            &Storage::with_root(dir.path().to_path_buf()),
+        );
+        assert_eq!(opened.portal.kind(), SourceKind::M3u);
+        assert_eq!(opened.state, PortalState::Configured);
+    }
+
+    #[tokio::test]
+    async fn using_a_url_source_shows_its_saved_list_before_the_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = wiremock::MockServer::start().await;
+        let fresh = "#EXTM3U\n#EXTINF:-1,Kanaal Drie\nhttps://d.example/drie.m3u8\n";
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(fresh)
+                    .set_delay(Duration::from_millis(400)),
+            )
+            .mount(&server)
+            .await;
+        let storage = Storage::with_root(dir.path().to_path_buf());
+        std::fs::create_dir_all(storage.cache_dir()).unwrap();
+        std::fs::write(storage.m3u_cache_path(2), TEST_LIST).unwrap();
+        let sources = Sources::parse(&format!(
+            "source=1;xtream;;u:p@h:80\nsource=2;m3u;Lijst;{}/tv.m3u\nactive=1\n",
+            server.uri()
+        ));
+        let mut h = Harness::start_with(
+            dir.path(),
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            sources,
+            None,
+        );
+        {
+            // The variable is the whole process's: held for the switch only.
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+            h.app.activate_source(2);
+            std::env::remove_var("BONGO_INI");
+        }
+        let names = |h: &Harness| -> Vec<String> {
+            h.app
+                .catalog
+                .zap_channels()
+                .into_iter()
+                .map(|c| c.name)
+                .collect()
+        };
+        wait_until("the saved list", || h.app.catalog.is_loaded()).await;
+        assert_eq!(names(&h), ["Kanaal Een", "Kanaal Twee", "Kanaal Twee"]);
+        wait_until("the fresh list", || names(&h) == ["Kanaal Drie"]).await;
+    }
+
+    #[tokio::test]
+    async fn favorites_and_presets_are_kept_per_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("test.ini");
+        // The variable is the whole process's: held for a switch only.
+        let switch = |h: &mut Harness, id| {
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", &ini);
+            h.app.activate_source(id);
+            std::env::remove_var("BONGO_INI");
+        };
+        let (mut h, _) = two_sources(dir.path()); // TEST 03 plays
+        h.app.toggle_favorite_current();
+        h.app.save_preset(1);
+        switch(&mut h, 2);
+        assert!(!h.app.favorites.contains(3), "source 2 starts with none");
+        assert!(h.app.presets.get(1).is_none());
+        wait_until("the list", || h.app.catalog.is_loaded()).await;
+        h.app.zap_by_id(crate::m3u::stream_id("Een.nl"));
+        h.app.toggle_favorite_current();
+        assert!(dir.path().join("favorites-2.json").exists());
+        switch(&mut h, 1);
+        assert!(h.app.favorites.contains(3), "source 1's own again");
+        assert_eq!(h.app.presets.get(1).map(|p| p.stream_id), Some(3));
+    }
+
+    #[test]
+    fn deleting_a_source_takes_its_files_and_never_the_source_in_use() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("test.ini");
+        std::env::set_var("BONGO_INI", &ini);
+        let sources = Sources::parse(
+            "source=1;xtream;;u:p@h:80\nsource=2;m3u;Lijst;https://a.example/tv.m3u\nactive=1\n",
+        );
+        let mut h = Harness::start_with(
+            dir.path(),
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            sources,
+            None,
+        );
+        let mut two = Storage::with_root(dir.path().to_path_buf());
+        two.set_source(2);
+        std::fs::create_dir_all(two.cache_dir()).unwrap();
+        for path in [
+            two.favorites_path(),
+            two.presets_path(),
+            two.last_watched_path(),
+            two.m3u_cache_path(2),
+        ] {
+            std::fs::write(path, "x").unwrap();
+        }
+        h.app.apply_settings_action(SettingsAction::DeleteSource(1));
+        assert!(h.app.sources.get(1).is_some(), "the source in use stays");
+        h.app.apply_settings_action(SettingsAction::DeleteSource(2));
+        assert!(h.app.sources.get(2).is_none());
+        assert!(!two.favorites_path().exists() && !two.m3u_cache_path(2).exists());
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "portal=u:p@h:80\n",
+            "one portal left: 0.6.1's ini"
+        );
+        std::env::remove_var("BONGO_INI");
+    }
+
+    #[tokio::test]
+    async fn a_setup_prompt_save_writes_the_ini_0_6_1_wrote() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("test.ini");
+        std::env::set_var("BONGO_INI", &ini);
+        let catalog = Arc::new(CatalogStore::new(idle_portal()));
+        let mut h = Harness::start(dir.path(), catalog, PortalState::Missing, None);
+        let creds = XtreamCreds {
+            username: "u2".into(),
+            password: "p2".into(),
+            host: "127.0.0.1".into(),
+            port: 1,
+        };
+        assert!(h
+            .app
+            .keep_xtream(portal_save(creds, "u2:p2@127.0.0.1:1"))
+            .is_ok());
+        std::env::remove_var("BONGO_INI");
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "portal=u2:p2@127.0.0.1:1\n"
+        );
+        assert_eq!(h.app.portal_state, PortalState::Configured);
+        assert_eq!(h.app.sources.active_id(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_new_source_is_used_at_once_only_when_none_is_in_use() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let file = dir.path().join("lijst.m3u");
+        std::fs::write(&file, TEST_LIST).unwrap();
+        let draft = SourceDraft {
+            editing: Editing::New,
+            kind: SourceKind::M3u,
+            name: "Gratis".into(),
+            address: file.display().to_string(),
+        };
+        // A portal is in use: the list is only added.
+        let mut h = Harness::start_with(
+            dir.path(),
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            Sources::parse("portal=u:p@h:80\n"),
+            None,
+        );
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(draft.clone()));
+        // An area shows from its second frame on.
+        h.frame(&[]);
+        h.frame(&[]);
+        assert_eq!(h.app.sources.list().len(), 2);
+        assert_eq!(h.app.sources.active_id(), Some(1));
+        assert_eq!(h.app.catalog.kind(), SourceKind::Xtream);
+        assert!(
+            h.painted.iter().any(|t| t == "source saved: Gratis"),
+            "{:?}",
+            h.painted
+        );
+        // Nothing usable in use (the setup prompt): the list is used at once.
+        let empty = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(CatalogStore::new(idle_portal()));
+        let mut fresh = Harness::start(empty.path(), catalog, PortalState::Missing, None);
+        fresh
+            .app
+            .apply_settings_action(SettingsAction::SaveSource(draft));
+        assert_eq!(fresh.app.sources.active_id(), Some(1));
+        assert_eq!(fresh.app.catalog.kind(), SourceKind::M3u);
+        assert_eq!(fresh.app.portal_state, PortalState::Configured);
+        std::env::remove_var("BONGO_INI");
+    }
+
+    #[tokio::test]
+    async fn the_m3u_source_in_use_saved_with_another_address_drops_its_saved_list() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let (old, new) = (dir.path().join("oud.m3u"), dir.path().join("nieuw.m3u"));
+        std::fs::write(&old, TEST_LIST).unwrap();
+        std::fs::write(&new, TEST_LIST).unwrap();
+        let storage = Storage::with_root(dir.path().to_path_buf());
+        std::fs::create_dir_all(storage.cache_dir()).unwrap();
+        std::fs::write(storage.m3u_cache_path(1), TEST_LIST).unwrap();
+        let sources = Sources::parse(&format!("source=1;m3u;Lijst;{}\nactive=1\n", old.display()));
+        let (portal, catalog) = M3uPortal::from_text(TEST_LIST).unwrap();
+        let store = Arc::new(CatalogStore::from_catalog(Arc::new(portal), catalog));
+        let mut h = Harness::start_with(
+            dir.path(),
+            store,
+            PortalState::Configured,
+            None,
+            None,
+            sources,
+            None,
+        );
+        let generation = h.app.catalog_generation;
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(SourceDraft {
+                editing: Editing::Saved(1),
+                kind: SourceKind::M3u,
+                name: "Lijst".into(),
+                address: new.display().to_string(),
+            }));
+        assert!(
+            !storage.m3u_cache_path(1).exists(),
+            "the old address's list"
+        );
+        assert_eq!(h.app.catalog_generation, generation + 1, "read again");
+        assert_eq!(
+            h.app.sources.get(1).map(|s| s.address.clone()),
+            Some(new.display().to_string())
+        );
+        std::env::remove_var("BONGO_INI");
+    }
+
+    #[test]
+    fn a_name_equal_to_its_kinds_default_is_kept_as_none() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let mut h = Harness::start_with(
+            dir.path(),
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            Sources::parse("portal=u:p@h:80\n"),
+            None,
+        );
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(SourceDraft {
+                editing: Editing::New,
+                kind: SourceKind::M3u,
+                name: " M3U list ".into(),
+                address: "https://a.example/tv.m3u".into(),
+            }));
+        assert_eq!(h.app.sources.get(2).map(|s| s.name.as_str()), Some(""));
+        std::env::remove_var("BONGO_INI");
+    }
+
+    #[test]
+    fn an_xtream_source_saved_while_another_is_in_use_is_only_kept() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let sources = Sources::parse(
+            "source=1;m3u;Lijst;https://a.example/tv.m3u\nsource=2;xtream;Oud;u:p@h:80\nactive=1\n",
+        );
+        let (portal, catalog) = M3uPortal::from_text(TEST_LIST).unwrap();
+        let store = Arc::new(CatalogStore::from_catalog(Arc::new(portal), catalog));
+        let mut h = Harness::start_with(
+            dir.path(),
+            store,
+            PortalState::Configured,
+            None,
+            None,
+            sources,
+            None,
+        );
+        let keep = KeepXtream {
+            creds: XtreamCreds {
+                username: "u2".into(),
+                password: "p2".into(),
+                host: "127.0.0.1".into(),
+                port: 1,
+            },
+            line: "u2:p2@127.0.0.1:1".into(),
+            editing: Editing::Saved(2),
+            name: "Nieuw".into(),
+        };
+        assert!(h.app.keep_xtream(keep).is_ok());
+        let two = h.app.sources.get(2).unwrap();
+        assert_eq!(
+            (two.name.as_str(), two.address.as_str()),
+            ("Nieuw", "u2:p2@127.0.0.1:1")
+        );
+        assert_eq!(
+            h.app.catalog.kind(),
+            SourceKind::M3u,
+            "the list stays in use"
+        );
+        assert_eq!(h.app.creds, None);
+        std::env::remove_var("BONGO_INI");
+    }
+
+    /// Source 1, the tests' Xtream portal, in use, and source 2, a list on the
+    /// web, saved next to it.
+    const PORTAL_AND_LIST: &str =
+        "source=1;xtream;;u:p@h:80\nsource=2;m3u;Lijst;https://a.example/tv.m3u\nactive=1\n";
+
+    fn portal_and_list(dir: &std::path::Path) -> Harness {
+        Harness::start_with(
+            dir,
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            Sources::parse(PORTAL_AND_LIST),
+            None,
+        )
+    }
+
+    /// Other Xtream credentials than the tests' portal's.
+    fn other_creds() -> XtreamCreds {
+        XtreamCreds {
+            username: "u2".into(),
+            password: "p2".into(),
+            host: "127.0.0.1".into(),
+            port: 1,
+        }
+    }
+
+    /// A list, as the sources section's Save hands it over.
+    fn list_draft(editing: Editing, name: &str, address: &str) -> SourceDraft {
+        SourceDraft {
+            editing,
+            kind: SourceKind::M3u,
+            name: name.into(),
+            address: address.into(),
+        }
+    }
+
+    /// Points `BONGO_INI` at a file in a folder that is not there, so that
+    /// nothing can be written to it. Hold ENV_LOCK; the caller removes the
+    /// variable.
+    fn point_ini_nowhere(dir: &std::path::Path) -> std::path::PathBuf {
+        let ini = dir.join("no-such-folder").join("test.ini");
+        std::env::set_var("BONGO_INI", &ini);
+        ini
+    }
+
+    /// The text of the toast on show.
+    fn toast_text(h: &Harness) -> String {
+        h.app
+            .toast
+            .as_ref()
+            .map(|t| t.0.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn only_the_default_name_of_the_ui_language_is_kept_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        for lang in Lang::ALL {
+            h.app.lang = lang;
+            for kind in [SourceKind::Xtream, SourceKind::M3u] {
+                let own = kind.default_name(lang);
+                let spaced = format!("  {own} ");
+                assert_eq!(h.app.stored_name(kind, &spaced), "", "{lang:?}, {kind:?}");
+                // The default of another language is a name like any other.
+                for other in Lang::ALL {
+                    let theirs = kind.default_name(other);
+                    if theirs != own {
+                        let stored = h.app.stored_name(kind, theirs);
+                        assert_eq!(stored, theirs, "{other:?}'s {kind:?} name in {lang:?}");
+                    }
+                }
+                assert_eq!(h.app.stored_name(kind, " Thuis "), "Thuis");
+            }
+        }
+    }
+
+    #[test]
+    fn deleting_the_saved_source_the_command_lines_portal_runs_on_leaves_its_files() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let mut h = portal_and_list(dir.path());
+        // `--xtream` runs: no saved source is in use, and its data is source 1's.
+        h.app.creds_from_command_line = true;
+        let one = Storage::with_root(dir.path().to_path_buf());
+        let files = [
+            one.favorites_path(),
+            one.presets_path(),
+            one.last_watched_path(),
+        ];
+        for path in &files {
+            std::fs::write(path, "x").unwrap();
+        }
+        h.app.apply_settings_action(SettingsAction::DeleteSource(1));
+        std::env::remove_var("BONGO_INI");
+        assert!(h.app.sources.get(1).is_none(), "no saved source is in use");
+        assert!(
+            files.iter().all(|path| path.exists()),
+            "the portal runs on them"
+        );
+    }
+
+    #[test]
+    fn a_list_the_ini_cannot_hold_is_not_kept_and_nothing_about_the_old_one_changes() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        point_ini_nowhere(dir.path());
+        let (old, new) = (dir.path().join("oud.m3u"), dir.path().join("nieuw.m3u"));
+        std::fs::write(&old, TEST_LIST).unwrap();
+        std::fs::write(&new, TEST_LIST).unwrap();
+        let storage = Storage::with_root(dir.path().to_path_buf());
+        std::fs::create_dir_all(storage.cache_dir()).unwrap();
+        std::fs::write(storage.m3u_cache_path(1), TEST_LIST).unwrap();
+        let sources = Sources::parse(&format!("source=1;m3u;Lijst;{}\nactive=1\n", old.display()));
+        let (portal, catalog) = M3uPortal::from_text(TEST_LIST).unwrap();
+        let store = Arc::new(CatalogStore::from_catalog(Arc::new(portal), catalog));
+        let mut h = Harness::start_with(
+            dir.path(),
+            store,
+            PortalState::Configured,
+            None,
+            None,
+            sources.clone(),
+            None,
+        );
+        let generation = h.app.catalog_generation;
+        // Another address for the list in use, and a second list.
+        for editing in [Editing::Saved(1), Editing::New] {
+            let draft = list_draft(editing, "Lijst", &new.display().to_string());
+            h.app
+                .apply_settings_action(SettingsAction::SaveSource(draft));
+        }
+        std::env::remove_var("BONGO_INI");
+        assert_eq!(h.app.sources, sources, "nothing was kept");
+        assert_eq!(h.app.catalog_generation, generation, "nothing was opened");
+        assert!(storage.m3u_cache_path(1).exists(), "the saved list stays");
+        assert!(
+            toast_text(&h).starts_with("could not write "),
+            "{}",
+            toast_text(&h)
+        );
+    }
+
+    #[test]
+    fn an_xtream_login_the_ini_cannot_hold_is_not_kept() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let ini = point_ini_nowhere(dir.path());
+        let catalog = Arc::new(CatalogStore::new(idle_portal()));
+        let mut h = Harness::start(dir.path(), catalog, PortalState::Missing, None);
+        let generation = h.app.catalog_generation;
+        let kept = h
+            .app
+            .keep_xtream(portal_save(other_creds(), "u2:p2@127.0.0.1:1"));
+        std::env::remove_var("BONGO_INI");
+        let Err(ConnState::WriteFailed { path, .. }) = kept else {
+            panic!("expected a failed write, got {kept:?}");
+        };
+        assert_eq!(std::path::PathBuf::from(path), ini);
+        assert!(h.app.sources.list().is_empty());
+        assert_eq!(h.app.portal_state, PortalState::Missing, "the prompt stays");
+        assert_eq!(h.app.creds, None);
+        assert_eq!(h.app.catalog_generation, generation);
+        assert!(
+            toast_text(&h).starts_with("could not write "),
+            "{}",
+            toast_text(&h)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_the_ini_cannot_hold_does_not_happen() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        point_ini_nowhere(dir.path());
+        let (mut h, _) = two_sources(dir.path());
+        let generation = h.app.catalog_generation;
+        h.app
+            .apply_settings_action(SettingsAction::ActivateSource(2));
+        std::env::remove_var("BONGO_INI");
+        assert!(h.sent().is_empty(), "the stream plays on");
+        assert_eq!(h.app.sources.active_id(), Some(1));
+        assert_eq!(h.app.storage.source(), 1);
+        assert_eq!(h.app.catalog.kind(), SourceKind::Xtream);
+        assert_eq!(h.app.creds, Some(test_creds()));
+        assert_eq!(h.app.catalog_generation, generation);
+        assert!(
+            toast_text(&h).starts_with("could not write "),
+            "{}",
+            toast_text(&h)
+        );
+    }
+
+    #[test]
+    fn a_delete_the_ini_cannot_hold_takes_nothing() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        point_ini_nowhere(dir.path());
+        let mut h = portal_and_list(dir.path());
+        let mut two = Storage::with_root(dir.path().to_path_buf());
+        two.set_source(2);
+        std::fs::create_dir_all(two.cache_dir()).unwrap();
+        let files = [two.favorites_path(), two.m3u_cache_path(2)];
+        for path in &files {
+            std::fs::write(path, "x").unwrap();
+        }
+        h.app.apply_settings_action(SettingsAction::DeleteSource(2));
+        std::env::remove_var("BONGO_INI");
+        assert!(h.app.sources.get(2).is_some(), "still saved");
+        assert!(files.iter().all(|path| path.exists()), "and its files stay");
+        assert!(
+            toast_text(&h).starts_with("could not write "),
+            "{}",
+            toast_text(&h)
+        );
+    }
+
+    #[test]
+    fn a_save_for_a_source_that_is_not_saved_adds_none() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("test.ini");
+        std::env::set_var("BONGO_INI", &ini);
+        let mut h = portal_and_list(dir.path());
+        let before = h.app.sources.clone();
+        let draft = |kind, address: &str| SourceDraft {
+            editing: Editing::Saved(9),
+            kind,
+            name: "Weg".into(),
+            address: address.into(),
+        };
+        let list = draft(SourceKind::M3u, "https://b.example/tv.m3u");
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(list));
+        // An Xtream source is not even tested.
+        let portal = draft(SourceKind::Xtream, "u2:p2@127.0.0.1:1");
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(portal));
+        assert_eq!(h.app.conn_state, ConnState::Idle);
+        // A test that finished after its source was deleted keeps nothing either.
+        let late = KeepXtream {
+            creds: other_creds(),
+            line: "u2:p2@127.0.0.1:1".into(),
+            editing: Editing::Saved(9),
+            name: "Weg".into(),
+        };
+        assert_eq!(h.app.keep_xtream(late), Err(ConnState::Idle));
+        std::env::remove_var("BONGO_INI");
+        assert_eq!(h.app.sources, before);
+        assert!(!ini.exists(), "nothing was written");
+    }
+
+    #[test]
+    fn a_save_of_the_other_kind_than_the_saved_source_is_refused() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("test.ini");
+        std::env::set_var("BONGO_INI", &ini);
+        let mut h = portal_and_list(dir.path());
+        let before = h.app.sources.clone();
+        // Credentials for the list (source 2) ...
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(SourceDraft {
+                editing: Editing::Saved(2),
+                kind: SourceKind::Xtream,
+                name: "Lijst".into(),
+                address: "u2:p2@127.0.0.1:1".into(),
+            }));
+        assert_eq!(h.app.conn_state, ConnState::Idle, "no test starts");
+        // ... and a list for the portal (source 1).
+        let list = list_draft(Editing::Saved(1), "Portaal", "https://b.example/tv.m3u");
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(list));
+        std::env::remove_var("BONGO_INI");
+        assert_eq!(h.app.sources, before);
+        assert!(!ini.exists(), "nothing was written");
+    }
+
+    #[test]
+    fn a_list_saved_from_the_command_lines_form_is_a_new_source_and_the_portal_stays() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let mut h = Harness::start_with(
+            dir.path(),
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            Sources::parse("portal=u:p@h:80\n"),
+            None,
+        );
+        h.app.creds_from_command_line = true;
+        let list = list_draft(Editing::CommandLine, "Gratis", "https://a.example/tv.m3u");
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(list));
+        std::env::remove_var("BONGO_INI");
+        let portal = h.app.sources.get(1).unwrap();
+        assert_eq!(
+            (portal.kind, portal.address.as_str()),
+            (SourceKind::Xtream, "u:p@h:80"),
+            "the portal keeps its address"
+        );
+        assert_eq!(h.app.sources.get(2).map(|s| s.kind), Some(SourceKind::M3u));
+        assert!(h.app.creds_from_command_line, "and keeps running");
+        assert_eq!(h.app.catalog.kind(), SourceKind::Xtream);
+    }
+
+    #[test]
+    fn an_address_with_nothing_in_it_is_not_kept() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("test.ini");
+        std::env::set_var("BONGO_INI", &ini);
+        let mut h = portal_and_list(dir.path());
+        let before = h.app.sources.clone();
+        for address in ["", "   ", "\r\n"] {
+            let draft = list_draft(Editing::New, "Leeg", address);
+            h.app
+                .apply_settings_action(SettingsAction::SaveSource(draft));
+        }
+        std::env::remove_var("BONGO_INI");
+        assert_eq!(h.app.sources, before);
+        assert!(!ini.exists(), "nothing was written");
+    }
+
+    #[tokio::test]
+    async fn using_the_source_in_use_or_one_that_is_not_saved_changes_nothing() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("test.ini");
+        std::env::set_var("BONGO_INI", &ini);
+        let (mut h, _) = two_sources(dir.path());
+        let generation = h.app.catalog_generation;
+        for id in [1, 9] {
+            h.app
+                .apply_settings_action(SettingsAction::ActivateSource(id));
+        }
+        std::env::remove_var("BONGO_INI");
+        assert!(h.sent().is_empty(), "the stream plays on");
+        assert_eq!(h.app.catalog_generation, generation);
+        assert!(!ini.exists(), "nothing was written");
+    }
+
+    #[tokio::test]
+    async fn with_the_command_lines_portal_running_no_saved_source_is_in_use() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("test.ini");
+        std::env::set_var("BONGO_INI", &ini);
+        let (mut h, _) = two_sources(dir.path());
+        h.app.creds_from_command_line = true;
+        let generation = h.app.catalog_generation;
+        // Source 1, with the same address, is a switch like any other: the
+        // command line's portal goes.
+        h.app
+            .apply_settings_action(SettingsAction::ActivateSource(1));
+        std::env::remove_var("BONGO_INI");
+        assert!(!h.app.creds_from_command_line);
+        assert_eq!(h.app.catalog_generation, generation + 1);
+        assert_eq!(Sources::load(&ini).active_id(), Some(1));
+    }
+
+    #[test]
+    fn using_a_source_with_placeholder_credentials_shows_the_prompt_and_resumes_nothing() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let sources = Sources::parse(
+            "source=1;xtream;;u:p@h:80\nsource=2;xtream;Voorbeeld;user:pass@host.example.com:80\nactive=1\n",
+        );
+        let mut h = Harness::start_with(
+            dir.path(),
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            sources,
+            None,
+        );
+        // Its last stream has the credentials in its address.
+        let mut two = Storage::with_root(dir.path().to_path_buf());
+        two.set_source(2);
+        let record = LastWatched {
+            url: "http://host.example.com:80/live/user/pass/7.m3u8".into(),
+            live: true,
+            adult: Some(false),
+        };
+        record.save(&two.last_watched_path());
+        h.sent();
+        h.app
+            .apply_settings_action(SettingsAction::ActivateSource(2));
+        std::env::remove_var("BONGO_INI");
+        assert_eq!(
+            h.app.portal_state,
+            PortalState::Placeholder,
+            "the prompt shows"
+        );
+        let sent = h.sent();
+        assert!(matches!(sent.as_slice(), [Cmd::Stop]), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn an_xtream_source_is_kept_once_it_logs_in_and_not_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("test.ini");
+        // A portal that takes every call as a login that works, and one that
+        // refuses the login.
+        let portal_answering = |status: u16| async move {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::path("/player_api.php"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(status)
+                        .set_body_string(r#"{"user_info":{"auth":1}}"#),
+                )
+                .mount(&server)
+                .await;
+            server
+        };
+        let (works, refuses) = (portal_answering(200).await, portal_answering(401).await);
+        let draft = |server: &wiremock::MockServer| SourceDraft {
+            editing: Editing::New,
+            kind: SourceKind::Xtream,
+            name: "Thuis".into(),
+            address: format!("u2:p2@127.0.0.1:{}", server.address().port()),
+        };
+        let mut h = portal_and_list(dir.path());
+        // A login that is refused keeps nothing.
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(draft(&refuses)));
+        assert_eq!(h.app.conn_state, ConnState::Testing);
+        wait_until("the verdict", || h.app.conn_slot.lock().is_some()).await;
+        h.frame(&[]);
+        assert_eq!(h.app.conn_state, ConnState::Done(ConnCheck::BadLogin));
+        assert_eq!(h.app.sources.list().len(), 2);
+        assert!(!ini.exists(), "nothing was written");
+        // One that logs in is kept, and not used: a portal is in use.
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(draft(&works)));
+        wait_until("the verdict", || h.app.conn_slot.lock().is_some()).await;
+        {
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", &ini);
+            h.frame(&[]);
+            std::env::remove_var("BONGO_INI");
+        }
+        let state = h.app.conn_state.clone();
+        assert!(
+            matches!(state, ConnState::Done(ConnCheck::Ok { .. })),
+            "{state:?}"
+        );
+        let three = h.app.sources.get(3).expect("kept as source 3");
+        assert_eq!(
+            (three.kind, three.name.as_str()),
+            (SourceKind::Xtream, "Thuis")
+        );
+        assert_eq!(h.app.sources.active_id(), Some(1), "and not used");
+        assert_eq!(h.app.creds, Some(test_creds()));
+        let saved = Sources::load(&ini);
+        let address = draft(&works).address;
+        assert_eq!(saved.get(3).map(|s| s.address.clone()), Some(address));
+    }
+
+    #[tokio::test]
+    async fn an_xtream_source_in_use_saved_again_is_used_at_once() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("test.ini");
+        std::env::set_var("BONGO_INI", &ini);
+        let mut h = portal_and_list(dir.path());
+        h.app.zap_by_id(3);
+        h.sent();
+        let generation = h.app.catalog_generation;
+        let keep = KeepXtream {
+            creds: other_creds(),
+            line: "u2:p2@127.0.0.1:1".into(),
+            editing: Editing::Saved(1),
+            name: "Thuis".into(),
+        };
+        assert!(h.app.keep_xtream(keep).is_ok());
+        std::env::remove_var("BONGO_INI");
+        assert_eq!(h.app.catalog_generation, generation + 1, "a new catalog");
+        assert_eq!(h.app.creds, Some(other_creds()));
+        assert!(h.sent().is_empty(), "TEST 03 plays on");
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "portal=u2:p2@127.0.0.1:1\n\
+             source=1;xtream;Thuis;u2:p2@127.0.0.1:1\n\
+             source=2;m3u;Lijst;https://a.example/tv.m3u\n\
+             active=1\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_portal_save_stops_adult_playback_and_leaves_other_streams_playing() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        for (sid, stops) in [(3, false), (901, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let mut h =
+                Harness::start(root.path(), loaded_catalog(), PortalState::Configured, None);
+            h.app.set_adult_visible(true);
+            h.app.zap_by_id(sid);
+            h.sent();
+            let keep = portal_save(other_creds(), "u2:p2@127.0.0.1:1");
+            assert!(h.app.keep_xtream(keep).is_ok());
+            let stopped = h.sent().iter().any(|c| matches!(c, Cmd::Stop));
+            assert_eq!(stopped, stops, "channel {sid}");
+            assert_eq!(h.app.current_url.is_none(), stops, "channel {sid}");
+        }
+        std::env::remove_var("BONGO_INI");
+    }
+
+    #[tokio::test]
+    async fn after_the_setup_prompts_login_the_pin_reset_finds_its_portal_on_a_list() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let file = dir.path().join("lijst.m3u");
+        std::fs::write(&file, TEST_LIST).unwrap();
+        let catalog = Arc::new(CatalogStore::new(idle_portal()));
+        let mut h = Harness::start(dir.path(), catalog, PortalState::Missing, None);
+        assert!(h
+            .app
+            .keep_xtream(portal_save(other_creds(), "u2:p2@127.0.0.1:1"))
+            .is_ok());
+        // The portal is in use: the list is only added, then put in use.
+        let list = list_draft(Editing::New, "Gratis", &file.display().to_string());
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(list));
+        h.app
+            .apply_settings_action(SettingsAction::ActivateSource(2));
+        std::env::remove_var("BONGO_INI");
+        assert_eq!(h.app.creds, None, "a list is in use");
+        h.app.settings.pin = Some(PinHash::new("1234").unwrap());
+        h.app
+            .apply_settings_action(SettingsAction::ResetPin("p2".into()));
+        assert!(h.app.settings.pin.is_none(), "the saved portal's password");
+    }
+
+    #[tokio::test]
+    async fn the_log_names_a_source_by_its_number_and_kind_never_by_its_address() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let mut h = Harness::start_with(
+            dir.path(),
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            Sources::parse("portal=u:p@h:80\n"),
+            None,
+        );
+        let mut two = Storage::with_root(dir.path().to_path_buf());
+        two.set_source(2);
+        std::fs::write(two.favorites_path(), "x").unwrap();
+        let address = "https://user:secret@lists.example/tv.m3u?token=abc123";
+        let log = LogCapture::start();
+        for action in [
+            SettingsAction::SaveSource(list_draft(Editing::New, "Gratis", address)),
+            SettingsAction::ActivateSource(2),
+            SettingsAction::ActivateSource(1),
+            SettingsAction::DeleteSource(1),
+            SettingsAction::DeleteSource(2),
+        ] {
+            h.app.apply_settings_action(action);
+        }
+        std::env::remove_var("BONGO_INI");
+        let text = log.text();
+        for line in [
+            "settings: source 2 saved (m3u)",
+            "source: active 2 (m3u)",
+            "source: m3u 2 (lists.example)",
+            "source: active 1 (xtream)",
+            "settings: source 1 is in use - not deleted",
+            "settings: source 2 deleted (1 files)",
+        ] {
+            assert!(text.contains(line), "{line:?} is not in the log:\n{text}");
+        }
+        for secret in ["secret", "abc123", "tv.m3u"] {
+            assert!(!text.contains(secret), "{secret} in the log:\n{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_list_added_at_the_setup_prompt_is_used_with_its_own_data() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let file = dir.path().join("lijst.m3u");
+        std::fs::write(&file, TEST_LIST).unwrap();
+        // The saved portal has the stand-in credentials: the setup prompt shows.
+        let sources = Sources::parse("source=1;xtream;;user:pass@host.example.com:80\nactive=1\n");
+        let catalog = Arc::new(CatalogStore::new(idle_portal()));
+        let mut h = Harness::start_with(
+            dir.path(),
+            catalog,
+            PortalState::Placeholder,
+            None,
+            None,
+            sources,
+            None,
+        );
+        h.app.favorites.toggle(3, "TEST 03"); // source 1's, in memory
+        let list = list_draft(Editing::New, "Gratis", &file.display().to_string());
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(list));
+        std::env::remove_var("BONGO_INI");
+        assert_eq!(h.app.sources.active_id(), Some(2));
+        assert_eq!(h.app.portal_state, PortalState::Configured);
+        assert_eq!(h.app.storage.source(), 2, "its own favorites and presets");
+        assert!(!h.app.favorites.contains(3), "not source 1's");
+    }
+
+    #[tokio::test]
+    async fn a_login_kept_as_a_source_whose_data_is_not_in_use_takes_that_sources_data() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        // `--xtream` runs on source 1's files; what it saves goes into the first
+        // saved portal, source 2.
+        let sources = Sources::parse(
+            "source=1;m3u;Lijst;https://a.example/tv.m3u\nsource=2;xtream;;u:p@h:80\nactive=1\n",
+        );
+        let mut h = Harness::start_with(
+            dir.path(),
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            sources,
+            None,
+        );
+        h.app.creds_from_command_line = true;
+        h.app.favorites.toggle(5, "TEST 05"); // source 1's, in memory
+        let mut two = Storage::with_root(dir.path().to_path_buf());
+        two.set_source(2);
+        let record = LastWatched {
+            url: live_url(3),
+            live: true,
+            adult: Some(false),
+        };
+        record.save(&two.last_watched_path());
+        h.sent();
+        let keep = portal_save(other_creds(), "u2:p2@127.0.0.1:1");
+        assert!(h.app.keep_xtream(keep).is_ok());
+        std::env::remove_var("BONGO_INI");
+        assert_eq!(h.app.sources.active_id(), Some(2));
+        assert_eq!(h.app.storage.source(), 2);
+        assert!(!h.app.favorites.contains(5), "not source 1's");
+        let sent = h.sent();
+        assert!(matches!(sent.first(), Some(Cmd::Stop)), "{sent:?}");
+        assert_eq!(loads(sent), [live_url(3)], "source 2's last channel");
+    }
+
+    #[test]
+    fn an_xtream_source_saved_under_its_kinds_default_name_is_kept_as_none() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let mut h = portal_and_list(dir.path());
+        let keep = KeepXtream {
+            creds: other_creds(),
+            line: "u2:p2@127.0.0.1:1".into(),
+            editing: Editing::New,
+            name: " Portal ".into(),
+        };
+        assert!(h.app.keep_xtream(keep).is_ok());
+        std::env::remove_var("BONGO_INI");
+        assert_eq!(h.app.sources.get(3).map(|s| s.name.as_str()), Some(""));
     }
 }

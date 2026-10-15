@@ -9,6 +9,7 @@ use crate::news::{default_rules, NewsRule};
 use crate::pin::valid_pin;
 use crate::portal::xtream::ConnCheck;
 use crate::settings::Settings;
+use crate::sources::{SourceDraft, SourceId};
 use egui::{Color32, Key, Modifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +96,13 @@ pub enum SettingsAction {
     /// Try these credentials (`user:pass@host:port`); keep and use them if
     /// they work.
     SavePortal(String),
+    /// Keep a source (see `SourceDraft`): an Xtream one is tested first and
+    /// kept only if it logs in.
+    SaveSource(SourceDraft),
+    /// Put this saved source in use.
+    ActivateSource(SourceId),
+    /// Remove this saved source, with its favorites, presets and saved list.
+    DeleteSource(SourceId),
     /// Show adult content if this is the PIN.
     Unlock(String),
     /// Choose the very first PIN (and unlock with it).
