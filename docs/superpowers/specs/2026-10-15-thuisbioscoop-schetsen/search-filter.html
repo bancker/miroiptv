@@ -1,0 +1,240 @@
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  .hc-cards{grid-template-columns:1fr !important;gap:2.4rem !important}
+  .hc-cards .card-image{aspect-ratio:auto !important;background:none !important;display:block !important;padding:0 !important}
+  .hc-screen{container-type:inline-size;position:relative;width:100%;aspect-ratio:16/9;overflow:hidden;background:radial-gradient(120% 90% at 75% -20%,#1c1a2c 0%,#08080d 55%);color:#f4f4f6;font-family:Inter,"Segoe UI",system-ui,sans-serif;border-radius:10px 10px 0 0;user-select:none}
+  .hc-screen *{box-sizing:border-box}
+  .hc-logo{font-family:"Bebas Neue",Impact,sans-serif;letter-spacing:.06em;font-size:2.1cqw;color:#ffc93c;line-height:1;white-space:nowrap}
+  .hc-logo small{font-family:Inter,sans-serif;font-size:.74cqw;letter-spacing:.14em;color:#d0d0d8;margin-left:.6cqw;font-weight:700;text-transform:uppercase;vertical-align:middle}
+  .hc-top{position:absolute;left:2.4cqw;right:2.4cqw;top:1.4cqw;display:flex;align-items:center;gap:2.8cqw;z-index:4}
+  .hc-nav{display:flex;gap:2cqw;font-size:1.12cqw;font-weight:600;color:#a9a9b5}
+  .hc-nav span{position:relative}
+  .hc-nav .on{color:#fff}
+  .hc-nav .on:after{content:"";position:absolute;left:0;right:0;bottom:-.6cqw;height:.22cqw;background:#ffc93c;border-radius:2px}
+  .hc-hint{position:absolute;left:0;right:0;bottom:0;height:3.3cqw;display:flex;align-items:center;gap:2cqw;padding:0 2.4cqw;font-size:.88cqw;color:#9a9aa6;background:linear-gradient(0deg,rgba(0,0,0,.94),rgba(0,0,0,0));z-index:20}
+  .hc-hint b{display:inline-block;min-width:1.5cqw;padding:.12cqw .42cqw;margin-right:.38cqw;border:1px solid #4a4a55;border-radius:.38cqw;color:#ececf2;font-weight:600;font-size:.78cqw;text-align:center;background:#15151b}
+  .hc-field{display:flex;align-items:center;gap:.9cqw;height:3.6cqw;border-radius:.7cqw;background:#15151c;border:.14cqw solid #ffc93c;padding:0 1.3cqw;font-size:1.45cqw;font-weight:600;box-shadow:0 0 0 .4cqw rgba(255,201,60,.12)}
+  .hc-field .q{color:#fff}
+  .hc-field .caret{display:inline-block;width:.14cqw;height:1.7cqw;background:#ffc93c;margin-left:.1cqw;animation:hcblink 1s steps(1) infinite}
+  @keyframes hcblink{50%{opacity:0}}
+  .hc-field .ph{color:#6f6f7b;font-weight:500;font-size:1.05cqw;margin-left:auto}
+  .hc-chip{display:inline-flex;align-items:center;gap:.45cqw;padding:.42cqw .95cqw;border-radius:1.2cqw;background:#191921;border:1px solid #33333e;font-size:.86cqw;font-weight:600;color:#cfcfd8;white-space:nowrap}
+  .hc-chip.on{background:#ffc93c;border-color:#ffc93c;color:#14110a}
+  .hc-chip.focus{outline:.2cqw solid #fff;outline-offset:.12cqw}
+  .hc-chip .x{font-weight:800;opacity:.7}
+  .hc-token{display:inline-flex;align-items:center;gap:.4cqw;padding:.28cqw .7cqw;border-radius:.45cqw;background:rgba(255,201,60,.16);border:1px solid rgba(255,201,60,.55);color:#ffe08a;font-size:1.05cqw;font-weight:700;white-space:nowrap}
+  .hc-token small{font-size:.66cqw;font-weight:800;letter-spacing:.1em;color:#c9a94a;text-transform:uppercase}
+  .hc-poster{position:relative;width:100%;aspect-ratio:2/3;border-radius:.55cqw;background:#1b1b22 center/cover no-repeat;overflow:hidden;box-shadow:0 .4cqw 1.2cqw rgba(0,0,0,.5)}
+  .hc-poster:after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,0,0,0) 45%,rgba(0,0,0,.88))}
+  .hc-poster span{position:absolute;left:.55cqw;right:.55cqw;bottom:.6cqw;z-index:1;font-family:"Bebas Neue",Impact,sans-serif;font-size:1.3cqw;line-height:.98;letter-spacing:.03em}
+  .hc-poster .kind{position:absolute;top:.45cqw;left:.45cqw;z-index:1;font-size:.58cqw;font-weight:800;letter-spacing:.08em;background:rgba(0,0,0,.7);padding:.1cqw .35cqw;border-radius:.22cqw;color:#e8e8ee}
+  .hc-poster .kind.serie{background:#ffc93c;color:#14110a}
+  .hc-focus .hc-poster{outline:.26cqw solid #fff;outline-offset:.16cqw;transform:scale(1.06);box-shadow:0 1cqw 2.4cqw rgba(0,0,0,.8)}
+  .hc-cap{margin-top:.45cqw;font-size:.78cqw;font-weight:700;color:#e6e6ec;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .hc-sub{font-size:.68cqw;color:#9a9aa6;margin-top:.1cqw;white-space:nowrap}
+  .hc-sub .star{color:#ffd75e;font-weight:800}
+  .hc-grid{display:grid;gap:1.4cqw .95cqw}
+  .hc-count{font-size:.86cqw;color:#9a9aa6;white-space:nowrap}
+  .hc-count b{color:#fff}
+
+  /* Z1 */
+  .z1-field{position:absolute;left:2.4cqw;right:2.4cqw;top:5.6cqw}
+  .z1-chips{position:absolute;left:2.4cqw;right:2.4cqw;top:10.4cqw;display:flex;gap:.6cqw;align-items:center}
+  .z1-grid{position:absolute;left:2.4cqw;right:2.4cqw;top:14cqw;grid-template-columns:repeat(9,1fr)}
+
+  /* Z2 */
+  .z2-side{position:absolute;left:2.4cqw;top:5.6cqw;bottom:3.6cqw;width:21cqw;display:flex;flex-direction:column;gap:1.1cqw}
+  .z2-side .hc-field{font-size:1.15cqw;height:3cqw}
+  .z2-group h5{margin:0 0 .5cqw 0;font-size:.74cqw;letter-spacing:.14em;color:#8f8f9b;font-weight:800;text-transform:uppercase}
+  .z2-opt{display:flex;align-items:center;gap:.6cqw;font-size:.88cqw;color:#cfcfd8;padding:.22cqw 0}
+  .z2-opt .box{width:1cqw;height:1cqw;border-radius:.22cqw;border:.12cqw solid #5a5a66;flex:0 0 auto}
+  .z2-opt.on .box{background:#ffc93c;border-color:#ffc93c}
+  .z2-opt.on{color:#fff;font-weight:700}
+  .z2-opt.focus{outline:.18cqw solid #fff;outline-offset:.2cqw;border-radius:.3cqw}
+  .z2-opt em{margin-left:auto;font-style:normal;color:#77777f;font-size:.76cqw}
+  .z2-main{position:absolute;left:26cqw;right:2.4cqw;top:5.6cqw}
+  .z2-head{display:flex;align-items:center;gap:.8cqw;margin-bottom:1.1cqw}
+  .z2-grid{grid-template-columns:repeat(7,1fr)}
+
+  /* Z3 */
+  .z3-field{position:absolute;left:2.4cqw;right:2.4cqw;top:5.6cqw}
+  .z3-field .hc-field{height:4.2cqw}
+  .z3-under{position:absolute;left:2.4cqw;right:2.4cqw;top:10.6cqw;display:flex;align-items:center;gap:1.2cqw}
+  .z3-sugg{display:flex;gap:.6cqw;align-items:center;font-size:.82cqw;color:#9a9aa6}
+  .z3-sugg .hc-chip{font-size:.8cqw;padding:.3cqw .8cqw}
+  .z3-grid{position:absolute;left:2.4cqw;right:2.4cqw;top:14.2cqw;grid-template-columns:repeat(9,1fr)}
+
+  .hc-notes{margin-top:2rem;padding:1.1rem 1.3rem;border-radius:12px;border:1px solid var(--border);background:var(--bg-secondary)}
+  .hc-notes h3{margin:0 0 .5rem 0}
+  .hc-grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}
+  .hc-grid3 div{font-size:.92rem;line-height:1.45}
+  @media (max-width:900px){.hc-grid3{grid-template-columns:1fr}}
+</style>
+
+<h2>Zoeken en filteren: wat voelt het meest vanzelfsprekend?</h2>
+<p class="subtitle">Steeds dezelfde opdracht: <i>"een Nederlandse komedie van de laatste jaren met een goede waardering"</i>. Typen gaat altijd meteen, zonder eerst te klikken, en de resultaten verschijnen terwijl je typt. ↓ brengt je van het zoekveld naar de resultaten, en Enter opent de serie- of filmpagina.</p>
+
+<div class="cards hc-cards">
+
+  <!-- ===================== Z1 ===================== -->
+  <div class="card" data-choice="z1" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="hc-screen">
+        <div class="hc-top"><div class="hc-logo">BONGO<small>Thuisbioscoop</small></div><div class="hc-nav"><span>Thuis</span><span>Series</span><span>Films</span><span>Mijn lijst</span><span class="on">🔍 Zoeken</span></div></div>
+        <div class="z1-field"><div class="hc-field">🔍 <span class="q"></span><span class="caret"></span><span class="ph">Typ een titel…</span></div></div>
+        <div class="z1-chips">
+          <span class="hc-chip">Alles ▾</span>
+          <span class="hc-chip on">Komedie <span class="x">✕</span></span>
+          <span class="hc-chip on">2020 en later <span class="x">✕</span></span>
+          <span class="hc-chip on focus">★ 7+ <span class="x">✕</span></span>
+          <span class="hc-chip on">Nederlands <span class="x">✕</span></span>
+          <span class="hc-chip">Nieuw</span>
+          <span class="hc-chip">Nog niet gezien</span>
+          <span class="hc-chip">＋ filter</span>
+          <span style="margin-left:auto" class="hc-count"><b>38</b> titels · Sorteer: <b>Best gewaardeerd ▾</b></span>
+        </div>
+        <div class="hc-grid z1-grid">
+          <div class="hc-focus"><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-luizen/300/450)"><span class="kind serie">SERIE</span><span>DE LUIZEN&shy;MOEDER</span></div><div class="hc-cap">De Luizenmoeder</div><div class="hc-sub"><span class="star">★ 7,8</span> · 2018–2021</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-ramses/300/450)"><span class="kind">FILM</span><span>ALLES IS ZOALS HET ZOU MOETEN</span></div><div class="hc-cap">Alles is zoals het zou moeten</div><div class="hc-sub"><span class="star">★ 7,4</span> · 2023</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-bon/300/450)"><span class="kind serie">SERIE</span><span>BON BINI HOLLAND</span></div><div class="hc-cap">Bon Bini: Judeska in da House</div><div class="hc-sub"><span class="star">★ 7,1</span> · 2022</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-vriend/300/450)"><span class="kind">FILM</span><span>DE BRIEF VOOR DE KONING</span></div><div class="hc-cap">De Tatta's</div><div class="hc-sub"><span class="star">★ 7,0</span> · 2020</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-oogst/300/450)"><span class="kind serie">SERIE</span><span>DE OOGST</span></div><div class="hc-cap">Hoogvliegers</div><div class="hc-sub"><span class="star">★ 7,3</span> · 2023</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-ff/300/450)"><span class="kind">FILM</span><span>FAMILIE&shy;WEEKEND</span></div><div class="hc-cap">Het Familieweekend</div><div class="hc-sub"><span class="star">★ 7,0</span> · 2021</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-kaas/300/450)"><span class="kind serie">SERIE</span><span>DIRTY LINES</span></div><div class="hc-cap">Dirty Lines</div><div class="hc-sub"><span class="star">★ 7,2</span> · 2022</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-bruid/300/450)"><span class="kind">FILM</span><span>DE BRUID</span></div><div class="hc-cap">Bruidsmeisjes</div><div class="hc-sub"><span class="star">★ 7,1</span> · 2024</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-zomer/300/450)"><span class="kind">FILM</span><span>ZOMER IN ZEELAND</span></div><div class="hc-cap">Zomer in Zeeland</div><div class="hc-sub"><span class="star">★ 7,0</span> · 2023</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r1/300/450)"><span class="kind serie">SERIE</span><span>ZOMERHUIS</span></div><div class="hc-cap">Het Zomerhuis</div><div class="hc-sub"><span class="star">★ 7,6</span> · 2022</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r2/300/450)"><span class="kind">FILM</span><span>KAPPEKOPPEN</span></div><div class="hc-cap">Kappekoppen</div><div class="hc-sub"><span class="star">★ 7,2</span> · 2021</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r3/300/450)"><span class="kind serie">SERIE</span><span>DE ZAAK</span></div><div class="hc-cap">De Zaak</div><div class="hc-sub"><span class="star">★ 7,5</span> · 2024</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r4/300/450)"><span class="kind">FILM</span><span>MOEDERS DAG</span></div><div class="hc-cap">Moedersdag</div><div class="hc-sub"><span class="star">★ 7,0</span> · 2022</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r5/300/450)"><span class="kind serie">SERIE</span><span>DE BUREN</span></div><div class="hc-cap">De Buren</div><div class="hc-sub"><span class="star">★ 7,4</span> · 2023</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r6/300/450)"><span class="kind">FILM</span><span>DE GOEDE DOCHTER</span></div><div class="hc-cap">De Goede Dochter</div><div class="hc-sub"><span class="star">★ 7,1</span> · 2024</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r7/300/450)"><span class="kind serie">SERIE</span><span>ROMEO</span></div><div class="hc-cap">Romeo</div><div class="hc-sub"><span class="star">★ 7,3</span> · 2021</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r8/300/450)"><span class="kind">FILM</span><span>HET PERFECTE PLAN</span></div><div class="hc-cap">Het Perfecte Plan</div><div class="hc-sub"><span class="star">★ 7,0</span> · 2020</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r9/300/450)"><span class="kind serie">SERIE</span><span>DE BAAS</span></div><div class="hc-cap">De Baas</div><div class="hc-sub"><span class="star">★ 7,2</span> · 2023</div></div>
+        </div>
+        <div class="hc-hint"><span><b>typen</b>zoekt</span><span><b>↓</b>naar de resultaten</span><span><b>Tab</b>naar de filters</span><span><b>Enter</b>filter aan/uit · titel openen</span><span><b>Esc</b>terug</span></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Z1 · Filterknoppen onder het zoekveld</h3>
+      <p>Een rij knoppen onder het zoekveld: type, genre, jaar, ★, taal, nieuw, nog niet gezien, plus sorteren. Wat aan staat is geel met een ✕. Tab springt naar de knoppen, Enter zet een filter aan of uit, en een ▾ opent een korte lijst. Compact en altijd zichtbaar; de knoppen kosten wel een extra stap (Tab) als je wilt filteren.</p>
+    </div>
+  </div>
+
+  <!-- ===================== Z2 ===================== -->
+  <div class="card" data-choice="z2" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="hc-screen">
+        <div class="hc-top"><div class="hc-logo">BONGO<small>Thuisbioscoop</small></div><div class="hc-nav"><span>Thuis</span><span>Series</span><span>Films</span><span>Mijn lijst</span><span class="on">🔍 Zoeken</span></div></div>
+        <div class="z2-side">
+          <div class="hc-field">🔍 <span class="caret"></span><span class="ph">Titel…</span></div>
+          <div class="z2-group"><h5>Soort</h5>
+            <div class="z2-opt on"><span class="box"></span>Alles<em>38</em></div>
+            <div class="z2-opt"><span class="box"></span>Series<em>17</em></div>
+            <div class="z2-opt"><span class="box"></span>Films<em>21</em></div>
+          </div>
+          <div class="z2-group"><h5>Genre</h5>
+            <div class="z2-opt on focus"><span class="box"></span>Komedie<em>1.802</em></div>
+            <div class="z2-opt"><span class="box"></span>Drama<em>4.119</em></div>
+            <div class="z2-opt"><span class="box"></span>Familie<em>933</em></div>
+            <div class="z2-opt"><span class="box"></span>Romantiek<em>1.240</em></div>
+            <div class="z2-opt" style="color:#8f8f9b">＋ 14 genres</div>
+          </div>
+          <div class="z2-group"><h5>Jaar</h5>
+            <div class="z2-opt on"><span class="box"></span>2020 en later</div>
+            <div class="z2-opt"><span class="box"></span>2010–2019</div>
+          </div>
+          <div class="z2-group"><h5>Waardering</h5>
+            <div class="z2-opt"><span class="box"></span>★ 8 en hoger</div>
+            <div class="z2-opt on"><span class="box"></span>★ 7 en hoger</div>
+          </div>
+          <div class="z2-group"><h5>Taal</h5>
+            <div class="z2-opt on"><span class="box"></span>Nederlands</div>
+          </div>
+        </div>
+        <div class="z2-main">
+          <div class="z2-head"><span class="hc-count"><b>38</b> titels</span><span class="hc-chip on">Komedie ✕</span><span class="hc-chip on">2020+ ✕</span><span class="hc-chip on">★ 7+ ✕</span><span class="hc-chip on">Nederlands ✕</span><span style="margin-left:auto" class="hc-count">Sorteer: <b>Best gewaardeerd ▾</b></span></div>
+          <div class="hc-grid z2-grid">
+            <div class="hc-focus"><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-luizen/300/450)"><span class="kind serie">SERIE</span><span>DE LUIZEN&shy;MOEDER</span></div><div class="hc-cap">De Luizenmoeder</div><div class="hc-sub"><span class="star">★ 7,8</span> · 2018–2021</div></div>
+            <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r1/300/450)"><span class="kind serie">SERIE</span><span>ZOMERHUIS</span></div><div class="hc-cap">Het Zomerhuis</div><div class="hc-sub"><span class="star">★ 7,6</span> · 2022</div></div>
+            <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r3/300/450)"><span class="kind serie">SERIE</span><span>DE ZAAK</span></div><div class="hc-cap">De Zaak</div><div class="hc-sub"><span class="star">★ 7,5</span> · 2024</div></div>
+            <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-ramses/300/450)"><span class="kind">FILM</span><span>ALLES IS ZOALS HET ZOU MOETEN</span></div><div class="hc-cap">Alles is zoals het zou moeten</div><div class="hc-sub"><span class="star">★ 7,4</span> · 2023</div></div>
+            <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r5/300/450)"><span class="kind serie">SERIE</span><span>DE BUREN</span></div><div class="hc-cap">De Buren</div><div class="hc-sub"><span class="star">★ 7,4</span> · 2023</div></div>
+            <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-oogst/300/450)"><span class="kind serie">SERIE</span><span>DE OOGST</span></div><div class="hc-cap">Hoogvliegers</div><div class="hc-sub"><span class="star">★ 7,3</span> · 2023</div></div>
+            <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r7/300/450)"><span class="kind serie">SERIE</span><span>ROMEO</span></div><div class="hc-cap">Romeo</div><div class="hc-sub"><span class="star">★ 7,3</span> · 2021</div></div>
+            <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-kaas/300/450)"><span class="kind serie">SERIE</span><span>DIRTY LINES</span></div><div class="hc-cap">Dirty Lines</div><div class="hc-sub"><span class="star">★ 7,2</span> · 2022</div></div>
+            <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r2/300/450)"><span class="kind">FILM</span><span>KAPPEKOPPEN</span></div><div class="hc-cap">Kappekoppen</div><div class="hc-sub"><span class="star">★ 7,2</span> · 2021</div></div>
+            <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r9/300/450)"><span class="kind serie">SERIE</span><span>DE BAAS</span></div><div class="hc-cap">De Baas</div><div class="hc-sub"><span class="star">★ 7,2</span> · 2023</div></div>
+            <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-bon/300/450)"><span class="kind serie">SERIE</span><span>BON BINI HOLLAND</span></div><div class="hc-cap">Bon Bini: Judeska</div><div class="hc-sub"><span class="star">★ 7,1</span> · 2022</div></div>
+            <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-bruid/300/450)"><span class="kind">FILM</span><span>DE BRUID</span></div><div class="hc-cap">Bruidsmeisjes</div><div class="hc-sub"><span class="star">★ 7,1</span> · 2024</div></div>
+            <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r6/300/450)"><span class="kind">FILM</span><span>DE GOEDE DOCHTER</span></div><div class="hc-cap">De Goede Dochter</div><div class="hc-sub"><span class="star">★ 7,1</span> · 2024</div></div>
+            <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-ff/300/450)"><span class="kind">FILM</span><span>FAMILIE&shy;WEEKEND</span></div><div class="hc-cap">Het Familieweekend</div><div class="hc-sub"><span class="star">★ 7,0</span> · 2021</div></div>
+          </div>
+        </div>
+        <div class="hc-hint"><span><b>↑↓</b>door de filters</span><span><b>Spatie</b>filter aan/uit</span><span><b>→</b>naar de resultaten</span><span><b>Enter</b>titel openen</span><span><b>Esc</b>terug</span></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Z2 · Filterkolom links, zoals een webwinkel</h3>
+      <p>Links het zoekveld en alle filters onder elkaar, met aantallen erbij ("Komedie 1.802"), zodat je ziet wat er is voordat je kiest. Rechts het raster, dat meteen meeverandert. Het krachtigst en het meest overzichtelijk bij een enorme catalogus. Het voelt wel meer als een winkel dan als een bioscoop, en de kolom kost een vijfde van het scherm.</p>
+    </div>
+  </div>
+
+  <!-- ===================== Z3 ===================== -->
+  <div class="card" data-choice="z3" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="hc-screen">
+        <div class="hc-top"><div class="hc-logo">BONGO<small>Thuisbioscoop</small></div><div class="hc-nav"><span>Thuis</span><span>Series</span><span>Films</span><span>Mijn lijst</span><span class="on">🔍 Zoeken</span></div></div>
+        <div class="z3-field"><div class="hc-field">🔍
+          <span class="hc-token"><small>genre</small>Komedie</span>
+          <span class="hc-token"><small>jaar</small>2020+</span>
+          <span class="hc-token"><small>waardering</small>★ 7+</span>
+          <span class="hc-token"><small>taal</small>Nederlands</span>
+          <span class="caret"></span>
+          <span class="ph">getypt: <span style="color:#cfcfd8">komedie 2020+ 7+ nl</span></span>
+        </div></div>
+        <div class="z3-under">
+          <span class="hc-count"><b>38</b> titels · Sorteer: <b>Best gewaardeerd ▾</b></span>
+          <span class="z3-sugg">Bedoel je ook: <span class="hc-chip">＋ Familie</span><span class="hc-chip">＋ Nog niet gezien</span><span class="hc-chip">＋ Nieuw</span></span>
+        </div>
+        <div class="hc-grid z3-grid">
+          <div class="hc-focus"><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-luizen/300/450)"><span class="kind serie">SERIE</span><span>DE LUIZEN&shy;MOEDER</span></div><div class="hc-cap">De Luizenmoeder</div><div class="hc-sub"><span class="star">★ 7,8</span> · 2018–2021</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r1/300/450)"><span class="kind serie">SERIE</span><span>ZOMERHUIS</span></div><div class="hc-cap">Het Zomerhuis</div><div class="hc-sub"><span class="star">★ 7,6</span> · 2022</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r3/300/450)"><span class="kind serie">SERIE</span><span>DE ZAAK</span></div><div class="hc-cap">De Zaak</div><div class="hc-sub"><span class="star">★ 7,5</span> · 2024</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-ramses/300/450)"><span class="kind">FILM</span><span>ALLES IS ZOALS HET ZOU MOETEN</span></div><div class="hc-cap">Alles is zoals het zou moeten</div><div class="hc-sub"><span class="star">★ 7,4</span> · 2023</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r5/300/450)"><span class="kind serie">SERIE</span><span>DE BUREN</span></div><div class="hc-cap">De Buren</div><div class="hc-sub"><span class="star">★ 7,4</span> · 2023</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-oogst/300/450)"><span class="kind serie">SERIE</span><span>DE OOGST</span></div><div class="hc-cap">Hoogvliegers</div><div class="hc-sub"><span class="star">★ 7,3</span> · 2023</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r7/300/450)"><span class="kind serie">SERIE</span><span>ROMEO</span></div><div class="hc-cap">Romeo</div><div class="hc-sub"><span class="star">★ 7,3</span> · 2021</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-kaas/300/450)"><span class="kind serie">SERIE</span><span>DIRTY LINES</span></div><div class="hc-cap">Dirty Lines</div><div class="hc-sub"><span class="star">★ 7,2</span> · 2022</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r2/300/450)"><span class="kind">FILM</span><span>KAPPEKOPPEN</span></div><div class="hc-cap">Kappekoppen</div><div class="hc-sub"><span class="star">★ 7,2</span> · 2021</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r9/300/450)"><span class="kind serie">SERIE</span><span>DE BAAS</span></div><div class="hc-cap">De Baas</div><div class="hc-sub"><span class="star">★ 7,2</span> · 2023</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-bon/300/450)"><span class="kind serie">SERIE</span><span>BON BINI HOLLAND</span></div><div class="hc-cap">Bon Bini: Judeska</div><div class="hc-sub"><span class="star">★ 7,1</span> · 2022</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-bruid/300/450)"><span class="kind">FILM</span><span>DE BRUID</span></div><div class="hc-cap">Bruidsmeisjes</div><div class="hc-sub"><span class="star">★ 7,1</span> · 2024</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r6/300/450)"><span class="kind">FILM</span><span>DE GOEDE DOCHTER</span></div><div class="hc-cap">De Goede Dochter</div><div class="hc-sub"><span class="star">★ 7,1</span> · 2024</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-ff/300/450)"><span class="kind">FILM</span><span>FAMILIE&shy;WEEKEND</span></div><div class="hc-cap">Het Familieweekend</div><div class="hc-sub"><span class="star">★ 7,0</span> · 2021</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-zomer/300/450)"><span class="kind">FILM</span><span>ZOMER IN ZEELAND</span></div><div class="hc-cap">Zomer in Zeeland</div><div class="hc-sub"><span class="star">★ 7,0</span> · 2023</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r4/300/450)"><span class="kind">FILM</span><span>MOEDERS DAG</span></div><div class="hc-cap">Moedersdag</div><div class="hc-sub"><span class="star">★ 7,0</span> · 2022</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-r8/300/450)"><span class="kind">FILM</span><span>HET PERFECTE PLAN</span></div><div class="hc-cap">Het Perfecte Plan</div><div class="hc-sub"><span class="star">★ 7,0</span> · 2020</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-z-vriend/300/450)"><span class="kind">FILM</span><span>DE TATTA'S</span></div><div class="hc-cap">De Tatta's</div><div class="hc-sub"><span class="star">★ 7,0</span> · 2020</div></div>
+        </div>
+        <div class="hc-hint"><span><b>typen</b>zoekt en filtert</span><span><b>⌫</b>haalt het laatste filter weg</span><span><b>↓</b>naar de resultaten</span><span><b>Enter</b>titel openen</span><span><b>Esc</b>terug</span></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Z3 · Slim zoeken: wat je typt, wordt vanzelf een filter</h3>
+      <p>Je typt gewoon: <code>komedie 2020+ 7+ nl</code>. Woorden die een genre, jaar, waardering of taal zijn, worden gele labels in het zoekveld. De rest zoekt op titel, dus <code>breaking</code> vindt Breaking Bad. ⌫ haalt het laatste label weg, en eronder staan voorstellen om er een filter bij te zetten. Geen knoppen en geen extra stap: het snelst met een toetsenbord, en voor wie het niet weet tonen de voorstellen wat kan.</p>
+    </div>
+  </div>
+
+</div>
+
+<div class="hc-notes">
+  <h3>Waar de filters hun gegevens vandaan halen</h3>
+  <div class="hc-grid3">
+    <div><b>Series zijn rijk.</b> Pandora's serielijst geeft per serie al genre, jaar, waardering, cast en de cover mee. Filteren daarop kan meteen, voor alle 10.589 series.</div>
+    <div><b>Films zijn karig in de lijst.</b> Per film staan in de lijst alleen naam, waardering, categorie en datum toegevoegd. Het jaar staat vaak in de naam ("Dune: Part Two (2024)"), en het genre in Pandora's categorie. Wat er niet in staat, komt uit de filmpagina zodra je die opent, of later uit ontwerp C.</div>
+    <div><b>Snel blijft heilig.</b> Zoeken en filteren gebeuren in het geheugen, op een kleine lijst kenmerken per titel (geen beschrijvingen of covers). Dat is in een paar milliseconden per toets, ook voor 58.000 titels. Covers komen alleen voor wat in beeld is.</div>
+  </div>
+</div>

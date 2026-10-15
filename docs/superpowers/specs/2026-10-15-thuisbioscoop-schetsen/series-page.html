@@ -1,0 +1,241 @@
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  .hc-cards{grid-template-columns:1fr !important;gap:2.4rem !important}
+  .hc-cards .card-image{aspect-ratio:auto !important;background:none !important;display:block !important;padding:0 !important}
+  .hc-screen{container-type:inline-size;position:relative;width:100%;aspect-ratio:16/9;overflow:hidden;background:#06060a;color:#f4f4f6;font-family:Inter,"Segoe UI",system-ui,sans-serif;border-radius:10px 10px 0 0;user-select:none}
+  .hc-screen *{box-sizing:border-box}
+  .hc-hint{position:absolute;left:0;right:0;bottom:0;height:3.3cqw;display:flex;align-items:center;gap:2cqw;padding:0 2.4cqw;font-size:.9cqw;color:#9a9aa6;background:linear-gradient(0deg,rgba(0,0,0,.94),rgba(0,0,0,0));z-index:20}
+  .hc-hint b{display:inline-block;min-width:1.5cqw;padding:.12cqw .42cqw;margin-right:.38cqw;border:1px solid #4a4a55;border-radius:.38cqw;color:#ececf2;font-weight:600;font-size:.8cqw;text-align:center;background:#15151b}
+  .hc-title{font-family:"Bebas Neue",Impact,sans-serif;line-height:.9;letter-spacing:.02em;text-shadow:0 .2cqw 1.2cqw rgba(0,0,0,.5)}
+  .hc-meta{display:flex;gap:.9cqw;align-items:center;font-size:.98cqw;color:#dcdce3;flex-wrap:wrap}
+  .hc-meta .star{color:#ffd75e;font-weight:800}
+  .hc-meta .src{font-size:.72cqw;color:#8f8f9b;font-weight:600;letter-spacing:.04em}
+  .hc-pill{border:1px solid rgba(255,255,255,.4);padding:.02cqw .42cqw;border-radius:.28cqw;font-size:.74cqw;font-weight:600}
+  .hc-plot{font-size:1cqw;line-height:1.48;color:#d4d4dc}
+  .hc-cast{font-size:.86cqw;line-height:1.45;color:#a3a3ae}
+  .hc-cast b{color:#d8d8e0;font-weight:600}
+  .hc-btn{display:inline-flex;align-items:center;gap:.55cqw;padding:.68cqw 1.4cqw;border-radius:.5cqw;font-weight:700;font-size:1.02cqw;white-space:nowrap}
+  .hc-btn.play{background:#fff;color:#0b0b0f}
+  .hc-btn.sec{background:rgba(120,120,135,.45);color:#fff}
+  .hc-btn.round{width:2.9cqw;height:2.9cqw;padding:0;justify-content:center;border-radius:50%;border:.14cqw solid rgba(255,255,255,.55);background:rgba(20,20,26,.6);color:#fff;font-size:1.15cqw}
+  .hc-btn.dash{border:.12cqw dashed rgba(255,255,255,.45);background:transparent;color:#cfcfd8}
+  .hc-btn.focus{outline:.24cqw solid #fff;outline-offset:.15cqw}
+  .hc-bar{height:.3cqw;background:rgba(255,255,255,.22);border-radius:.2cqw;overflow:hidden}
+  .hc-bar u{display:block;height:100%;background:#ffc93c}
+
+  /* episode row (vertical lists) */
+  .hc-ep{display:grid;grid-template-columns:auto 1fr;gap:1.1cqw;align-items:center;padding:.8cqw .9cqw;border-radius:.7cqw;position:relative}
+  .hc-ep.focus{background:rgba(255,255,255,.09);outline:.2cqw solid rgba(255,255,255,.9)}
+  .hc-ep .still{position:relative;width:11.2cqw;aspect-ratio:16/9;border-radius:.45cqw;background:#1d1d24 center/cover no-repeat;overflow:hidden}
+  .hc-ep .still .hc-bar{position:absolute;left:0;right:0;bottom:0;border-radius:0}
+  .hc-ep .still .done{position:absolute;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;font-size:1.6cqw;color:#9be59b}
+  .hc-ep .num{font-family:"Bebas Neue",Impact,sans-serif;font-size:1.7cqw;color:#8f8f9b;margin-right:.5cqw}
+  .hc-ep .head{display:flex;align-items:baseline;gap:.6cqw;font-weight:700;font-size:1.02cqw}
+  .hc-ep .dur{margin-left:auto;font-weight:600;font-size:.82cqw;color:#a9a9b5;white-space:nowrap}
+  .hc-ep .txt{font-size:.82cqw;line-height:1.42;color:#a9a9b5;margin-top:.25cqw;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .hc-badge{font-size:.6cqw;font-weight:800;letter-spacing:.08em;background:#e50914;color:#fff;padding:.1cqw .35cqw;border-radius:.22cqw}
+  .hc-badge.left{background:#ffc93c;color:#14110a}
+
+  /* ---------- 1: Netflix modal ---------- */
+  .hc-1-under{position:absolute;inset:0;background:url(https://picsum.photos/seed/bongo-hero-wasteland/1600/900) center/cover;filter:blur(.25cqw) brightness(.35) saturate(.8)}
+  .hc-1-modal{position:absolute;left:18.5cqw;top:1.4cqw;width:63cqw;bottom:-4cqw;border-radius:1cqw;background:#141419;overflow:hidden;box-shadow:0 2cqw 5cqw rgba(0,0,0,.8)}
+  .hc-1-hero{position:relative;height:22cqw;background:#2a2a30 center 35%/cover no-repeat}
+  .hc-1-hero:after{content:"";position:absolute;inset:0;background:linear-gradient(0deg,#141419 0%,rgba(20,20,25,.35) 45%,rgba(20,20,25,.05) 100%)}
+  .hc-1-x{position:absolute;right:1.1cqw;top:1.1cqw;z-index:3;width:2.4cqw;height:2.4cqw;border-radius:50%;background:#141419;display:flex;align-items:center;justify-content:center;font-size:1.1cqw}
+  .hc-1-copy{position:absolute;left:2.4cqw;bottom:1.6cqw;z-index:2}
+  .hc-1-copy .hc-title{font-size:4.6cqw;margin-bottom:1cqw}
+  .hc-1-btns{display:flex;gap:.8cqw;align-items:center}
+  .hc-1-body{display:grid;grid-template-columns:1.6fr 1fr;gap:2.2cqw;padding:.6cqw 2.4cqw 1.2cqw 2.4cqw}
+  .hc-1-eps{padding:0 1.5cqw}
+  .hc-1-epsh{display:flex;align-items:center;justify-content:space-between;padding:.4cqw .9cqw .8cqw .9cqw}
+  .hc-1-epsh h4{margin:0;font-size:1.35cqw;font-weight:800}
+  .hc-select{border:1px solid #4a4a55;background:#22222a;border-radius:.45cqw;padding:.5cqw 1cqw;font-weight:700;font-size:.98cqw}
+
+  /* ---------- 2: full page, two columns ---------- */
+  .hc-2-bg{position:absolute;inset:0;background:#202028 center/cover no-repeat;filter:brightness(.42) saturate(.9)}
+  .hc-2-shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(6,6,10,.96) 0%,rgba(6,6,10,.82) 38%,rgba(6,6,10,.55) 100%)}
+  .hc-2-left{position:absolute;left:3cqw;top:3.2cqw;width:35cqw;z-index:2}
+  .hc-2-left .hc-title{font-size:5.2cqw;margin-bottom:1cqw}
+  .hc-2-btns{display:flex;flex-wrap:wrap;gap:.8cqw;margin:1.3cqw 0 1.4cqw 0}
+  .hc-2-right{position:absolute;left:42cqw;right:2.6cqw;top:3cqw;bottom:3.6cqw;z-index:2}
+  .hc-tabs{display:flex;gap:.6cqw;margin-bottom:1cqw;flex-wrap:nowrap}
+  .hc-tab{padding:.5cqw 1.05cqw;border-radius:1.2cqw;font-weight:700;font-size:.92cqw;color:#bdbdc7;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);white-space:nowrap}
+  .hc-tab.on{background:#ffc93c;color:#14110a;border-color:#ffc93c}
+  .hc-2-list{display:flex;flex-direction:column;gap:.3cqw}
+
+  /* ---------- 3: row at the bottom ---------- */
+  .hc-3-bg{position:absolute;inset:0;background:#202028 center 30%/cover no-repeat;filter:saturate(1.05) contrast(1.05)}
+  .hc-3-shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(6,6,10,.95) 0%,rgba(6,6,10,.6) 40%,rgba(6,6,10,0) 70%),linear-gradient(0deg,rgba(6,6,10,.98) 0%,rgba(6,6,10,.7) 38%,rgba(6,6,10,0) 62%)}
+  .hc-3-copy{position:absolute;left:2.6cqw;top:3cqw;width:42cqw;z-index:2}
+  .hc-3-copy .hc-title{font-size:5cqw;margin-bottom:.9cqw}
+  .hc-3-btns{display:flex;gap:.8cqw;margin-top:1.2cqw}
+  .hc-3-bottom{position:absolute;left:2.6cqw;right:0;bottom:3.8cqw;z-index:3}
+  .hc-3-detail{font-size:.95cqw;color:#d4d4dc;margin-bottom:.9cqw;max-width:60cqw;line-height:1.45}
+  .hc-3-detail b{color:#fff}
+  .hc-3-row{display:flex;gap:1cqw}
+  .hc-3-card{flex:0 0 auto;width:15.4cqw}
+  .hc-3-card .img{position:relative;aspect-ratio:16/9;border-radius:.55cqw;background:#1d1d24 center/cover no-repeat;overflow:hidden;box-shadow:0 .5cqw 1.4cqw rgba(0,0,0,.55)}
+  .hc-3-card .img .hc-bar{position:absolute;left:0;right:0;bottom:0;border-radius:0}
+  .hc-3-card.focus .img{outline:.26cqw solid #fff;outline-offset:.16cqw;transform:scale(1.06)}
+  .hc-3-card .cap{margin-top:.55cqw;font-size:.82cqw;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .hc-3-card .sub{font-size:.7cqw;color:#9a9aa6;margin-top:.1cqw}
+
+  /* ---------- next-episode preview ---------- */
+  .hc-next-bg{position:absolute;inset:0;background:url(https://picsum.photos/seed/bongo-credits-road/1600/900) center/cover;filter:brightness(.55)}
+  .hc-next-credits{position:absolute;left:8cqw;top:12cqw;font-family:"Bebas Neue",Impact,sans-serif;font-size:2.2cqw;line-height:1.35;color:rgba(255,255,255,.75);letter-spacing:.08em}
+  .hc-next-card{position:absolute;right:2.4cqw;bottom:5cqw;width:34cqw;border-radius:.9cqw;background:rgba(14,14,18,.92);border:1px solid rgba(255,255,255,.12);box-shadow:0 1.2cqw 3cqw rgba(0,0,0,.7);display:grid;grid-template-columns:auto 1fr;gap:1.2cqw;padding:1.2cqw}
+  .hc-next-card .still{width:12cqw;aspect-ratio:16/9;border-radius:.45cqw;background:#222 center/cover no-repeat}
+  .hc-next-k{font-size:.72cqw;font-weight:800;letter-spacing:.16em;color:#ffc93c}
+  .hc-next-t{font-size:1.15cqw;font-weight:800;margin:.25cqw 0 .3cqw 0}
+  .hc-next-s{font-size:.82cqw;color:#a9a9b5}
+  .hc-next-ring{display:inline-flex;align-items:center;justify-content:center;width:2.2cqw;height:2.2cqw;border-radius:50%;border:.22cqw solid #ffc93c;border-right-color:rgba(255,201,60,.25);font-weight:800;font-size:.95cqw;margin-right:.6cqw}
+  .hc-notes{margin-top:2rem;padding:1.1rem 1.3rem;border-radius:12px;border:1px solid var(--border);background:var(--bg-secondary)}
+  .hc-notes h3{margin:0 0 .5rem 0}
+  .hc-grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}
+  .hc-grid3 div{font-size:.92rem;line-height:1.45}
+  @media (max-width:900px){.hc-grid3{grid-template-columns:1fr}}
+</style>
+
+<h2>De seriepagina: hoe kies je seizoen en aflevering?</h2>
+<p class="subtitle">Deze pagina opent met Enter op een serie, vanuit Thuis, een rij of Zoeken. Bovenaan alles om te beslissen of je gaat kijken. Daaronder de seizoenen en afleveringen. Een film krijgt dezelfde pagina zonder de afleveringen. Klik op de opzet die je het prettigst vindt.</p>
+
+<div class="cards hc-cards">
+
+  <!-- ===================== 1 ===================== -->
+  <div class="card" data-choice="1" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="hc-screen">
+        <div class="hc-1-under"></div>
+        <div class="hc-1-modal">
+          <div class="hc-1-hero" style="background-image:url(https://picsum.photos/seed/bongo-desert-rv/1400/620)">
+            <div class="hc-1-x">✕</div>
+            <div class="hc-1-copy">
+              <div class="hc-title">BREAKING BAD</div>
+              <div class="hc-1-btns">
+                <span class="hc-btn play focus">▶&nbsp; Verder kijken · S2 A5</span>
+                <span class="hc-btn dash">▶ Trailer</span>
+                <span class="hc-btn round">＋</span>
+                <span class="hc-btn round">👍</span>
+                <span class="hc-btn round">👎</span>
+              </div>
+            </div>
+          </div>
+          <div class="hc-1-body">
+            <div>
+              <div class="hc-meta"><span class="star">★ 9,5</span><span class="src">PANDORA</span><span>2008–2013</span><span class="hc-pill">16</span><span>5 seizoenen</span><span class="hc-pill">HD</span></div>
+              <p class="hc-plot" style="margin:.8cqw 0 0 0">Een scheikundeleraar met een dodelijke diagnose begint samen met een oud-leerling een drugslab, om zijn gezin een toekomst te geven. Elke stap maakt hem iemand anders.</p>
+            </div>
+            <div class="hc-cast"><b>Met:</b> Bryan Cranston, Aaron Paul, Anna Gunn, Dean Norris<br><b>Genre:</b> Drama, Misdaad, Thriller<br><b>Bedacht door:</b> Vince Gilligan</div>
+          </div>
+          <div class="hc-1-eps">
+            <div class="hc-1-epsh"><h4>Afleveringen</h4><span class="hc-select">Seizoen 2 ▾ &nbsp;<span style="color:#9a9aa6;font-weight:600">13 afl.</span></span></div>
+            <div class="hc-ep"><div class="still" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e4/400/225)"><div class="done">✓</div></div><div><div class="head"><span class="num">4</span>Down<span class="dur">47 min</span></div><div class="txt">Skyler houdt afstand en Jesse raakt zijn huis kwijt. Walt probeert zijn twee levens uit elkaar te houden.</div></div></div>
+            <div class="hc-ep focus"><div class="still" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e5/400/225)"><div class="hc-bar"><u style="width:52%"></u></div></div><div><div class="head"><span class="num">5</span>Breakage <span class="hc-badge left">NOG 23 MIN</span><span class="dur">47 min</span></div><div class="txt">Walt en Jesse bouwen hun handel uit en zoeken nieuwe verkopers. Hank kampt met de nasleep van El Paso.</div></div></div>
+            <div class="hc-ep"><div class="still" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e6/400/225)"></div><div><div class="head"><span class="num">6</span>Peekaboo<span class="dur">47 min</span></div><div class="txt">Jesse gaat verhaal halen bij een stel dat hem heeft bestolen, en vindt in hun huis iets wat hij niet verwacht.</div></div></div>
+          </div>
+        </div>
+        <div class="hc-hint"><span><b>↑↓</b>aflevering</span><span><b>←→</b>seizoen</span><span><b>Enter</b>spelen</span><span><b>Tab</b>knoppen</span><span><b>Esc</b>terug naar Thuis</span></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>1 · Netflix-venster: een groot venster boven Thuis</h3>
+      <p>Thuis blijft vaag zichtbaar achter het venster. Bovenaan de achtergrond met titel en knoppen: verder kijken, trailer, + Mijn lijst, 👍 en 👎. Dan waardering, jaar, beschrijving en cast. Onderaan de afleveringen van het gekozen seizoen, met still, nummer, titel, duur, twee regels tekst, ✓ voor gezien en een balk voor half gezien. Je voelt dat je "even binnenkijkt" en zo weer terug bent.</p>
+    </div>
+  </div>
+
+  <!-- ===================== 2 ===================== -->
+  <div class="card" data-choice="2" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="hc-screen">
+        <div class="hc-2-bg" style="background-image:url(https://picsum.photos/seed/bongo-desert-rv/1600/900)"></div>
+        <div class="hc-2-shade"></div>
+        <div class="hc-2-left">
+          <div class="hc-title">BREAKING BAD</div>
+          <div class="hc-meta"><span class="star">★ 9,5</span><span class="src">PANDORA</span><span>2008–2013</span><span class="hc-pill">16</span><span>5 seizoenen</span></div>
+          <div class="hc-2-btns">
+            <span class="hc-btn play">▶&nbsp; Verder kijken · S2 A5</span>
+            <span class="hc-btn sec">↺&nbsp; Vanaf het begin</span>
+            <span class="hc-btn round">＋</span><span class="hc-btn round">👍</span><span class="hc-btn round">👎</span>
+          </div>
+          <p class="hc-plot">Een scheikundeleraar met een dodelijke diagnose begint samen met een oud-leerling een drugslab, om zijn gezin een toekomst te geven. Elke stap maakt hem iemand anders.</p>
+          <div class="hc-cast" style="margin-top:1cqw"><b>Met:</b> Bryan Cranston, Aaron Paul, Anna Gunn<br><b>Genre:</b> Drama, Misdaad, Thriller</div>
+        </div>
+        <div class="hc-2-right">
+          <div class="hc-tabs"><span class="hc-tab">Seizoen 1</span><span class="hc-tab on">Seizoen 2</span><span class="hc-tab">Seizoen 3</span><span class="hc-tab">Seizoen 4</span><span class="hc-tab">Seizoen 5</span></div>
+          <div class="hc-2-list">
+            <div class="hc-ep"><div class="still" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e3/400/225)"><div class="done">✓</div></div><div><div class="head"><span class="num">3</span>Bit by a Dead Bee<span class="dur">47 min</span></div><div class="txt">Walt en Jesse moeten een verklaring vinden voor hun verdwijning.</div></div></div>
+            <div class="hc-ep"><div class="still" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e4/400/225)"><div class="done">✓</div></div><div><div class="head"><span class="num">4</span>Down<span class="dur">47 min</span></div><div class="txt">Skyler houdt afstand en Jesse raakt zijn huis kwijt.</div></div></div>
+            <div class="hc-ep focus"><div class="still" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e5/400/225)"><div class="hc-bar"><u style="width:52%"></u></div></div><div><div class="head"><span class="num">5</span>Breakage <span class="hc-badge left">NOG 23 MIN</span><span class="dur">47 min</span></div><div class="txt">Walt en Jesse bouwen hun handel uit en zoeken nieuwe verkopers.</div></div></div>
+            <div class="hc-ep"><div class="still" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e6/400/225)"></div><div><div class="head"><span class="num">6</span>Peekaboo<span class="dur">47 min</span></div><div class="txt">Jesse gaat verhaal halen en vindt iets wat hij niet verwacht.</div></div></div>
+            <div class="hc-ep"><div class="still" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e7/400/225)"></div><div><div class="head"><span class="num">7</span>Negro y Azul<span class="dur">47 min</span></div><div class="txt">Een gerucht over Jesse verspreidt zich door de stad.</div></div></div>
+          </div>
+        </div>
+        <div class="hc-hint"><span><b>↑↓</b>aflevering</span><span><b>←→</b>seizoen</span><span><b>Enter</b>spelen</span><span><b>Tab</b>naar de knoppen links</span><span><b>Esc</b>terug</span></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>2 · Volledige pagina in twee kolommen</h3>
+      <p>Het hele scherm is van de serie. Links staat alles om te beslissen: titel, waardering, de knoppen (verder kijken, vanaf het begin, + Mijn lijst, 👍 👎), de beschrijving en de cast. Rechts de seizoenen als tabs en de afleveringen eronder. ←/→ wisselt van seizoen, ↑/↓ kiest een aflevering, precies zoals de zenderlijst werkt (groepen ↔ zenders). Rustig, alles in één oogopslag, en het past ook bij series met veel seizoenen.</p>
+    </div>
+  </div>
+
+  <!-- ===================== 3 ===================== -->
+  <div class="card" data-choice="3" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="hc-screen">
+        <div class="hc-3-bg" style="background-image:url(https://picsum.photos/seed/bongo-desert-rv/1600/900)"></div>
+        <div class="hc-3-shade"></div>
+        <div class="hc-3-copy">
+          <div class="hc-title">BREAKING BAD</div>
+          <div class="hc-meta"><span class="star">★ 9,5</span><span class="src">PANDORA</span><span>2008–2013</span><span class="hc-pill">16</span><span>5 seizoenen</span><span>Drama · Misdaad</span></div>
+          <p class="hc-plot" style="margin:.9cqw 0 0 0;max-width:38cqw">Een scheikundeleraar met een dodelijke diagnose begint samen met een oud-leerling een drugslab, om zijn gezin een toekomst te geven.</p>
+          <div class="hc-3-btns"><span class="hc-btn play">▶&nbsp; Verder kijken · S2 A5</span><span class="hc-btn round">＋</span><span class="hc-btn round">👍</span><span class="hc-btn round">👎</span></div>
+        </div>
+        <div class="hc-3-bottom">
+          <div class="hc-tabs"><span class="hc-tab">Seizoen 1</span><span class="hc-tab on">Seizoen 2</span><span class="hc-tab">Seizoen 3</span><span class="hc-tab">Seizoen 4</span><span class="hc-tab">Seizoen 5</span></div>
+          <div class="hc-3-detail"><b>A5 · Breakage</b> · 47 min · nog 23 min. Walt en Jesse bouwen hun handel uit en zoeken nieuwe verkopers.</div>
+          <div class="hc-3-row">
+            <div class="hc-3-card"><div class="img" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e3/480/270)"><div class="hc-bar"><u style="width:100%;background:#7bd87b"></u></div></div><div class="cap">3 · Bit by a Dead Bee</div><div class="sub">✓ gezien</div></div>
+            <div class="hc-3-card"><div class="img" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e4/480/270)"><div class="hc-bar"><u style="width:100%;background:#7bd87b"></u></div></div><div class="cap">4 · Down</div><div class="sub">✓ gezien</div></div>
+            <div class="hc-3-card focus"><div class="img" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e5/480/270)"><div class="hc-bar"><u style="width:52%"></u></div></div><div class="cap">5 · Breakage</div><div class="sub">nog 23 min</div></div>
+            <div class="hc-3-card"><div class="img" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e6/480/270)"></div><div class="cap">6 · Peekaboo</div><div class="sub">47 min</div></div>
+            <div class="hc-3-card"><div class="img" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e7/480/270)"></div><div class="cap">7 · Negro y Azul</div><div class="sub">47 min</div></div>
+            <div class="hc-3-card"><div class="img" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e8/480/270)"></div><div class="cap">8 · Better Call Saul</div><div class="sub">47 min</div></div>
+          </div>
+        </div>
+        <div class="hc-hint"><span><b>←→</b>aflevering</span><span><b>↑</b>seizoenen en knoppen</span><span><b>Enter</b>spelen</span><span><b>Esc</b>terug</span></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>3 · Groot beeld met een rij afleveringen onderin</h3>
+      <p>De achtergrond blijft groot en mooi, zoals bij Apple TV of de tv-app van Pathé Thuis. Onderin de seizoenen als tabs en de afleveringen als een rij stills. ←/→ loopt door de afleveringen, en de beschrijving van de gekozen aflevering staat erboven. Het meest filmisch, maar per keer zie je minder tekst, en bij 20+ afleveringen scroll je meer.</p>
+    </div>
+  </div>
+
+</div>
+
+<h2 style="margin-top:2.6rem">Zo voelt "volgende aflevering"</h2>
+<p class="subtitle">Op elke seriepagina hetzelfde. Bij de aftiteling komt rechtsonder de volgende aflevering op, met een aftelling van 10 seconden. Enter speelt hem meteen, Esc kijkt de aftiteling uit. Na de laatste aflevering van een seizoen volgt aflevering 1 van het volgende.</p>
+<div class="hc-screen" style="border-radius:10px">
+  <div class="hc-next-bg"></div>
+  <div class="hc-next-credits">REGIE<br>VINCE GILLIGAN<br><br>MUZIEK<br>DAVE PORTER</div>
+  <div class="hc-next-card">
+    <div class="still" style="background-image:url(https://picsum.photos/seed/bongo-ep-s2e6/400/225)"></div>
+    <div>
+      <div class="hc-next-k">VOLGENDE AFLEVERING</div>
+      <div class="hc-next-t">S2 · A6 · Peekaboo</div>
+      <div class="hc-next-s">47 min · Jesse gaat verhaal halen en vindt iets wat hij niet verwacht.</div>
+      <div style="margin-top:.9cqw;display:flex;align-items:center;gap:.8cqw"><span class="hc-btn play" style="font-size:.95cqw"><span class="hc-next-ring">8</span>Nu spelen</span><span class="hc-btn sec" style="font-size:.95cqw">Esc · aftiteling</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="hc-notes">
+  <h3>Wat op elke seriepagina komt, in alle drie</h3>
+  <div class="hc-grid3">
+    <div><b>Verder kijken weet waar je was.</b> De grote knop springt naar de goede aflevering en de goede minuut. Is alles gezien, dan wordt het "Opnieuw kijken". Een aflevering telt als gezien vanaf ±90 %, of als de aftiteling begint.</div>
+    <div><b>Beoordelen of je gaat kijken.</b> Waardering, jaar, leeftijd, seizoenen, beschrijving en cast komen van Pandora, met de bron erbij (<span style="color:#8f8f9b">PANDORA</span>). IMDb en Rotten Tomatoes komen later op dezelfde plek, met ontwerp C. Met 👍/👎 geef je je eigen oordeel, en + zet de serie in Mijn lijst.</div>
+    <div><b>De trailer (gestippelde knop): jij beslist.</b> Pandora geeft vaak een YouTube-code mee. Die afspelen vraagt een extra programma naast de exe (yt-dlp, ±15 MB), dat ook af en toe bijgewerkt moet worden. Dat bespreken we apart, als je de trailer wilt.</div>
+  </div>
+</div>

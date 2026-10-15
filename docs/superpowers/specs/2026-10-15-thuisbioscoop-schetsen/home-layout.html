@@ -1,0 +1,265 @@
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  .hc-cards{grid-template-columns:1fr !important;gap:2.4rem !important}
+  .hc-cards .card-image{aspect-ratio:auto !important;background:none !important;display:block !important;padding:0 !important}
+  .hc-screen{container-type:inline-size;position:relative;width:100%;aspect-ratio:16/9;overflow:hidden;background:#06060a;color:#f4f4f6;font-family:Inter,"Segoe UI",system-ui,sans-serif;border-radius:10px 10px 0 0;user-select:none}
+  .hc-screen *{box-sizing:border-box}
+  .hc-logo{font-family:"Bebas Neue",Impact,sans-serif;letter-spacing:.06em;font-size:2.3cqw;color:#ffc93c;line-height:1;white-space:nowrap}
+  .hc-logo small{font-family:Inter,sans-serif;font-size:.78cqw;letter-spacing:.14em;color:#d0d0d8;margin-left:.7cqw;font-weight:700;text-transform:uppercase;vertical-align:middle}
+  .hc-nav{display:flex;gap:2.1cqw;font-size:1.2cqw;font-weight:600;color:#a9a9b5}
+  .hc-nav span{position:relative}
+  .hc-nav .on{color:#fff}
+  .hc-nav .on:after{content:"";position:absolute;left:0;right:0;bottom:-.65cqw;height:.22cqw;background:#ffc93c;border-radius:2px}
+  .hc-hint{position:absolute;left:0;right:0;bottom:0;height:3.3cqw;display:flex;align-items:center;gap:2cqw;padding:0 2.4cqw;font-size:.9cqw;color:#9a9aa6;background:linear-gradient(0deg,rgba(0,0,0,.92),rgba(0,0,0,0));z-index:9}
+  .hc-hint b{display:inline-block;min-width:1.5cqw;padding:.12cqw .42cqw;margin-right:.38cqw;border:1px solid #4a4a55;border-radius:.38cqw;color:#ececf2;font-weight:600;font-size:.8cqw;text-align:center;background:#15151b}
+  .hc-row-title{font-size:1.3cqw;font-weight:700;margin:0 0 .75cqw 0;color:#f2f2f6;display:flex;align-items:baseline;gap:.8cqw}
+  .hc-row-title em{font-style:normal;font-weight:500;font-size:.85cqw;color:#8f8f9b}
+  .hc-row{display:flex;gap:.85cqw}
+  .hc-poster{position:relative;flex:0 0 auto;width:9.1cqw;aspect-ratio:2/3;border-radius:.55cqw;background:#1b1b22 center/cover no-repeat;overflow:hidden;box-shadow:0 .4cqw 1.2cqw rgba(0,0,0,.5);transition:transform .2s}
+  .hc-poster:after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,0,0,0) 42%,rgba(0,0,0,.88))}
+  .hc-poster span{position:absolute;left:.6cqw;right:.6cqw;bottom:.65cqw;z-index:1;font-family:"Bebas Neue",Impact,sans-serif;font-size:1.42cqw;line-height:.98;letter-spacing:.03em;text-shadow:0 .1cqw .4cqw rgba(0,0,0,.6)}
+  .hc-poster i{position:absolute;top:.5cqw;right:.5cqw;z-index:1;font-style:normal;font-size:.75cqw;font-weight:800;background:rgba(0,0,0,.66);padding:.12cqw .4cqw;border-radius:.32cqw;color:#ffd75e}
+  .hc-poster .new{position:absolute;top:.5cqw;left:.5cqw;z-index:1;font-size:.62cqw;font-weight:800;letter-spacing:.08em;background:#e50914;padding:.12cqw .38cqw;border-radius:.25cqw}
+  .hc-focus{outline:.26cqw solid #fff;outline-offset:.16cqw;transform:scale(1.07);z-index:3;box-shadow:0 1.2cqw 2.6cqw rgba(0,0,0,.8)}
+  .hc-land{position:relative;flex:0 0 auto;width:16.6cqw;aspect-ratio:16/9;border-radius:.55cqw;background:#1b1b22 center/cover no-repeat;overflow:hidden;box-shadow:0 .4cqw 1.2cqw rgba(0,0,0,.5)}
+  .hc-land:after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,0,0,0) 30%,rgba(0,0,0,.92))}
+  .hc-land .t{position:absolute;left:.8cqw;bottom:1.45cqw;z-index:1;font-weight:800;font-size:1.08cqw}
+  .hc-land .s{position:absolute;left:.8cqw;bottom:.6cqw;z-index:1;font-size:.76cqw;color:#cfcfd8}
+  .hc-land .bar{position:absolute;left:0;right:0;bottom:0;height:.32cqw;background:rgba(255,255,255,.22);z-index:2}
+  .hc-land .bar u{display:block;height:100%;background:#ffc93c}
+  .hc-land .play{position:absolute;right:.7cqw;bottom:.65cqw;z-index:2;width:1.9cqw;height:1.9cqw;border-radius:50%;background:rgba(255,255,255,.92);color:#000;font-size:.9cqw;display:flex;align-items:center;justify-content:center}
+  .hc-btn{display:inline-flex;align-items:center;gap:.6cqw;padding:.72cqw 1.55cqw;border-radius:.5cqw;font-weight:700;font-size:1.1cqw;white-space:nowrap}
+  .hc-btn.play{background:#fff;color:#0b0b0f}
+  .hc-btn.info{background:rgba(120,120,135,.5);color:#fff}
+  .hc-meta{display:flex;gap:.95cqw;align-items:center;font-size:1cqw;color:#dcdce3;flex-wrap:wrap}
+  .hc-meta .star{color:#ffd75e;font-weight:800}
+  .hc-pill{border:1px solid rgba(255,255,255,.4);padding:.02cqw .42cqw;border-radius:.28cqw;font-size:.76cqw;font-weight:600}
+
+  /* ---------- A: Netflix ---------- */
+  .hc-a-hero{position:absolute;left:0;right:0;top:0;height:40cqw;background:#2a1d14 center 30%/cover no-repeat;filter:saturate(1.08) contrast(1.06)}
+  .hc-a-shade{position:absolute;left:0;right:0;top:0;height:40cqw;background:linear-gradient(90deg,rgba(6,6,10,.95) 0%,rgba(6,6,10,.75) 32%,rgba(6,6,10,.05) 65%),linear-gradient(0deg,#06060a 0%,rgba(6,6,10,0) 38%)}
+  .hc-a-top{position:absolute;left:2.4cqw;right:2.4cqw;top:1.6cqw;display:flex;align-items:center;gap:3cqw;z-index:4}
+  .hc-a-top .sp{flex:1}
+  .hc-a-icons{display:flex;gap:1.6cqw;font-size:1.25cqw;color:#e6e6ec}
+  .hc-a-copy{position:absolute;left:2.4cqw;top:7.4cqw;width:40cqw;z-index:4}
+  .hc-a-kicker{font-size:.82cqw;font-weight:800;letter-spacing:.2em;color:#ffc93c;margin-bottom:.5cqw}
+  .hc-a-title{font-family:"Bebas Neue",Impact,sans-serif;font-size:5.4cqw;line-height:.9;letter-spacing:.02em;margin-bottom:.9cqw;text-shadow:0 .2cqw 1.2cqw rgba(0,0,0,.5)}
+  .hc-a-plot{font-size:1.04cqw;line-height:1.45;color:#d6d6dd;margin:.9cqw 0 1.25cqw 0;max-width:34cqw}
+  .hc-a-btns{display:flex;gap:.9cqw}
+  .hc-a-rows{position:absolute;left:2.4cqw;right:0;top:29.6cqw;z-index:5}
+
+  /* ---------- B: Pathé Thuis ---------- */
+  .hc-b{background:radial-gradient(120% 80% at 70% -10%,#1d1a2e 0%,#09090e 55%)}
+  .hc-b-top{position:absolute;left:2.4cqw;right:2.4cqw;top:1.5cqw;height:3.4cqw;display:flex;align-items:center;gap:3cqw}
+  .hc-b-search{margin-left:auto;width:24cqw;height:2.8cqw;border-radius:1.4cqw;background:#17171f;border:1px solid #34343f;display:flex;align-items:center;gap:.8cqw;padding:0 1.2cqw;font-size:1cqw;color:#8e8e9a}
+  .hc-b-filters{position:absolute;left:2.4cqw;right:2.4cqw;top:6.4cqw;display:flex;align-items:center;gap:.7cqw}
+  .hc-chip{padding:.45cqw 1cqw;border-radius:1.2cqw;background:#191921;border:1px solid #33333e;font-size:.88cqw;font-weight:600;color:#cfcfd8;white-space:nowrap}
+  .hc-chip.on{background:#ffc93c;border-color:#ffc93c;color:#14110a}
+  .hc-chip.focus{outline:.2cqw solid #fff;outline-offset:.12cqw}
+  .hc-b-count{margin-left:auto;font-size:.88cqw;color:#9a9aa6;white-space:nowrap}
+  .hc-b-grid{position:absolute;left:2.4cqw;right:2.4cqw;top:10.4cqw;display:grid;grid-template-columns:repeat(8,1fr);gap:1.6cqw 1.05cqw}
+  .hc-b-grid .hc-poster{width:100%}
+  .hc-b-cap{margin-top:.5cqw;font-size:.82cqw;font-weight:600;color:#e6e6ec;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .hc-b-sub{font-size:.72cqw;color:#9a9aa6;margin-top:.12cqw}
+  .hc-b-sub .star{color:#ffd75e;font-weight:800}
+
+  /* ---------- C: Disney+ ---------- */
+  .hc-c{background:linear-gradient(180deg,#0f1630 0%,#0a0d1c 45%,#07080f 100%)}
+  .hc-c-rail{position:absolute;left:0;top:0;bottom:0;width:5.2cqw;background:linear-gradient(90deg,rgba(0,0,0,.55),rgba(0,0,0,0));display:flex;flex-direction:column;align-items:center;gap:2.3cqw;padding-top:1.8cqw;z-index:6}
+  .hc-c-rail .lg{font-family:"Bebas Neue",Impact,sans-serif;font-size:2.2cqw;color:#ffc93c;margin-bottom:.8cqw}
+  .hc-c-rail .ic{width:2.6cqw;height:2.6cqw;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.25cqw;color:#c8cbe0}
+  .hc-c-rail .ic.on{background:rgba(255,255,255,.14);color:#fff}
+  .hc-c-car{position:absolute;left:5.2cqw;right:0;top:2.2cqw;height:21cqw}
+  .hc-c-slide{position:absolute;top:0;height:19.5cqw;border-radius:.9cqw;background:#222 center/cover no-repeat;overflow:hidden;box-shadow:0 1cqw 2.4cqw rgba(0,0,0,.6)}
+  .hc-c-slide.side{opacity:.45;transform:scale(.92)}
+  .hc-c-slide.main{left:9cqw;width:70cqw;outline:.24cqw solid rgba(255,255,255,.95);outline-offset:.2cqw}
+  .hc-c-slide.prev{left:-58cqw;width:66cqw}
+  .hc-c-slide.next{left:81cqw;width:66cqw}
+  .hc-c-slide:after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,rgba(5,8,20,.92) 0%,rgba(5,8,20,.5) 38%,rgba(5,8,20,0) 70%)}
+  .hc-c-slide .cp{position:absolute;left:2.4cqw;top:3.4cqw;z-index:2;width:30cqw}
+  .hc-c-slide .ttl{font-family:"Bebas Neue",Impact,sans-serif;font-size:4.2cqw;line-height:.92;margin:.4cqw 0 .8cqw 0}
+  .hc-c-dots{position:absolute;left:44cqw;top:20.3cqw;display:flex;gap:.5cqw}
+  .hc-c-dots u{display:block;width:.55cqw;height:.55cqw;border-radius:50%;background:#4a4e66}
+  .hc-c-dots u.on{background:#fff;width:1.6cqw;border-radius:.3cqw}
+  .hc-c-rows{position:absolute;left:7cqw;right:0;top:24.2cqw}
+  .hc-brand{flex:0 0 auto;width:13.4cqw;aspect-ratio:16/9;border-radius:.7cqw;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:1.55cqw;letter-spacing:.02em;border:1px solid rgba(255,255,255,.12);box-shadow:0 .5cqw 1.4cqw rgba(0,0,0,.55)}
+
+  .hc-rec{margin-top:2rem;padding:1.1rem 1.3rem;border-radius:12px;border:1px solid var(--border);background:var(--bg-secondary)}
+  .hc-rec h3{margin:0 0 .4rem 0}
+  .hc-keys{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-top:.6rem}
+  .hc-keys div{font-size:.92rem;line-height:1.45}
+  @media (max-width:900px){.hc-keys{grid-template-columns:1fr}}
+</style>
+
+<h2>Startscherm van de thuisbioscoop: welke opzet voelt goed?</h2>
+<p class="subtitle">Drie richtingen, getekend als het echte app-venster (16:9). In alle drie bedien je alles met pijltjes, Enter en Esc, en de muis werkt mee. De foto's zijn plaatsvervangers voor de echte covers van Pandora. Klik op de opzet die het meest "thuisbioscoop" voelt.</p>
+
+<div class="cards hc-cards">
+
+  <!-- ===================== A ===================== -->
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="hc-screen">
+        <div class="hc-a-hero" style="background-image:url(https://picsum.photos/seed/bongo-hero-wasteland/1600/900)"></div>
+        <div class="hc-a-shade"></div>
+        <div class="hc-a-top">
+          <div class="hc-logo">BONGO<small>Thuisbioscoop</small></div>
+          <div class="hc-nav"><span class="on">Thuis</span><span>Series</span><span>Films</span><span>Mijn lijst</span></div>
+          <div class="sp"></div>
+          <div class="hc-a-icons"><span>🔍</span><span>⚙</span></div>
+        </div>
+        <div class="hc-a-copy">
+          <div class="hc-a-kicker">SERIE · NIEUW SEIZOEN</div>
+          <div class="hc-a-title">THE LAST OF US</div>
+          <div class="hc-meta"><span class="star">★ 8,8</span><span>2023</span><span class="hc-pill">16</span><span>Drama · Sci-fi</span><span>2 seizoenen</span></div>
+          <p class="hc-a-plot">Twintig jaar na de ineenstorting van de beschaving smokkelt Joel een tienermeisje dwars door een verwoest Amerika. Ze zijn allebei meer kwijt dan ze toegeven.</p>
+          <div class="hc-a-btns"><span class="hc-btn play">▶&nbsp; Afspelen</span><span class="hc-btn info">ⓘ&nbsp; Meer info</span></div>
+        </div>
+        <div class="hc-a-rows">
+          <div class="hc-row-title">Verder kijken <em>3 titels</em></div>
+          <div class="hc-row">
+            <div class="hc-land hc-focus" style="background-image:url(https://picsum.photos/seed/bongo-desert-lab/640/360)"><div class="t">Breaking Bad</div><div class="s">S2 · A5 · nog 23 min</div><div class="play">▶</div><div class="bar"><u style="width:52%"></u></div></div>
+            <div class="hc-land" style="background-image:url(https://picsum.photos/seed/bongo-kitchen-chef/640/360)"><div class="t">The Bear</div><div class="s">S3 · A2 · nog 11 min</div><div class="bar"><u style="width:68%"></u></div></div>
+            <div class="hc-land" style="background-image:url(https://picsum.photos/seed/bongo-desert-dune/640/360)"><div class="t">Dune: Part Two</div><div class="s">Film · nog 1 u 4 min</div><div class="bar"><u style="width:37%"></u></div></div>
+            <div class="hc-land" style="background-image:url(https://picsum.photos/seed/bongo-amsterdam-night/640/360)"><div class="t">Mocro Maffia</div><div class="s">S4 · A1 · begin</div><div class="bar"><u style="width:4%"></u></div></div>
+            <div class="hc-land" style="background-image:url(https://picsum.photos/seed/bongo-office-light/640/360)"><div class="t">Severance</div><div class="s">S2 · A7 · nog 30 min</div><div class="bar"><u style="width:41%"></u></div></div>
+          </div>
+          <div class="hc-row-title" style="margin-top:1.55cqw">Nieuw toegevoegd <em>deze week</em></div>
+          <div class="hc-row">
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-p-shogun/300/450)"><span class="new">NIEUW</span><i>★ 8,6</i><span>SHŌGUN</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-p-ripley/300/450)"><i>★ 8,1</i><span>RIPLEY</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-p-fallout/300/450)"><span class="new">NIEUW</span><i>★ 8,4</i><span>FALLOUT</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-p-slowhorses/300/450)"><i>★ 8,2</i><span>SLOW HORSES</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-p-undercover/300/450)"><i>★ 7,9</i><span>UNDERCOVER</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-p-oppenheimer/300/450)"><i>★ 8,3</i><span>OPPEN&shy;HEIMER</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-p-dragon/300/450)"><i>★ 8,4</i><span>HOUSE OF THE DRAGON</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-p-flikken/300/450)"><i>★ 7,2</i><span>FLIKKEN MAASTRICHT</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-p-nightagent/300/450)"><i>★ 7,5</i><span>THE NIGHT AGENT</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-p-succession/300/450)"><i>★ 8,8</i><span>SUCCESSION</span></div>
+          </div>
+        </div>
+        <div class="hc-hint"><span><b>←→↑↓</b>kiezen</span><span><b>Enter</b>info</span><span><b>▶</b>direct spelen</span><span><b>f</b>zoeken</span><span><b>Esc</b>terug naar tv</span></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A · Netflix-stijl: één grote uitgelichte titel, daaronder rijen</h3>
+      <p>Bovenaan een uitgelichte titel met een grote achtergrond, waardering en een korte beschrijving. Daaronder de rijen: Verder kijken (met voortgangsbalk), Nieuw toegevoegd, Best gewaardeerd en Pandora's categorieën. ↑/↓ wisselt van rij en ←/→ loopt door een rij. Het is het meest "achteroverleunen", met de mooiste eerste indruk. Kosten: per keer één grote afbeelding plus de covers die in beeld zijn.</p>
+    </div>
+  </div>
+
+  <!-- ===================== B ===================== -->
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="hc-screen hc-b">
+        <div class="hc-b-top">
+          <div class="hc-logo">BONGO<small>Thuisbioscoop</small></div>
+          <div class="hc-nav"><span class="on">Films</span><span>Series</span><span>Verder kijken</span><span>Mijn lijst</span></div>
+          <div class="hc-b-search">🔍&nbsp; Zoek een film of serie…</div>
+        </div>
+        <div class="hc-b-filters">
+          <span class="hc-chip">Genre: Alle ▾</span>
+          <span class="hc-chip">Jaar: 2020+ ▾</span>
+          <span class="hc-chip on focus">★ 7 en hoger</span>
+          <span class="hc-chip">Nederlands</span>
+          <span class="hc-chip">Nieuw</span>
+          <span class="hc-chip">Nog niet gezien</span>
+          <span class="hc-b-count">1.284 films · Sorteer: <b style="color:#fff">Best gewaardeerd ▾</b></span>
+        </div>
+        <div class="hc-b-grid">
+          <div><div class="hc-poster hc-focus" style="background-image:url(https://picsum.photos/seed/bongo-g-dune/300/450)"><span>DUNE: PART TWO</span></div><div class="hc-b-cap">Dune: Part Two</div><div class="hc-b-sub"><span class="star">★ 8,5</span> · 2024 · 2 u 46</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-oppen/300/450)"><span>OPPENHEIMER</span></div><div class="hc-b-cap">Oppenheimer</div><div class="hc-b-sub"><span class="star">★ 8,3</span> · 2023 · 3 u 00</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-spider/300/450)"><span>SPIDER-VERSE</span></div><div class="hc-b-cap">Across the Spider-Verse</div><div class="hc-b-sub"><span class="star">★ 8,4</span> · 2023 · 2 u 20</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-poor/300/450)"><span>POOR THINGS</span></div><div class="hc-b-cap">Poor Things</div><div class="hc-b-sub"><span class="star">★ 7,9</span> · 2023 · 2 u 21</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-holdovers/300/450)"><span>THE HOLDOVERS</span></div><div class="hc-b-cap">The Holdovers</div><div class="hc-b-sub"><span class="star">★ 7,9</span> · 2023 · 2 u 13</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-anatomy/300/450)"><span>ANATOMIE D'UNE CHUTE</span></div><div class="hc-b-cap">Anatomie d'une chute</div><div class="hc-b-sub"><span class="star">★ 7,7</span> · 2023 · 2 u 31</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-zone/300/450)"><span>THE ZONE OF INTEREST</span></div><div class="hc-b-cap">The Zone of Interest</div><div class="hc-b-sub"><span class="star">★ 7,4</span> · 2023 · 1 u 45</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-civil/300/450)"><span>CIVIL WAR</span></div><div class="hc-b-cap">Civil War</div><div class="hc-b-sub"><span class="star">★ 7,1</span> · 2024 · 1 u 49</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-perfect/300/450)"><span>PERFECT DAYS</span></div><div class="hc-b-cap">Perfect Days</div><div class="hc-b-sub"><span class="star">★ 7,9</span> · 2023 · 2 u 04</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-past/300/450)"><span>PAST LIVES</span></div><div class="hc-b-cap">Past Lives</div><div class="hc-b-sub"><span class="star">★ 7,8</span> · 2023 · 1 u 46</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-killers/300/450)"><span>KILLERS OF THE FLOWER MOON</span></div><div class="hc-b-cap">Killers of the Flower Moon</div><div class="hc-b-sub"><span class="star">★ 7,6</span> · 2023 · 3 u 26</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-wonka/300/450)"><span>WONKA</span></div><div class="hc-b-cap">Wonka</div><div class="hc-b-sub"><span class="star">★ 7,1</span> · 2023 · 1 u 56</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-saltburn/300/450)"><span>SALTBURN</span></div><div class="hc-b-cap">Saltburn</div><div class="hc-b-sub"><span class="star">★ 7,0</span> · 2023 · 2 u 11</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-boy/300/450)"><span>THE BOY AND THE HERON</span></div><div class="hc-b-cap">The Boy and the Heron</div><div class="hc-b-sub"><span class="star">★ 7,5</span> · 2023 · 2 u 04</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-godzilla/300/450)"><span>GODZILLA MINUS ONE</span></div><div class="hc-b-cap">Godzilla Minus One</div><div class="hc-b-sub"><span class="star">★ 7,7</span> · 2023 · 2 u 05</div></div>
+          <div><div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-g-challengers/300/450)"><span>CHALLENGERS</span></div><div class="hc-b-cap">Challengers</div><div class="hc-b-sub"><span class="star">★ 7,1</span> · 2024 · 2 u 11</div></div>
+        </div>
+        <div class="hc-hint"><span><b>←→↑↓</b>kiezen</span><span><b>Tab</b>naar de filters</span><span><b>Enter</b>info</span><span><b>f</b>zoeken</span><span><b>Esc</b>terug naar tv</span></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B · Pathé Thuis-stijl: tabbladen, filterknoppen en een raster</h3>
+      <p>Bovenaan tabbladen (Films, Series, Verder kijken, Mijn lijst) en een zoekveld. Daaronder filterknoppen: genre, jaar, ★ 7+, Nederlands, nieuw, nog niet gezien, plus sorteren. Dan een raster covers met titel, waardering, jaar en duur. Het snelst om iets <i>te vinden</i> en te kiezen, minder "bioscoopgevoel" bij het openen. Kosten: veel covers tegelijk in beeld, dus alleen ophalen wat zichtbaar is.</p>
+    </div>
+  </div>
+
+  <!-- ===================== C ===================== -->
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="hc-screen hc-c">
+        <div class="hc-c-rail">
+          <div class="lg">B</div>
+          <div class="ic on">⌂</div><div class="ic">🔍</div><div class="ic">🎬</div><div class="ic">📺</div><div class="ic">★</div><div class="ic">⚙</div>
+        </div>
+        <div class="hc-c-car">
+          <div class="hc-c-slide side prev" style="background-image:url(https://picsum.photos/seed/bongo-c-prev/1200/400)"></div>
+          <div class="hc-c-slide main" style="background-image:url(https://picsum.photos/seed/bongo-c-main-sea/1400/420)">
+            <div class="cp">
+              <div class="hc-a-kicker">NIEUW BIJ PANDORA</div>
+              <div class="ttl">SHŌGUN</div>
+              <div class="hc-meta"><span class="star">★ 8,6</span><span>2024</span><span class="hc-pill">16</span><span>Drama · Historisch</span></div>
+            </div>
+          </div>
+          <div class="hc-c-slide side next" style="background-image:url(https://picsum.photos/seed/bongo-c-next/1200/400)"></div>
+        </div>
+        <div class="hc-c-dots"><u></u><u class="on"></u><u></u><u></u><u></u></div>
+        <div class="hc-c-rows">
+          <div class="hc-row-title">Platformen <em>uit Pandora's categorieën</em></div>
+          <div class="hc-row">
+            <div class="hc-brand" style="background:linear-gradient(135deg,#1a0000,#5a0000);color:#e50914">NETFLIX</div>
+            <div class="hc-brand" style="background:linear-gradient(135deg,#120a2a,#3b1f86);color:#d9cbff">HBO MAX</div>
+            <div class="hc-brand" style="background:linear-gradient(135deg,#04103a,#0d3fb0);color:#cfe3ff">DISNEY+</div>
+            <div class="hc-brand" style="background:linear-gradient(135deg,#00141f,#00618a);color:#9fe7ff">PRIME VIDEO</div>
+            <div class="hc-brand" style="background:linear-gradient(135deg,#2a0618,#9b1450);color:#ffd2e6">VIDEOLAND</div>
+            <div class="hc-brand" style="background:linear-gradient(135deg,#111,#3a3a3a);color:#fff">APPLE TV+</div>
+          </div>
+          <div class="hc-row-title" style="margin-top:1.4cqw">Series voor jou</div>
+          <div class="hc-row">
+            <div class="hc-poster hc-focus" style="background-image:url(https://picsum.photos/seed/bongo-c-p1/300/450)"><i>★ 8,7</i><span>THE BEAR</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-c-p2/300/450)"><i>★ 8,7</i><span>SEVERANCE</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-c-p3/300/450)"><i>★ 8,1</i><span>BABY REINDEER</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-c-p4/300/450)"><i>★ 7,6</i><span>DE LUIZEN&shy;MOEDER</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-c-p5/300/450)"><i>★ 8,2</i><span>SLOW HORSES</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-c-p6/300/450)"><i>★ 8,0</i><span>TOP BOY</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-c-p7/300/450)"><i>★ 8,4</i><span>FARGO</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-c-p8/300/450)"><i>★ 7,8</i><span>LUPIN</span></div>
+            <div class="hc-poster" style="background-image:url(https://picsum.photos/seed/bongo-c-p9/300/450)"><i>★ 8,2</i><span>DARK</span></div>
+          </div>
+        </div>
+        <div class="hc-hint" style="left:5.2cqw"><span><b>←</b>naar het menu</span><span><b>→↑↓</b>kiezen</span><span><b>Enter</b>info</span><span><b>f</b>zoeken</span><span><b>Esc</b>terug naar tv</span></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>C · Disney+-stijl: menu links, een draaiende banner, platformtegels</h3>
+      <p>Links een smal icoonmenu (Thuis, Zoeken, Films, Series, Mijn lijst). Bovenaan een banner die doorbladert, met daaronder tegels per platform, als Pandora zijn series zo indeelt (vaak is dat zo: "NETFLIX SERIES", "HBO", …), en rijen covers. Het voelt het meest als een streamingdienst. Wel één bedieningslaag extra (← naar het menu), en de platformtegels hangen af van Pandora's indeling.</p>
+    </div>
+  </div>
+
+  <!-- ===================== A+B ===================== -->
+  <div class="card" data-choice="ab" onclick="toggleSelect(this)">
+    <div class="card-body">
+      <h3>A + B: mijn voorstel</h3>
+      <p><b>Thuis</b> is opzet A: de uitgelichte titel en de rijen, voor het achteroverleunen en de eerste indruk. Achter de tabbladen <b>Series</b> en <b>Films</b> zit opzet B: het raster met filterknoppen en sorteren, voor als je iets zoekt. <b>Zoeken</b> (<code>f</code>) zoekt in alles en kent dezelfde filters. Zo heb je het gevoel van Netflix en het gemak van Pathé Thuis in één.</p>
+    </div>
+  </div>
+
+</div>
+
+<div class="hc-rec">
+  <h3>Wat in alle drie hetzelfde is</h3>
+  <div class="hc-keys">
+    <div><b>Snel blijft heilig.</b> De thuisbioscoop kost niets zolang hij dicht is. Bij het openen komen alleen de covers die in beeld zijn, en elke cover wordt één keer opgehaald en daarna van schijf gelezen. Het starten van de app en het zappen worden niet trager.</div>
+    <div><b>Live tv loopt door.</b> Tot je iets kiest om te kijken, speelt de zender gewoon verder achter de thuisbioscoop. Esc brengt je terug. Een film of aflevering neemt de sessie van je account, net als nu.</div>
+    <div><b>Eén plek om alles te openen.</b> Een eigen toets opent de thuisbioscoop (welke, beslissen we later), en <code>f</code> blijft zoeken. Enter op een titel opent eerst de infopagina; ▶ (of Enter op "Afspelen") start hem. De infopagina zie je in het volgende scherm.</div>
+  </div>
+</div>
