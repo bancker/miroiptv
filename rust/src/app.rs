@@ -109,6 +109,10 @@ fn last_watched_record(
     hint: Option<bool>,
     reload: bool,
 ) -> Option<LastWatched> {
+    // No address plays nothing: the next start would resume nothing.
+    if url.is_empty() {
+        return None;
+    }
     let catalog_says = catalog_says_adult(catalog, url);
     let adult = if catalog_says == Some(true) || hint == Some(true) {
         Some(true)
@@ -1827,6 +1831,12 @@ impl TvApp {
             return;
         }
         let url = self.catalog.portal().live_stream_url(sid);
+        // An M3U list has no address for an id it does not hold: a target the
+        // zap pacer held while a fresh list dropped it. What plays stays.
+        if url.is_empty() {
+            tracing::warn!("zap: stream_id={} has no address - not loaded", sid);
+            return;
+        }
         // A channel of an M3U list that has no name is named after its address.
         tracing::info!(
             "zap: -> {} (stream_id={}, idx={:?}, prev={:?})",
@@ -9097,6 +9107,35 @@ https://c.example/twee-nieuws.m3u8\n";
         h.press(&[Key::Enter]);
         assert_eq!(loads(h.sent()), ["https://a.example/een.m3u8"]);
         assert_eq!(h.app.current_name.as_deref(), Some("Kanaal Een"));
+    }
+
+    #[tokio::test]
+    async fn a_channel_the_list_no_longer_has_loads_nothing_and_is_not_the_last_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), TEST_LIST);
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        h.press(&[Key::ArrowDown]); // Kanaal Twee plays
+        h.sent();
+        let before = read_last_watched(dir.path()).url;
+        // The zap pacer held a channel that the fresh list dropped meanwhile:
+        // the list has no address for it.
+        h.app.zap_to(12345, "Weg", Some(0));
+        assert!(loads(h.sent()).is_empty(), "nothing loads");
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal Twee"));
+        assert_eq!(read_last_watched(dir.path()).url, before);
+    }
+
+    #[test]
+    fn an_empty_address_is_never_recorded_as_the_last_channel() {
+        let (portal, catalog) = M3uPortal::from_text(TEST_LIST).unwrap();
+        let m3u = CatalogStore::from_catalog(Arc::new(portal), catalog);
+        let xtream = CatalogStore::from_catalog(idle_portal(), adult_catalog());
+        for store in [&m3u, &xtream] {
+            for hint in [None, Some(false)] {
+                let record = last_watched_record(store, "", true, hint, false);
+                assert!(record.is_none(), "{:?}", record.map(|r| r.url));
+            }
+        }
     }
 
     #[tokio::test]

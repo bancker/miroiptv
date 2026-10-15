@@ -73,6 +73,32 @@ fn a_kodi_header_suffix_is_read_and_wins_over_extvlcopt() {
 }
 
 #[test]
+fn a_kodi_header_with_nothing_in_its_value_is_no_header() {
+    let (address, headers) =
+        split_headers("http://a.example/1|User-Agent=&Referer=https%3A%2F%2Fr.example%2F");
+    assert_eq!(address, "http://a.example/1");
+    assert_eq!(headers.user_agent, None);
+    assert_eq!(headers.referrer.as_deref(), Some("https://r.example/"));
+    let (_, headers) = split_headers("http://a.example/1|Referer=%20");
+    assert_eq!(headers.referrer, None, "a value of spaces only");
+    // So the list's #EXTVLCOPT counts, and the URL carries no empty header.
+    let c = one("#EXTINF:-1,Een\n#EXTVLCOPT:http-user-agent=Vlc\nhttp://a.example/1|User-Agent=\n");
+    assert_eq!(c.user_agent.as_deref(), Some("Vlc"));
+    let playlist = read("#EXTINF:-1,Een\nhttp://a.example/1|User-Agent=\n").unwrap();
+    let url = &playlist.streams[&playlist.live[0].stream_id].url;
+    assert_eq!(url, "http://a.example/1");
+}
+
+#[test]
+fn a_stream_line_with_nothing_before_its_headers_is_no_channel() {
+    // `|://x`: the `://` is in the headers; no address is left to play.
+    let list = parse("#EXTM3U\n#EXTINF:-1,Leeg\n|://x\n#EXTINF:-1,Goed\nhttp://a.example/1\n");
+    let names: Vec<&str> = list.channels.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["Goed"], "and its #EXTINF goes with it");
+    assert!(read("#EXTM3U\n|://x\n").is_none(), "no channel: no list");
+}
+
+#[test]
 fn a_bom_crlf_and_no_header_are_fine() {
     let c = one("\u{feff}#EXTINF:-1 tvg-id=\"Een.nl\",Een\r\nhttp://a.example/1\r\n");
     assert_eq!(

@@ -3,8 +3,9 @@
 //!
 //! Tolerant of what lists in the wild do: a BOM, CRLF line ends, no `#EXTM3U`
 //! header, an `#EXTINF` with no URL after it (dropped), a URL with no `#EXTINF`
-//! (named after its URL, the account in it masked), and `#` lines it does not
-//! know (skipped).
+//! (named after its URL, the account in it masked), a stream line with no
+//! address before its headers (dropped, with its `#EXTINF`), and `#` lines it
+//! does not know (skipped).
 
 use crate::portal::LiveChannel;
 use std::collections::{HashMap, HashSet};
@@ -161,6 +162,11 @@ pub fn parse(text: &str) -> M3uList {
             let (url, piped) = split_headers(line);
             let info = info.take().unwrap_or_default();
             let headers = std::mem::take(&mut pending);
+            // Nothing before the headers (`|://x`): no address to play. The
+            // line goes, and the #EXTINF and headers before it with it.
+            if url.trim().is_empty() {
+                continue;
+            }
             // No name at all: the address, with the account masked. The name
             // reaches the toasts, the search, the favorites and the log, and a
             // paid provider's address holds user and password.
@@ -347,7 +353,9 @@ pub fn with_headers(url: String, user_agent: Option<&str>, referrer: Option<&str
 
 /// The address and the headers of a URL that [`with_headers`] made, or that a
 /// list wrote in Kodi's way. Header names count in any case, `Referrer` as
-/// `Referer`; other headers are ignored.
+/// `Referer`; other headers are ignored, and so is one with nothing in its
+/// value (`User-Agent=`): it would send an empty header, and win over the
+/// list's `#EXTVLCOPT`.
 pub fn split_headers(url: &str) -> (&str, Headers) {
     let Some((address, options)) = url.split_once('|') else {
         return (url, Headers::default());
@@ -360,6 +368,9 @@ pub fn split_headers(url: &str) -> (&str, Headers) {
         let value = urlencoding::decode(value)
             .map(|v| v.into_owned())
             .unwrap_or_else(|_| value.to_owned());
+        if value.trim().is_empty() {
+            continue;
+        }
         match name.trim().to_ascii_lowercase().as_str() {
             "user-agent" => headers.user_agent = Some(value),
             "referer" | "referrer" => headers.referrer = Some(value),
