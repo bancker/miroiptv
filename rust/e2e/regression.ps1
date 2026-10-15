@@ -1,14 +1,14 @@
 <#
 The regression set of 0.6.0: the keyboard-only end-to-end scenarios of part 1 that passed when it was
-released (0.5.2; groups R, B, C, N, X) and those of part 2's guide (group G). Each scenario opens the
-app's window once, a full run about a hundred times; run it when nobody minds windows coming and
-going.
+released (0.5.2; groups R, B, C, N, X), those of part 2's guide (group G) and those of the M3U sources
+(group M). Each scenario opens the app's window once, a full run about 110 times; run it when nobody
+minds windows coming and going.
 
   powershell -NoProfile -ExecutionPolicy Bypass -File e2e\regression.ps1 -Group R      # one group
-  powershell -NoProfile -ExecutionPolicy Bypass -File e2e\regression.ps1 -Group R,B,C,N,X,G
+  powershell -NoProfile -ExecutionPolicy Bypass -File e2e\regression.ps1 -Group R,B,C,N,X,G,M
   powershell -NoProfile -ExecutionPolicy Bypass -File e2e\regression.ps1 -Summary
 
-Without -Group the groups are R,B,C,N: X and G have to be named.
+Without -Group the groups are R,B,C,N: X, G and M have to be named.
 
 Groups
   R  the R49 re-runs: first-focus scenarios with commands that pass on a normal keyboard after item I.1
@@ -17,6 +17,7 @@ Groups
   N  new scenarios for the fixes (A, C, D, F, G, H, J, L, M)
   X  the other extras of the Task 12-17 reports that run through run-scenario.ps1 alone
   G  the guide of 0.6.0 part 2 (MOCK_GUIDE)
+  M  M3U sources (MOCK_M3U)
 
 Everything goes through rust\e2e\run-scenario.ps1 (mock portal, isolated config folder). No mouse, no
 SendInput: keys are posted to the app's window by the harness. The script refuses to start while a key
@@ -29,7 +30,8 @@ param(
     [string[]]$Group = @('R', 'B', 'C', 'N'),
     [switch]$DryRun,    # print the command lines (and check the parameter names), run nothing
     [string[]]$Only,    # run only the scenarios whose id matches one of these -like patterns (keep a
-                        # scenario that depends on an earlier one, e.g. T12-2 and T12-2b, in one batch)
+                        # scenario that depends on an earlier one, e.g. T12-2 and T12-2b, or M-zap and
+                        # M-restart, in one batch)
     [switch]$Summary,   # run nothing: summarise results.jsonl (the latest row per id) and exit
     [string]$Results = (Join-Path $env:TEMP 'bongo-regression')
 )
@@ -345,12 +347,67 @@ function Group-G {
     Scn 'G-cache-2' @{ MockEnv = $G; ConfigDir = $dc; Resume = 3; Seconds = 14; Expect = 'guide: epg cache read \(10 channels' }
 }
 
+# ---- M: M3U sources ----------------------------------------------------------------------------
+# Each scenario starts with -NoPortal and an ini in its own config folder that names the sources; the mock's list
+# (MOCK_M3U) has 21 channels. M-add, M-switch and M-getphp press the keys that settings_ui's and app's keyboard tests
+# press (the Bronnen pane's Tab order, pinned there). The SLEEPs after a Save or a Use are margin, the tests need none;
+# an Xtream Save gets a long one, because its answer comes whenever the mock's login is over and a Tab in that frame is lost.
+function Group-M {
+    'M: M3U sources (MOCK_M3U)'
+    $M = @{ MOCK_M3U = '1' }
+    $list = 'http://127.0.0.1:18080/m3u/list.m3u'
+    # A fresh config folder whose ini holds these lines.
+    function IniDir([string]$name, [string]$ini) {
+        $d = Fresh $name
+        New-Item -ItemType Directory -Force $d | Out-Null
+        [IO.File]::WriteAllText((Join-Path $d 'BongoPlayer.ini'), $ini)
+        $d
+    }
+    $onlyList = "source=1;m3u;Testlijst;$list`nactive=1`n"
+    $portal = "portal=tester:secret@127.0.0.1:18080`n"
+    # The list comes in the background; a zap plays straight from its server, not through the relay.
+    $dz = IniDir 'm-zap' $onlyList
+    Scn 'M-zap' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $dz; Seconds = 14; Keys = 'SLEEP:1500;DOWN;SLEEP:3000'; Expect = 'source: m3u 1 \(127\.0\.0\.1\)', 'm3u: list of source 1 read \(21 channels', 'zap: -> M3U 02', 'loadfile http://127\.0\.0\.1:18080/m3uplay/2\.m3u8', 'mpv: file-loaded'; Forbid = 'relay: first bytes', 'portal: no credentials' }
+    # The next start shows the saved list at once, resumes M3U 02 from it, and finds the download the same.
+    Scn 'M-restart' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $dz; Seconds = 10; Expect = 'm3u: saved list of source 1 \(21 channels', 'resuming last watched', 'loadfile http://127\.0\.0\.1:18080/m3uplay/2\.m3u8', 'm3u: list of source 1 unchanged' }
+    # The channel that plays only with its own User-Agent.
+    Scn 'M-ua' @{ MockEnv = $M; NoPortal = $true; ConfigDir = (IniDir 'm-ua' $onlyList); Seconds = 16; Keys = 'SLEEP:1500;f;SLEEP:400;TEXT:m3u ua;SLEEP:800;ENTER;SLEEP:3000'; Expect = 'loadfile http://127\.0\.0\.1:18080/m3uplay/ua\.m3u8 \(user-agent\)', 'mpv: file-loaded'; Forbid = 'end-file \(reason=error\)' }
+    # The channel that plays only with its own Referer, and the load after it: libmpv once put the referrer back as an
+    # empty string after a load (Task 6), so every later load sent an empty Referer. The mock answers 400 to a Referer
+    # on any channel but M3U REF, so a leak from M3U REF into M3U 01 ends the file with an error.
+    Scn 'M-ref' @{ MockEnv = $M; NoPortal = $true; ConfigDir = (IniDir 'm-ref' $onlyList); Seconds = 20; Keys = 'SLEEP:1500;f;SLEEP:400;TEXT:m3u ref;SLEEP:800;ENTER;SLEEP:3000;f;SLEEP:400;TEXT:m3u 01;SLEEP:800;ENTER;SLEEP:3000'; Expect = 'loadfile http://127\.0\.0\.1:18080/m3uplay/ref\.m3u8 \(referrer\)', 'zap: -> M3U 01', 'loadfile http://127\.0\.0\.1:18080/m3uplay/1\.m3u8'; Forbid = 'end-file \(reason=error\)', 'loadfile http://127\.0\.0\.1:18080/m3uplay/1\.m3u8 \(' }
+    # A dead channel: the error names it, and the app stays on it.
+    Scn 'M-dead' @{ MockEnv = $M; NoPortal = $true; ConfigDir = (IniDir 'm-dead' $onlyList); Seconds = 16; Keys = 'SLEEP:1500;f;SLEEP:400;TEXT:m3u dood;SLEEP:800;ENTER;SLEEP:4000'; Expect = 'zap: -> M3U DOOD', 'toast: streamfout op M3U DOOD'; Forbid = 'zap: -> M3U [01]' }
+    # No guide for an M3U source.
+    Scn 'M-guide' @{ MockEnv = $M; NoPortal = $true; ConfigDir = (IniDir 'm-guide' $onlyList); Seconds = 10; Keys = 'SLEEP:1500;g'; Expect = 'toast: voor deze bron is er nog geen gids'; Forbid = 'guide: opened' }
+    # Added in the settings next to the saved portal, then put in use: the keys of settings_ui's
+    # an_m3u_list_is_added_by_keyboard and app's an_m3u_list_is_added_and_used_by_keyboard_alone.
+    $da = IniDir 'm-add' $portal
+    Scn 'M-add' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $da; Resume = 3; Seconds = 26; Keys = "o;DOWN;ENTER;TAB;TAB;TAB;TAB;TAB;TAB;ENTER;TAB;ENTER;TAB;TEXT:$list;TAB;ENTER;SLEEP:800;TAB;TAB;TAB;TAB;TAB;ENTER;SLEEP:3000;ESC;ESC"; Expect = 'settings: source 2 saved \(m3u\)', 'source: active 2 \(m3u\)', 'player: stop', 'source: m3u 2 \(127\.0\.0\.1\)', 'm3u: list of source 2 read \(21 channels' } {
+        $ini = Get-Content -Raw (Join-Path $da 'BongoPlayer.ini')
+        ($ini -match [regex]::Escape("source=2;m3u;;$list")) -and ($ini -match 'active=2')
+    }
+    # From the saved portal (source 1, in use) to the list (source 2): the keys of settings_ui's
+    # the_list_marks_the_source_in_use_and_use_sends_the_chosen_one.
+    $ds = IniDir 'm-switch' "portal=tester:secret@127.0.0.1:18080`nsource=1;xtream;;tester:secret@127.0.0.1:18080`nsource=2;m3u;Testlijst;$list`nactive=1`n"
+    Scn 'M-switch' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $ds; Resume = 3; Seconds = 24; Keys = 'o;DOWN;ENTER;TAB;TAB;TAB;TAB;TAB;TAB;ENTER;SLEEP:300;TAB;TAB;TAB;TAB;TAB;ENTER;SLEEP:3000;ESC;ESC'; Expect = 'portal: xtream <user>@127\.0\.0\.1:18080', 'source: active 2 \(m3u\)', 'source: m3u 2 \(127\.0\.0\.1\)', 'player: stop', 'm3u: list of source 2 read \(21 channels' } {
+        (Get-Content -Raw (Join-Path $ds 'BongoPlayer.ini')) -match 'active=2'
+    }
+    # An Xtream portal's get.php link typed as a list: offered, and saved as an Xtream source (the keys of
+    # settings_ui's a_get_php_link_by_keyboard_becomes_an_xtream_source_to_save). Its password never reaches the log.
+    $getphp = 'http://127.0.0.1:18080/get.php?username=tester&password=secret&type=m3u_plus'
+    $dg = IniDir 'm-getphp' $portal
+    Scn 'M-getphp' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $dg; Resume = 3; Seconds = 26; Keys = "o;DOWN;ENTER;TAB;TAB;TAB;TAB;TAB;TAB;ENTER;TAB;ENTER;TAB;TEXT:$getphp;TAB;ENTER;SLEEP:300;TAB;ENTER;SLEEP:300;TAB;TAB;TAB;TAB;ENTER;SLEEP:3000;ESC;ESC"; Expect = 'settings: connection check Ok', 'settings: source 2 saved \(xtream\)'; Forbid = 'password=secret', 'get\.php\?username' } {
+        (Get-Content -Raw (Join-Path $dg 'BongoPlayer.ini')) -match [regex]::Escape('source=2;xtream;;tester:secret@127.0.0.1:18080')
+    }
+}
+
 # ====================================================================================================
 if ($Summary) {
     $latest = [ordered]@{}
     foreach ($line in Get-Content $jsonl -ErrorAction SilentlyContinue) { $o = $line | ConvertFrom-Json; $latest[$o.id] = $o }
     $rows = @($latest.Values)
-    foreach ($g in 'R', 'N', 'C', 'B', 'X', 'G') {
+    foreach ($g in 'R', 'N', 'C', 'B', 'X', 'G', 'M') {
         $m = @($rows | Where-Object { $_.group -eq $g })
         if (-not $m.Count) { continue }
         "{0}: {1} scenario(s): {2} PASS, {3} PASS on re-run, {4} FAIL, {5} refused-for-good; {6} refusal(s) retried" -f $g, $m.Count,
@@ -369,6 +426,7 @@ foreach ($g in $Group) {
         'N' { Group-N }
         'X' { Group-X }
         'G' { Group-G }
+        'M' { Group-M }
         default { Write-Warning "unknown group $g" }
     }
 }

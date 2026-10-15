@@ -100,7 +100,8 @@ elseif ($Settings) { [IO.File]::WriteAllText($settingsFile, $Settings) }
 elseif (-not (Test-Path $settingsFile)) { [IO.File]::WriteAllText($settingsFile, '{"language":"nl"}') }
 $lastUrl = if ($ResumeUrl) { $ResumeUrl } elseif ($Resume) { "http://127.0.0.1:$Port/live/tester/secret/$Resume.m3u8" } else { '' }
 if ($lastUrl) {
-    $live = if ($lastUrl -match '/live/') { 'true' } else { 'false' }
+    # An M3U channel (/m3uplay/) is live too.
+    $live = if ($lastUrl -match '/live/|/m3uplay/') { 'true' } else { 'false' }
     # 0.6 adds an adult flag (Task 16); older versions ignore it.
     $adult = if ($OldResumeFile) { '' } else { ',"adult":false' }
     Set-Content (Join-Path $ConfigDir 'last_watched.json') ('{"url":"' + $lastUrl + '","live":' + $live + $adult + '}') -Encoding ASCII -NoNewline
@@ -191,7 +192,7 @@ $log = Get-ChildItem (Join-Path $ConfigDir 'log') -Filter 'BongoPlayer.log.*' -E
 $lines = if ($log) { Get-Content $log.FullName -Encoding UTF8 } else { @() }
 "config folder: $ConfigDir"
 '=== app log (zaps, loads, settings, adult, news, pause, errors) ==='
-$lines | Where-Object { $_ -match 'zap: |loadfile|resuming|resume:|settings:|adult:|news picker|pause:|player: stop|toast:|relay: (first bytes|the portal)|end-file \(reason=(eof|error)\)|ERROR' } |
+$lines | Where-Object { $_ -match 'zap: |source: |m3u: |loadfile|resuming|resume:|settings:|adult:|news picker|pause:|player: stop|toast:|relay: (first bytes|the portal)|end-file \(reason=(eof|error)\)|ERROR' } |
     ForEach-Object { '  ' + (($_ -replace '^\d{4}-\d\d-\d\dT(\d\d:\d\d:\d\d\.\d{3})\d*Z', '$1') -replace '\s+(main|mpv-player|tokio-rt-worker)\s+\S+: ', ' ') }
 '=== mock portal: live requests ==='
 if (Test-Path $reqLog) { Get-Content $reqLog | Where-Object { $_ -match '/live/' } | ForEach-Object { '  ' + $_ } }

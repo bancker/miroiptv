@@ -39,6 +39,17 @@ Environment:
                      "Journaal k" at 19:00 local every day; the programme on now comes
                      twice (5 minutes apart) with an overlapping one at its end, as the
                      real portal sends it; channel 2 sends no has_archive
+  MOCK_M3U=1         an M3U list of 21 channels at /m3u/list.m3u: "M3U 01".."M3U 18" (tvg-id
+                     m3uk.test) play /m3uplay/k.m3u8, a live playlist on the test segments
+                     with no token; "M3U UA" (/m3uplay/ua.m3u8) plays only with the
+                     User-Agent BongoTest/1.0, which its #EXTVLCOPT line names (403
+                     otherwise); "M3U DOOD" (/m3uplay/dead.m3u8) is 404; "M3U REF"
+                     (/m3uplay/ref.m3u8, last) plays only with the Referer http://ref.test/,
+                     which its #EXTVLCOPT line names (403 otherwise). Any other /m3uplay/
+                     request that carries a Referer header answers 400: a referrer that
+                     leaked from an earlier load
+  MOCK_M3U_BIG=N     /m3u/big.m3u: N channels "GROOT nnnnn" in iptv-org's form (logos, groups,
+                     an x-tvg-url); the first 18 play like M3U 01..18 (the startup measurement)
 """
 import base64
 import datetime
@@ -186,6 +197,46 @@ def png(k):
             + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
 
+M3U_UA = "BongoTest/1.0"
+M3U_REF = "http://ref.test/"
+
+
+def m3u_list():
+    """MOCK_M3U's list: 21 channels."""
+    lines = ["#EXTM3U"]
+    for k in range(1, 19):
+        lines += [f'#EXTINF:-1 tvg-id="m3u{k}.test" group-title="Test",M3U {k:02d}',
+                  f"http://127.0.0.1:{PORT}/m3uplay/{k}.m3u8"]
+    lines += ['#EXTINF:-1 group-title="Test",M3U UA', f"#EXTVLCOPT:http-user-agent={M3U_UA}",
+              f"http://127.0.0.1:{PORT}/m3uplay/ua.m3u8"]
+    lines += ['#EXTINF:-1 group-title="Test",M3U DOOD', f"http://127.0.0.1:{PORT}/m3uplay/dead.m3u8"]
+    # Last, so that no earlier channel moves.
+    lines += ['#EXTINF:-1 group-title="Test",M3U REF', f"#EXTVLCOPT:http-referrer={M3U_REF}",
+              f"http://127.0.0.1:{PORT}/m3uplay/ref.m3u8"]
+    return "\n".join(lines) + "\n"
+
+
+def m3u_big(n):
+    """MOCK_M3U_BIG's list of n channels."""
+    lines = ['#EXTM3U x-tvg-url="https://epg.example/guide.xml.gz"']
+    for i in range(n):
+        play = f"http://127.0.0.1:{PORT}/m3uplay/{i + 1}.m3u8" if i < 18 else \
+            f"http://127.0.0.1:{PORT}/m3uplay/none/{i}.m3u8"
+        lines += [f'#EXTINF:-1 tvg-id="Groot{i}.xx" tvg-logo="https://logos.example/{i}.png" '
+                  f'group-title="Groep {i % 183}",GROOT {i:05d}', play]
+    return "\n".join(lines) + "\n"
+
+
+def live_playlist(tag):
+    """A sliding live playlist of 4 s segments under /seg/<tag>/."""
+    first = max(0, int((time.time() - T0) / SEG_DUR) - 2)
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{SEG_DUR}",
+             f"#EXT-X-MEDIA-SEQUENCE:{first}"]
+    for s in range(first, first + 3):
+        lines += [f"#EXTINF:{SEG_DUR}.000,", f"/seg/{tag}/{s}.ts"]
+    return ("\n".join(lines) + "\n").encode()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -264,6 +315,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for s in range(first, first + 3):
                 lines += [f"#EXTINF:{SEG_DUR}.000,", f"/seg/{tok}/{s}.ts"]
             return self.reply(200, ("\n".join(lines) + "\n").encode(), "application/vnd.apple.mpegurl")
+        if p.split("?")[0] == "/m3u/list.m3u" and ENV("MOCK_M3U") == "1":
+            return self.reply(200, m3u_list().encode(), "audio/x-mpegurl")
+        if p.split("?")[0] == "/m3u/big.m3u" and ENV("MOCK_M3U_BIG"):
+            return self.reply(200, m3u_big(int(ENV("MOCK_M3U_BIG"))).encode(), "audio/x-mpegurl")
+        if p.startswith("/m3uplay/"):
+            name = p.rsplit("/", 1)[1].split(".")[0]
+            if name == "dead" or "/none/" in p:
+                return self.reply(404, b"not found")
+            # Only M3U REF asks for a Referer. One on any other channel leaked from an
+            # earlier load (mpv's per-file `referrer` once came back as an empty string
+            # and went out with every load after it); an empty one counts as well.
+            referer = self.headers.get("Referer")
+            if name == "ref":
+                if referer != M3U_REF:
+                    return self.reply(403, b"forbidden")
+            elif referer is not None:
+                return self.reply(400, b"a Referer that this channel did not ask for")
+            if name == "ua" and self.headers.get("User-Agent") != M3U_UA:
+                return self.reply(403, b"forbidden")
+            return self.reply(200, live_playlist(f"m3u{name}"), "application/vnd.apple.mpegurl")
         if p.startswith("/seg/"):
             n = int(p.rsplit("/", 1)[1].split(".")[0])
             with open(os.path.join(SEGDIR, f"seg{n % NSEG}.ts"), "rb") as f:

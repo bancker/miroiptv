@@ -11,10 +11,19 @@
 # Like run-scenario.ps1 it refuses to start while Tab, Shift, Ctrl, Alt, Enter,
 # Esc, Space, an arrow key, PgUp, PgDn, Home or End is held down (see
 # held-keys.ps1).
+#
+# -M3u measures the new exe resuming an M3U channel with an M3U source of 11,000
+# channels in use (MOCK_M3U_BIG), the baseline as before on the Xtream portal: the
+# spec's "not slower than 0.6.1, with an M3U source in use". Its config folder is
+# kept between runs, so from the second run on the saved list is there, as on a
+# real machine. MOCK_LATENCY slows only /live/ and /edge/ requests and an M3U
+# resume makes none of them, so against a baseline the new exe is favoured a
+# little: read both numbers as they come.
 param(
     [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\BongoPlayer.exe'),
     [int]$Runs = 10,
-    [string]$Baseline = ''
+    [string]$Baseline = '',
+    [switch]$M3u
 )
 . (Join-Path $PSScriptRoot 'held-keys.ps1')
 Assert-KeysUp
@@ -25,9 +34,18 @@ function Secs($line) {
     if ($line -match 'T(\d\d):(\d\d):(\d\d\.\d+)Z') { [int]$Matches[1] * 3600 + [int]$Matches[2] * 60 + [double]$Matches[3] }
 }
 # One run of the exe; the seconds from "starting" to the first picture, or nothing.
-function Measure-Run([string]$ExePath) {
-    $out = & (Join-Path $PSScriptRoot 'run-scenario.ps1') -Exe $ExePath -Resume 3 -Seconds 8 -MpvVerbose `
-        -MockEnv @{ MOCK_LATENCY = '1' } -Settings '{"language":"nl"}'
+function Measure-Run([string]$ExePath, [bool]$AsM3u) {
+    $common = @{ Exe = $ExePath; Seconds = 8; MpvVerbose = $true; Settings = '{"language":"nl"}' }
+    if ($AsM3u) {
+        $dir = Join-Path $env:TEMP 'bongo-measure-m3u'
+        New-Item -ItemType Directory -Force $dir | Out-Null
+        [IO.File]::WriteAllText((Join-Path $dir 'BongoPlayer.ini'), "source=1;m3u;Groot;http://127.0.0.1:18080/m3u/big.m3u`nactive=1`n")
+        $out = & (Join-Path $PSScriptRoot 'run-scenario.ps1') @common -NoPortal -ConfigDir $dir `
+            -ResumeUrl 'http://127.0.0.1:18080/m3uplay/3.m3u8' `
+            -MockEnv @{ MOCK_LATENCY = '1'; MOCK_M3U = '1'; MOCK_M3U_BIG = '11000' }
+    } else {
+        $out = & (Join-Path $PSScriptRoot 'run-scenario.ps1') @common -Resume 3 -MockEnv @{ MOCK_LATENCY = '1' }
+    }
     $dir = (($out | Select-String '^config folder: (.+)$').Matches[0].Groups[1].Value).Trim()
     $log = Get-ChildItem (Join-Path $dir 'log') -Filter 'BongoPlayer.log.*' -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $log) { return }
@@ -44,17 +62,18 @@ function Summary([string]$label, $times) {
     '{0}median: {1} s (min {2}, max {3}) over {4} runs' -f $label, (Num $median), (Num $s[0]), (Num $s[$n - 1]), $n
 }
 
-$targets = @(@{ Label = ''; Exe = $Exe; Times = @() })
+$targets = @(@{ Label = ''; Exe = $Exe; M3u = [bool]$M3u; Times = @() })
 if ($Baseline) {
     if (-not (Test-Path $Baseline)) { throw "baseline exe not found: $Baseline" }
-    $targets = @(@{ Label = 'baseline'; Exe = $Baseline; Times = @() }, @{ Label = 'new'; Exe = $Exe; Times = @() })
+    $targets = @(@{ Label = 'baseline'; Exe = $Baseline; M3u = $false; Times = @() },
+                 @{ Label = 'new'; Exe = $Exe; M3u = [bool]$M3u; Times = @() })
 }
 $n = 0
 for ($i = 1; $i -le $Runs; $i++) {
     foreach ($t in $targets) {
         $n++
         $name = if ($t.Label) { "run $n ($($t.Label))" } else { "run $n" }
-        $secs = Measure-Run $t.Exe
+        $secs = Measure-Run $t.Exe $t.M3u
         if ($null -ne $secs) { $t.Times += $secs; '{0}: {1} s' -f $name, (Num $secs) }
         else { '{0}: no picture' -f $name }
     }
