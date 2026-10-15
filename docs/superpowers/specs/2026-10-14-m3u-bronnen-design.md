@@ -322,7 +322,8 @@ openliet. Kort:
   hervat. Een nieuwe bron gaat alleen meteen in gebruik als er geen bruikbare bron in gebruik is.
 - Verwijderen vraagt een tweede druk, en de bron die in gebruik is kan niet weg.
 - De headers per zender gaan mee in de URL, op de manier van Kodi (`url|User-Agent=…`). mpv krijgt ze als
-  opties voor dat ene bestand.
+  opties voor dat ene bestand. Alleen een load van een M3U-bron splitst ze af; elke andere URL gaat
+  ongewijzigd naar mpv, zoals in 0.6.1, want een Xtream-wachtwoord kan een `|` bevatten.
 - De naam in `#EXTINF` begint na de eerste komma buiten aanhalingstekens, niet na de laatste: een naam mag
   zelf komma's hebben.
 - Een download die gelijk is aan de bewaarde lijst verandert niets. Een HTML-pagina of een lijst zonder

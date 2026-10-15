@@ -14,8 +14,12 @@ use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
 pub enum Cmd {
-    /// Load this URL; it may carry its headers: `url|User-Agent=…&Referer=…` (`loadfile_args`).
+    /// Load this URL as it is, byte for byte: an Xtream URL's password may
+    /// hold a `|`.
     LoadUrl(String),
+    /// Load this URL of an M3U list's stream, which may carry its headers:
+    /// `url|User-Agent=…&Referer=…` (`loadfile_args`).
+    LoadWithHeaders(String),
     Pause(bool),
     /// Stop playing; nothing is loaded afterwards.
     Stop,
@@ -84,26 +88,14 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
             loop {
                 loop {
                     match cmd_rx.try_recv() {
-                        Ok(Cmd::LoadUrl(url)) => {
-                            let args = loadfile_args(&url);
-                            let (_, headers) = crate::m3u::split_headers(&url);
-                            let sent: Vec<&str> = [
-                                ("user-agent", headers.user_agent.is_some()),
-                                ("referrer", headers.referrer.is_some()),
-                            ]
-                            .into_iter()
-                            .filter_map(|(name, on)| on.then_some(name))
-                            .collect();
-                            let address = crate::redact::redact(&args[1]);
-                            if sent.is_empty() {
-                                info!("loadfile {}", address);
-                            } else {
-                                info!("loadfile {} ({})", address, sent.join(", "));
-                            }
-                            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                            if let Err(e) = mpv.command(&args) {
-                                warn!("loadfile failed: {}", e);
-                                let _ = evt_tx.send(Event::Error { msg: e.to_string() });
+                        Ok(load @ (Cmd::LoadUrl(_) | Cmd::LoadWithHeaders(_))) => {
+                            if let Some((args, line)) = loadfile_command(&load) {
+                                info!("{}", line);
+                                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                                if let Err(e) = mpv.command(&args) {
+                                    warn!("loadfile failed: {}", e);
+                                    let _ = evt_tx.send(Event::Error { msg: e.to_string() });
+                                }
                             }
                         }
                         Ok(Cmd::Pause(p)) => {
@@ -208,6 +200,36 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
         evt_rx: parking_lot::Mutex::new(evt_rx),
         frames,
     })
+}
+
+/// What the player thread runs for a load, and the line it logs (`None` for a
+/// command that is no load). A plain load hands mpv its URL as it is, as 0.6.1
+/// did; only a load with headers has them split off (`loadfile_args`). The line
+/// names the headers a load sends, never their values, and its address goes
+/// through `redact`.
+pub fn loadfile_command(cmd: &Cmd) -> Option<(Vec<String>, String)> {
+    let (args, sent) = match cmd {
+        Cmd::LoadUrl(url) => (vec!["loadfile".to_owned(), url.clone()], Vec::new()),
+        Cmd::LoadWithHeaders(url) => {
+            let (_, headers) = crate::m3u::split_headers(url);
+            let sent: Vec<&str> = [
+                ("user-agent", headers.user_agent.is_some()),
+                ("referrer", headers.referrer.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(name, on)| on.then_some(name))
+            .collect();
+            (loadfile_args(url), sent)
+        }
+        _ => return None,
+    };
+    let address = crate::redact::redact(&args[1]);
+    let line = if sent.is_empty() {
+        format!("loadfile {address}")
+    } else {
+        format!("loadfile {address} ({})", sent.join(", "))
+    };
+    Some((args, line))
 }
 
 /// The `loadfile` command for `url`. A URL that carries headers
@@ -376,6 +398,46 @@ mod tests {
             effective_log_level("ffmpeg", "error", "Invalid data found when processing input"),
             "error"
         );
+    }
+
+    #[test]
+    fn an_xtream_url_goes_to_mpv_byte_for_byte_with_a_pipe_in_its_password() {
+        // 0.6.1 sent a film's or an episode's URL as it is, and a password may
+        // hold a `|`.
+        for url in [
+            "http://h:80/movie/u/pa|ss/9.mkv",
+            "http://h:80/series/u/pa|ss/7.mp4",
+        ] {
+            let load = super::Cmd::LoadUrl(url.into());
+            let (args, line) = super::loadfile_command(&load).unwrap();
+            assert_eq!(args, ["loadfile", url]);
+            assert!(!line.contains("pa|ss"), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_lists_load_hands_its_headers_over_and_its_line_names_only_them() {
+        use super::Cmd::LoadWithHeaders;
+        let url = crate::m3u::with_headers(
+            "https://a.example/1.m3u8".into(),
+            Some("Secret-Agent/1"),
+            Some("https://ref.example/x"),
+        );
+        let (args, line) = super::loadfile_command(&LoadWithHeaders(url.clone())).unwrap();
+        assert_eq!(args, super::loadfile_args(&url), "options of that one file");
+        assert_eq!(args[1], "https://a.example/1.m3u8");
+        assert_eq!(
+            line,
+            "loadfile https://a.example/1.m3u8 (user-agent, referrer)"
+        );
+        let one = crate::m3u::with_headers("http://a.example/2".into(), Some("VLC"), None);
+        let (_, line) = super::loadfile_command(&LoadWithHeaders(one)).unwrap();
+        assert_eq!(line, "loadfile http://a.example/2 (user-agent)");
+        let none = LoadWithHeaders("http://a.example/3".into());
+        let (args, line) = super::loadfile_command(&none).unwrap();
+        assert_eq!(args, ["loadfile", "http://a.example/3"]);
+        assert_eq!(line, "loadfile http://a.example/3");
+        assert!(super::loadfile_command(&super::Cmd::Stop).is_none());
     }
 
     #[test]

@@ -1384,7 +1384,14 @@ impl TvApp {
         // After a stop: what is on the bus now is the stopped stream's. Read
         // before the load goes out, so no frame of the new stream is counted.
         self.frame_fence.load(self.player.frames.version());
-        let _ = self.player.cmd_tx.send(Cmd::LoadUrl(play));
+        // A list's stream carries the headers its server wants in its URL;
+        // any other goes to mpv as it is (an Xtream password may hold a `|`).
+        let load = if self.catalog.kind() == SourceKind::M3u {
+            Cmd::LoadWithHeaders(play)
+        } else {
+            Cmd::LoadUrl(play)
+        };
+        let _ = self.player.cmd_tx.send(load);
         self.stream_starting_since = Some(Instant::now());
         // Remember as last-watched so the next launch resumes it, unless it is
         // adult content (what is known about that: see last_watched_record).
@@ -4485,7 +4492,7 @@ https://c.example/twee-nieuws.m3u8\n";
     fn loads(sent: Vec<Cmd>) -> Vec<String> {
         sent.into_iter()
             .filter_map(|c| match c {
-                Cmd::LoadUrl(u) => Some(u),
+                Cmd::LoadUrl(u) | Cmd::LoadWithHeaders(u) => Some(u),
                 _ => None,
             })
             .collect()
@@ -5143,7 +5150,8 @@ https://c.example/twee-nieuws.m3u8\n";
     }
 
     fn zapped(sent: &[Cmd]) -> bool {
-        sent.iter().any(|c| matches!(c, Cmd::LoadUrl(_)))
+        sent.iter()
+            .any(|c| matches!(c, Cmd::LoadUrl(_) | Cmd::LoadWithHeaders(_)))
     }
 
     #[tokio::test]
@@ -8987,6 +8995,59 @@ https://c.example/twee-nieuws.m3u8\n";
         let loads = loads(h.sent());
         assert_eq!(loads.len(), 1, "{loads:?}");
         assert!(loads[0].starts_with("http://127.0.0.1:"), "{loads:?}");
+    }
+
+    #[tokio::test]
+    async fn an_m3u_channel_hands_mpv_its_headers_as_options_of_that_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), TEST_LIST);
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        h.sent();
+        h.press(&[Key::ArrowDown]); // Kanaal Twee, with a User-Agent and a Referer
+        let sent = h.sent();
+        let load = sent.iter().find_map(crate::player::loadfile_command);
+        let (args, line) = load.expect("a load");
+        assert_eq!(
+            args,
+            [
+                "loadfile",
+                "https://b.example/twee.m3u8",
+                "replace",
+                "-1",
+                "user-agent=%9%Bongo/1.0,http-header-fields=%33%Referer: https://www.example.com/",
+            ]
+        );
+        assert_eq!(
+            line,
+            "loadfile https://b.example/twee.m3u8 (user-agent, referrer)"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_xtream_film_with_a_pipe_in_the_password_reaches_mpv_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds = XtreamCreds {
+            password: "pa|ss".into(),
+            ..test_creds()
+        };
+        let portal = Arc::new(XtreamPortal::new(creds.clone()));
+        let catalog = Arc::new(CatalogStore::from_catalog(portal, adult_catalog()));
+        let mut h = Harness::start_with(
+            dir.path(),
+            catalog,
+            PortalState::Configured,
+            None,
+            Some(creds),
+            Sources::default(),
+            None,
+        );
+        h.sent();
+        h.app.play_movie(9, "Film");
+        let sent = h.sent();
+        let load = sent.iter().find_map(crate::player::loadfile_command);
+        let (args, _) = load.expect("a load");
+        // Byte for byte, as 0.6.1 sent it.
+        assert_eq!(args, ["loadfile", "http://h:80/movie/u/pa|ss/9.mkv"]);
     }
 
     #[tokio::test]
