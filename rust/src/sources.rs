@@ -47,6 +47,16 @@ impl SourceKind {
             },
         )
     }
+
+    /// Whether `name` is this kind's default name in any language, spaces
+    /// aside. Such a name is no name of the user's own: it is stored empty and
+    /// shown in the language in use, also when a form was made in another one.
+    pub fn is_default_name(self, name: &str) -> bool {
+        let name = name.trim();
+        Lang::ALL
+            .iter()
+            .any(|lang| self.default_name(*lang) == name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

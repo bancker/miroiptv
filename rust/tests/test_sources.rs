@@ -232,6 +232,22 @@ fn a_source_without_a_name_has_the_default_of_its_kind() {
 }
 
 #[test]
+fn a_kinds_default_name_in_any_language_is_no_name_of_its_own() {
+    for kind in [SourceKind::Xtream, SourceKind::M3u] {
+        for lang in Lang::ALL {
+            let name = kind.default_name(lang);
+            assert!(kind.is_default_name(name), "{kind:?} in {lang:?}");
+            assert!(kind.is_default_name(&format!("  {name} \r\n")), "{name}");
+        }
+        assert!(!kind.is_default_name("Thuis"));
+        assert!(!kind.is_default_name(""));
+    }
+    // The default of the other kind is a name like any other.
+    let portal = SourceKind::Xtream.default_name(Lang::En);
+    assert!(!SourceKind::M3u.is_default_name(portal));
+}
+
+#[test]
 fn a_web_address_is_http_or_https_with_a_host() {
     assert!(is_web_address(IPTV_ORG));
     assert!(is_web_address(" http://127.0.0.1:18080/m3u/list.m3u "));

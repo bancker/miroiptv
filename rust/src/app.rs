@@ -1301,6 +1301,11 @@ impl TvApp {
         for a in actions {
             self.apply_settings_action(a);
         }
+        // An answer to an action (a source to show next) gives the keyboard to
+        // its form now, in this frame, so that a Tab in the next one moves on.
+        if let Some(overlay) = self.settings_ui.as_mut() {
+            overlay.settle_keyboard(ctx);
+        }
     }
 
     /// A fixed text in the UI language.
@@ -2622,10 +2627,11 @@ impl TvApp {
     }
 
     /// The name a source is saved under: none when it is its kind's default
-    /// in the UI language (it then shows in whichever language is chosen).
+    /// in any language (it then shows in whichever language is chosen, also
+    /// when the form was made in another one).
     fn stored_name(&self, kind: SourceKind, name: &str) -> String {
         let name = name.trim();
-        if name == kind.default_name(self.lang) {
+        if kind.is_default_name(name) {
             String::new()
         } else {
             name.to_owned()
@@ -2704,7 +2710,7 @@ impl TvApp {
         }
         self.write_sources(&sources)?;
         self.sources = sources;
-        self.show_in_settings(Editing::Saved(id));
+        self.show_kept_in_settings(Editing::Saved(id));
         if !activate {
             tracing::info!("settings: source {} saved (xtream)", id);
             let shown = self.sources.get(id).map(|s| s.display_name(self.lang));
@@ -2867,10 +2873,21 @@ impl TvApp {
         self.show_in_settings(shown);
     }
 
-    /// The settings' sources section shows this source next, if it is open.
+    /// The settings' sources section shows this source next, if it is open:
+    /// the answer to a Save of a list, a Use or a Delete, given in the frame of
+    /// that action (`paint_settings` settles the keyboard then).
     fn show_in_settings(&mut self, editing: Editing) {
         if let Some(ui) = self.settings_ui.as_mut() {
             ui.show_source(editing);
+        }
+    }
+
+    /// The same for the source an Xtream Save kept, which comes when its login
+    /// has been tried, whenever that is: the section shows it only if the form
+    /// that asked is still the one on show, not one the user moved on to.
+    fn show_kept_in_settings(&mut self, editing: Editing) {
+        if let Some(ui) = self.settings_ui.as_mut() {
+            ui.show_kept_source(editing);
         }
     }
 
@@ -10254,24 +10271,28 @@ https://c.example/twee-nieuws.m3u8\n";
     }
 
     #[test]
-    fn only_the_default_name_of_the_ui_language_is_kept_as_none() {
+    fn a_default_name_in_any_language_is_kept_as_none() {
         let dir = tempfile::tempdir().unwrap();
         let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
         for lang in Lang::ALL {
             h.app.lang = lang;
             for kind in [SourceKind::Xtream, SourceKind::M3u] {
-                let own = kind.default_name(lang);
-                let spaced = format!("  {own} ");
-                assert_eq!(h.app.stored_name(kind, &spaced), "", "{lang:?}, {kind:?}");
-                // The default of another language is a name like any other.
-                for other in Lang::ALL {
-                    let theirs = kind.default_name(other);
-                    if theirs != own {
-                        let stored = h.app.stored_name(kind, theirs);
-                        assert_eq!(stored, theirs, "{other:?}'s {kind:?} name in {lang:?}");
-                    }
+                // The form may have been made in another language than the one in
+                // use now: the default of the kind in any of them is no name of its
+                // own, whatever spaces are around it.
+                for made_in in Lang::ALL {
+                    let spaced = format!("  {} ", kind.default_name(made_in));
+                    let stored = h.app.stored_name(kind, &spaced);
+                    assert_eq!(stored, "", "{made_in:?}'s {kind:?} name in {lang:?}");
                 }
                 assert_eq!(h.app.stored_name(kind, " Thuis "), "Thuis");
+                // The default of the other kind is a name like any other.
+                let other = match kind {
+                    SourceKind::Xtream => SourceKind::M3u,
+                    SourceKind::M3u => SourceKind::Xtream,
+                };
+                let theirs = other.default_name(lang);
+                assert_eq!(h.app.stored_name(kind, theirs), theirs);
             }
         }
     }
@@ -10967,16 +10988,23 @@ https://c.example/twee-nieuws.m3u8\n";
         );
     }
 
-    /// A portal that takes every call as a login that works.
-    async fn portal_that_logs_in() -> wiremock::MockServer {
+    /// A portal that answers every call with this status (and a body that is a
+    /// login that works, for a 200).
+    async fn portal_answering(status: u16) -> wiremock::MockServer {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::path("/player_api.php"))
             .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_string(r#"{"user_info":{"auth":1}}"#),
+                wiremock::ResponseTemplate::new(status)
+                    .set_body_string(r#"{"user_info":{"auth":1}}"#),
             )
             .mount(&server)
             .await;
         server
+    }
+
+    /// A portal that takes every call as a login that works.
+    async fn portal_that_logs_in() -> wiremock::MockServer {
+        portal_answering(200).await
     }
 
     /// The test of a login has come in; the frame that takes it in writes the
@@ -11142,9 +11170,247 @@ https://c.example/twee-nieuws.m3u8\n";
         // Delete button it was on is disabled now and keeps no focus.
         let shown = h.app.settings_ui.as_ref().unwrap().form_address();
         assert_eq!(shown, Some((SourceKind::Xtream, "h:80".to_owned())));
+        h.type_text("x");
+        h.frame(&[]);
         assert!(
-            h.ctx.memory(|m| m.focused()).is_some(),
-            "the keyboard is not left nowhere"
+            h.painted.iter().any(|p| p == "Portalx"),
+            "a typed character lands in the name: {:?}",
+            h.painted
+        );
+        let shown = h.app.settings_ui.as_ref().unwrap().form_address();
+        assert_eq!(shown, Some((SourceKind::Xtream, "h:80".to_owned())));
+    }
+
+    // ---- the sources section: the verdict, a late answer, keys without pauses ----
+
+    /// Into a new Xtream source's form in the settings, from the portal in use
+    /// (`portal_and_list`), with this server, and Save pressed: its login is on
+    /// its way (nothing runs until the test awaits). The Save button is disabled
+    /// while the login is tried, and has taken the keyboard along.
+    fn save_a_new_portal(h: &mut Harness, server_port: u16) {
+        h.press(&[Key::O, Key::ArrowDown, Key::Enter]);
+        for _ in 0..7 {
+            h.press(&[Key::Tab]); // user, password, Test, Save, row 1, row 2, New source
+        }
+        h.press(&[Key::Enter]); // a new source: its Xtream radio
+        h.press(&[Key::Tab, Key::Tab]); // the M3U radio, the server field
+        h.type_text(&format!("127.0.0.1:{server_port}"));
+        h.press(&[Key::Tab]);
+        h.type_text("u2");
+        h.press(&[Key::Tab]);
+        h.type_text("p2");
+        h.press(&[Key::Tab, Key::Tab, Key::Enter]); // Test, Save
+        assert_eq!(h.app.conn_state, ConnState::Testing);
+    }
+
+    /// Shift+Tab, and the quiet frame in which the focus has moved.
+    fn press_shift_tab(h: &mut Harness) {
+        let shift = egui::Modifiers::SHIFT;
+        let tab = egui::Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: shift,
+        };
+        h.frame_holding(shift, vec![tab]);
+        h.frame(&[]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_shows_its_failure_under_the_form_that_asked_and_nowhere_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = portal_answering(401).await;
+        let mut h = portal_and_list(dir.path());
+        save_a_new_portal(&mut h, server.address().port());
+        take_in_the_login(&mut h, dir.path()).await;
+        assert_eq!(h.app.conn_state, ConnState::Done(ConnCheck::BadLogin));
+        let failure = "Wrong username or password";
+        let says = |h: &Harness| h.painted.iter().any(|p| p == failure);
+        assert!(says(&h), "under the form that asked: {:?}", h.painted);
+        // The keyboard went with the Save button, which is disabled while a login is
+        // tried. Shift+Tab from nowhere goes to the last stop (New source), then back
+        // to row 2 and row 1: the portal in use, which is fine.
+        for _ in 0..3 {
+            press_shift_tab(&mut h);
+        }
+        h.press(&[Key::Enter]);
+        let shown = h.app.settings_ui.as_ref().unwrap().form_address();
+        assert_eq!(shown, Some((SourceKind::Xtream, "h:80".to_owned())));
+        assert!(!says(&h), "{:?}", h.painted);
+    }
+
+    #[tokio::test]
+    async fn a_late_login_does_not_replace_the_form_the_user_moved_on_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = portal_that_logs_in().await;
+        let mut h = portal_and_list(dir.path());
+        save_a_new_portal(&mut h, server.address().port());
+        // The login is on its way. Meanwhile the user starts another new source. The
+        // Save button is disabled for now and has taken the keyboard along:
+        // Shift+Tab from nowhere goes to the last stop, New source.
+        press_shift_tab(&mut h);
+        h.press(&[Key::Enter]);
+        h.press(&[Key::Tab, Key::Tab]); // the M3U radio, the server field
+        h.type_text("x");
+        take_in_the_login(&mut h, dir.path()).await;
+        // The portal is kept all the same, and listed ...
+        assert_eq!(h.app.sources.list().len(), 3);
+        assert!(
+            h.painted.iter().any(|p| p == "Portal · Xtream"),
+            "{:?}",
+            h.painted
+        );
+        // ... but the new form is where the user left it, with its character, and
+        // the keyboard is still in its field.
+        let host = |s: &str| Some((SourceKind::Xtream, s.to_owned()));
+        assert_eq!(
+            h.app.settings_ui.as_ref().unwrap().form_address(),
+            host("x")
+        );
+        h.type_text("y");
+        assert_eq!(
+            h.app.settings_ui.as_ref().unwrap().form_address(),
+            host("xy")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_keys_of_m_add_work_with_no_pause_between_the_save_and_the_tabs() {
+        // The keys of the e2e scenario M-add, each in a frame of its own, the Tabs
+        // right behind the Enter that saves: no quiet frame between them.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let file = dir.path().join("lijst.m3u");
+        std::fs::write(&file, TEST_LIST).unwrap();
+        let mut h = Harness::start_with(
+            dir.path(),
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            Sources::parse("portal=u:p@h:80\n"),
+            None,
+        );
+        let keys = |h: &mut Harness, keys: &[Key]| {
+            for &key in keys {
+                h.frame(&[key]);
+            }
+        };
+        h.press(&[Key::O]);
+        keys(&mut h, &[Key::ArrowDown, Key::Enter]);
+        keys(&mut h, &[Key::Tab; 6]);
+        keys(&mut h, &[Key::Enter, Key::Tab, Key::Enter, Key::Tab]);
+        h.type_text(&file.display().to_string());
+        keys(&mut h, &[Key::Tab, Key::Enter]); // Save
+        assert_eq!(h.app.sources.list().len(), 2, "saved as source 2");
+        keys(&mut h, &[Key::Tab; 5]); // address, Save, row 1, row 2, Use this source
+        keys(&mut h, &[Key::Enter]);
+        assert_eq!(h.app.sources.active_id(), Some(2));
+        assert_eq!(h.app.catalog.kind(), SourceKind::M3u);
+        std::env::remove_var("BONGO_INI");
+    }
+
+    /// Source 1, the tests' portal, in use, and source 2, a list in a file in
+    /// `dir`. Nothing in it writes the ini or asks the network: hold ENV_LOCK
+    /// with `BONGO_INI` in `dir` for what does.
+    fn portal_and_a_list_in_a_file(dir: &std::path::Path) -> Harness {
+        let file = dir.join("lijst.m3u");
+        std::fs::write(&file, TEST_LIST).unwrap();
+        let sources = Sources::parse(&format!(
+            "source=1;xtream;;u:p@h:80\nsource=2;m3u;Lijst;{}\nactive=1\n",
+            file.display()
+        ));
+        Harness::start_with(
+            dir,
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            sources,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_tab_in_the_frame_after_a_use_moves_on_from_the_name() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let mut h = portal_and_a_list_in_a_file(dir.path());
+        h.press(&[Key::O, Key::ArrowDown, Key::Enter]);
+        for _ in 0..6 {
+            h.press(&[Key::Tab]); // user, password, Test, Save, row 1, row 2
+        }
+        h.press(&[Key::Enter]); // the list
+        for _ in 0..5 {
+            h.frame(&[Key::Tab]); // address, Save, row 1, row 2, Use this source
+        }
+        h.frame(&[Key::Enter]); // the list is in use now: the form shows it again
+        assert_eq!(h.app.sources.active_id(), Some(2));
+        // The very next frame has the Tab, then a character: it goes to the address.
+        h.frame(&[Key::Tab]);
+        h.type_text("x");
+        std::env::remove_var("BONGO_INI");
+        let shown = h.app.settings_ui.as_ref().unwrap().form_address();
+        let address = shown.map(|(_, address)| address).unwrap_or_default();
+        assert!(address.ends_with("lijst.m3ux"), "{address}");
+    }
+
+    #[test]
+    fn a_tab_in_the_frame_after_a_delete_moves_on_from_the_name() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let mut h = portal_and_a_list_in_a_file(dir.path());
+        h.press(&[Key::O, Key::ArrowDown, Key::Enter]);
+        for _ in 0..6 {
+            h.press(&[Key::Tab]); // user, password, Test, Save, row 1, row 2
+        }
+        h.press(&[Key::Enter]); // the list
+        for _ in 0..7 {
+            h.frame(&[Key::Tab]); // address, Save, row 1, row 2, Use, New, Delete
+        }
+        h.frame(&[Key::Enter]); // asks
+        h.frame(&[Key::Enter]); // deletes: the form shows the portal in use again
+        assert_eq!(h.app.sources.list().len(), 1);
+        // The very next frame has the Tab, then a character: it goes to the server.
+        h.frame(&[Key::Tab]);
+        h.type_text("x");
+        std::env::remove_var("BONGO_INI");
+        let shown = h.app.settings_ui.as_ref().unwrap().form_address();
+        assert_eq!(shown, Some((SourceKind::Xtream, "h:80x".to_owned())));
+    }
+
+    #[test]
+    fn a_default_name_made_in_one_language_is_kept_as_none_in_another() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("test.ini");
+        std::env::set_var("BONGO_INI", &ini);
+        let file = dir.path().join("lijst.m3u");
+        std::fs::write(&file, TEST_LIST).unwrap();
+        let mut h = portal_and_list(dir.path());
+        h.app.lang = Lang::Nl;
+        h.press(&[Key::O, Key::ArrowDown, Key::Enter]);
+        for _ in 0..7 {
+            h.press(&[Key::Tab]); // user, password, Test, Save, row 1, row 2, New source
+        }
+        h.press(&[Key::Enter, Key::Tab, Key::Enter, Key::Tab]); // a new list: "M3U-lijst"
+        h.type_text(&file.display().to_string());
+        // The language is switched while the form is open, as in the Language section.
+        h.app
+            .apply_settings_action(SettingsAction::SetLanguage(Lang::En));
+        h.press(&[Key::Tab, Key::Enter]); // Save
+        std::env::remove_var("BONGO_INI");
+        assert_eq!(h.app.sources.get(3).map(|s| s.name.as_str()), Some(""));
+        let saved = std::fs::read_to_string(&ini).unwrap();
+        assert!(saved.contains("source=3;m3u;;"), "{saved}");
+        assert!(
+            h.painted.iter().any(|p| p == "M3U list · M3U"),
+            "the row shows the English default: {:?}",
+            h.painted
         );
     }
 }
