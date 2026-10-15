@@ -73,6 +73,11 @@ pub struct GuideChannel {
 /// first appear. Of several live or catch-up variants the one zapping would
 /// pick wins ([`zap_preference`]); on a tie, the first.
 pub fn guide_channels_of(live: &[LiveChannel]) -> Vec<GuideChannel> {
+    // A column needs a catch-up variant, so without one there is none. An M3U
+    // list never has one: grouping its ~11,000 names to find that out took ~6 ms.
+    if !live.iter().any(|c| c.tv_archive == 1) {
+        return Vec::new();
+    }
     let mut order: Vec<String> = Vec::new();
     let mut groups: HashMap<String, Vec<&LiveChannel>> = HashMap::new();
     for ch in live {

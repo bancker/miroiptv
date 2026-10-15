@@ -1,4 +1,4 @@
-use bongo_player::catalog::{CatalogNotice, CatalogStatus, CatalogStore};
+use bongo_player::catalog::{guide_channels_of, CatalogNotice, CatalogStatus, CatalogStore};
 use bongo_player::epg::Epg;
 use bongo_player::portal::m3u::M3uPortal;
 use bongo_player::portal::{Catalog, Episode, LiveChannel, Portal, PortalError};
@@ -324,4 +324,57 @@ fn an_m3u_catalog_says_not_adult_by_its_kind_whatever_the_data_says() {
     let (_, catalog) = flagged();
     let xtream = CatalogStore::from_catalog(Arc::new(ScriptedPortal::new([])), catalog);
     assert!(xtream.is_adult_url(&url), "the flag counts for Xtream");
+}
+
+/// A list of `n` channels in iptv-org's shape: a tvg-id, a group and a logo
+/// each, and the quality in the name.
+fn list_of(n: usize) -> String {
+    let mut text = String::from("#EXTM3U\n");
+    for i in 0..n {
+        text.push_str(&format!(
+            "#EXTINF:-1 tvg-id=\"Kanaal{i}.xx@SD\" tvg-logo=\"https://logos.example/{i}.png\" \
+             group-title=\"Groep {}\",Kanaal {i} (1080p)\nhttps://cdn{}.example.net/live/{i}/index.m3u8\n",
+            i % 183,
+            i % 9
+        ));
+    }
+    text
+}
+
+/// Calls `work` `n` times and prints the first call (as a start makes it), the
+/// best and the mean, in ms. It asserts no speed: a busy machine would fail it.
+fn print_timing(what: &str, n: usize, mut work: impl FnMut()) {
+    let ms: Vec<f64> = (0..n)
+        .map(|_| {
+            let t0 = std::time::Instant::now();
+            work();
+            t0.elapsed().as_secs_f64() * 1000.0
+        })
+        .collect();
+    let best = ms.iter().copied().fold(f64::MAX, f64::min);
+    let mean = ms.iter().sum::<f64>() / n as f64;
+    println!(
+        "{what}: first {:.3} ms, best {best:.3} ms, mean {mean:.3} ms ({n} calls)",
+        ms[0]
+    );
+}
+
+/// Timed by hand: what an M3U catalog of iptv-org's size costs where it is
+/// stored (the guide's merge, once for every catalog put: the saved list and
+/// the fresh one) and per up/down press (the zap list: every key repeat clones
+/// the whole list).
+/// `cargo test --release --test test_catalog_m3u -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn an_eleven_thousand_channel_m3u_catalog_timed() {
+    let (portal, catalog) = M3uPortal::from_text(&list_of(11_262)).unwrap();
+    assert_eq!(catalog.live.len(), 11_262);
+    print_timing("guide_channels_of", 20, || {
+        let guide = std::hint::black_box(guide_channels_of(std::hint::black_box(&catalog.live)));
+        assert!(guide.is_empty(), "an M3U list has no catch-up");
+    });
+    let store = CatalogStore::from_catalog(Arc::new(portal), catalog);
+    print_timing("zap_channels", 100, || {
+        assert_eq!(std::hint::black_box(store.zap_channels()).len(), 11_262);
+    });
 }

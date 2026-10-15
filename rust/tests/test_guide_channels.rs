@@ -1,5 +1,6 @@
 use bongo_player::args::XtreamCreds;
 use bongo_player::catalog::{guide_channels_of, CatalogStore};
+use bongo_player::portal::m3u::M3uPortal;
 use bongo_player::portal::xtream::XtreamPortal;
 use bongo_player::portal::{Catalog, LiveChannel};
 use std::sync::Arc;
@@ -67,6 +68,33 @@ fn a_channel_with_a_catch_up_twin_is_one_column() {
 fn a_channel_without_catch_up_is_no_column() {
     let live = [ch(1, "INFO CHANNEL PANDORA", 0), ch(2, "NL | OPENHAARD", 0)];
     assert!(guide_channels_of(&live).is_empty());
+}
+
+/// An M3U list has no catch-up (`tv_archive` 0 on every entry), so it has no
+/// guide columns, however many entries share a name or a quality.
+/// `guide_channels_of` leaves such a list at once; it used to group the names of
+/// 11,000 entries to find nothing (about 6 ms in a release build, twice a start).
+///
+/// This pins the RESULT that early exit must not change, not the speed: it
+/// passed before the exit was there. It fails when a list without catch-up
+/// gets a column, e.g. an exit that returns the entries, or
+/// `best(true).or_else(|| best(false))?` in the grouping.
+#[test]
+fn a_list_without_catch_up_has_no_guide_columns() {
+    let (portal, catalog) = M3uPortal::from_text(
+        "#EXTM3U\n\
+         #EXTINF:-1 tvg-id=\"NPO1.nl\",NL | NPO 1\nhttps://a.example/npo1.m3u8\n\
+         #EXTINF:-1,NL | NPO 1 HD\nhttps://a.example/npo1hd.m3u8\n\
+         #EXTINF:-1,NL | RTL 4\nhttps://a.example/rtl4.m3u8\n",
+    )
+    .unwrap();
+    assert_eq!(catalog.live.len(), 3);
+    assert!(catalog.live.iter().all(|c| c.tv_archive == 0));
+    assert!(guide_channels_of(&catalog.live).is_empty());
+    let store = CatalogStore::from_catalog(Arc::new(portal), catalog);
+    assert!(store.guide_channels().is_empty());
+    store.set_adult_unlocked(true);
+    assert!(store.guide_channels().is_empty(), "the PIN changes nothing");
 }
 
 #[test]
