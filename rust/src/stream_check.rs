@@ -14,8 +14,10 @@
 //! verification on for mpv too. At most one check per channel and [`AT_ONCE`]
 //! at a time, on the app's tokio runtime; the answers wait in a slot the app
 //! drains once per frame. The app never asks the server of the stream that
-//! plays ([`same_server`]). An address never reaches a log line or a `Debug`
-//! print: a paid list's addresses hold credentials.
+//! plays ([`same_server`]): not when a suspect is confirmed, and not later
+//! either, when the user moves to that server while its check waits or is on
+//! its way ([`StreamChecker::forget_server`]). An address never reaches a log
+//! line or a `Debug` print: a paid list's addresses hold credentials.
 
 use parking_lot::Mutex;
 use reqwest::header::HeaderValue;
@@ -111,6 +113,23 @@ pub struct Checked {
     pub answer: Answer,
 }
 
+/// Where an address is: its scheme, its host in lower case and its port (the
+/// scheme's default when it names none). What [`same_server`] compares.
+type Server = (String, String, Option<u16>);
+
+/// A check on its way.
+struct Running {
+    /// The ticket its answer must carry.
+    ticket: u64,
+    /// Aborted when the check is dropped.
+    task: tokio::task::JoinHandle<()>,
+    /// Where its address is (`None`: an address that cannot be read), for
+    /// [`StreamChecker::forget_server`].
+    server: Option<Server>,
+    /// For the app's log, should the check be dropped.
+    name: String,
+}
+
 /// The checks of the source in use.
 pub struct StreamChecker {
     /// Built on the first check, not before: a session without one pays
@@ -118,9 +137,8 @@ pub struct StreamChecker {
     client: Option<reqwest::Client>,
     /// The client could not be built (warned once): no check asks then.
     client_failed: bool,
-    /// Checks on their way: stream id → the ticket its answer must carry, and
-    /// its task, aborted when the check is dropped.
-    in_flight: HashMap<i64, (u64, tokio::task::JoinHandle<()>)>,
+    /// Checks on their way, by stream id.
+    in_flight: HashMap<i64, Running>,
     /// Checks waiting for one of the [`AT_ONCE`] places.
     waiting: VecDeque<Check>,
     next_ticket: u64,
@@ -173,7 +191,7 @@ impl StreamChecker {
             let ours = self
                 .in_flight
                 .get(&checked.stream_id)
-                .is_some_and(|(t, _)| *t == ticket);
+                .is_some_and(|running| running.ticket == ticket);
             if ours {
                 self.in_flight.remove(&checked.stream_id);
                 answers.push(checked);
@@ -190,18 +208,60 @@ impl StreamChecker {
     /// Needs a tokio runtime context, as it may spawn that check (see
     /// [`StreamChecker::start`]).
     pub fn forget(&mut self, stream_id: i64) {
-        if let Some((_, task)) = self.in_flight.remove(&stream_id) {
-            task.abort();
+        if let Some(running) = self.in_flight.remove(&stream_id) {
+            running.task.abort();
         }
         self.waiting.retain(|c| c.stream_id != stream_id);
         self.fill();
     }
 
+    /// Drops every check, waiting or on its way, whose address is on the
+    /// server of `url` (see [`same_server`]): the stream that plays from now on
+    /// is there, and a paid list's portal allows one session per account, so
+    /// the check would take that session or be refused and mark a channel that
+    /// works (ruling 28b). The app calls it on every load, so a check that
+    /// waited for a place, or has not answered yet, does not ask the server the
+    /// user moved to. Gives the stream id and the name of each check it
+    /// dropped, in the order of the ids, for the log; their answers are
+    /// ignored. A place freed goes to the check that waits at once. Nothing to
+    /// look at while no check runs or waits.
+    ///
+    /// Needs a tokio runtime context, as it may spawn that check (see
+    /// [`StreamChecker::start`]).
+    pub fn forget_server(&mut self, url: &str) -> Vec<(i64, String)> {
+        let mut dropped = Vec::new();
+        if self.in_flight.is_empty() && self.waiting.is_empty() {
+            return dropped;
+        }
+        // An address that cannot be read is on no server, so never on this one.
+        let Some(server) = server_of(url) else {
+            return dropped;
+        };
+        self.in_flight.retain(|&stream_id, running| {
+            if running.server.as_ref() != Some(&server) {
+                return true;
+            }
+            running.task.abort();
+            dropped.push((stream_id, std::mem::take(&mut running.name)));
+            false
+        });
+        self.waiting.retain(|check| {
+            if server_of(&check.url).as_ref() != Some(&server) {
+                return true;
+            }
+            dropped.push((check.stream_id, check.name.clone()));
+            false
+        });
+        dropped.sort_unstable_by_key(|&(stream_id, _)| stream_id);
+        self.fill();
+        dropped
+    }
+
     /// Drops every check: another source is in use, and their answers are
     /// ignored.
     pub fn reset(&mut self) {
-        for (_, (_, task)) in self.in_flight.drain() {
-            task.abort();
+        for (_, running) in self.in_flight.drain() {
+            running.task.abort();
         }
         self.waiting.clear();
     }
@@ -235,6 +295,8 @@ impl StreamChecker {
         let client = self.http_client();
         let done = self.done.clone();
         let stream_id = check.stream_id;
+        let server = server_of(&check.url);
+        let name = check.name.clone();
         let task = tokio::spawn(async move {
             let web = check.url.starts_with("http://") || check.url.starts_with("https://");
             let answer = match client.filter(|_| web) {
@@ -249,7 +311,13 @@ impl StreamChecker {
             };
             done.lock().push((ticket, checked));
         });
-        self.in_flight.insert(stream_id, (ticket, task));
+        let running = Running {
+            ticket,
+            task,
+            server,
+            name,
+        };
+        self.in_flight.insert(stream_id, running);
     }
 
     /// The HTTP client, built on the first check. `None` when it cannot be
@@ -398,7 +466,7 @@ pub fn same_server(a: &str, b: &str) -> bool {
 
 /// The scheme, the host in lower case and the port of `url` (the scheme's
 /// default when it names none).
-fn server_of(url: &str) -> Option<(String, String, Option<u16>)> {
+fn server_of(url: &str) -> Option<Server> {
     let address = url.split('|').next().unwrap_or(url);
     let parsed = reqwest::Url::parse(address).ok()?;
     let host = parsed.host_str()?.to_ascii_lowercase();
@@ -567,6 +635,99 @@ mod tests {
         }
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].answer, Answer::Status(404));
+        assert_eq!(checker.in_flight(), 0);
+    }
+
+    // ---- the server of the stream that plays from now on ----
+
+    #[tokio::test]
+    async fn forgetting_a_server_drops_its_checks_waiting_or_on_their_way() {
+        // Six slow checks: four on their way, two waiting. 1 and 5 are on `here`,
+        // the server of the stream that plays from now on; 2, 3, 4 and 6 are not.
+        let here = answering(404, Duration::from_millis(300)).await;
+        let elsewhere = answering(404, Duration::from_millis(300)).await;
+        let mut checker = StreamChecker::new();
+        let servers = [&here, &elsewhere, &elsewhere, &elsewhere, &here, &elsewhere];
+        for (id, server) in (1..).zip(servers) {
+            checker.start(check(id, format!("{}/{id}", server.uri())));
+        }
+        assert_eq!(checker.in_flight(), AT_ONCE);
+        assert!(checker.checking(5) && checker.checking(6), "two wait");
+        // What plays has headers after a Kodi `|`, and a path of its own.
+        let playing = format!("{}/live/9.m3u8|User-Agent=Bongo%2F1.0", here.uri());
+        let dropped = checker.forget_server(&playing);
+        assert_eq!(dropped, [(1, "K1".to_owned()), (5, "K5".to_owned())]);
+        assert!(!checker.checking(1) && !checker.checking(5));
+        for id in [2, 3, 4, 6] {
+            assert!(checker.checking(id), "{id} stays");
+        }
+        // The place of check 1 went to the check that waited, 6.
+        assert_eq!(checker.in_flight(), AT_ONCE);
+        // Their answers come, and only theirs.
+        let mut got = Vec::new();
+        for _ in 0..1000 {
+            got.extend(checker.drain().into_iter().map(|checked| checked.stream_id));
+            if !checker.checking(2)
+                && !checker.checking(3)
+                && !checker.checking(4)
+                && !checker.checking(6)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        got.sort_unstable();
+        assert_eq!(got, [2, 3, 4, 6]);
+        // Check 5 never started: nothing asked its path.
+        let asked = here.received_requests().await.unwrap();
+        let paths: Vec<&str> = asked.iter().map(|request| request.url.path()).collect();
+        assert!(!paths.contains(&"/5"), "{paths:?}");
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_server_no_check_is_on_changes_nothing() {
+        let server = answering(404, Duration::from_millis(200)).await;
+        let mut checker = StreamChecker::new();
+        // Nothing runs: nothing to look at.
+        assert!(checker.forget_server("https://x.example/a.m3u8").is_empty());
+        checker.start(check(1, format!("{}/1", server.uri())));
+        let port = server.address().port();
+        let others = [
+            "https://x.example/a.m3u8".to_owned(),
+            // The same host on another port, and with the other scheme's port.
+            format!("http://127.0.0.1:{}/1", port.wrapping_add(1)),
+            "https://127.0.0.1/1".to_owned(),
+            // No address: it is on no server, so never on this one.
+            "not an address".to_owned(),
+            String::new(),
+        ];
+        for other in others {
+            assert!(checker.forget_server(&other).is_empty(), "{other:?}");
+            assert!(checker.checking(1), "{other:?}");
+        }
+        // Its own server, whatever the path: gone.
+        let own = format!("{}/anything", server.uri());
+        assert_eq!(checker.forget_server(&own), [(1, "K1".to_owned())]);
+        assert!(!checker.checking(1));
+    }
+
+    #[tokio::test]
+    async fn an_answer_already_in_the_slot_of_a_forgotten_server_never_lands() {
+        let server = answering(404, Duration::ZERO).await;
+        let mut checker = StreamChecker::new();
+        checker.start(check(1, format!("{}/1", server.uri())));
+        for _ in 0..1000 {
+            if !checker.done.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(checker.done.lock().len(), 1, "the answer is in the slot");
+        assert_eq!(checker.forget_server(&server.uri()), [(1, "K1".to_owned())]);
+        assert!(
+            checker.drain().is_empty(),
+            "the answer of a dropped check landed"
+        );
         assert_eq!(checker.in_flight(), 0);
     }
 
