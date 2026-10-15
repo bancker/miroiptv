@@ -10,14 +10,14 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-15-zenderlijst-design.md`
 
-**Where:** the main checkout `C:\Dropbox\Sources\tv`, branch `feat/zenderlijst`, which the controller rebases on the finished `feat/m3u-bronnen` and checks out there before Task 1. The M3U branch got commits after this plan was written (docs, an early exit in `catalog::guide_channels_of`, and a fix wave and a residual round up to the M3U branch's final head: `Cmd::LoadWithHeaders` and `player::loadfile_command`, `split_headers` skipping empty values, `Portal::retire`, `Sources::keep` returning `Option` and never giving a list id 1, the `zap_to` empty-address guard, the eof-before-picture frame drop, test-only `Debug` on the source types, the tests' `loads`/`zapped` taking both load kinds, and `list_server`; then a played channel that keeps its own last frame when its reloads run out, the NUL check reading only the first KB, and `Cmd`, `XtreamCreds`, `XtreamPortal` and `LastWatched` deriving `Debug` in tests only). This plan names functions and types, never line numbers. When a function it names reads differently from what a step shows around the change, keep the step's meaning, make the change there, and say so in your report.
+**Where:** the main checkout `C:\Dropbox\Sources\tv`, branch `feat/zenderlijst`, which the controller rebases on the finished `feat/m3u-bronnen` and checks out there before Task 1. The M3U branch got commits after this plan was written (docs, an early exit in `catalog::guide_channels_of`, and a fix wave and a residual round up to the M3U branch's final head: `Cmd::LoadWithHeaders` and `player::loadfile_command`, `split_headers` skipping empty values, `Portal::retire`, `Sources::keep` returning `Option` and never giving a list id 1, the `zap_to` empty-address guard, the eof-before-picture frame drop, test-only `Debug` on the source types, the tests' `loads`/`zapped` taking both load kinds, and `list_server`; then a played channel that keeps its own last frame when its reloads run out (`current_has_played`), the NUL check reading only the first KB, `Cmd`, `XtreamCreds`, `XtreamPortal`, `LastWatched` and `args::Cli` deriving `Debug` in tests only, a pick that never played taking off the picture of one that did (a test), and the download's buffer sized from Content-Length only once its first KB has passed the NUL check). This plan names functions and types, never line numbers. When a function it names reads differently from what a step shows around the change, keep the step's meaning, make the change there, and say so in your report.
 
 ## Global Constraints
 
 - **Performance is binding.** Startup and zapping are not slower than 0.6.1: the A/B script (`rust/e2e/measure-startup.ps1 -Baseline`) against the 0.6.1 release exe, at least 10 runs each, median and minimum within ±10 %, with an Xtream source, and with an active M3U source of about 11,000 channels (`-M3u`). The groups and their order are worked out in 20 ms or less for 11,000 channels in a release build, and keep less than 1 MB: positions, never copies of channels. A zap press copies no channel list. A closed list costs nothing per frame: no work, no memory. No network, except one check per confirmed suspect (M3U only); no new thread. The only new work at startup is reading one small file when an M3U catalog loads.
 - **Dependencies:** no new crates. `serde`, `serde_json`, `chrono` and `parking_lot` are direct dependencies already; `tempfile` is a dev-dependency.
 - **Texts:** no UI text outside `i18n.rs`; every key has NL, EN and DE; log lines stay English.
-- **Credentials:** an M3U address is a credential. The marks file holds stream ids and unix times only: no names, no URLs. Log lines name a channel by its name (through `crate::redact::redact`) and its stream id, as the zap line does; never a URL, also not the address the check before a mark asks (`Check` has no `Debug`). `Cmd`, `XtreamCreds`, `CredsSource`, `XtreamPortal` and `LastWatched` derive `Debug` in the crate's own tests only, and the integration tests (`rust/tests/`) link the lib without them: code there never formats one with `{:?}`, nor compares one with `assert_eq!` or takes one out of `unwrap_err`.
+- **Credentials:** an M3U address is a credential. The marks file holds stream ids and unix times only: no names, no URLs. Log lines name a channel by its name (through `crate::redact::redact`) and its stream id, as the zap line does; never a URL, also not the address the check before a mark asks (`Check` has no `Debug`). `Cmd`, `args::Cli`, `XtreamCreds`, `CredsSource`, `XtreamPortal` and `LastWatched` derive `Debug` in the crate's own tests only, and the integration tests (`rust/tests/`) link the lib without them: code there never formats one with `{:?}`, nor compares one with `assert_eq!` or takes one out of `unwrap_err`.
 - **The catalog is the only filter.** Zapping, the channel list and the search read the adult lock and the defect marks through `CatalogStore`, never from a copy of their own.
 - **Defect marks are an M3U source's alone.** An Xtream portal never reads, writes or applies them, and never checks an address.
 - **Release profile** is `panic = "abort"`: nothing may rely on catching a panic.
@@ -33,6 +33,7 @@
 - **Formatting:**
   - Every new file is rustfmt-clean (`rustfmt --check --edition 2021 <file>`).
   - In `app.rs` and `catalog.rs` (not rustfmt-clean), format only the lines you add. Before you edit such a file, note `rustfmt --check --edition 2021 <file> 2>&1 | grep -c '^Diff in'`; the count must be the same afterwards. Put new `use` lines inside the file's existing import block.
+  - The old hunks at the base (Task 1 notes them): `app.rs` 7, `catalog.rs` 3, `main.rs` 0, `player/mod.rs` 2, `portal/mod.rs` 1 (the one in `portal/xtream.rs`, which it declares), `portal/xtream.rs` 1, `tests/test_args.rs` 8, `tests/test_xtream.rs` 8; every other file is clean. No task touches `main.rs`, `player/`, `portal/` or those two test files. Every task keeps these counts: its new or touched code adds no hunk.
   - rustfmt on a file also checks the modules that file declares. Never pass `lib.rs` to it.
   - Files that are clean before you edit them stay clean: check `storage.rs`, `i18n.rs`, `guide_ui.rs` and the test files you touch before and after.
 - **Clippy:** `cargo clippy --all-targets` shows only the 2 pre-existing warnings (`portal/xtream.rs` items after a test module, `main.rs` nul-terminated string).
@@ -66,7 +67,7 @@ The spec is the authority. These settle what it leaves open, one line each: what
 
 1. **Where a start "fails before its first picture" (§4.1):** `EndOfFile` "error"; "eof" once the reload budget is spent; a refused load (`Event::Error` while starting); the stall watchdog. Only on an M3U source, while `stream_starting_since` is set, for a live channel with a stream id. These are all the ways a start ends without a picture today.
 2. **"The app gives the start up" (stall watchdog):** an M3U channel that showed no picture since it was picked is no longer reloaded when the watchdog fires; it stops as a refused load does (Stop, the old picture goes, "streamfout op …") and becomes a suspect. A reload would only start the 25 s wait over, with a "herverbinden" toast each time. Xtream is unchanged.
-3. **A channel that showed a picture since it was picked** (`current_showed_picture`, kept by reloads of the same stream, cleared by every other load) is never a suspect: its failing reloads are the "zender die beeld gaf en daarna wegvalt" of §4.1.
+3. **A channel that showed a picture since it was picked** (`current_has_played`, the base's flag: kept by reloads of the same stream, cleared by every other load and by `stop_playback`) is never a suspect: its failing reloads are the "zender die beeld gaf en daarna wegvalt" of §4.1.
 4. **"First picture" is mpv's playback-restart (`Event::PlaybackStarted`)**, the moment that clears `stream_starting_since`. Any first picture confirms the other suspects, also one of a stream without a stream id: the connection worked.
 5. **Clocks:** `BadStreams` takes `now: Instant` (the 2 minutes) and `now_unix: i64` (the 7 days) as arguments; the app passes `Instant::now()` and `chrono::Utc::now().timestamp()`; tests pass made-up values. No clock trait: the module's tests cover both windows exactly, and app tests use real time and files with old timestamps.
 6. **A mark keeps the time of the failure**, which "hoe lang geleden" shows and the 7 days count from; "older than 7 days" is more than 604,800 s.
@@ -90,9 +91,9 @@ The spec is the authority. These settle what it leaves open, one line each: what
 24. **The list leaves 64 px under it** for the toast: "streamfout op …" must stay visible (§3.5).
 25. **While the list is open no other hotkey works** (§3.1), and opening it closes the favorites list (its rows take clicks).
 26. **`T::NoGuideForSource` goes; `T::HelpOpenGuide` names the list.** `g` while an M3U catalog loads shows the guide's existing `T::GuideCatalogLoading`.
-27. **e2e:** `M-list` replaces `M-guide` (its toast is gone); `M-defect` goes M3U DOOD → M3U UA → Down and expects M3U REF, since DOOD sits between UA and REF in the mock's file order; the check finds `/m3uplay/dead.m3u8` 404, so the mark comes as before.
+27. **e2e:** `M-list` replaces `M-guide` (its toast is gone); `M-defect` goes M3U DOOD → M3U UA → Down and expects M3U REF, since DOOD sits between UA and REF in the mock's file order; the check finds `/m3uplay/dead.m3u8` 404, so the mark comes as before. The mock serves DOOD under `localhost` and every other channel under `127.0.0.1`, so DOOD is not on the server of UA, which plays (ruling 28b).
 28. **The check before a mark (the user, 2026-10-15: "Ja, met controle"):** a suspect that the 2-minute rule confirms is not marked at once. Its address is asked once, in the background: one GET with the channel's own User-Agent and Referer (the `|…` split `loadfile_args` uses), 5 s for the connection and the headers, the status only (the body is never read). A status of 400 or more after redirects, no connection (DNS, refused, a failed TLS handshake) or no answer in time marks it; 2xx or 3xx drops the suspicion. At most one check per suspect and 4 in flight; a renewal of a marked channel needs none; another source (switch, save) drops the running checks and ignores their answers. On the app's tokio runtime, the client built on the first check, the answers through a slot `update_ui` drains (as the logos'). Why: a Wi-Fi drop of under 2 minutes would mark every channel tried during it.
-28b. **A check never asks the server of the stream that plays now.** That stream is the channel whose first picture confirms the suspect. A paid list served by an Xtream portal gives every channel one account, and the portal allows one session per account. Either the newest wins, so the check's GET takes the playing channel's session (an eof, a reload, a visible "herverbinden"), or the portal refuses it with a 4xx, which would mark a live channel. Such a suspect is not marked and its suspicion goes. The log says `m3u: <name> (stream_id <id>) not checked (the server of what plays), not marked`. "The same server" is the same scheme, host (any letter case) and port, the scheme's default port filled in (`stream_check::same_server`).
+    - **28b.** **A check never asks the server of the stream that plays now.** That stream is the channel whose first picture confirms the suspect. A paid list served by an Xtream portal gives every channel one account, and the portal allows one session per account. Either the newest wins, so the check's GET takes the playing channel's session (an eof, a reload, a visible "herverbinden"), or the portal refuses it with a 4xx, which would mark a live channel. Such a suspect is not marked and its suspicion goes. The log says `m3u: <name> (stream_id <id>) not checked (the server of what plays), not marked`. "The same server" is the same scheme, host (any letter case) and port, the scheme's default port filled in (`stream_check::same_server`).
 29. **An address the check cannot ask** (no http or https, or no HTTP client) is not marked: the spec marks a confirmed suspect only when the check finds it dead too (§4.2), and its error falls to the safe side. Its suspicion goes; the log says `m3u: <name> (stream_id <id>) not checked (<what>), not marked`.
 30. **A channel that names no User-Agent is asked as mpv asks it**, with libmpv's default `libmpv` (pinned by an ignored smoke test against the vendored libmpv), so the server answers the check as it answered the player. It takes a certificate and header bytes as mpv does: no certificate check, header values as bytes. The check hands no `Referer` of its own on through a redirect: that would give a tokenized address to another server. A delete never touches the source in use, so only a switch or a save drops checks.
 31. **`bad_streams.rs` keeps a `write_atomic` of its own**, as each file kind of the app does (args.rs, settings.rs, sources.rs, guide/cache.rs, portal/m3u.rs): one shared helper is a cleanup of its own.
@@ -181,8 +182,20 @@ A pure module that keeps the suspicions of this session and the marks of one sou
 
 - [ ] **Step 1: The baseline**
 
-Run: `ct`, then `cc`.
-Expected: everything passes, and clippy shows the 2 old warnings. Note the passing tests and the warnings for your report: every later task compares with them.
+Run: `ct`, then `cc`, then the old rustfmt hunks of every file but `lib.rs` (it prints only the files that have some): `cd /c/Dropbox/Sources/tv/rust && for f in $(find src tests -name '*.rs' | grep -v '^src/lib.rs$' | sort); do n=$(rustfmt --check --edition 2021 $f 2>&1 | grep -c '^Diff in'); [ "$n" = 0 ] || echo "$f: $n"; done`
+Expected: everything passes; clippy shows the 2 old warnings; the hunks are these seven lines, and every other file (`main.rs` among them) is clean (Global Constraints, Formatting):
+
+```
+src/app.rs: 7
+src/catalog.rs: 3
+src/player/mod.rs: 2
+src/portal/mod.rs: 1
+src/portal/xtream.rs: 1
+tests/test_args.rs: 8
+tests/test_xtream.rs: 8
+```
+
+Note the passing tests, the warnings and the hunks for your report: every later task compares with them.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -1389,7 +1402,7 @@ Expected: all pass (the module's own tests, `dedupe_zap` among them).
 - [ ] **Step 8: Format, lint, full suite**
 
 - Run `fmt tests/test_zap_ring.rs tests/test_catalog_m3u.rs`. Expected: no output.
-- Check the hunk count of `catalog.rs`: the same as before.
+- Check the hunk count of `catalog.rs`: 3, as at the baseline (Task 1).
 - Run `cc`. Expected: only the 2 old warnings.
 - Run `ct`. Expected: everything passes.
 
@@ -1690,7 +1703,7 @@ Expected: all pass, the old zapping tests among them (`an_xtream_portal_zaps_on_
 
 - [ ] **Step 5: Format, lint, full suite**
 
-- Check the hunk count of `app.rs`: the same as before.
+- Check the hunk count of `app.rs`: 7, as at the baseline (Task 1).
 - Run `cc`. Expected: only the 2 old warnings (no unused import).
 - Run `ct`. Expected: everything passes.
 
@@ -2439,11 +2452,11 @@ The app keeps the M3U source's marks (`BadStreams`), read when its catalog loads
   - Task 2: `CatalogStore::{set_defect, is_defect, live_name}`;
   - Task 3: `TvApp::plays`, the tests' `RING`, `m3u_sid`, `ring_url`;
   - Task 4: `StreamChecker::{new, start, drain, forget, reset, checking, in_flight}`, `Check`, `Checked`, `Answer::{is_dead, kind, Unchecked}`, `same_server`;
+  - `current_has_played: bool` (app.rs, from the base): the stream that plays has shown a picture since it was picked; `PlaybackStarted` sets it, a load that is no reload clears it;
   - existing in `app.rs`: `drain_events` (the `PlaybackStarted`, `EndOfFile` and `Error` arms), `stop_for_refused_load` (renamed here to `stop_failed_start`), `check_stall`, `load_url_with`, `stop_playback`, `install_portal`, `paint_search`, `paint_favs`, `handle_keys` (F5), the field `current_url`; the tests' `Harness`, `m3u_app`, `loads`, `live_url`, `loaded_catalog`, `two_sources`, `write_last_watched`, `wait_until`, `list_server`, `f_pressed`, `shift_f_pressed`, `LogCapture`, `ENV_LOCK`.
 - Produces (`app.rs`):
   ```rust
-  // TvApp fields
-  current_showed_picture: bool,
+  // TvApp fields (`current_has_played`, the base's, gains a doc and a clear in stop_playback)
   bad_streams: Option<BadStreams>,
   bad_streams_for: Option<(u64, u64)>,     // (catalog generation, catalog revision)
   stream_checks: StreamChecker,            // the checks before a mark
@@ -2988,13 +3001,23 @@ In `rust/src/app.rs`:
 
 1. Imports: add `use crate::bad_streams::{BadStreams, Failure};` and `use crate::stream_check::{same_server, Answer, Check, StreamChecker};` inside the import block.
 
-2. Fields, after `stream_starting_since`:
+2. The marks read the base's field `current_has_played` (after `stream_starting_since`): the stream that plays has shown a picture since it was picked. It keeps its name; its doc gains what the marks read in it, so the whole doc becomes:
 
 ```rust
-    /// What plays has shown a picture since it was picked (a reload of it keeps
-    /// this, every other load clears it): a start of it that fails then is a
-    /// stream that dropped, not a dead channel (spec 2026-10-15 §4.1).
-    current_showed_picture: bool,
+    /// The stream that plays has shown a picture since it was picked: its
+    /// first `PlaybackStarted` sets this, and any load but a reload of it
+    /// clears it, as `stop_playback` does. A reload sets `stream_starting_since`
+    /// again, but the picture on the screen is still its own. The defect marks
+    /// read it too (spec 2026-10-15 §4.1): a start of a stream that has played
+    /// and then fails is a stream that dropped, never a suspect
+    /// (`note_start_failure`), and the stall watchdog gives up only a start
+    /// that has not played (`check_stall`).
+    current_has_played: bool,
+```
+
+Fields, after `current_has_played`:
+
+```rust
     /// The defect marks of the M3U source in use, read when its catalog loads;
     /// none on an Xtream portal. The catalog holds a copy for its filter
     /// (`CatalogStore::set_defect`): every change here is handed to it.
@@ -3007,30 +3030,21 @@ In `rust/src/app.rs`:
     stream_checks: StreamChecker,
 ```
 
-and in `TvApp::start`'s struct literal, after `stream_starting_since: None,`: `current_showed_picture: false, bad_streams: None, bad_streams_for: None, stream_checks: StreamChecker::new(),` (one per line).
+and in `TvApp::start`'s struct literal, after `current_has_played: false,`: `bad_streams: None, bad_streams_for: None, stream_checks: StreamChecker::new(),` (one per line).
 
-3. In `load_url_with`, the block `if !reload { self.playing_resumed = false; }` becomes:
+3. `load_url_with` stays as it is: its `if !reload { … }` block clears `current_has_played` already.
 
-```rust
-        if !reload {
-            self.playing_resumed = false;
-            // Another stream: nothing of it has shown yet.
-            self.current_showed_picture = false;
-        }
-```
+4. In `stop_playback`, after `self.stream_starting_since = None;`, add `self.current_has_played = false;`. The base has no such line; the frame drop of the `EndOfFile` arm reads the flag only while `stream_starting_since` is set, which `stop_playback` clears, so nothing changes for it.
 
-4. In `stop_playback`, after `self.stream_starting_since = None;`, add `self.current_showed_picture = false;`.
-
-5. In `drain_events`, in the `Event::PlaybackStarted` arm, after `self.stream_starting_since = None;`, add:
+5. In `drain_events`, in the `Event::PlaybackStarted` arm, after the base's `self.current_has_played = true;`, add:
 
 ```rust
                     // What plays has shown a picture since it was picked, and the
                     // connection works: the marks hear of it (spec §4.2, §4.4).
-                    self.current_showed_picture = true;
                     self.note_first_picture();
 ```
 
-6. In `drain_events`, in the `Event::EndOfFile` arm, at the end of the branch `if reason == "error" || (reason == "eof" && live) { … }` (after the M3U block that takes the old picture off the screen, which reads `stream_starting_since`), add:
+6. In `drain_events`, in the `Event::EndOfFile` arm, at the end of the branch `if reason == "error" || (reason == "eof" && live) { … }` (after the M3U block that takes the old picture off the screen, which reads `stream_starting_since` and `current_has_played`; `note_start_failure` takes `stream_starting_since`, so it comes after), add:
 
 ```rust
                         // A start that ended without a picture: a suspect (spec §4.1).
@@ -3039,18 +3053,35 @@ and in `TvApp::start`'s struct literal, after `stream_starting_since: None,`: `c
 
 7. In the `Event::Error` arm, `self.stop_for_refused_load()` becomes `self.stop_failed_start()`.
 
-8. In the doc of the field `stream_starting_since`, `stop_for_refused_load` becomes `stop_failed_start`. Replace `fn stop_for_refused_load` with:
+8. The doc of the field `stream_starting_since`, which names `stop_for_refused_load`, says which paths read which flag. It becomes:
+
+```rust
+    /// When the stream that loads now went to the player; its first frame
+    /// clears it. EPG fetching waits meanwhile (10 s at most): zapping first.
+    /// An M3U channel that fails while it is set has shown no picture of its
+    /// own unless it played since it was picked (`current_has_played`; a reload
+    /// sets this one again). The `Event::EndOfFile` arm of `drain_events` and
+    /// `note_start_failure` read both. `stop_failed_start` reads this one only
+    /// (a refused load, played or not), and `check_stall` calls it only for a
+    /// start that has not played.
+    stream_starting_since: Option<Instant>,
+```
+
+Replace `fn stop_for_refused_load` with:
 
 ```rust
     /// The start of an M3U channel that cannot go on: mpv refused the load (a
     /// list's address or header holds what it cannot take, a NUL byte), or the
-    /// stall watchdog gave it up (no picture since it was picked, see
-    /// `check_stall`). What mpv still plays, the stream before it or the load
-    /// that hangs, stops, and its picture goes, as a dead channel's does; the
-    /// toast names the channel, the app stays on it, and the channel is a
-    /// suspect (`note_start_failure`). True when it was dealt with so. (M3U
-    /// only: an Xtream portal's loads go through the relay, with nothing in
-    /// them mpv can refuse, and its watchdog reloads.)
+    /// stall watchdog gave it up. What mpv still plays, the stream before it or
+    /// the load that hangs, stops, and its picture goes, as a dead channel's
+    /// does; the toast names the channel and the app stays on it. It asks only
+    /// whether the stream is still starting (`stream_starting_since`), never
+    /// whether it has played (`current_has_played`): the `Event::Error` arm
+    /// calls it for a refused load either way, and `check_stall` only for a
+    /// start that has not played. `note_start_failure` then makes the channel a
+    /// suspect unless it has played. True when it was dealt with so. (M3U only:
+    /// an Xtream portal's loads go through the relay, with nothing in them mpv
+    /// can refuse, and its watchdog reloads.)
     fn stop_failed_start(&mut self) -> bool {
         if self.catalog.kind() != SourceKind::M3u || self.stream_starting_since.is_none() {
             return false;
@@ -3092,7 +3123,7 @@ and in `TvApp::start`'s struct literal, after `stream_starting_since: None,`: `c
             self.bad_streams = Some(BadStreams::load(self.storage.bad_streams_path()));
             // What plays showed its picture before the marks were read (a resume
             // on a list that loaded late): it plays again, whichever way it came.
-            if self.current_showed_picture {
+            if self.current_has_played {
                 self.note_first_picture();
             }
         }
@@ -3116,14 +3147,15 @@ and in `TvApp::start`'s struct literal, after `stream_starting_since: None,`: `c
     /// The start of the M3U channel that plays ended without a first picture
     /// (spec §4.1): mpv ended the file with an error or refused the load, or the
     /// app gave the start up (the reload budget, the stall watchdog). It becomes
-    /// a suspect, or a marked one is marked anew. Not a channel that showed a
-    /// picture since it was picked: its reloads are a stream that dropped. Once
-    /// per start: the start is over, so `stream_starting_since` goes.
+    /// a suspect, or a marked one is marked anew. Not a channel that has played
+    /// since it was picked (`current_has_played`): its reloads are a stream that
+    /// dropped. Once per start: the start is over, so `stream_starting_since`
+    /// goes.
     fn note_start_failure(&mut self) {
         if self.catalog.kind() != SourceKind::M3u || self.stream_starting_since.take().is_none() {
             return;
         }
-        if self.current_showed_picture || !self.current_live {
+        if self.current_has_played || !self.current_live {
             return;
         }
         let Some(sid) = self.current_stream_id else {
@@ -3239,12 +3271,13 @@ and in `TvApp::start`'s struct literal, after `stream_starting_since: None,`: `c
 9. In `check_stall`, after `if self.last_progress_at.elapsed() < self.health.stall_limit() { return; }`, add:
 
 ```rust
-        // An M3U channel that has shown no picture since it was picked is not
+        // An M3U channel that has not played since it was picked is not
         // reloaded: the app gives its start up (spec 2026-10-15 §4.1), as when
         // mpv refuses a load, and it becomes a suspect. A reload would only start
-        // the wait over, with a "herverbinden" toast each time.
+        // the wait over, with a "herverbinden" toast each time. This is where
+        // `current_has_played` is asked: `stop_failed_start` itself does not.
         let waited = self.last_progress_at.elapsed().as_secs();
-        if !self.current_showed_picture && self.stop_failed_start() {
+        if !self.current_has_played && self.stop_failed_start() {
             tracing::warn!("m3u: no picture ~{}s after the start - given up", waited);
             return;
         }
@@ -3332,12 +3365,12 @@ and make the loop:
 - [ ] **Step 5: Run the tests to see them pass**
 
 Run: `ct --lib app::tests::`
-Expected: all pass, the old M3U ones among them (`a_dead_m3u_channel_names_itself_and_the_app_stays_on_it`, `a_load_mpv_refuses_stops_the_stream_before_it_and_names_the_channel`, `a_dead_m3u_channel_takes_the_picture_of_the_channel_before_off_the_screen`, `an_m3u_channel_that_showed_its_own_picture_keeps_its_last_frame_when_it_errors`, `an_m3u_channel_that_keeps_ending_before_its_first_picture_takes_the_one_before_off` (the eof arm the hook of item 6 sits after), `a_refused_m3u_load_takes_the_picture_of_the_channel_before_off_the_screen` (the refused load, now `stop_failed_start`)).
+Expected: all pass, the old M3U ones among them (`a_dead_m3u_channel_names_itself_and_the_app_stays_on_it`, `a_load_mpv_refuses_stops_the_stream_before_it_and_names_the_channel`, `a_dead_m3u_channel_takes_the_picture_of_the_channel_before_off_the_screen`, `an_m3u_channel_that_showed_its_own_picture_keeps_its_last_frame_when_it_errors`, `an_m3u_channel_that_keeps_ending_before_its_first_picture_takes_the_one_before_off` (the eof arm the hook of item 6 sits after), `a_refused_m3u_load_takes_the_picture_of_the_channel_before_off_the_screen` (the refused load, now `stop_failed_start`), `an_m3u_channel_that_has_played_keeps_its_own_last_frame_when_its_reloads_fail` and `an_m3u_pick_that_never_played_takes_off_the_picture_of_one_that_did` (both on `current_has_played`, which the marks now read and `stop_playback` clears too)).
 
 - [ ] **Step 6: Format, lint, full suite**
 
 - Run `fmt src/i18n.rs`. Expected: no output.
-- Check the hunk count of `app.rs`: the same as before.
+- Check the hunk count of `app.rs`: 7, as at the baseline (Task 1).
 - Run `cc`. Expected: only the 2 old warnings.
 - Run `ct`. Expected: everything passes.
 
@@ -4126,7 +4159,7 @@ Expected: all pass. The budget test prints its line (debug build: slower than th
 - [ ] **Step 6: Format, lint, full suite**
 
 - Run `fmt src/channel_list.rs tests/test_channel_list.rs`. Expected: no output.
-- Check the hunk count of `catalog.rs`: the same as before.
+- Check the hunk count of `catalog.rs`: 3, as at the baseline (Task 1).
 - Run `cc`. Expected: only the 2 old warnings.
 - Run `ct`. Expected: everything passes.
 
@@ -4645,7 +4678,7 @@ In `rust/src/i18n.rs`, after the block under `// Sources: an M3U list`, add:
 
 The footer names the keys in words, as the guide's and the news picker's footers do.
 
-In `rust/src/guide_ui.rs` (check it with `fmt src/guide_ui.rs` before and after):
+In `rust/src/guide_ui.rs` (clean at the base: `fmt src/guide_ui.rs` shows nothing before and after):
 - `const CLICK: Sense = Sense {` becomes `pub(crate) const CLICK: Sense = Sense {`, and its doc "A click target the keyboard never reaches: the guide's keys are its own, and a focused widget would take Enter or Space for a click." becomes "A click target the keyboard never reaches: the guide's keys are its own (the channel list's too), and a focused widget would take Enter or Space for a click."
 - `fn single_line(` becomes `pub(crate) fn single_line(`.
 - `play_mark` takes its colour: its doc becomes "▶: a past programme that can be watched back (the guide); the channel that plays (the channel list)."; its signature `pub(crate) fn play_mark(p: &egui::Painter, center: Pos2, color: Color32)`; `REPLAY_BLUE` in its body becomes `color`; and its call in `paint_row` becomes `Playable::Replay => play_mark(p, Pos2::new(row.right() - 14.0, row.center().y), REPLAY_BLUE),`.
@@ -5128,7 +5161,7 @@ Expected: all pass, the guide's own tests too (its play mark keeps its colour).
 
 - [ ] **Step 6: Format, lint, full suite**
 
-- Run `fmt src/channel_list_ui.rs src/i18n.rs src/guide_ui.rs`. Expected: no output (for `guide_ui.rs`: what it showed before you edited it, nothing more).
+- Run `fmt src/channel_list_ui.rs src/i18n.rs src/guide_ui.rs`. Expected: no output (`guide_ui.rs` is clean at the base, and stays so).
 - Run `cc`. Expected: only the 2 old warnings.
 - Run `ct`. Expected: everything passes.
 
@@ -5785,7 +5818,7 @@ Expected: all pass. `an_m3u_zap_asks_for_no_epg_and_the_guide_never_starts_fetch
 - [ ] **Step 6: Format, lint, full suite**
 
 - Run `fmt src/i18n.rs`. Expected: no output.
-- Check the hunk count of `app.rs`: the same as before.
+- Check the hunk count of `app.rs`: 7, as at the baseline (Task 1).
 - Run `cc`. Expected: only the 2 old warnings.
 - Run `ct`. Expected: everything passes. Report the total.
 
@@ -5798,18 +5831,52 @@ Files: `rust/src/app.rs`, `rust/src/i18n.rs`.
 
 ### Task 9: End-to-end: `M-list` and `M-defect`
 
-Two scenarios in group M, against the mock's M3U list (its file order: M3U 01..18, M3U UA, M3U DOOD, M3U REF; all in group "Test"). `M-list` replaces `M-guide`, whose toast is gone.
+Two scenarios in group M, against the mock's M3U list (its file order: M3U 01..18, M3U UA, M3U DOOD, M3U REF; all in group "Test"). `M-list` replaces `M-guide`, whose toast is gone. First the mock serves M3U DOOD under `localhost`, so that ruling 28b lets the check ask its address.
 
 **The implementer writes the scripts and runs `-DryRun` only.** The controller asks the user before any run that opens windows (Task 10, last step).
 
 **Files:**
-- Modify: `rust/e2e/regression.ps1`, `rust/e2e/run-scenario.ps1`, `rust/e2e/README.md`
+- Modify: `rust/e2e/mock_portal.py`, `rust/e2e/regression.ps1`, `rust/e2e/run-scenario.ps1`, `rust/e2e/README.md`
 
 **Interfaces:**
-- Consumes the log lines of Tasks 3, 5 and 8: `zap: -> <name> (stream_id=<id>, idx=<idx>, prev=<prev>)`, `m3u: <name> (stream_id <id>) failed before its first picture`, `… marked defect (<what the check got>)`, `channel list: opened (<n> channels, <m> groups)`, `channel list: closed`; the debug line `toast: …`; and the marks file `bad_streams.json` in the config folder. The mock's `/m3uplay/dead.m3u8` answers the check 404 too, so M3U DOOD is still marked.
-- Produces: `regression.ps1 -Group M` with `M-list` and `M-defect`.
+- Consumes the log lines of Tasks 3, 5 and 8: `zap: -> <name> (stream_id=<id>, idx=<idx>, prev=<prev>)`, `m3u: <name> (stream_id <id>) failed before its first picture`, `… marked defect (<what the check got>)`, `channel list: opened (<n> channels, <m> groups)`, `channel list: closed`; the debug line `toast: …`; and the marks file `bad_streams.json` in the config folder. The mock's `/m3uplay/dead.m3u8` answers the check 404 too, so M3U DOOD is still marked: from Step 1 on its address is under `localhost`, and M3U UA, which confirms it, plays from `127.0.0.1`, another server (ruling 28b, Task 4's `same_server`).
+- Produces: `regression.ps1 -Group M` with `M-list` and `M-defect`; the mock's M3U DOOD under `localhost`.
 
-- [ ] **Step 1: The scenarios**
+- [ ] **Step 1: The mock serves M3U DOOD under `localhost`**
+
+Every channel of the mock's list is on `127.0.0.1:18080`, and a check never asks the server of what plays (ruling 28b). M3U UA's picture would confirm M3U DOOD, its address would never be asked, and M-defect would mark nothing. `localhost` is another server by its host, and it still reaches the mock.
+
+In `rust/e2e/mock_portal.py`:
+
+1. In `m3u_list()`, M3U DOOD's line
+
+```python
+    lines += ['#EXTINF:-1 group-title="Test",M3U DOOD', f"http://127.0.0.1:{PORT}/m3uplay/dead.m3u8"]
+```
+
+becomes
+
+```python
+    # Under localhost, every other channel under 127.0.0.1: see MOCK_M3U above.
+    lines += ['#EXTINF:-1 group-title="Test",M3U DOOD', f"http://localhost:{PORT}/m3uplay/dead.m3u8"]
+```
+
+2. In the docstring, at the end of the `MOCK_M3U=1` entry (after `/m3uplay/none/... are not playable: they answer 404 first.)`), add these lines, in the entry's own indent:
+
+```
+                     M3U DOOD's address is under localhost, every other one under
+                     127.0.0.1: the check before a defect mark never asks the server of
+                     the stream that plays, and localhost is another server by its host
+                     that still reaches this mock. The mock listens on 127.0.0.1 only;
+                     Windows resolves localhost to ::1 and then 127.0.0.1, and the ::1
+                     attempt is refused, so mpv and the check go on to 127.0.0.1.
+```
+
+From `C:\Dropbox\Sources\tv\rust`, check that the file still parses (this writes nothing): `py -3 -c "import ast, sys; ast.parse(open(sys.argv[1], encoding='utf-8').read())" e2e/mock_portal.py`. Expected: no output.
+
+M-dead's patterns (`zap: -> M3U DOOD`, `toast: streamfout op M3U DOOD`) name no host, and no other pattern in `regression.ps1`, the e2e README or this plan names DOOD's address: they all hold.
+
+- [ ] **Step 2: The scenarios**
 
 In `rust/e2e/regression.ps1`'s `Group-M`, replace the scenario `M-guide` and its comment line with:
 
@@ -5826,7 +5893,8 @@ and after the scenario `M-dead`, add:
 ```powershell
     # A dead channel, then one that plays: the dead one is confirmed, the check finds its address 404 too, and it is
     # marked (bad_streams.json holds its id and time); zapping skips it. In the mock's file order M3U DOOD lies
-    # between M3U UA and M3U REF, so DOWN from UA lands on REF.
+    # between M3U UA and M3U REF, so DOWN from UA lands on REF. DOOD is under localhost and UA under 127.0.0.1: two
+    # servers, so the check asks DOOD's address (it never asks the server of what plays).
     $dd = IniDir 'm-defect' $onlyList
     Scn 'M-defect' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $dd; Seconds = 26; Keys = 'SLEEP:1500;f;SLEEP:400;TEXT:m3u dood;SLEEP:800;ENTER;SLEEP:4000;f;SLEEP:400;TEXT:m3u ua;SLEEP:800;ENTER;SLEEP:4000;DOWN;SLEEP:3000'; Expect = 'm3u: M3U DOOD \(stream_id \d+\) failed before its first picture', 'm3u: M3U DOOD \(stream_id \d+\) marked defect \(http 404\)', 'zap: -> M3U REF \(stream_id=\d+, idx=Some\(19\), prev=Some\("M3U UA"\)\)'; Forbid = 'zap: -> M3U DOOD \(stream_id=\d+, idx=[^,]*, prev=Some\("M3U UA"\)\)' } {
         (Get-Content -Raw (Join-Path $dd 'bad_streams.json')) -match '^\{"version":1,"marks":\{"\d+":\d+\}\}$'
@@ -5837,19 +5905,23 @@ In the header's group list, `M  M3U sources (MOCK_M3U)` becomes `M  M3U sources 
 
 In the comment above `function Group-M`, "M-zap, M-add, M-switch and M-getphp change what is in their folder" becomes "M-zap, M-add, M-switch, M-getphp, M-list and M-defect change what is in their folder".
 
-- [ ] **Step 2: The harness's view of the log**
+- [ ] **Step 3: The harness's view of the log**
 
 In `rust/e2e/run-scenario.ps1`, add `channel list: |` to the alternatives of the app-log filter that prints the log lines (after `guide: opened|`). It only changes what the output shows; `-Expect` and `-Forbid` read every line already.
 
-- [ ] **Step 3: The README**
+- [ ] **Step 4: The README**
 
-In `rust/e2e/README.md`, in "## Regression set", after the sentence that ends "run the two together.", add:
+In `rust/e2e/README.md`, where it describes `MOCK_M3U=1`'s list, the sentence `"M3U DOOD" answers 404.` becomes:
 
-> `M-list` opens the channel list with `g` and starts M3U 02 from it. `M-defect` makes M3U DOOD fail, plays M3U UA (which confirms DOOD; the check before the mark finds `/m3uplay/dead.m3u8` 404 and marks it) and zaps down past DOOD to M3U REF; its check reads `bad_streams.json` in its folder, and its `-Before` makes the folder anew for a re-run, as the marks change it.
+> "M3U DOOD" answers 404; its address is under `localhost`, every other one under `127.0.0.1` (see `M-defect`).
+
+In "## Regression set", after the sentence that ends "run the two together.", add:
+
+> `M-list` opens the channel list with `g` and starts M3U 02 from it. `M-defect` makes M3U DOOD fail, plays M3U UA (which confirms DOOD; DOOD is under `localhost` and UA under `127.0.0.1`, two servers, so the check before the mark asks DOOD's address, finds `/m3uplay/dead.m3u8` 404 and marks it) and zaps down past DOOD to M3U REF; its check reads `bad_streams.json` in its folder, and its `-Before` makes the folder anew for a re-run, as the marks change it.
 
 In the sentence after it, "`M-zap`, `M-add`, `M-switch` and `M-getphp` change what is in their folder" becomes "`M-zap`, `M-add`, `M-switch`, `M-getphp`, `M-list` and `M-defect` change what is in their folder".
 
-- [ ] **Step 4: Dry run**
+- [ ] **Step 5: Dry run**
 
 Run (from `C:\Dropbox\Sources\tv\rust`): `powershell -NoProfile -ExecutionPolicy Bypass -File e2e\regression.ps1 -Group M -DryRun`
 Expected: `# M-list` and `# M-defect   (+ a check of the files afterwards)`, each followed by its `run-scenario.ps1` command; no `# M-guide`; no "has no parameter" error; one `# M-` line more than before. Opens no window.
@@ -5857,10 +5929,10 @@ Expected: `# M-list` and `# M-defect   (+ a check of the files afterwards)`, eac
 Run: `powershell -NoProfile -ExecutionPolicy Bypass -File e2e\regression.ps1 -Group R,B,C,N,X,G -DryRun | Select-String '^# ' | Measure-Object`
 Expected: the same count as before this task (those groups are unchanged).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
-Message: `test(e2e): M-list and M-defect: the channel list on g, a dead channel marked and skipped`, followed by the two attribution lines.
-Files: `rust/e2e/regression.ps1`, `rust/e2e/run-scenario.ps1`, `rust/e2e/README.md`.
+Message: `test(e2e): M-list and M-defect: the channel list on g, a dead channel marked and skipped; the mock serves M3U DOOD under localhost`, followed by the two attribution lines.
+Files: `rust/e2e/mock_portal.py`, `rust/e2e/regression.ps1`, `rust/e2e/run-scenario.ps1`, `rust/e2e/README.md`.
 
 ---
 
@@ -5880,7 +5952,7 @@ Files: `rust/e2e/regression.ps1`, `rust/e2e/run-scenario.ps1`, `rust/e2e/README.
 
 2. After the `zap.rs` bullet, add:
 
-   > - **`bad_streams.rs`** — defect marks of an M3U source. A channel whose start ends without a first picture (an mpv error, a refused load, the reload budget, the stall watchdog; `TvApp::note_start_failure`) is a suspect; another channel's first picture within 2 minutes confirms it (`note_first_picture`), else the suspicion lapses. A confirmed suspect is marked only when the check of its address (`stream_check.rs`) finds it dead too (`drain_stream_checks`), so a Wi-Fi drop of any length marks no good channel. Its own picture clears it. A channel that showed a picture since it was picked is never a suspect (`current_showed_picture`). Marks last 7 days, per source in `bad_streams.json` / `bad_streams-<id>.json` (stream ids and unix times only), read when the source's catalog loads (`refresh_defects`); app.rs hands every change to the catalog.
+   > - **`bad_streams.rs`** — defect marks of an M3U source. A channel whose start ends without a first picture (an mpv error, a refused load, the reload budget, the stall watchdog; `TvApp::note_start_failure`) is a suspect; another channel's first picture within 2 minutes confirms it (`note_first_picture`), else the suspicion lapses. A confirmed suspect is marked only when the check of its address (`stream_check.rs`) finds it dead too (`drain_stream_checks`), so a Wi-Fi drop of any length marks no good channel. Its own picture clears it. A channel that has played since it was picked is never a suspect (`current_has_played`, the flag the M3U frame drop reads too). Marks last 7 days, per source in `bad_streams.json` / `bad_streams-<id>.json` (stream ids and unix times only), read when the source's catalog loads (`refresh_defects`); app.rs hands every change to the catalog.
    > - **`stream_check.rs`** — the check before a defect mark: one GET of a confirmed suspect's address with the channel's own User-Agent and Referer (libmpv's `libmpv` when it names none), as mpv asks it (no certificate check, header values as bytes), 5 s for the connection and the headers, the status only. 400 or more, no connection or no answer in time marks it; 2xx/3xx drops the suspicion; an address the check cannot ask is not marked. It never asks the server of the stream that plays (`same_server`: scheme, host, port): on a paid list one account serves every channel and its portal allows one session, so such a suspect is not marked. At most one check per channel and 4 at once (`StreamChecker`), on the tokio runtime with a client built on the first check; the answers come through a slot `update_ui` drains. A switch or save of the source drops the running checks. The address never reaches the log (`Check` has no `Debug`). This is the only network the defect marks use.
    > - **`channel_list.rs` / `channel_list_ui.rs`** — `g` on an M3U source: the channel list over the running picture. `channel_list.rs` builds the groups (`ChannelGroups::build`: All channels, Favorites, the list's `group-title`s A–Z by `natural_cmp`, No group, Defect channels) as positions in the catalog's channels (`CatalogStore::channel_groups`), and keeps the selection (`Cursor`); `channel_list_ui.rs` draws the rows on screen only and returns `ListAction`s. A move starts the channel behind the list through the app's one `ZapPacer`; Enter closes and plays, Esc/g close. The groups are built when the list opens and again while it is open when the catalog, the marks or the favorites change; a closed list holds nothing.
 
@@ -5890,10 +5962,10 @@ Files: `rust/e2e/regression.ps1`, `rust/e2e/run-scenario.ps1`, `rust/e2e/README.
 
 5. In "Gotchas worth knowing":
    - At the end of the gotcha "The catalog is the only adult filter", add: "It is the only defect filter too: zapping, the channel list and the search read `CatalogStore::{zap_ring, channel_groups, is_defect}`, never a copy of the marks of their own."
-   - The gotcha "A new M3U channel never shows the picture of the one before it": the M3U branch's last commits rewrote it, so edit it as it reads at this branch's base, keeping its words where they still hold. Afterwards it names `app.rs::stop_failed_start` (where it named `stop_for_refused_load`) and the arm of `Event::EndOfFile` for an error or an eof that the reloads did not get past, and among the starts that leave the screen black it counts one the stall watchdog gives up.
+   - The gotcha "A new M3U channel never shows the picture of the one before it": the M3U branch's last commits rewrote it, so edit it as it reads at this branch's base, keeping its words where they still hold. Afterwards it names `app.rs::stop_failed_start` (where it named `stop_for_refused_load`) and the arm of `Event::EndOfFile` for an error or an eof that the reloads did not get past; it says exactly which of them reads which flag (the `EndOfFile` arm reads `stream_starting_since` and `current_has_played`; `stop_failed_start` reads `stream_starting_since` only, for a refused load whether the channel played or not, and `check_stall` calls it only for a start that has not played); and among the starts that leave the screen black it counts one the stall watchdog gives up.
    - Add:
 
-   > - **An M3U start the stall watchdog would reload is given up instead.** A channel of an M3U list that showed no picture since it was picked stops with "streamfout op …" when the watchdog fires (`stop_failed_start`, as for a load mpv refuses) and becomes a suspect; a reload would only start the 25 s wait over. One that showed a picture is reloaded as before, and Xtream is unchanged.
+   > - **An M3U start the stall watchdog would reload is given up instead.** A channel of an M3U list that has not played since it was picked (`current_has_played`, which `check_stall` asks) stops with "streamfout op …" when the watchdog fires (`stop_failed_start`, as for a load mpv refuses; that function itself asks only `stream_starting_since`) and becomes a suspect; a reload would only start the 25 s wait over. One that has played is reloaded as before, and Xtream is unchanged.
 
 - [ ] **Step 2: rust/README.md**
 
@@ -5947,8 +6019,8 @@ In `rust/build-zip.ps1`'s README text, the key line of `g` becomes:
 - Run `ct`. Expected: all pass. Report the total and how many are new since Task 1's baseline.
 - Run `cc`. Expected: the 2 old warnings only.
 - Run `fmt src/bad_streams.rs src/stream_check.rs src/channel_list.rs src/channel_list_ui.rs src/storage.rs src/i18n.rs tests/test_bad_streams.rs tests/test_stream_check.rs tests/test_zap_ring.rs tests/test_channel_list.rs tests/test_storage.rs tests/test_mpv_smoke.rs tests/test_catalog_m3u.rs`. Expected: no output.
-- `guide_ui.rs`: what `fmt src/guide_ui.rs` showed before Task 7, nothing more.
-- The hunk counts of `app.rs` and `catalog.rs`: the counts noted before Tasks 2 and 3.
+- Run `fmt src/guide_ui.rs`. Expected: no output, as at the baseline.
+- The hunk counts of `app.rs` and `catalog.rs`: 7 and 3, as at Task 1's baseline.
 - Run `bash rust/e2e/test-check-staged.sh`. Expected: every case `ok`.
 
 - [ ] **Step 6: The grouping and a zap press in a release build**
