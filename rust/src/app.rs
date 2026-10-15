@@ -2,7 +2,7 @@ use crate::args::{
     credentials_line, parse_xtream_creds, resolve_creds, CredsError, CredsSource, XtreamCreds,
 };
 use crate::catalog::GuideChannel;
-use crate::catalog::{fallback_variant, quality_label, quality_rank, zap_position, CatalogNotice, CatalogStatus, CatalogStore};
+use crate::catalog::{fallback_variant, quality_label, quality_rank, CatalogNotice, CatalogStatus, CatalogStore, ZapFrom};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::{Entry as FavoriteEntry, Favorites};
 use crate::guide::fetch::EpgFetcher;
@@ -21,14 +21,13 @@ use crate::player::{Cmd, Event, FrameFence, PlayerHandle, RgbaFrame};
 use crate::portal::m3u::M3uPortal;
 use crate::presets::Presets;
 use crate::portal::xtream::ConnCheck;
-use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};
+use crate::portal::{xtream::XtreamPortal, Portal};
 use crate::search::{self, ItemKind, SearchItem};
 use crate::settings::Settings;
 use crate::settings_ui::{
     action_button, conn_rich_text, marker_scroll_area, paint_scroll_marker, ConnState,
     SettingsAction, SettingsUi, SettingsView,
 };
-use crate::shortcuts;
 use crate::sources::{Editing, Source, SourceDraft, SourceId, SourceKind, Sources};
 use crate::storage::Storage;
 use crate::window_drag::{self, Mouse, RightDrag};
@@ -697,8 +696,9 @@ pub struct TvApp {
     /// mpv plays the portal directly.
     relay: Option<Relay>,
     /// Paces up/down zapping: quick presses or a held arrow key only move the
-    /// target (sid, name, zap index); the channel the user stops on loads.
-    zap_pacer: ZapPacer<(i64, String, usize)>,
+    /// target (sid, name, ring position; none for a pick in the channel list);
+    /// the channel the user stops on loads.
+    zap_pacer: ZapPacer<(i64, String, Option<usize>)>,
 
     // ---- freeze detection: surfaces cache-underrun stalls (paused-for-cache) ----
     /// Per-stream freeze tracker (reset on load; counts only post-first-frame
@@ -1846,9 +1846,15 @@ impl TvApp {
         }
         let url = self.catalog.portal().live_stream_url(sid);
         // An M3U list has no address for an id it does not hold: a target the
-        // zap pacer held while a fresh list dropped it. What plays stays.
+        // zap pacer held while a fresh list dropped it. What plays stays, and so
+        // would the flip's toast that named the target, over the channel that
+        // plays on: it goes.
         if url.is_empty() {
             tracing::warn!("zap: stream_id={} has no address - not loaded", sid);
+            let flip = format!("[TV] {}", name);
+            if self.toast.as_ref().is_some_and(|t| t.0 == flip) {
+                self.toast = None;
+            }
             return;
         }
         // A channel of an M3U list that has no name is named after its address.
@@ -1886,25 +1892,20 @@ impl TvApp {
         }
     }
 
-    /// Where the playing channel sits in `zap`, also when it was resumed at
-    /// startup rather than zapped to (else arrow up lands on the list's end).
-    fn zap_index_of_current(&self, zap: &[LiveChannel]) -> Option<usize> {
-        let sid = self.current_stream_id?;
-        // Its own entry first: on an M3U list that is the only way to it. In
-        // the deduped Xtream list an entry stands for every variant.
-        if let Some(i) = zap.iter().position(|c| c.stream_id == sid) {
-            return Some(i);
-        }
-        let nav = self.catalog.quality_nav(sid);
-        zap_position(zap, nav.ladder.first()?)
-    }
-
     /// Whether the portal refused live stream `sid` to this account this
     /// session (the relay saw its 407 - RTL 4 UHD, every time).
     fn is_refused(&self, sid: i64) -> bool {
         self.relay
             .as_ref()
             .is_some_and(|r| r.refused(&self.catalog.portal().live_stream_url(sid)))
+    }
+
+    /// Whether live channel `sid` is what plays and has not ended with an error:
+    /// a start of it now would only start it over. One that failed is no
+    /// longer playing, so a flip back to it, or Enter in the channel list,
+    /// tries it again.
+    fn plays(&self, sid: i64) -> bool {
+        self.current_stream_id == Some(sid) && self.stall_watchdog_armed
     }
 
     /// Play the channel's best variant the portal does not refuse instead of
@@ -1929,50 +1930,66 @@ impl TvApp {
     /// (quick presses, a held key) only the channel names show and the one
     /// they stop on loads - a portal session per keypress gets throttled.
     fn zap_delta(&mut self, delta: i32, repeat: bool) {
-        // Zap over the deduped list so up/down skips HD/UHD/FHD/catch-up
-        // duplicates of the same channel (one best-quality entry each).
-        let zap = self.catalog.zap_channels();
-        if zap.is_empty() {
-            if !self.catalog.is_loaded() {
-                self.set_toast(self.t(T::CatalogLoading));
-            } else {
-                self.set_toast(self.t(T::NoLiveChannels));
+        // The ring: one entry per channel (an Xtream portal's variants merged,
+        // the defect channels of an M3U list out), worked out once per catalog,
+        // lock and marks, so a press copies nothing.
+        let ring = match self.catalog.zap_ring() {
+            Some(ring) if !ring.is_empty() => ring,
+            _ => {
+                let key = if self.catalog.is_loaded() {
+                    T::NoLiveChannels
+                } else {
+                    T::CatalogLoading
+                };
+                self.set_toast(self.t(key));
+                return;
             }
+        };
+        // From the channel a flip waits on, else from the one that plays: its
+        // ring position while that still holds it (the list may have changed
+        // under it), else the channel itself; with nothing, from the start.
+        let from = match self.zap_pacer.waiting() {
+            Some((sid, _, Some(pos))) => ZapFrom::Pos {
+                pos: *pos,
+                sid: *sid,
+            },
+            Some((sid, _, None)) => ZapFrom::Channel(*sid),
+            None => match (self.current_idx, self.current_stream_id) {
+                (Some(pos), Some(sid)) => ZapFrom::Pos { pos, sid },
+                (None, Some(sid)) => ZapFrom::Channel(sid),
+                (_, None) => ZapFrom::Start,
+            },
+        };
+        let Some((pos, channel)) = ring
+            .step(from, delta)
+            .and_then(|pos| ring.get(pos).map(|c| (pos, c)))
+        else {
             return;
-        }
-        // The list may have changed under the index (an M3U list's fresh copy, a
-        // refetch): an index whose entry is not what plays is found again.
-        let current_idx = self
-            .current_idx
-            .filter(|&i| zap.get(i).map(|c| c.stream_id) == self.current_stream_id);
-        let from = self
+        };
+        let (sid, name) = (channel.stream_id, channel.name.clone());
+        match self
             .zap_pacer
-            .waiting()
-            .map(|t| t.2)
-            .or(current_idx)
-            .or_else(|| self.zap_index_of_current(&zap));
-        if let Some(i) = shortcuts::next_live_idx(from, zap.len(), delta) {
-            let name = zap[i].name.clone();
-            let target = (zap[i].stream_id, name.clone(), i);
-            match self.zap_pacer.press(Instant::now(), target, repeat) {
-                Some((sid, name, i)) => self.zap_to(sid, &name, Some(i)),
-                None => self.set_toast(format!("[TV] {}", name)),
-            }
+            .press(Instant::now(), (sid, name.clone(), Some(pos)), repeat)
+        {
+            Some((sid, name, idx)) => self.zap_to(sid, &name, idx),
+            None => self.set_toast(format!("[TV] {}", name)),
         }
     }
 
     fn zap_by_id(&mut self, sid: i64) {
-        let live = self.catalog.live_channels();
-        let Some(ch) = live.iter().find(|c| c.stream_id == sid) else {
+        // One look at the catalog, no copy of its list: the name of a channel
+        // that shows (a defect one does: a preset or a favorite plays it).
+        let Some(name) = self.catalog.live_name(sid) else {
             return;
         };
-        let name = ch.name.clone();
-        // Park the up/down cursor on this channel's entry in the zap list so
-        // subsequent zapping continues from the right place; play the exact sid
-        // requested. `zap_position` finds its own entry first (on an M3U list
-        // two channels may share a name), else the one that stands for it in
-        // the deduped Xtream list.
-        let idx = zap_position(&self.catalog.zap_channels(), ch);
+        // Up/down then go on from here: its own entry in the ring (on an M3U
+        // list two channels may share a name), else the one that stands for it
+        // in the deduped Xtream list. A channel out of the ring (marked defect)
+        // has none: zapping steps from its place in the file.
+        let idx = self
+            .catalog
+            .zap_ring()
+            .and_then(|ring| ring.position_of(sid));
         self.zap_to(sid, &name, idx);
     }
 
@@ -4370,9 +4387,17 @@ impl TvApp {
             self.catalog_noted = true;
             self.on_catalog_loaded();
         }
-        // The channel the user stopped flipping on.
+        // The channel the user stopped flipping on; not when it is the one that
+        // plays (flipped away and back): a second load would only re-buffer it.
         if let Some((sid, name, idx)) = self.zap_pacer.due(Instant::now()) {
-            self.zap_to(sid, &name, Some(idx));
+            if self.plays(sid) {
+                tracing::debug!("zap: {} plays already", crate::redact::redact(&name));
+                if idx.is_some() {
+                    self.current_idx = idx;
+                }
+            } else {
+                self.zap_to(sid, &name, idx);
+            }
         }
         self.check_stall();
         self.forward_window_size(ctx);
@@ -4466,6 +4491,7 @@ impl TvApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::portal::LiveChannel;
     use crate::window_drag::{ScreenPos, VK_LBUTTON, VK_RBUTTON};
 
     #[test]
@@ -9751,6 +9777,146 @@ https://c.example/twee-nieuws.m3u8\n";
             ],
             "{text}"
         );
+    }
+
+    // ---- zapping through the ring ----
+
+    /// Four channels, A to D, in this order. With no tvg-id their keys, and so
+    /// their stream ids, are their names.
+    const RING: &str = "#EXTM3U\n\
+#EXTINF:-1,Kanaal A\nhttps://a.example/a.m3u8\n\
+#EXTINF:-1,Kanaal B\nhttps://b.example/b.m3u8\n\
+#EXTINF:-1,Kanaal C\nhttps://c.example/c.m3u8\n\
+#EXTINF:-1,Kanaal D\nhttps://d.example/d.m3u8\n";
+
+    /// The stream id of a channel of a list whose channels have no tvg-id.
+    fn m3u_sid(name: &str) -> i64 {
+        crate::m3u::stream_id(name)
+    }
+
+    /// Where channel `letter` of `RING` plays from.
+    fn ring_url(letter: char) -> String {
+        format!("https://{letter}.example/{letter}.m3u8")
+    }
+
+    #[tokio::test]
+    async fn zapping_skips_a_defect_channel_both_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), RING);
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        h.app.catalog.set_defect([(m3u_sid("Kanaal B"), 0)].into());
+        h.app.zap_by_id(m3u_sid("Kanaal A"));
+        h.sent();
+        h.press(&[Key::ArrowDown]);
+        assert_eq!(loads(h.sent()), [ring_url('c')], "past B");
+        h.press(&[Key::ArrowUp]);
+        assert_eq!(loads(h.sent()), [ring_url('a')], "and back past B");
+    }
+
+    #[tokio::test]
+    async fn a_defect_channel_that_plays_zaps_on_from_its_place_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), RING);
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        h.app.catalog.set_defect([(m3u_sid("Kanaal B"), 0)].into());
+        // A preset, a favorite or the search still plays it.
+        h.app.zap_by_id(m3u_sid("Kanaal B"));
+        assert_eq!(loads(h.sent()), [ring_url('b')]);
+        assert_eq!(h.app.current_idx, None, "it has no place in the ring");
+        h.press(&[Key::ArrowDown]);
+        assert_eq!(
+            loads(h.sent()),
+            [ring_url('c')],
+            "the one after it in the file"
+        );
+        h.app.zap_by_id(m3u_sid("Kanaal B"));
+        h.sent();
+        h.press(&[Key::ArrowUp]);
+        assert_eq!(loads(h.sent()), [ring_url('a')], "the one before it");
+    }
+
+    #[tokio::test]
+    async fn flipping_away_and_back_to_the_channel_that_plays_loads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), RING);
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        h.app.zap_by_id(m3u_sid("Kanaal A"));
+        h.sent();
+        // A lone press: B at once. A held key then overshoots to C and comes back.
+        h.frame(&[Key::ArrowDown]);
+        h.frame(&[Key::ArrowDown]);
+        h.frame(&[Key::ArrowUp]);
+        assert_eq!(loads(h.sent()), [ring_url('b')]);
+        std::thread::sleep(Duration::from_millis(350));
+        h.frame(&[]);
+        assert!(loads(h.sent()).is_empty(), "B plays on");
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal B"));
+    }
+
+    #[tokio::test]
+    async fn a_hidden_channel_is_not_played_by_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        h.sent();
+        h.app.zap_by_id(901); // adult, locked
+        assert!(loads(h.sent()).is_empty());
+        h.app.zap_by_id(3);
+        assert_eq!(loads(h.sent()), [live_url(3)]);
+        assert_eq!(h.app.current_idx, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_flip_to_a_channel_the_fresh_list_dropped_leaves_no_toast_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), RING);
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        h.app.zap_by_id(m3u_sid("Kanaal A"));
+        // A lone press: B at once. The held key then flips on to C, which waits.
+        h.frame(&[Key::ArrowDown]);
+        h.frame(&[Key::ArrowDown]);
+        let toast = |h: &Harness| h.app.toast.as_ref().map(|(t, _, _)| t.clone());
+        assert_eq!(toast(&h).as_deref(), Some("[TV] Kanaal C"), "the flip");
+        // The fresh copy of the list has no Kanaal C.
+        let fresh = RING.replace("#EXTINF:-1,Kanaal C\nhttps://c.example/c.m3u8\n", "");
+        let (portal, catalog) = M3uPortal::from_text(&fresh).unwrap();
+        h.app.catalog = Arc::new(CatalogStore::from_catalog(Arc::new(portal), catalog));
+        h.sent();
+        std::thread::sleep(Duration::from_millis(350));
+        h.frame(&[]);
+        assert!(loads(h.sent()).is_empty(), "C has no address now");
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal B"));
+        // No toast names the channel that vanished.
+        let named = |t: &String| t.contains("Kanaal C");
+        assert!(toast(&h).filter(named).is_none(), "{:?}", toast(&h));
+        assert!(!h.painted.iter().any(named), "{:?}", h.painted);
+    }
+
+    #[tokio::test]
+    async fn a_toast_set_since_the_flip_stays_when_the_dropped_channel_is_not_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), RING);
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        h.app.zap_by_id(m3u_sid("Kanaal A"));
+        // A lone press: B at once. The held key then flips on to C, which waits.
+        h.frame(&[Key::ArrowDown]);
+        h.frame(&[Key::ArrowDown]);
+        // The fresh copy of the list has no Kanaal C, and the stream of B fails
+        // meanwhile: a toast of its own, set since the flip.
+        let fresh = RING.replace("#EXTINF:-1,Kanaal C\nhttps://c.example/c.m3u8\n", "");
+        let (portal, catalog) = M3uPortal::from_text(&fresh).unwrap();
+        h.app.catalog = Arc::new(CatalogStore::from_catalog(Arc::new(portal), catalog));
+        let event = Event::EndOfFile {
+            reason: "error".into(),
+        };
+        h.events.send(event).unwrap();
+        h.frame(&[]);
+        let error = "stream error on Kanaal B - zap up or down to retry";
+        assert!(h.painted.iter().any(|t| t == error), "{:?}", h.painted);
+        h.sent();
+        std::thread::sleep(Duration::from_millis(350));
+        h.frame(&[]);
+        assert!(loads(h.sent()).is_empty(), "C has no address now");
+        assert!(h.painted.iter().any(|t| t == error), "{:?}", h.painted);
     }
 
     // ---- the picture of the channel before ----
