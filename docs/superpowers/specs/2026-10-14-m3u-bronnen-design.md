@@ -327,8 +327,9 @@ openliet. Kort, en waar deze sectie afwijkt van die Rulings, gaat deze sectie vo
 - De naam in `#EXTINF` begint na de eerste komma buiten aanhalingstekens, niet na de laatste: een naam mag
   zelf komma's hebben.
 - Een download die gelijk is aan de bewaarde lijst verandert niets. Een HTML-pagina of een lijst zonder
-  zenders is "geen zenderlijst". Dat is ook een lijst van meer dan 128 MB, gedownload of in een bestand
-  (er wordt niet meer van gelezen), en wat in de eerste KB een NUL-byte heeft (een video, een archief).
+  zenders is "geen zenderlijst". Dat is ook een lijst van meer dan 128 MB, gedownload of in een bestand,
+  en wat in de eerste KB een NUL-byte heeft (een video, een archief, een stream). In beide gevallen wordt er
+  niet verder gelezen: de eerste KB wordt bekeken zodra hij binnen is.
 - De foutmelding van een dode zender noemt de zender, ook bij Xtream.
 - Logregels noemen een M3U-bron bij id en host, nooit bij adres.
 - De versie gaat in dit plan niet omhoog.

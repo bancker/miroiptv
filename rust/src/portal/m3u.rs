@@ -135,8 +135,10 @@ impl M3uPortal {
 
     /// The list at `url`, as bytes. A refusal is its status. More than
     /// `max_bytes` is no list: a Content-Length that says so is enough, and no
-    /// more of the body is read than the cap. Any other failure is reqwest's
-    /// without the URL, which may hold a password.
+    /// more of the body is read than the cap. Nor is a NUL byte in the first
+    /// KB, looked for as it comes in: a stream's address taken for a list's is
+    /// read no further. Any other failure is reqwest's without the URL, which
+    /// may hold a password.
     async fn download(&self, url: &str) -> Result<Vec<u8>, PortalError> {
         let mut answer = self
             .client
@@ -159,8 +161,13 @@ impl M3uPortal {
             .await
             .map_err(|e| PortalError::Http(e.without_url()))?
         {
+            // The first KB is looked at while it comes in, a shorter body too.
+            let in_head = body.len() < NUL_SCAN_BYTES;
             if !append_within(&mut body, &chunk, max as usize) {
                 return Err(too_big(self.id, max));
+            }
+            if in_head && !is_text(&body) {
+                return Err(not_text(self.id));
             }
         }
         Ok(body)
@@ -173,6 +180,15 @@ fn too_big(id: SourceId, max: u64) -> PortalError {
         "m3u: list of source {} is over {} KB - no channel list",
         id,
         max / 1024
+    );
+    PortalError::NotAList
+}
+
+/// What a list with a NUL byte in its first KB is, with a word in the log first.
+fn not_text(id: SourceId) -> PortalError {
+    tracing::warn!(
+        "m3u: list of source {} has a NUL byte in its first KB - no channel list",
+        id
     );
     PortalError::NotAList
 }
@@ -193,26 +209,57 @@ fn append_within(body: &mut Vec<u8>, chunk: &[u8], max: usize) -> bool {
     true
 }
 
-/// The bytes of the file at `path`, or `None` when it holds more than `max`.
-/// Such a file is not read, and no more than `max` of one that grows while it
-/// is read.
-fn read_at_most(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
-    let file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    if len > max {
-        return Ok(None);
-    }
-    let mut bytes = Vec::with_capacity(len as usize);
-    file.take(max + 1).read_to_end(&mut bytes)?;
-    Ok((bytes.len() as u64 <= max).then_some(bytes))
+/// What reading a list's bytes came to: all of them, or why it stopped.
+enum Took {
+    /// All of them: within the cap, and text as far as the first KB tells.
+    All(Vec<u8>),
+    /// More than the cap.
+    TooBig,
+    /// A NUL byte in the first KB: no text (a video, an archive).
+    NotText,
 }
 
-/// The list in `bytes`, if they are one. A NUL byte in the first KB says they
-/// are no text (a video, an archive), and they are read no further.
-fn read_list(bytes: &[u8]) -> Option<Playlist> {
-    if bytes[..bytes.len().min(NUL_SCAN_BYTES)].contains(&0) {
-        return None;
+/// The bytes of the file at `path`, read as [`read_bytes`] does.
+fn read_at_most(path: &Path, max: u64) -> std::io::Result<Took> {
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    read_bytes(file, len, max)
+}
+
+/// The `len` bytes of `reader` (a file of that length), `max` at most. More
+/// than `max` is not read at all, and no more than `max` of a file that grows
+/// while it is read. The first KB comes first, and with a NUL byte in it
+/// nothing after it is read.
+fn read_bytes(mut reader: impl Read, len: u64, max: u64) -> std::io::Result<Took> {
+    if len > max {
+        return Ok(Took::TooBig);
     }
+    let mut bytes = Vec::with_capacity((len as usize).min(NUL_SCAN_BYTES));
+    (&mut reader)
+        .take(NUL_SCAN_BYTES as u64)
+        .read_to_end(&mut bytes)?;
+    if !is_text(&bytes) {
+        return Ok(Took::NotText);
+    }
+    bytes.reserve_exact((len as usize).saturating_sub(bytes.len()));
+    let rest = (max + 1).saturating_sub(bytes.len() as u64);
+    reader.take(rest).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Ok(Took::TooBig);
+    }
+    Ok(Took::All(bytes))
+}
+
+/// Whether `bytes` can be a list's, as far as their first KB tells: a NUL byte
+/// there says they are no text (a video, an archive). The one check of it, for
+/// a download as it comes in and for a file before the rest of it is read.
+fn is_text(bytes: &[u8]) -> bool {
+    !bytes[..bytes.len().min(NUL_SCAN_BYTES)].contains(&0)
+}
+
+/// The list in `bytes`, if they are one. Their first KB was looked at for a NUL
+/// byte (`is_text`) as they came: by the download, or by the file's read.
+fn read_list(bytes: &[u8]) -> Option<Playlist> {
     m3u::read(&String::from_utf8_lossy(bytes))
 }
 
@@ -256,12 +303,15 @@ fn read_download(
 /// file. A web address with a mistyped scheme (`htps://user:pass@…`) is taken
 /// for a file too, so the text goes through `redact`.
 fn read_file(path: &Path, max: u64, id: SourceId) -> Result<(Playlist, usize), PortalError> {
-    let bytes = read_at_most(path, max)
-        .map_err(|e| {
-            let said = format!("{}: {}", path.display(), e);
-            PortalError::File(crate::redact::redact(&said).into_owned())
-        })?
-        .ok_or_else(|| too_big(id, max))?;
+    let took = read_at_most(path, max).map_err(|e| {
+        let said = format!("{}: {}", path.display(), e);
+        PortalError::File(crate::redact::redact(&said).into_owned())
+    })?;
+    let bytes = match took {
+        Took::All(bytes) => bytes,
+        Took::TooBig => return Err(too_big(id, max)),
+        Took::NotText => return Err(not_text(id)),
+    };
     let playlist = read_list(&bytes).ok_or(PortalError::NotAList)?;
     Ok((playlist, bytes.len()))
 }
@@ -302,7 +352,9 @@ impl Portal for M3uPortal {
         let t0 = Instant::now();
         let (path, max) = (self.cache.clone(), self.max_bytes);
         let (playlist, size) = tokio::task::spawn_blocking(move || {
-            let bytes = read_at_most(&path, max).ok()??;
+            let Took::All(bytes) = read_at_most(&path, max).ok()? else {
+                return None;
+            };
             let playlist = read_list(&bytes)?;
             Some((playlist, bytes.len()))
         })
@@ -521,12 +573,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("lijst.m3u");
         std::fs::write(&file, vec![b'x'; 2048]).unwrap();
-        assert!(
-            read_at_most(&file, 2047).unwrap().is_none(),
-            "one byte over"
-        );
+        let over = read_at_most(&file, 2047).unwrap();
+        assert!(matches!(over, Took::TooBig), "one byte over");
         let read = read_at_most(&file, 2048).unwrap();
-        assert_eq!(read.map(|b| b.len()), Some(2048), "the cap itself fits");
+        assert!(
+            matches!(read, Took::All(b) if b.len() == 2048),
+            "the cap itself fits"
+        );
         assert!(read_at_most(&dir.path().join("weg.m3u"), 2048).is_err());
     }
 
@@ -541,16 +594,97 @@ mod tests {
         assert_eq!(body.len(), 1024, "as it was");
     }
 
+    /// A server that answers one GET with `first` as a chunk of its body and
+    /// then holds the connection open, sending nothing more: a live stream's
+    /// server, as far as the first bytes go. Its URL.
+    async fn stalling(first: &[u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/live.ts", listener.local_addr().unwrap());
+        let mut answer = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        answer.extend_from_slice(format!("{:x}\r\n", first.len()).as_bytes());
+        answer.extend_from_slice(first);
+        answer.extend_from_slice(b"\r\n");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if socket.read(&mut byte).await.unwrap() == 0 {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            socket.write_all(&answer).await.unwrap();
+            // No more, and no end: the socket stays open with this task.
+            std::future::pending::<()>().await;
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_download_with_a_nul_in_its_first_kb_stops_there() {
+        // A live stream's address taken for a list's: it never ends. The client
+        // would wait for its time-out (30 s), the test waits 5.
+        let mut first = vec![b'x'; NUL_SCAN_BYTES];
+        first[..8].copy_from_slice(b"G\0\x11\x10\0\0\xb0\x0d");
+        let url = stalling(&first).await;
+        let portal = M3uPortal::new(2, &url, PathBuf::new());
+        let read = tokio::time::timeout(Duration::from_secs(5), portal.download(&url)).await;
+        let read = read.expect("it stops at the first KB");
+        let read = read.map(|bytes| bytes.len());
+        assert!(matches!(read, Err(PortalError::NotAList)), "{read:?}");
+    }
+
+    #[tokio::test]
+    async fn a_download_that_ends_inside_its_first_kb_is_looked_at_too() {
+        let body = "#EXTM3U\n\0\n#EXTINF:-1,A\nhttps://a.example/1.m3u8\n";
+        let server = serving(body, false).await;
+        let url = format!("{}/tv.m3u", server.uri());
+        let portal = M3uPortal::new(2, &url, PathBuf::new());
+        let read = portal.download(&url).await.map(|bytes| bytes.len());
+        assert!(matches!(read, Err(PortalError::NotAList)), "{read:?}");
+    }
+
+    /// A reader that counts the bytes it hands out.
+    struct Counting<R> {
+        inner: R,
+        given: usize,
+    }
+
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.given += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_file_with_a_nul_in_its_first_kb_is_read_no_further() {
+        // A video's first bytes, and a MB after them.
+        let mut video = vec![b'x'; 1 << 20];
+        video[..8].copy_from_slice(b"\0\0\0\x18ftyp");
+        let mut reader = Counting {
+            inner: &video[..],
+            given: 0,
+        };
+        let took = read_bytes(&mut reader, video.len() as u64, MAX_LIST_BYTES).unwrap();
+        assert!(matches!(took, Took::NotText));
+        assert!(reader.given <= 4 * 1024, "{} bytes read", reader.given);
+    }
+
     #[test]
     fn a_nul_is_looked_for_in_the_first_kb_only() {
         let list = list_of(30);
         assert!(list.len() > NUL_SCAN_BYTES);
         let mut late = list.clone().into_bytes();
         late.push(0);
-        assert!(read_list(&late).is_some(), "a NUL after the first KB");
+        assert!(is_text(&late), "a NUL after the first KB");
+        assert!(read_list(&late).is_some());
         let mut early = list.into_bytes();
         early[NUL_SCAN_BYTES - 1] = 0;
-        assert!(read_list(&early).is_none(), "a NUL in the first KB");
+        assert!(!is_text(&early), "a NUL in the first KB");
     }
 
     #[tokio::test]
