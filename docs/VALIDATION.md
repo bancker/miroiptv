@@ -36,11 +36,25 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] First start (no `settings.json`): a language screen in three languages, the Windows language preselected; Enter picks it and the last channel then plays
 - [ ] `o` opens the settings; Up/Down choose a section, Enter opens it, Esc goes back; Esc or `o` in the list closes
 - [ ] Switch the language: every text changes at once (help, toasts, guide, settings)
-- [ ] Portal: Test with a wrong password → "Gebruiker of wachtwoord onjuist"; Save with the right one → "Verbonden: N zenders", or just "Verbonden" when the channel list is slow to arrive; `BongoPlayer.ini` then holds the line `portal=<user>:<password>@<server>:<port>`
-- [ ] Portal: a pasted server such as `http://host:8080/` (with a line break after it) connects like `host:8080`; a busy portal (HTTP 503 or 509) reads "Server niet bereikbaar", not "Geen geldige portal"
-- [ ] Started with `--xtream user:pass@host:port`: Settings → Portal shows a note under the fields that the portal comes from the command line and that what is saved there only counts without that option; after a Save the note is gone
+- [ ] Bronnen: Test with a wrong password → "Gebruiker of wachtwoord onjuist"; Save with the right one → "Verbonden: N zenders", or just "Verbonden" when the channel list is slow to arrive; `BongoPlayer.ini` then holds the line `portal=<user>:<password>@<server>:<port>`
+- [ ] Bronnen: a pasted server such as `http://host:8080/` (with a line break after it) connects like `host:8080`; a busy portal (HTTP 503 or 509) reads "Server niet bereikbaar", not "Geen geldige portal"
+- [ ] Started with `--xtream user:pass@host:port`: Settings → Bronnen shows a note under the fields that the portal comes from the command line and that what is saved there only counts without that option; after a Save the note is gone
 - [ ] Controls: reverse zapping → arrow up and wheel up go to the next channel; the help shows it
 - [ ] `?` opens the help; its `o` row is underlined and a click on it opens the settings; in a small window the help scrolls with the wheel, a thin marker shows the position, and Tab stops only on the `o` row
+
+## Bronnen (M3U)
+- [ ] `o` → Bronnen with one portal: the form shows the portal (Name, Server, User, Password, Test, Save) and the list below it marks it "in gebruik"; Test and Save work as before
+- [ ] Nieuwe bron → M3U → `https://iptv-org.github.io/iptv/index.m3u` → Opslaan: "bron opgeslagen"; the portal stays in use; Actief maken: the list loads (about 11,000 channels), up/down zaps in the list's own order, `f` finds a channel, Shift+F and `*` keep favorites of this source only
+- [ ] Quit and start again: the list shows at once (the saved one), the last channel resumes, the debug log says `m3u: saved list of source <id>` and then `m3u: list of source <id> read` or `… unchanged`
+- [ ] A channel of the list with an `#EXTVLCOPT` User-Agent plays; a dead one says "streamfout op <naam>" and the app stays on it; `g` says "voor deze bron is er nog geen gids"
+- [ ] Zap from a playing channel to a dead one: the picture goes black under the error toast, not the picture of the channel before it frozen under the new name; a channel that played and then dies keeps its own last frame
+- [ ] Back to the portal with Actief maken: the portal's favorites, presets and last channel are back; the guide works
+- [ ] An M3U address with a password (`https://user:pass@…`): nothing of it in the log (`%APPDATA%\BongoPlayer\config\log\`), only `source: m3u <id> (<host>)`
+- [ ] A `http://…/get.php?username=…&password=…` link typed as an M3U address, then Opslaan: the question offers an Xtream source; "Als Xtream-bron" fills Server, User and Password. The same link with `https://` stays an M3U list, with no question
+- [ ] A list in a file (`C:\…\lijst.m3u`) loads; remove the file and start again: the empty state says "zenderlijst ophalen mislukt" with its path
+- [ ] Verwijderen is disabled for the source in use; for another source it asks twice ("Echt verwijderen (met favorieten)?") and takes that source's favorites, presets, last channel and saved list along
+- [ ] First start without any source: the setup prompt's last line is a link to Bronnen with a new M3U list ready; typing there types, it fires no hotkey
+- [ ] Downgrade check: with a portal and an M3U list saved, BongoPlayer 0.6.1 still starts on the portal
 
 ## Adult content
 - [ ] Locked (after every start): zapping, search, guide, favorites and presets show no adult channels or films
@@ -52,7 +66,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] Close the app while adult content plays → the next start does not resume it
 - [ ] A channel the portal flagged adult since it was last watched (its `last_watched.json` still says not adult): the start resumes it, and when the catalog has loaded it stops with "Vergrendeld"; the next start does not resume it
 - [ ] Forgot PIN: the portal password clears it
-- [ ] Saving another portal (Settings → Portal) while adult content plays stops playback
+- [ ] Saving another portal (Settings → Bronnen) while adult content plays stops playback
 - [ ] In the PIN dialogs Enter moves to the next field and Esc cancels the open dialog first
 - [ ] After 3 wrong PINs and Forgot PIN the 30 s wait is gone (a new PIN can be chosen at once)
 - [ ] A bare adult stream URL on the command line (`BongoPlayer.exe <url>`) → the next plain start does not resume it

@@ -303,3 +303,75 @@ geheugenvoetafdruk vraagt een eigen aanpak.
 | De LGPL-build van libmpv (het licentieproject) | Kan protocollen als SRT of RTMP laten vallen. Dat is acceptabel: ze zijn zeldzaam en het is "best effort" |
 | Willekeurige servers | Ze gedragen zich anders dan het portaal: trage of dode streams, en vaak een eigen User-Agent. Daarom zijn er de headers per zender en de foutmelding zonder doorspringen |
 | Zappen door 11.000 zenders | Kan traag aanvoelen. `zap.rs` regelt het tempo al, en favorieten en presets zijn de snelle weg |
+
+## 10. Uitwerking in het bouwplan
+
+Het bouwplan (`docs/superpowers/plans/2026-10-14-m3u-bronnen.md`, "Rulings") legt vast wat dit ontwerp
+openliet. Kort:
+
+- `o` werkt niet in het startscherm (typen mag nooit een sneltoets zijn). Daarom is de nieuwe regel een
+  link naar Bronnen met een nieuwe M3U-lijst klaar.
+- De ini: `portal=` (kopie van de eerste Xtream-bron), `source=<id>;<soort>;<naam>;<adres>` en
+  `active=<id>`. Eén portaal met de standaardnaam blijft precies de regel van 0.6.1.
+- Een bron zonder eigen naam heet "Portaal" of "M3U-lijst" in de taal van de app.
+- Bron 1 houdt de bestanden van 0.6.1; andere bronnen hebben bestanden met hun id. `--xtream` gebruikt die
+  van bron 1.
+- Van bron wisselen werkt als een start op die bron: wat speelt stopt, de laatste zender van die bron
+  hervat. Een nieuwe bron gaat alleen meteen in gebruik als er geen bruikbare bron in gebruik is.
+- Verwijderen vraagt een tweede druk, en de bron die in gebruik is kan niet weg.
+- De headers per zender gaan mee in de URL, op de manier van Kodi (`url|User-Agent=…`). mpv krijgt ze als
+  opties voor dat ene bestand.
+- De naam in `#EXTINF` begint na de eerste komma buiten aanhalingstekens, niet na de laatste: een naam mag
+  zelf komma's hebben.
+- Een download die gelijk is aan de bewaarde lijst verandert niets. Een HTML-pagina of een lijst zonder
+  zenders is "geen zenderlijst".
+- De foutmelding van een dode zender noemt de zender, ook bij Xtream.
+- Logregels noemen een M3U-bron bij id en host, nooit bij adres.
+- De versie gaat in dit plan niet omhoog.
+
+Tijdens het bouwen kwamen er besluiten bij. Waar ze afwijken van de paragrafen hierboven (§3.4: "de laatste
+komma", §3.5: "een positieve i64"), gaan ze voor:
+
+- De `stream_id` volgt uit de eerste 8 bytes van de SHA-256 van de sleutel (big-endian), één bit naar rechts
+  geschoven (`>> 1`), zodat hij nooit negatief is. Opgeslagen favorieten en presets bevatten deze id's, dus
+  de uitkomst mag nooit meer veranderen.
+- mpv krijgt de User-Agent als de optie `user-agent` en de Referer als een regel in `http-header-fields`
+  (`Referer: …`, een komma als `\,`), allebei alleen voor dat ene bestand. De optie `referrer` is niet
+  gebruikt: libmpv zette die na een bestand terug als lege tekst, en elke volgende load stuurde dan een lege
+  `Referer:`.
+- Een NUL-byte in een argument van een mpv-opdracht (een lijst kan er een bevatten) geeft een fout in plaats
+  van een paniek, want de release-build breekt bij een paniek af. De zender krijgt de melding van een dode
+  zender.
+- Een M3U-zender die mpv weigert, of die met een fout eindigt voordat hij een beeld heeft getoond, laat het
+  scherm zwart (de lege toestand). Het beeld van de zender ervoor blijft dus niet bevroren onder de nieuwe
+  naam staan. Heeft de zender al gespeeld, dan blijft zijn eigen laatste beeld staan. Xtream houdt het
+  gedrag van 0.6.1.
+- De vraag of een `…/get.php?username=…&password=…`-link een Xtream-bron moet worden, komt alleen bij een
+  `http://`-link: de Xtream-client spreekt alleen gewoon HTTP, dus een `https://`-link zou een bron worden
+  die nooit verbindt. Een `https://`-link blijft een M3U-lijst, zonder vraag. De vraag hoort bij het adres:
+  wie het adres wijzigt, krijgt hem opnieuw, en een bewaarde lijst met hetzelfde adres krijgt hem niet nog
+  eens als alleen de naam verandert.
+- Een naam die gelijk is aan de standaardnaam van zijn soort, in welke van de drie talen ook, geldt niet als
+  eigen naam en wordt leeg bewaard. Hij verschijnt dan in de taal die op dat moment is gekozen.
+- Een `;` in een naam wordt bij het bewaren een komma (`;` scheidt de velden van de `source=`-regel). Hij
+  valt niet weg. Regeleinden vallen wel weg.
+- De ini wordt bij elke wijziging van de bronnen eerst geschreven. Mislukt dat, ook bij van bron wisselen,
+  dan verandert er niets en noemt de melding de schrijffout. Zo is wat draait altijd wat de volgende start
+  opent.
+- Een relatief pad naar een lijstbestand wordt als absoluut pad bewaard (`std::path::absolute`): de volgende
+  start draait misschien in een andere map.
+- `redact()` maskeert ook `user:pass@` in elke URL, de query van een lijstadres (`.m3u`, `.m3u8`,
+  `get.php`, in elke hoofdletter) en de korte Xtream-vorm van een stream-URL
+  (`host/<gebruiker>/<wachtwoord>/<cijfers>[.ext]`), zoals betaalde lijsten die gebruiken. Een token in de
+  query van een andere URL (`…/1.ts?token=…`) wordt niet gemaskeerd. Elke logregel, foutmelding of toast die
+  een adres of een stream-URL noemt, gaat door `redact()` of noemt alleen id en host.
+- Een zender zonder naam in de lijst heet naar zijn `tvg-name`, anders naar zijn URL met het account
+  gemaskeerd. Die naam komt in meldingen, zoeken en favorieten.
+- Het pad van een lokaal bestand is geen inlogkenmerk: de lege toestand en het log mogen het noemen.
+- Het resultaat van een verbindingstest of van een Opslaan staat alleen onder het formulier dat erom vroeg.
+  Komt de uitslag van een Opslaan nadat de gebruiker naar een ander formulier is gegaan, dan blijft dat
+  formulier staan en is de bron toch bewaard.
+- Bronnen houdt de plek van het oude Portaal (tweede in de lijst). Een uitgeschakelde knop is geen Tab-stop.
+  `o`, ↓, Enter zet de cursor in het veld Server (bij een lijst: Adres) van de bron in gebruik, zodat de
+  Tab-tellingen naar Test en Opslaan gelijk blijven. Na een antwoord van de app (opslaan, wisselen,
+  verwijderen) staat de cursor in de naam van het formulier dat dan verschijnt.

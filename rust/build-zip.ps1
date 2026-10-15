@@ -52,8 +52,10 @@ USAGE
 1. Double-click run.bat (or BongoPlayer.exe).
 2. First start: choose your language, then enter your Xtream portal (server,
    user, password) when asked. The app tests it and keeps it in
-   BongoPlayer.ini next to the exe.
-3. Change the language, the portal and more later in the settings (press o).
+   BongoPlayer.ini next to the exe. Or press the link under it to add an M3U
+   list (a URL or a file) in the settings.
+3. Change the language, the sources (Xtream portals, M3U lists) and more later
+   in the settings (press o).
 
 OR from the command line:
   BongoPlayer.exe --xtream user:pass@host:port      (beats the saved portal for
@@ -84,12 +86,12 @@ KEYS
   + / -                              higher / lower quality (live)
   left / right arrow                 seek -30s / +30s (movies, catch-up)
   space                              pause / play (movies, series, catch-up)
-  o                                  settings (language, portal, adult content, news)
+  o                                  settings (language, sources, adult content, news)
   ?                                  all keys
   F11                                fullscreen
   t                                  borderless + always on top
   right mouse button + drag          move the borderless window
-  F5                                 retry the portal fetch
+  F5                                 fetch the portal or the list again
   d                                  debug info
   Esc                                close overlays
 
