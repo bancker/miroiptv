@@ -26,7 +26,9 @@ pub struct Cli {
     pub console: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+/// `Debug` for the tests only: it would print the password.
+#[derive(PartialEq, Eq, Clone)]
+#[cfg_attr(test, derive(Debug))]
 pub struct XtreamCreds {
     pub username: String,
     pub password: String,
@@ -171,8 +173,10 @@ pub enum CredsOrigin {
     Ini,
 }
 
-/// Where the portal credentials come from at startup.
-#[derive(Debug, PartialEq, Eq)]
+/// Where the portal credentials come from at startup. `Debug` for the tests
+/// only, as for [`XtreamCreds`], which it holds.
+#[derive(PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 pub enum CredsSource {
     /// Usable credentials, and which place they came from: `--xtream` if it has
     /// real values, else the ini.

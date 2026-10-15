@@ -12,7 +12,9 @@ use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, error, info, warn};
 
-#[derive(Debug)]
+/// What the app tells the player. `Debug` for the tests only: a load holds a
+/// stream URL, with the account in it.
+#[cfg_attr(test, derive(Debug))]
 pub enum Cmd {
     /// Load this URL as it is, byte for byte: an Xtream URL's password may
     /// hold a `|`.

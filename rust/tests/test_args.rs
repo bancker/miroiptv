@@ -3,18 +3,29 @@ use bongo_player::args::{
     CredsOrigin, CredsSource, XtreamCreds,
 };
 
+/// The fields of credentials, to compare and to print: outside the crate's own
+/// tests `XtreamCreds` has no `Debug`, which would print the password.
+fn fields(c: &XtreamCreds) -> (&str, &str, &str, u16) {
+    (&c.username, &c.password, &c.host, c.port)
+}
+
+/// What a `CredsSource` says, to compare and to print, without the password:
+/// outside the crate's own tests it has no `Debug` either.
+fn said(s: &CredsSource) -> String {
+    match s {
+        CredsSource::Configured(c, origin) => {
+            format!("{}@{}:{} from {origin:?}", c.username, c.host, c.port)
+        }
+        CredsSource::Placeholder => "placeholder".into(),
+        CredsSource::Missing => "missing".into(),
+        CredsSource::Invalid(e) => format!("invalid: {e}"),
+    }
+}
+
 #[test]
 fn parses_xtream_creds_with_port() {
     let c = parse_xtream_creds("user:pass@host.example.com:8080").unwrap();
-    assert_eq!(
-        c,
-        XtreamCreds {
-            username: "user".into(),
-            password: "pass".into(),
-            host: "host.example.com".into(),
-            port: 8080,
-        }
-    );
+    assert_eq!(fields(&c), ("user", "pass", "host.example.com", 8080));
 }
 
 #[test]
@@ -79,7 +90,7 @@ fn placeholder_cli_credentials_fall_back_to_the_ini() {
             assert_eq!(c.username, "real");
             assert_eq!(origin, CredsOrigin::Ini);
         }
-        other => panic!("expected the ini's credentials, got {other:?}"),
+        other => panic!("expected the ini's credentials, got {}", said(&other)),
     }
 }
 
@@ -90,14 +101,20 @@ fn real_cli_credentials_still_win_over_the_ini() {
             assert_eq!(c.username, "cli");
             assert_eq!(origin, CredsOrigin::CommandLine);
         }
-        other => panic!("expected the command-line credentials, got {other:?}"),
+        other => panic!(
+            "expected the command-line credentials, got {}",
+            said(&other)
+        ),
     }
 }
 
 #[test]
 fn missing_placeholder_and_unreadable_credentials_are_told_apart() {
-    assert_eq!(resolve_creds(None, None), CredsSource::Missing);
-    assert_eq!(resolve_creds(Some("user:pass@host.example.com"), None), CredsSource::Placeholder);
+    assert_eq!(said(&resolve_creds(None, None)), "missing");
+    assert_eq!(
+        said(&resolve_creds(Some("user:pass@host.example.com"), None)),
+        "placeholder"
+    );
     assert!(matches!(resolve_creds(None, Some("nonsense@")), CredsSource::Invalid(_)));
 }
 
@@ -107,15 +124,7 @@ fn credentials_written_by_the_app_read_back_the_same() {
     let ini = dir.path().join("BongoPlayer.ini");
     bongo_player::args::write_ini_creds(&ini, "bob:p@ss=w:rd@srv.example.net:8080").unwrap();
     let back = parse_xtream_creds(&read_ini_creds(&ini).unwrap()).unwrap();
-    assert_eq!(
-        back,
-        XtreamCreds {
-            username: "bob".into(),
-            password: "p@ss=w:rd".into(),
-            host: "srv.example.net".into(),
-            port: 8080,
-        }
-    );
+    assert_eq!(fields(&back), ("bob", "p@ss=w:rd", "srv.example.net", 8080));
 }
 
 #[test]
@@ -126,13 +135,8 @@ fn a_user_name_with_an_equals_sign_reads_back_the_same() {
     bongo_player::args::write_ini_creds(&ini, "b=ob:p@ss=w:rd@srv.example.net:8080").unwrap();
     let back = parse_xtream_creds(&read_ini_creds(&ini).unwrap()).unwrap();
     assert_eq!(
-        back,
-        XtreamCreds {
-            username: "b=ob".into(),
-            password: "p@ss=w:rd".into(),
-            host: "srv.example.net".into(),
-            port: 8080,
-        }
+        fields(&back),
+        ("b=ob", "p@ss=w:rd", "srv.example.net", 8080)
     );
 }
 
@@ -179,7 +183,7 @@ fn credentials_with_nothing_on_the_command_line_come_from_the_ini() {
             assert_eq!(c.username, "ini");
             assert_eq!(origin, CredsOrigin::Ini);
         }
-        other => panic!("expected the ini's credentials, got {other:?}"),
+        other => panic!("expected the ini's credentials, got {}", said(&other)),
     }
 }
 
@@ -240,13 +244,5 @@ fn a_cleaned_line_reads_back_as_the_fields_it_was_made_from() {
         "https://srv.example.net:8080/\r\n",
     );
     let c = parse_xtream_creds(&line).unwrap();
-    assert_eq!(
-        c,
-        XtreamCreds {
-            username: "bob".into(),
-            password: "p@ss w:rd".into(),
-            host: "srv.example.net".into(),
-            port: 8080,
-        }
-    );
+    assert_eq!(fields(&c), ("bob", "p@ss w:rd", "srv.example.net", 8080));
 }

@@ -32,7 +32,9 @@ pub fn stream_ref(url: &str) -> Option<(StreamKind, i64)> {
     Some((kind, id))
 }
 
-#[derive(Debug, Clone)]
+/// `Debug` for the tests only: it would print the password.
+#[derive(Clone)]
+#[cfg_attr(test, derive(Debug))]
 pub struct XtreamPortal {
     pub creds: XtreamCreds,
     client: reqwest::Client,

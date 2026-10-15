@@ -41,7 +41,9 @@ use tracing::warn;
 
 /// Persisted "what was playing" so startup can resume it. `live` flags whether
 /// the stall watchdog should arm on resume (live channels yes, VOD/catch-up no).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// `Debug` for the tests only: the URL holds the account.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 struct LastWatched {
     url: String,
     live: bool,
