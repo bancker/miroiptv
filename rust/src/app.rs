@@ -10096,7 +10096,8 @@ https://c.example/twee-nieuws.m3u8\n";
         fresh
             .app
             .apply_settings_action(SettingsAction::SaveSource(draft));
-        assert_eq!(fresh.app.sources.active_id(), Some(1));
+        // Source 1's files are the portal's: a list is never source 1.
+        assert_eq!(fresh.app.sources.active_id(), Some(2));
         assert_eq!(fresh.app.catalog.kind(), SourceKind::M3u);
         assert_eq!(fresh.app.portal_state, PortalState::Configured);
         std::env::remove_var("BONGO_INI");
@@ -10835,6 +10836,88 @@ https://c.example/twee-nieuws.m3u8\n";
         assert_eq!(h.app.portal_state, PortalState::Configured);
         assert_eq!(h.app.storage.source(), 2, "its own favorites and presets");
         assert!(!h.app.favorites.contains(3), "not source 1's");
+    }
+
+    /// A portable zip unzipped into a new folder: no ini beside the exe, but the
+    /// config folder holds the favorites 0.6.1's portal left (`favorites.json`,
+    /// source 1's). The setup prompt shows. Also the list `lijst.m3u` in `dir`.
+    fn a_new_folder_with_old_favorites(dir: &std::path::Path) -> (Harness, String) {
+        let mut old = Favorites::default();
+        old.toggle(3, "TEST 03");
+        let storage = Storage::with_root(dir.to_path_buf());
+        old.save(&storage.favorites_path()).unwrap();
+        let file = dir.join("lijst.m3u");
+        std::fs::write(&file, TEST_LIST).unwrap();
+        let catalog = Arc::new(CatalogStore::new(idle_portal()));
+        let h = Harness::start(dir, catalog, PortalState::Missing, None);
+        (h, file.display().to_string())
+    }
+
+    #[tokio::test]
+    async fn a_list_saved_from_the_setup_prompts_link_never_takes_the_portals_files() {
+        let env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let (mut h, file) = a_new_folder_with_old_favorites(dir.path());
+        // The prompt's link (Connect, disabled, is no stop), the list's address
+        // in the form it opens, Save.
+        h.press(&[Key::Tab, Key::Tab, Key::Tab, Key::Tab, Key::Enter]);
+        h.type_text(&file);
+        h.press(&[Key::Tab, Key::Enter]);
+        std::env::remove_var("BONGO_INI");
+        drop(env);
+        assert_eq!(h.app.catalog.kind(), SourceKind::M3u, "the list is in use");
+        assert_ne!(
+            h.app.storage.source(),
+            1,
+            "source 1's files are the portal's"
+        );
+        wait_until("the list", || h.app.catalog.is_loaded()).await;
+        let shown = shown_favorites(&h.app.favorites, &h.app.catalog);
+        assert!(
+            shown.is_empty(),
+            "the portal's favorites on the list: {shown:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_portal_saved_after_that_list_is_source_1_with_its_old_favorites() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = portal_that_logs_in().await;
+        let (mut h, file) = a_new_folder_with_old_favorites(dir.path());
+        {
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+            let list = list_draft(Editing::New, "Gratis", &file);
+            h.app
+                .apply_settings_action(SettingsAction::SaveSource(list));
+            std::env::remove_var("BONGO_INI");
+        }
+        assert_eq!(h.app.catalog.kind(), SourceKind::M3u, "the list is in use");
+        // A portal added in Bronnen: tested, kept, not used.
+        let portal = SourceDraft {
+            editing: Editing::New,
+            kind: SourceKind::Xtream,
+            name: "Thuis".into(),
+            address: format!("u2:p2@127.0.0.1:{}", server.address().port()),
+        };
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(portal));
+        take_in_the_login(&mut h, dir.path()).await;
+        let kind = h.app.sources.get(1).map(|s| s.kind);
+        assert_eq!(kind, Some(SourceKind::Xtream), "the portal is source 1");
+        {
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+            h.app
+                .apply_settings_action(SettingsAction::ActivateSource(1));
+            std::env::remove_var("BONGO_INI");
+        }
+        assert_eq!(h.app.storage.source(), 1);
+        assert!(
+            h.app.favorites.contains(3),
+            "0.6.1's favorites are the portal's"
+        );
     }
 
     #[tokio::test]

@@ -251,9 +251,9 @@ impl Sources {
     /// Keeps a source as `editing` says, and returns its id. A saved one
     /// changes its name and address, and keeps its kind. The command line's
     /// portal goes into the first Xtream source. A new one, or a command-line
-    /// portal with no Xtream source to go into, is added with the next id
-    /// (1 + the highest). Names lose `;`, CR and LF; both lose the spaces
-    /// around them.
+    /// portal with no Xtream source to go into, is added with an id of its own
+    /// (see `new_id`). Names lose `;`, CR and LF; both lose the spaces around
+    /// them.
     pub fn keep(
         &mut self,
         editing: Editing,
@@ -276,7 +276,7 @@ impl Sources {
                 source.id
             }
             None => {
-                let id = self.list.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+                let id = self.new_id(kind);
                 self.list.push(Source {
                     id,
                     kind,
@@ -285,6 +285,20 @@ impl Sources {
                 });
                 id
             }
+        }
+    }
+
+    /// The id a new source of `kind` gets. Source 1 keeps 0.6.1's files
+    /// (`favorites.json` and the rest), which are the portal's: an M3U list
+    /// never gets 1, but 1 + the highest id, 2 at least. A portal gets 1 when
+    /// no portal is saved and 1 is free, else 1 + the highest. An ini that
+    /// holds a list as source 1 already is read as it is.
+    fn new_id(&self, kind: SourceKind) -> SourceId {
+        let highest = self.list.iter().map(|s| s.id).max().unwrap_or(0);
+        match kind {
+            SourceKind::M3u => highest.max(1) + 1,
+            SourceKind::Xtream if self.first_xtream().is_none() && self.get(1).is_none() => 1,
+            SourceKind::Xtream => highest + 1,
         }
     }
 

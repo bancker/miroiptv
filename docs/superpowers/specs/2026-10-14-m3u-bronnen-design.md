@@ -315,7 +315,9 @@ openliet. Kort:
   `active=<id>`. Eén portaal met de standaardnaam blijft precies de regel van 0.6.1.
 - Een bron zonder eigen naam heet "Portaal" of "M3U-lijst" in de taal van de app.
 - Bron 1 houdt de bestanden van 0.6.1; andere bronnen hebben bestanden met hun id. `--xtream` gebruikt die
-  van bron 1.
+  van bron 1. Die bestanden zijn van het portaal, dus een M3U-lijst wordt nooit bron 1: een nieuwe lijst
+  krijgt 1 + het hoogste id, minstens 2, en een nieuw portaal krijgt 1 als er nog geen portaal is en 1 vrij
+  is. Een oudere ini met een lijst als bron 1 wordt gelezen zoals hij is.
 - Van bron wisselen werkt als een start op die bron: wat speelt stopt, de laatste zender van die bron
   hervat. Een nieuwe bron gaat alleen meteen in gebruik als er geen bruikbare bron in gebruik is.
 - Verwijderen vraagt een tweede druk, en de bron die in gebruik is kan niet weg.

@@ -90,7 +90,7 @@ fn with_source_lines_the_portal_line_is_only_a_copy() {
 #[test]
 fn the_portal_line_is_the_first_xtream_source_so_0_6_1_starts_on_it() {
     let mut s = Sources::default();
-    s.keep(
+    let list = s.keep(
         Editing::New,
         SourceKind::M3u,
         "Gratis",
@@ -102,7 +102,8 @@ fn the_portal_line_is_the_first_xtream_source_so_0_6_1_starts_on_it() {
         "Mijn portal",
         "u:p@portal.example:8080",
     );
-    s.set_active(1);
+    // The list is in use.
+    assert!(s.set_active(list));
     let dir = tempfile::tempdir().unwrap();
     let ini = dir.path().join("BongoPlayer.ini");
     s.save(&ini).unwrap();
@@ -143,36 +144,63 @@ fn broken_source_lines_are_skipped() {
 #[test]
 fn keep_changes_a_saved_one_adds_a_new_one_and_numbers_from_the_highest() {
     let mut s = Sources::default();
+    // A list never gets 1: source 1 keeps 0.6.1's files, which are the portal's.
     let first = s.keep(Editing::New, SourceKind::M3u, "A", "http://a.example/1");
     let second = s.keep(Editing::New, SourceKind::M3u, "B", "http://b.example/2");
-    assert_eq!((first, second), (1, 2));
-    assert_eq!(s.remove(1).map(|g| g.name), Some("A".into()));
-    assert_eq!(s.keep(Editing::New, SourceKind::Xtream, "C", "u:p@h:80"), 3);
+    assert_eq!((first, second), (2, 3));
+    // The first portal takes 1, which is free; the next one numbers from the
+    // highest.
+    assert_eq!(s.keep(Editing::New, SourceKind::Xtream, "C", "u:p@h:80"), 1);
+    assert_eq!(s.keep(Editing::New, SourceKind::Xtream, "D", "v:q@h:80"), 4);
+    assert_eq!(s.remove(2).map(|g| g.name), Some("A".into()));
+    assert_eq!(
+        s.keep(Editing::New, SourceKind::M3u, "E", "http://e.example/5"),
+        5
+    );
     // A saved one changes in place, its kind stays.
     assert_eq!(
         s.keep(
-            Editing::Saved(2),
+            Editing::Saved(3),
             SourceKind::M3u,
             "B2",
             "http://b.example/3"
         ),
-        2
+        3
     );
     assert_eq!(
-        s.get(2).map(row),
-        Some(row(&m3u(2, "B2", "http://b.example/3")))
+        s.get(3).map(row),
+        Some(row(&m3u(3, "B2", "http://b.example/3")))
     );
     // The command line's portal is the first Xtream source...
     assert_eq!(
         s.keep(Editing::CommandLine, SourceKind::Xtream, "", "x:y@h:81"),
-        3
-    );
-    assert_eq!(s.get(3).map(|c| c.address.as_str()), Some("x:y@h:81"));
-    // ...and a new one when there is none.
-    let mut none = Sources::default();
-    assert_eq!(
-        none.keep(Editing::CommandLine, SourceKind::Xtream, "", "x:y@h:81"),
         1
+    );
+    assert_eq!(s.get(1).map(|c| c.address.as_str()), Some("x:y@h:81"));
+    // ...and a new one when there is none: source 1, lists or not.
+    for ini in ["", "source=2;m3u;A;http://a.example/1\n"] {
+        let mut none = Sources::parse(ini);
+        assert_eq!(
+            none.keep(Editing::CommandLine, SourceKind::Xtream, "", "x:y@h:81"),
+            1,
+            "{ini:?}"
+        );
+    }
+}
+
+#[test]
+fn a_list_saved_as_source_1_before_stays_source_1() {
+    // Read as it is: no migration. Its number is taken, so the first portal
+    // numbers from the highest, and so does the next list.
+    let mut s = Sources::parse("source=1;m3u;Lijst;http://a.example/1\nactive=1\n");
+    assert_eq!(
+        rows(s.list()),
+        rows(&[m3u(1, "Lijst", "http://a.example/1")])
+    );
+    assert_eq!(s.keep(Editing::New, SourceKind::Xtream, "", "u:p@h:80"), 2);
+    assert_eq!(
+        s.keep(Editing::New, SourceKind::M3u, "", "http://b.example/2"),
+        3
     );
 }
 
@@ -195,7 +223,7 @@ fn names_lose_semicolons_and_line_breaks_addresses_their_spaces() {
 fn a_password_with_semicolons_and_at_signs_goes_round() {
     let mut s = Sources::default();
     s.keep(Editing::New, SourceKind::M3u, "M", "http://a.example/1");
-    s.keep(
+    let id = s.keep(
         Editing::New,
         SourceKind::Xtream,
         "X",
@@ -203,7 +231,7 @@ fn a_password_with_semicolons_and_at_signs_goes_round() {
     );
     let back = Sources::parse(&s.to_text());
     assert_eq!(
-        back.get(2).map(|x| x.address.as_str()),
+        back.get(id).map(|x| x.address.as_str()),
         Some("bob:p;a@ss=w:rd@srv.example.net:8080")
     );
 }

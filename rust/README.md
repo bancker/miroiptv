@@ -44,7 +44,8 @@ extraction.
   the next start while the fresh list downloads.
 - Favorites, presets and the last channel are kept per source: source 1 in
   `favorites.json`, `presets.json`, `last_watched.json`, another source in
-  `favorites-<id>.json` and so on.
+  `favorites-<id>.json` and so on. Source 1's files are 0.6.1's portal's, so
+  an M3U list never becomes source 1.
 - Preferences: `settings.json` in `%APPDATA%\BongoPlayer\config\`. It holds the
   language, reversed zapping, the adult-content PIN (a salted hash, never the
   PIN) and the news rules; a file that is missing or broken gives the defaults.
