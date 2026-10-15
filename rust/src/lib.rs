@@ -32,5 +32,6 @@ pub mod settings_ui;
 pub mod shortcuts;
 pub mod sources;
 pub mod storage;
+pub mod stream_check;
 pub mod window_drag;
 pub mod zap;

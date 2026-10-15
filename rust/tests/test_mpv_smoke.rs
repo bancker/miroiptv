@@ -43,3 +43,15 @@ fn loadfile_dummy_succeeds() {
     ]);
     assert!(r.is_ok(), "loadfile should succeed: {:?}", r);
 }
+
+#[test]
+#[ignore]
+fn the_defect_check_sends_mpvs_own_user_agent() {
+    // A channel that names no User-Agent is asked with the one mpv sent it.
+    let mpv = Mpv::new().expect("mpv init");
+    assert_eq!(
+        mpv.get_property_string("user-agent").as_deref(),
+        Some(bongo_player::stream_check::MPV_USER_AGENT),
+        "set stream_check::MPV_USER_AGENT to what mpv says"
+    );
+}
