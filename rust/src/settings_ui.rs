@@ -141,7 +141,8 @@ pub enum SettingsAction {
     SaveSource(SourceDraft),
     /// Put this saved source in use.
     ActivateSource(SourceId),
-    /// Remove this saved source, with its favorites, presets and saved list.
+    /// Remove this saved source, with its favorites, presets, defect marks and
+    /// saved list.
     DeleteSource(SourceId),
     /// Show adult content if this is the PIN.
     Unlock(String),

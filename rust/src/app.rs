@@ -1,6 +1,7 @@
 use crate::args::{
     credentials_line, parse_xtream_creds, resolve_creds, CredsError, CredsSource, XtreamCreds,
 };
+use crate::bad_streams::{BadStreams, Failure};
 use crate::catalog::GuideChannel;
 use crate::catalog::{fallback_variant, quality_label, quality_rank, CatalogNotice, CatalogStatus, CatalogStore, ZapFrom, ZapRing};
 use crate::epg::{Epg, EpgEntry};
@@ -30,6 +31,7 @@ use crate::settings_ui::{
 };
 use crate::sources::{Editing, Source, SourceDraft, SourceId, SourceKind, Sources};
 use crate::storage::Storage;
+use crate::stream_check::{same_server, Answer, Check, StreamChecker};
 use crate::window_drag::{self, Mouse, RightDrag};
 use crate::zap::ZapPacer;
 use egui::{Color32, ColorImage, Key, TextureHandle, TextureOptions};
@@ -650,15 +652,32 @@ pub struct TvApp {
     epg_cache_retry_after: Option<Instant>,
     /// When the stream that loads now went to the player; its first frame
     /// clears it. EPG fetching waits meanwhile (10 s at most): zapping first.
-    /// A channel of an M3U list that fails while it is set, and has not played
-    /// since it was picked (`current_has_played`), has shown no picture of its
-    /// own (see `drain_events` and `stop_for_refused_load`).
+    /// An M3U channel that fails while it is set has shown no picture of its
+    /// own unless it played since it was picked (`current_has_played`; a reload
+    /// sets this one again). The `Event::EndOfFile` arm of `drain_events` and
+    /// `note_start_failure` read both. `stop_failed_start` reads this one only
+    /// (a refused load, played or not), and `check_stall` calls it only for a
+    /// start that has not played.
     stream_starting_since: Option<Instant>,
     /// The stream that plays has shown a picture since it was picked: its
     /// first `PlaybackStarted` sets this, and any load but a reload of it
-    /// clears it. A reload sets `stream_starting_since` again, but the picture
-    /// on the screen is still its own.
+    /// clears it, as `stop_playback` does. A reload sets
+    /// `stream_starting_since` again, but the picture on the screen is still
+    /// its own. The defect marks read it too (spec 2026-10-15 §4.1): a start of
+    /// a stream that has played and then fails is a stream that dropped, never
+    /// a suspect (`note_start_failure`), and the stall watchdog gives up only a
+    /// start that has not played (`check_stall`).
     current_has_played: bool,
+    /// The defect marks of the M3U source in use, read when its catalog loads;
+    /// none on an Xtream portal. The catalog holds a copy for its filter
+    /// (`CatalogStore::set_defect`): every change here is handed to it.
+    bad_streams: Option<BadStreams>,
+    /// The catalog (generation, revision) the marks were brought up to date for.
+    bad_streams_for: Option<(u64, u64)>,
+    /// The checks before a mark (spec §4.2): a confirmed suspect's address is
+    /// asked once more in the background; `drain_stream_checks` takes the
+    /// answers in. Builds nothing until the first check.
+    stream_checks: StreamChecker,
     /// A catch-up pick loading behind the wait screen.
     pending_catchup: Option<PendingCatchup>,
     /// Tracks borderless+always-on-top toggle (`t` key).
@@ -896,6 +915,9 @@ impl TvApp {
             epg_cache_retry_after: None,
             stream_starting_since: None,
             current_has_played: false,
+            bad_streams: None,
+            bad_streams_for: None,
+            stream_checks: StreamChecker::new(),
             pending_catchup: None,
             borderless: false,
             right_drag: None,
@@ -1118,6 +1140,7 @@ impl TvApp {
         self.playing_resumed = false;
         self.stall_watchdog_armed = false;
         self.stream_starting_since = None;
+        self.current_has_played = false;
         self.frame_fence.stop();
         self.video_tex = None;
         tracing::info!("player: stop");
@@ -1428,7 +1451,8 @@ impl TvApp {
     /// current URL - the automatic version of the user's "zap up then back
     /// down" fix. Runs every update() (~30 Hz, even with no frames) so it fires
     /// while the picture is frozen. Uses FrameBus::version() to avoid cloning
-    /// the pixel buffer.
+    /// the pixel buffer. An M3U channel that never showed a picture is given
+    /// up instead of reloaded (see below).
     fn check_stall(&mut self) {
         if !self.stall_watchdog_armed || self.zap_pacer.waiting().is_some() {
             return; // nothing to watch, or the user is zapping away anyway
@@ -1444,6 +1468,16 @@ impl TvApp {
         }
         const COOLDOWN: Duration = Duration::from_secs(15);
         if self.last_progress_at.elapsed() < self.health.stall_limit() {
+            return;
+        }
+        // An M3U channel that has not played since it was picked is not
+        // reloaded: the app gives its start up (spec 2026-10-15 §4.1), as when
+        // mpv refuses a load, and it becomes a suspect. A reload would only start
+        // the wait over, with a "herverbinden" toast each time. This is where
+        // `current_has_played` is asked: `stop_failed_start` itself does not.
+        let waited = self.last_progress_at.elapsed().as_secs();
+        if !self.current_has_played && self.stop_failed_start() {
+            tracing::warn!("m3u: no picture ~{}s after the start - given up", waited);
             return;
         }
         if let Some(t) = self.last_recovery_at {
@@ -1477,6 +1511,9 @@ impl TvApp {
                     self.health.mark_started();
                     self.stream_starting_since = None;
                     self.current_has_played = true;
+                    // What plays has shown a picture since it was picked, and the
+                    // connection works: the marks hear of it (spec §4.2, §4.4).
+                    self.note_first_picture();
                     // mpv restarts before it renders the first picture of the new
                     // file, and the bus still holds the last one of the stream
                     // before. A catch-up wait goes on until a newer picture is
@@ -1519,8 +1556,10 @@ impl TvApp {
                     if reason == "eof" && live && self.zap_pacer.waiting().is_some() {
                         // The user is zapping away anyway. The stream has ended
                         // all the same: it no longer plays (`plays`), so a flip
-                        // back to it loads it again.
+                        // back to it loads it again. A start that ended without
+                        // a picture is a failed start all the same (spec §4.1).
                         self.stall_watchdog_armed = false;
+                        self.note_start_failure();
                         continue;
                     }
                     if reason == "eof" && live {
@@ -1586,6 +1625,8 @@ impl TvApp {
                             self.frame_fence.load(self.player.frames.version());
                             self.video_tex = None;
                         }
+                        // A start that ended without a picture: a suspect (spec §4.1).
+                        self.note_start_failure();
                     } else {
                         tracing::debug!("mpv end-file ({}) - toast suppressed", reason);
                     }
@@ -1597,7 +1638,7 @@ impl TvApp {
                             wait.failed.get_or_insert(msg);
                         }
                         None => {
-                            if !self.stop_for_refused_load() {
+                            if !self.stop_failed_start() {
                                 self.set_toast(self.tr(T::ErrorMsg, &[&msg]));
                             }
                         }
@@ -1636,15 +1677,19 @@ impl TvApp {
         }
     }
 
-    /// A player error while an M3U channel is still starting is mpv refusing
-    /// the load itself (a list's address or header holds what it cannot take, a
-    /// NUL byte): the stream before it was never replaced and would play on
-    /// under the new channel's name. That stream stops and its picture goes,
-    /// as a dead channel's does, and the toast names the channel; the app
-    /// stays on it. True when the error was dealt with so. (M3U only: an
-    /// Xtream portal's loads go through the relay, with nothing in them mpv can
-    /// refuse.)
-    fn stop_for_refused_load(&mut self) -> bool {
+    /// The start of an M3U channel that cannot go on: mpv refused the load (a
+    /// list's address or header holds what it cannot take, a NUL byte), or the
+    /// stall watchdog gave it up. What mpv still plays, the stream before it or
+    /// the load that hangs, stops, and its picture goes, as a dead channel's
+    /// does; the toast names the channel and the app stays on it. It asks only
+    /// whether the stream is still starting (`stream_starting_since`), never
+    /// whether it has played (`current_has_played`): the `Event::Error` arm
+    /// calls it for a refused load either way, and `check_stall` only for a
+    /// start that has not played. `note_start_failure` then makes the channel a
+    /// suspect unless it has played. True when it was dealt with so. (M3U only:
+    /// an Xtream portal's loads go through the relay, with nothing in them mpv
+    /// can refuse, and its watchdog reloads.)
+    fn stop_failed_start(&mut self) -> bool {
         if self.catalog.kind() != SourceKind::M3u || self.stream_starting_since.is_none() {
             return false;
         }
@@ -1660,9 +1705,195 @@ impl TvApp {
         self.video_tex = None;
         // Nothing plays to watch, and a reload would be refused again.
         self.stall_watchdog_armed = false;
+        // A suspect; the start is over (this clears `stream_starting_since`).
+        self.note_start_failure();
         self.stream_starting_since = None;
         self.set_toast(self.tr(T::StreamErrorOn, &[&name]));
         true
+    }
+
+    /// The marks of the M3U source in use, up to date with its catalog (spec
+    /// §4.4, §4.5): read from the source's file when its catalog first loads in a
+    /// catalog generation (a start, a switch to it, its address saved again); on
+    /// every new copy of the list, marks older than seven days go. Three
+    /// comparisons per frame otherwise, and nothing at all on an Xtream portal.
+    fn refresh_defects(&mut self) {
+        if self.catalog.kind() != SourceKind::M3u {
+            return;
+        }
+        let key = (self.catalog_generation, self.catalog.revision());
+        if self.bad_streams_for == Some(key) || !self.catalog.is_loaded() {
+            return;
+        }
+        let read_for = self.bad_streams_for.map(|(generation, _)| generation);
+        if self.bad_streams.is_none() || read_for != Some(self.catalog_generation) {
+            self.bad_streams = Some(BadStreams::load(self.storage.bad_streams_path()));
+            // What plays showed its picture before the marks were read (a resume
+            // on a list that loaded late): it plays again, whichever way it came.
+            if self.current_has_played {
+                self.note_first_picture();
+            }
+        }
+        self.bad_streams_for = Some(key);
+        self.expire_defects();
+    }
+
+    /// Marks older than seven days go (spec §4.4), and the catalog gets the
+    /// marks that are left. Runs when a copy of the list loads, and on F5.
+    fn expire_defects(&mut self) {
+        let Some(bad) = self.bad_streams.as_mut() else {
+            return;
+        };
+        let gone = bad.expire(chrono::Utc::now().timestamp());
+        if gone > 0 {
+            tracing::info!("m3u: {} defect marks expired", gone);
+        }
+        self.catalog.set_defect(bad.marks().clone());
+    }
+
+    /// The start of the M3U channel that plays ended without a first picture
+    /// (spec §4.1): mpv ended the file with an error or refused the load, or the
+    /// app gave the start up (the reload budget, the stall watchdog). It becomes
+    /// a suspect, or a marked one is marked anew. Not a channel that has played
+    /// since it was picked (`current_has_played`): its reloads are a stream that
+    /// dropped. Once per start: the start is over, so `stream_starting_since`
+    /// goes.
+    fn note_start_failure(&mut self) {
+        if self.catalog.kind() != SourceKind::M3u || self.stream_starting_since.take().is_none() {
+            return;
+        }
+        if self.current_has_played || !self.current_live {
+            return;
+        }
+        let Some(sid) = self.current_stream_id else {
+            return;
+        };
+        // A resumed channel has no name of its own yet: the list's.
+        let Some(name) = self
+            .current_name
+            .clone()
+            .or_else(|| self.catalog.live_name(sid))
+        else {
+            return;
+        };
+        let Some(bad) = self.bad_streams.as_mut() else {
+            return;
+        };
+        let shown = crate::redact::redact(&name);
+        tracing::info!(
+            "m3u: {} (stream_id {}) failed before its first picture",
+            shown,
+            sid
+        );
+        let failure = bad.failed(sid, &name, Instant::now(), chrono::Utc::now().timestamp());
+        if failure == Failure::Renewed {
+            // Marked already: no check, a new seven days (spec §4.4).
+            tracing::info!(
+                "m3u: {} (stream_id {}) marked defect (failed again)",
+                shown,
+                sid
+            );
+            self.catalog.set_defect(bad.marks().clone());
+        }
+    }
+
+    /// A first picture (spec §4.2, §4.4): the suspects that failed within two
+    /// minutes before it are confirmed (the connection works), and their
+    /// addresses are asked once more before any of them is marked
+    /// (`drain_stream_checks` takes the answers in). One on the server of what
+    /// plays is not asked (ruling 28b), so not marked. What plays loses its own
+    /// suspicion, its mark and its check.
+    fn note_first_picture(&mut self) {
+        let Some(bad) = self.bad_streams.as_mut() else {
+            return;
+        };
+        let sid = self.current_stream_id;
+        let seen = bad.first_picture(sid, Instant::now());
+        if seen.cleared {
+            // A resumed channel has no name of its own yet: the list's.
+            let name = self
+                .current_name
+                .clone()
+                .or_else(|| sid.and_then(|sid| self.catalog.live_name(sid)));
+            tracing::info!(
+                "m3u: {} (stream_id {}) plays again, mark cleared",
+                crate::redact::redact(name.as_deref().unwrap_or("?")),
+                sid.unwrap_or_default()
+            );
+            self.catalog.set_defect(bad.marks().clone());
+        }
+        // It shows a picture: a check of its own address means nothing now.
+        if let Some(sid) = sid {
+            self.stream_checks.forget(sid);
+        }
+        for confirmed in seen.confirmed {
+            let url = self.catalog.portal().live_stream_url(confirmed.stream_id);
+            // Never the server of what plays (ruling 28b): on a paid list one
+            // account serves every channel, and its portal allows one session.
+            // The check would take the session of what plays, or be refused and
+            // mark a channel that works. No check, no mark: the suspicion goes.
+            if same_server(self.current_url.as_deref().unwrap_or(""), &url) {
+                tracing::info!(
+                    "m3u: {} (stream_id {}) not checked (the server of what plays), not marked",
+                    crate::redact::redact(&confirmed.name),
+                    confirmed.stream_id
+                );
+                continue;
+            }
+            self.stream_checks.start(Check {
+                stream_id: confirmed.stream_id,
+                name: confirmed.name,
+                failed_unix: confirmed.failed_unix,
+                url,
+            });
+        }
+    }
+
+    /// The verdicts of the checks before a mark (spec §4.2): an address that
+    /// answers with a status of 400 or more, does not connect or does not
+    /// answer in time gets the mark, with the time of its failure; one that
+    /// answers again, or that could not be asked, is no suspect any more. The
+    /// log names the channel and what its address did, never the address.
+    /// Nothing while no check runs.
+    fn drain_stream_checks(&mut self) {
+        if self.stream_checks.in_flight() == 0 {
+            return;
+        }
+        for checked in self.stream_checks.drain() {
+            let shown = crate::redact::redact(&checked.name).into_owned();
+            let sid = checked.stream_id;
+            if matches!(checked.answer, Answer::Failed | Answer::Unchecked) {
+                // What the check could not find out is no proof of a dead
+                // stream: no mark (spec §4.2, ruling 29).
+                tracing::info!(
+                    "m3u: {} (stream_id {}) not checked ({}), not marked",
+                    shown,
+                    sid,
+                    checked.answer.kind()
+                );
+                continue;
+            }
+            if !checked.answer.is_dead() {
+                tracing::info!(
+                    "m3u: {} (stream_id {}) answers again, not marked",
+                    shown,
+                    sid
+                );
+                continue;
+            }
+            let Some(bad) = self.bad_streams.as_mut() else {
+                continue;
+            };
+            bad.mark(sid, checked.failed_unix);
+            let kind = checked.answer.kind();
+            tracing::info!(
+                "m3u: {} (stream_id {}) marked defect ({})",
+                shown,
+                sid,
+                kind
+            );
+            self.catalog.set_defect(bad.marks().clone());
+        }
     }
 
     fn drain_epg(&mut self) {
@@ -2699,6 +2930,12 @@ impl TvApp {
         self.epg_cache_retry_after = None;
         self.epg_cache_write_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.adult_note = None;
+        // The marks are the old source's: the new one's are read when its
+        // catalog loads. Its checks go too: their answers are ignored (a delete
+        // never touches the source in use, so only this drops them).
+        self.bad_streams = None;
+        self.bad_streams_for = None;
+        self.stream_checks.reset();
         // Whatever waited for the old portal's catalog, or was told by it, means
         // nothing to the new one: a 0.5 resume would play the old portal's URL
         // through it, an old stream id would be another channel, a catch-up
@@ -2714,11 +2951,11 @@ impl TvApp {
         }
     }
 
-    /// Source `id`'s favorites, presets and last channel from now on. What
-    /// plays is the other source's: it stops, and this source's last channel
-    /// resumes, as at a start (which resumes only on a source that can run: the
-    /// last stream of one that shows the setup prompt has its credentials in
-    /// its address).
+    /// Source `id`'s favorites, presets, last channel and defect marks from now
+    /// on (the marks are read when its catalog loads). What plays is the other
+    /// source's: it stops, and this source's last channel resumes, as at a start
+    /// (which resumes only on a source that can run: the last stream of one that
+    /// shows the setup prompt has its credentials in its address).
     fn use_data_of(&mut self, id: SourceId) {
         self.storage.set_source(id);
         self.favorites = Favorites::load(&self.storage.favorites_path()).unwrap_or_default();
@@ -2888,8 +3125,8 @@ impl TvApp {
 
     /// Keeps an M3U source and, when `save_activates` says so, uses it at once:
     /// its list is read again, and a changed address drops the old one's
-    /// saved list. An address with nothing in it is not kept (it would be
-    /// dropped again when the ini is read).
+    /// saved list and defect marks. An address with nothing in it is not kept
+    /// (it would be dropped again when the ini is read).
     fn save_m3u(&mut self, draft: SourceDraft) {
         if !self.can_keep(draft.editing, SourceKind::M3u) {
             return;
@@ -2931,6 +3168,11 @@ impl TvApp {
                 self.catalog.portal().retire();
             }
             self.storage.remove_saved_list(id);
+            // Its marks too: they are stream ids of the old list, and would hide
+            // channels of the new one that work for a week. The list in use reads
+            // none when its catalog loads: `install_portal` below drops the marks
+            // held in memory, and the catalog they were handed to.
+            self.storage.remove_bad_streams(id);
         }
         self.set_toast(self.tr(T::SourceSaved, &[&source.display_name(self.lang)]));
         if activate {
@@ -2945,10 +3187,10 @@ impl TvApp {
     }
 
     /// Puts saved source `id` in use, as a start on it would: its portal, its
-    /// favorites and presets, its last channel. The ini says so for the next
-    /// start and is written first: when that fails nothing changes, so what
-    /// runs is always what the next start opens. Nothing to do for the source
-    /// that is in use already.
+    /// favorites and presets, its last channel and its defect marks. The ini
+    /// says so for the next start and is written first: when that fails nothing
+    /// changes, so what runs is always what the next start opens. Nothing to do
+    /// for the source that is in use already.
     fn activate_source(&mut self, id: SourceId) {
         let Some(source) = self.sources.get(id).cloned() else {
             return;
@@ -2971,10 +3213,10 @@ impl TvApp {
         self.set_toast(self.tr(T::SourceInUse, &[&source.display_name(self.lang)]));
     }
 
-    /// Removes saved source `id`, with its favorites, presets, last channel and
-    /// saved list. Never the source in use (the settings offer no Delete for
-    /// it), and never the files whose data is in use (the command line's
-    /// portal uses source 1's).
+    /// Removes saved source `id`, with its favorites, presets, last channel,
+    /// defect marks and saved list. Never the source in use (the settings offer
+    /// no Delete for it), and never the files whose data is in use (the command
+    /// line's portal uses source 1's).
     fn delete_source(&mut self, id: SourceId) {
         if self.in_use(id) {
             tracing::warn!("settings: source {} is in use - not deleted", id);
@@ -3229,6 +3471,9 @@ impl TvApp {
             match self.portal_state {
                 PortalState::Configured => {
                     self.catalog.spawn_fetch();
+                    // F5 lets old marks go too (spec §4.4), also when the list
+                    // comes back the same and no new copy loads.
+                    self.expire_defects();
                     let key = match self.catalog.kind() {
                         SourceKind::Xtream => T::RetryingPortal,
                         SourceKind::M3u => T::FetchingList,
@@ -3507,13 +3752,15 @@ impl TvApp {
                                     format!("[{}]", crate::i18n::t(lang, T::TagSeries))
                                 }
                             };
-                            if ui
-                                .selectable_label(
-                                    i == self.search_sel,
-                                    format!("{} {}", tag, it.name),
-                                )
-                                .clicked()
-                            {
+                            // A channel marked defect still shows, named so (spec §4.3).
+                            let defect = it.kind == ItemKind::Live && self.catalog.is_defect(it.id);
+                            let text = if defect {
+                                let label = crate::i18n::t(lang, T::DefectLabel);
+                                format!("{} {} · {}", tag, it.name, label)
+                            } else {
+                                format!("{} {}", tag, it.name)
+                            };
+                            if ui.selectable_label(i == self.search_sel, text).clicked() {
                                 zap_pick = Some((it.id, it.name.clone(), it.kind));
                             }
                         }
@@ -3563,6 +3810,12 @@ impl TvApp {
         let mut zap_id: Option<i64> = None;
         let mut remove_id: Option<i64> = None;
         let entries = shown_favorites(&self.favorites, &self.catalog);
+        // Marked defect: still listed, named so (spec §4.3). No ✕: the row has
+        // its x to remove the favorite already.
+        let defect: Vec<bool> = entries
+            .iter()
+            .map(|e| self.catalog.is_defect(e.stream_id))
+            .collect();
         let loaded = self.catalog.is_loaded();
         let lang = self.lang;
 
@@ -3583,10 +3836,18 @@ impl TvApp {
                             };
                             ui.label(egui::RichText::new(crate::i18n::t(lang, text)).italics());
                         }
-                        for entry in entries {
+                        for (entry, defect) in entries.into_iter().zip(defect) {
                             ui.horizontal(|ui| {
                                 if ui.selectable_label(false, &entry.name).clicked() {
                                     zap_id = Some(entry.stream_id);
+                                }
+                                if defect {
+                                    let label = crate::i18n::t(lang, T::DefectLabel);
+                                    ui.label(
+                                        egui::RichText::new(label)
+                                            .small()
+                                            .color(Color32::from_rgb(230, 120, 110)),
+                                    );
                                 }
                                 if ui.small_button("x").clicked() {
                                     remove_id = Some(entry.stream_id);
@@ -4418,6 +4679,11 @@ impl TvApp {
             self.catalog_noted = true;
             self.on_catalog_loaded();
         }
+        // The M3U source's marks, once its catalog is there (after the catalog's
+        // first word: a resumed channel knows its stream id by then), and the
+        // verdicts of the checks before a mark.
+        self.refresh_defects();
+        self.drain_stream_checks();
         // The channel the user stopped flipping on; not when it is the one that
         // plays (flipped away and back): a second load would only re-buffer it.
         if let Some((sid, name, idx)) = self.zap_pacer.due(Instant::now()) {
@@ -10079,6 +10345,841 @@ https://c.example/twee-nieuws.m3u8\n";
         assert_eq!(toast_text(&h), "[TV] Kanaal A");
     }
 
+    // ---- defect marks ----
+
+    /// The start of what plays ends before its first picture: mpv closes the
+    /// file with an error, as for a server that answers 404.
+    fn start_fails(h: &mut Harness) {
+        h.events
+            .send(Event::EndOfFile {
+                reason: "error".into(),
+            })
+            .unwrap();
+        h.frame(&[]);
+    }
+
+    /// What plays shows its first picture (mpv's playback-restart).
+    fn picture_comes(h: &mut Harness) {
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.frame(&[]);
+    }
+
+    fn now_unix() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    /// Source 1's marks file in `root`, holding these marks (stream id, unix
+    /// seconds).
+    fn write_marks(root: &std::path::Path, marks: &[(i64, i64)]) {
+        let body: Vec<String> = marks
+            .iter()
+            .map(|(id, at)| format!("\"{id}\":{at}"))
+            .collect();
+        let text = format!("{{\"version\":1,\"marks\":{{{}}}}}", body.join(","));
+        std::fs::write(root.join("bad_streams.json"), text).unwrap();
+    }
+
+    /// The marks in source 1's file in `root`.
+    fn marks_in(root: &std::path::Path) -> std::collections::HashMap<i64, i64> {
+        BadStreams::load(root.join("bad_streams.json"))
+            .marks()
+            .clone()
+    }
+
+    /// `RING` with Kanaal B at `server` (a `list_server`, whose every answer to
+    /// a GET is what a channel's address answers the check before a mark), so
+    /// the check asks it and no other machine.
+    fn ring_with_b_at(server: &wiremock::MockServer) -> String {
+        RING.replace(
+            "https://b.example/b.m3u8",
+            &format!("{}/b.m3u8", server.uri()),
+        )
+    }
+
+    /// Frames until the checks before a mark have answered and the answers were
+    /// taken in (2 s at most).
+    async fn checks_answered(h: &mut Harness) {
+        for _ in 0..400 {
+            h.frame(&[]);
+            if h.app.stream_checks.in_flight() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the checks did not answer");
+    }
+
+    #[tokio::test]
+    async fn a_dead_channel_followed_by_one_that_plays_is_marked_once_its_address_fails_too() {
+        let server = list_server(404, "", Duration::from_millis(200)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), &ring_with_b_at(&server));
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        let log = LogCapture::start();
+        let b = m3u_sid("Kanaal B");
+        h.app.zap_by_id(b);
+        start_fails(&mut h);
+        assert!(!h.app.catalog.is_defect(b), "a suspect, not marked yet");
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        picture_comes(&mut h);
+        // Confirmed: its address is asked first; the mark waits for the answer.
+        assert!(h.app.stream_checks.checking(b));
+        assert!(
+            !h.app.catalog.is_defect(b),
+            "not before the answer is taken in"
+        );
+        checks_answered(&mut h).await;
+        assert!(h.app.catalog.is_defect(b));
+        assert!(marks_in(dir.path()).contains_key(&b), "written");
+        let text = log.text();
+        for said in [
+            "failed before its first picture",
+            "marked defect (http 404)",
+        ] {
+            let line = format!("m3u: Kanaal B (stream_id {b}) {said}");
+            assert!(text.contains(&line), "{line}\n{text}");
+        }
+        assert!(
+            !text.contains(&server.uri()),
+            "no address in the log:\n{text}"
+        );
+        h.sent();
+        h.press(&[Key::ArrowUp]);
+        assert_eq!(loads(h.sent()), [ring_url('a')], "zapping skips B");
+    }
+
+    #[tokio::test]
+    async fn a_dead_channel_whose_address_answers_again_is_not_marked() {
+        let server = list_server(200, "", Duration::ZERO).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), &ring_with_b_at(&server));
+        let log = LogCapture::start();
+        let b = m3u_sid("Kanaal B");
+        h.app.zap_by_id(b);
+        start_fails(&mut h);
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        picture_comes(&mut h);
+        checks_answered(&mut h).await;
+        assert!(
+            !h.app.catalog.is_defect(b),
+            "a Wi-Fi drop, not a dead channel"
+        );
+        assert!(!dir.path().join("bad_streams.json").exists());
+        let text = log.text();
+        let line = format!("m3u: Kanaal B (stream_id {b}) answers again, not marked");
+        assert!(text.contains(&line), "{text}");
+        assert!(
+            !text.contains(&server.uri()),
+            "no address in the log:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_suspect_on_the_server_of_what_plays_is_not_asked_and_one_on_another_port_is() {
+        // B and C on one server, D on another port of that host. Both would
+        // answer 404, so a check of B would mark it.
+        let here = list_server(404, "", Duration::ZERO).await;
+        let other_port = list_server(404, "", Duration::ZERO).await;
+        let at = |server: &wiremock::MockServer, file: &str| format!("{}/{file}", server.uri());
+        let list = RING
+            .replace("https://b.example/b.m3u8", &at(&here, "b.m3u8"))
+            .replace("https://c.example/c.m3u8", &at(&here, "c.m3u8"))
+            .replace("https://d.example/d.m3u8", &at(&other_port, "d.m3u8"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), &list);
+        let log = LogCapture::start();
+        let (b, d) = (m3u_sid("Kanaal B"), m3u_sid("Kanaal D"));
+        h.app.zap_by_id(b);
+        start_fails(&mut h);
+        h.app.zap_by_id(d);
+        start_fails(&mut h);
+        // C plays: its picture confirms B and D.
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        picture_comes(&mut h);
+        assert!(!h.app.stream_checks.checking(b), "C's server");
+        assert!(h.app.stream_checks.checking(d), "another port");
+        let suspects = h.app.bad_streams.as_ref().map(|bad| bad.suspects());
+        assert_eq!(suspects, Some(0), "B is no suspect any more");
+        checks_answered(&mut h).await;
+        assert!(!h.app.catalog.is_defect(b), "not marked");
+        assert!(h.app.catalog.is_defect(d), "asked, and dead");
+        let asked = here.received_requests().await.unwrap();
+        assert!(asked.is_empty(), "nothing asked C's server");
+        let text = log.text();
+        let said = "not checked (the server of what plays), not marked";
+        let line = format!("m3u: Kanaal B (stream_id {b}) {said}");
+        assert!(text.contains(&line), "{text}");
+        assert!(!text.contains(&here.uri()), "no address:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn a_switch_of_source_during_a_check_leaves_no_mark() {
+        let server = list_server(404, "", Duration::from_millis(400)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let list = ring_with_b_at(&server);
+        let (twee, drie) = (dir.path().join("twee.m3u"), dir.path().join("drie.m3u"));
+        std::fs::write(&twee, &list).unwrap();
+        std::fs::write(&drie, &list).unwrap();
+        let sources = Sources::parse(&format!(
+            "source=2;m3u;Twee;{}\nsource=3;m3u;Drie;{}\nactive=2\n",
+            twee.display(),
+            drie.display()
+        ));
+        let portal = M3uPortal::new(2, &twee.display().to_string(), dir.path().join("m3u-2.m3u"));
+        let store = Arc::new(CatalogStore::new(Arc::new(portal)));
+        let mut h = Harness::start_with(
+            dir.path(),
+            store.clone(),
+            PortalState::Configured,
+            None,
+            None,
+            sources,
+            None,
+        );
+        // Source 2's files, as main starts the app on it. Set before its list
+        // loads, which is when its marks are read (as `downloading` does).
+        h.app.storage.set_source(2);
+        store.spawn_fetch();
+        wait_until("list 2", || store.is_loaded()).await;
+        h.frame(&[]);
+        let b = m3u_sid("Kanaal B");
+        h.app.zap_by_id(b);
+        start_fails(&mut h);
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        picture_comes(&mut h);
+        assert!(
+            h.app.stream_checks.checking(b),
+            "B's address is being asked"
+        );
+        {
+            // The variable is the whole process's: held for the switch only.
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+            h.app.activate_source(3);
+            std::env::remove_var("BONGO_INI");
+        }
+        assert!(
+            !h.app.stream_checks.checking(b),
+            "dropped with the old source"
+        );
+        wait_until("list 3", || h.app.catalog.is_loaded()).await;
+        // Past the old check's answer: source 3's marks are read and stay clean.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        for _ in 0..5 {
+            h.frame(&[]);
+        }
+        assert!(
+            !h.app.catalog.is_defect(b),
+            "no mark from the old source's check"
+        );
+        assert!(!dir.path().join("bad_streams-3.json").exists());
+        assert!(!dir.path().join("bad_streams.json").exists());
+        assert!(!dir.path().join("bad_streams-2.json").exists());
+    }
+
+    #[tokio::test]
+    async fn a_dead_m3u_channel_with_no_picture_after_it_is_not_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), RING);
+        // B fails, then C fails too: the connection may be gone.
+        h.app.zap_by_id(m3u_sid("Kanaal B"));
+        start_fails(&mut h);
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        start_fails(&mut h);
+        assert!(!h.app.catalog.is_defect(m3u_sid("Kanaal B")));
+        assert!(!h.app.catalog.is_defect(m3u_sid("Kanaal C")));
+        let suspects = h.app.bad_streams.as_ref().map(|bad| bad.suspects());
+        assert_eq!(suspects, Some(2), "two suspects, neither confirmed");
+        assert_eq!(h.app.stream_checks.in_flight(), 0, "nothing asked");
+        assert!(!dir.path().join("bad_streams.json").exists());
+    }
+
+    #[tokio::test]
+    async fn a_channel_that_showed_a_picture_and_then_failed_is_no_suspect() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), RING);
+        let b = m3u_sid("Kanaal B");
+        h.app.zap_by_id(b);
+        picture_comes(&mut h);
+        // It drops: an eof reloads it, and the reload fails before a picture.
+        h.events
+            .send(Event::EndOfFile {
+                reason: "eof".into(),
+            })
+            .unwrap();
+        h.frame(&[]);
+        start_fails(&mut h);
+        let suspects = |h: &Harness| h.app.bad_streams.as_ref().map(|bad| bad.suspects());
+        assert_eq!(suspects(&h), Some(0), "a stream that dropped: no suspect");
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        picture_comes(&mut h);
+        assert!(
+            !h.app.stream_checks.checking(b),
+            "nothing confirmed, nothing asked"
+        );
+        assert!(!h.app.catalog.is_defect(b));
+    }
+
+    #[tokio::test]
+    async fn the_reload_budget_spent_on_a_start_without_a_picture_makes_a_suspect() {
+        let server = list_server(404, "", Duration::ZERO).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), &ring_with_b_at(&server));
+        let b = m3u_sid("Kanaal B");
+        h.app.zap_by_id(b);
+        h.sent();
+        for _ in 0..4 {
+            h.events
+                .send(Event::EndOfFile {
+                    reason: "eof".into(),
+                })
+                .unwrap();
+            h.frame(&[]);
+        }
+        assert_eq!(
+            loads(h.sent()).len(),
+            3,
+            "three reloads, then the budget is spent"
+        );
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        picture_comes(&mut h);
+        checks_answered(&mut h).await;
+        assert!(h.app.catalog.is_defect(b));
+    }
+
+    #[tokio::test]
+    async fn a_refused_load_makes_a_suspect() {
+        let server = list_server(404, "", Duration::ZERO).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), &ring_with_b_at(&server));
+        let b = m3u_sid("Kanaal B");
+        h.app.zap_by_id(b);
+        let refused = Event::Error {
+            msg: "mpv error -4: an argument holds a NUL byte".into(),
+        };
+        h.events.send(refused).unwrap();
+        h.frame(&[]);
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        picture_comes(&mut h);
+        checks_answered(&mut h).await;
+        assert!(h.app.catalog.is_defect(b));
+    }
+
+    #[tokio::test]
+    async fn the_stall_watchdog_gives_up_an_m3u_start_without_a_picture() {
+        let server = list_server(404, "", Duration::ZERO).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), &ring_with_b_at(&server));
+        let b = m3u_sid("Kanaal B");
+        h.app.zap_by_id(b);
+        // A frame for the zap's toast: egui keeps a new area (the toast's)
+        // invisible in its first frame, and the error toast below must show.
+        h.frame(&[]);
+        h.sent();
+        // No picture for longer than the watchdog gives a start.
+        h.app.last_progress_at = Instant::now()
+            .checked_sub(Duration::from_secs(26))
+            .expect("the machine has run for 26 s");
+        h.frame(&[]);
+        let sent = h.sent();
+        assert!(sent.iter().any(|c| matches!(c, Cmd::Stop)), "{sent:?}");
+        assert!(loads(sent).is_empty(), "no reload, no herverbinden");
+        let named = "stream error on Kanaal B - zap up or down to retry";
+        assert!(h.painted.iter().any(|t| t == named), "{:?}", h.painted);
+        assert!(!h.app.stall_watchdog_armed);
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        picture_comes(&mut h);
+        checks_answered(&mut h).await;
+        assert!(h.app.catalog.is_defect(b));
+    }
+
+    #[tokio::test]
+    async fn an_xtream_portal_stalled_before_its_first_picture_still_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        h.app.zap_by_id(3);
+        h.sent();
+        h.app.last_progress_at = Instant::now()
+            .checked_sub(Duration::from_secs(26))
+            .expect("the machine has run for 26 s");
+        h.frame(&[]);
+        assert_eq!(loads(h.sent()), [live_url(3)], "reloaded as before");
+    }
+
+    #[tokio::test]
+    async fn a_marked_channel_found_by_the_search_is_named_so_and_loses_its_mark_once_it_plays() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = m3u_sid("Kanaal B");
+        write_marks(dir.path(), &[(b, now_unix() - 60)]);
+        let mut h = m3u_app(dir.path(), RING);
+        assert!(h.app.catalog.is_defect(b), "read at the start");
+        let log = LogCapture::start();
+        h.frame_with(f_pressed());
+        h.frame(&[]);
+        h.type_text("kanaal b");
+        h.frame(&[]);
+        assert!(
+            h.painted.iter().any(|t| t == "[LIVE] Kanaal B · broken"),
+            "{:?}",
+            h.painted
+        );
+        h.sent();
+        h.press(&[Key::Enter]);
+        assert_eq!(loads(h.sent()), [ring_url('b')]);
+        picture_comes(&mut h);
+        assert!(!h.app.catalog.is_defect(b));
+        assert!(marks_in(dir.path()).is_empty(), "written");
+        let line = format!("m3u: Kanaal B (stream_id {b}) plays again, mark cleared");
+        assert!(log.text().contains(&line), "{}", log.text());
+    }
+
+    #[tokio::test]
+    async fn the_favorites_list_names_a_defect_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = m3u_sid("Kanaal B");
+        write_marks(dir.path(), &[(b, now_unix() - 60)]);
+        let mut favorites = Favorites::default();
+        favorites.toggle(b, "Kanaal B");
+        favorites.save(&dir.path().join("favorites.json")).unwrap();
+        let mut h = m3u_app(dir.path(), RING);
+        h.frame_holding(egui::Modifiers::SHIFT, shift_f_pressed());
+        h.frame(&[]);
+        assert!(h.painted.iter().any(|t| t == "Kanaal B"), "{:?}", h.painted);
+        assert!(h.painted.iter().any(|t| t == "broken"), "{:?}", h.painted);
+    }
+
+    #[tokio::test]
+    async fn a_preset_still_plays_a_defect_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = m3u_sid("Kanaal B");
+        write_marks(dir.path(), &[(b, now_unix() - 60)]);
+        let mut h = m3u_app(dir.path(), RING);
+        h.app.presets.set(1, b, "Kanaal B");
+        h.sent();
+        h.app.recall_preset(1);
+        assert_eq!(loads(h.sent()), [ring_url('b')]);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_defect_channel_plays_and_its_picture_clears_the_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = m3u_sid("Kanaal B");
+        write_marks(dir.path(), &[(b, now_unix() - 60)]);
+        write_last_watched(dir.path(), &ring_url('b'), true, Some(false));
+        let mut h = m3u_app(dir.path(), RING);
+        assert_eq!(loads(h.sent()), [ring_url('b')], "the resume plays it");
+        assert!(h.app.catalog.is_defect(b));
+        picture_comes(&mut h);
+        assert!(!h.app.catalog.is_defect(b));
+    }
+
+    #[tokio::test]
+    async fn a_resumed_channel_that_showed_its_picture_before_the_list_loaded_loses_its_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lijst.m3u");
+        std::fs::write(&file, RING).unwrap();
+        let b = m3u_sid("Kanaal B");
+        write_marks(dir.path(), &[(b, now_unix() - 60)]);
+        write_last_watched(dir.path(), &ring_url('b'), true, Some(false));
+        let portal = M3uPortal::new(1, &file.display().to_string(), dir.path().join("m3u-1.m3u"));
+        let store = Arc::new(CatalogStore::new(Arc::new(portal)));
+        let mut h = Harness::start_with(
+            dir.path(),
+            store.clone(),
+            PortalState::Configured,
+            None,
+            None,
+            Sources::default(),
+            None,
+        );
+        assert_eq!(
+            loads(h.sent()),
+            [ring_url('b')],
+            "resumed before the list is read"
+        );
+        // Its picture comes while nothing knows its stream id or the marks.
+        picture_comes(&mut h);
+        store.spawn_fetch();
+        wait_until("the list", || store.is_loaded()).await;
+        h.frame(&[]);
+        assert!(!h.app.catalog.is_defect(b), "it plays: the mark goes");
+        assert!(marks_in(dir.path()).is_empty(), "written");
+    }
+
+    #[tokio::test]
+    async fn the_marks_survive_a_restart_and_old_ones_expire() {
+        let server = list_server(404, "", Duration::ZERO).await;
+        let dir = tempfile::tempdir().unwrap();
+        let b = m3u_sid("Kanaal B");
+        {
+            let mut h = m3u_app(dir.path(), &ring_with_b_at(&server));
+            h.app.zap_by_id(b);
+            start_fails(&mut h);
+            h.app.zap_by_id(m3u_sid("Kanaal C"));
+            picture_comes(&mut h);
+            checks_answered(&mut h).await;
+            assert!(h.app.catalog.is_defect(b));
+        }
+        // The next start: B is still marked. A mark of C from eight days ago is
+        // put in the file; it goes when the list loads.
+        let c = m3u_sid("Kanaal C");
+        let mut marks = marks_in(dir.path());
+        marks.insert(c, now_unix() - 8 * 24 * 3600);
+        let marks: Vec<(i64, i64)> = marks.into_iter().collect();
+        write_marks(dir.path(), &marks);
+        let log = LogCapture::start();
+        let h = m3u_app(dir.path(), RING);
+        assert!(h.app.catalog.is_defect(b), "kept");
+        assert!(!h.app.catalog.is_defect(c), "expired");
+        assert!(
+            log.text().contains("m3u: 1 defect marks expired"),
+            "{}",
+            log.text()
+        );
+        let kept: Vec<i64> = marks_in(dir.path()).keys().copied().collect();
+        assert_eq!(kept, [b], "written");
+    }
+
+    #[tokio::test]
+    async fn an_xtream_portal_reads_and_marks_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_marks(dir.path(), &[(3, now_unix() - 60)]);
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        assert!(!h.app.catalog.is_defect(3), "no marks read");
+        h.app.zap_by_id(3);
+        start_fails(&mut h);
+        picture_comes(&mut h);
+        assert!(h.app.bad_streams.is_none());
+        assert_eq!(h.app.stream_checks.in_flight(), 0, "and checks nothing");
+        assert_eq!(marks_in(dir.path()).len(), 1, "the file is left alone");
+    }
+
+    #[tokio::test]
+    async fn switching_to_a_list_reads_that_sources_own_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut h, _) = two_sources(dir.path());
+        let een = crate::m3u::stream_id("Een.nl");
+        let record = format!(
+            "{{\"version\":1,\"marks\":{{\"{een}\":{}}}}}",
+            now_unix() - 60
+        );
+        std::fs::write(dir.path().join("bad_streams-2.json"), record).unwrap();
+        {
+            // The variable is the whole process's: held for the switch only.
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+            h.app.activate_source(2);
+            std::env::remove_var("BONGO_INI");
+        }
+        wait_until("the list", || h.app.catalog.is_loaded()).await;
+        h.frame(&[]);
+        assert!(h.app.catalog.is_defect(een), "bad_streams-2.json");
+    }
+
+    // ---- defect marks: beyond the brief's list ----
+
+    #[tokio::test]
+    async fn a_start_that_ends_without_a_picture_while_the_user_flips_on_is_a_suspect() {
+        // The stream can end in an eof, which a flip answers by dropping out
+        // early (the user is zapping away anyway), or in an error.
+        for reason in ["eof", "error"] {
+            let server = list_server(404, "", Duration::ZERO).await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut h = m3u_app(dir.path(), &ring_with_b_at(&server));
+            h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+            let b = m3u_sid("Kanaal B");
+            h.app.zap_by_id(m3u_sid("Kanaal A"));
+            // A lone press: B at once. The held key then flips on to C, which waits.
+            h.frame(&[Key::ArrowDown]);
+            h.frame(&[Key::ArrowDown]);
+            assert_eq!(h.app.current_stream_id, Some(b), "{reason}");
+            assert!(h.app.zap_pacer.waiting().is_some(), "{reason}: C waits");
+            let ended = Event::EndOfFile {
+                reason: reason.into(),
+            };
+            h.events.send(ended).unwrap();
+            h.frame(&[]);
+            let suspects = h.app.bad_streams.as_ref().map(|bad| bad.suspects());
+            assert_eq!(suspects, Some(1), "{reason}: B never showed a picture");
+            // The flip lands on C; its picture confirms B, whose address is dead.
+            std::thread::sleep(Duration::from_millis(350));
+            h.frame(&[]);
+            assert_eq!(
+                h.app.current_stream_id,
+                Some(m3u_sid("Kanaal C")),
+                "{reason}"
+            );
+            picture_comes(&mut h);
+            checks_answered(&mut h).await;
+            assert!(h.app.catalog.is_defect(b), "{reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_marked_channel_that_fails_again_is_marked_anew_without_a_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = m3u_sid("Kanaal B");
+        let three_days_ago = now_unix() - 3 * 24 * 3600;
+        write_marks(dir.path(), &[(b, three_days_ago)]);
+        let mut h = m3u_app(dir.path(), RING);
+        let log = LogCapture::start();
+        // A preset, a favorite or the search still plays it.
+        h.app.zap_by_id(b);
+        start_fails(&mut h);
+        let line = format!("m3u: Kanaal B (stream_id {b}) marked defect (failed again)");
+        assert!(log.text().contains(&line), "{}", log.text());
+        assert!(h.app.catalog.is_defect(b));
+        let suspects = h.app.bad_streams.as_ref().map(|bad| bad.suspects());
+        assert_eq!(suspects, Some(0), "marked already: no suspicion");
+        // Seven days again, counted from this failure, and written.
+        let renewed = marks_in(dir.path())[&b];
+        assert!(renewed >= now_unix() - 60, "renewed: {renewed}");
+        // Another channel's picture has nothing to confirm: no check.
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        picture_comes(&mut h);
+        assert!(!h.app.stream_checks.checking(b));
+        assert_eq!(h.app.stream_checks.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_suspect_that_plays_before_its_check_answers_is_not_marked() {
+        let server = list_server(404, "", Duration::from_millis(400)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), &ring_with_b_at(&server));
+        let b = m3u_sid("Kanaal B");
+        h.app.zap_by_id(b);
+        start_fails(&mut h);
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        picture_comes(&mut h);
+        assert!(
+            h.app.stream_checks.checking(b),
+            "B's address is being asked"
+        );
+        // The user tries B again, and it plays: the answer means nothing now.
+        h.app.zap_by_id(b);
+        picture_comes(&mut h);
+        assert!(!h.app.stream_checks.checking(b), "its check is dropped");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        for _ in 0..5 {
+            h.frame(&[]);
+        }
+        assert!(
+            !h.app.catalog.is_defect(b),
+            "it plays, it is no dead channel"
+        );
+        assert!(!dir.path().join("bad_streams.json").exists());
+    }
+
+    #[tokio::test]
+    async fn f5_lets_a_mark_older_than_seven_days_go_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (b, c) = (m3u_sid("Kanaal B"), m3u_sid("Kanaal C"));
+        write_marks(dir.path(), &[(b, now_unix() - 60)]);
+        let mut h = m3u_app(dir.path(), RING);
+        // C was marked while the app ran, and its mark has grown old since: it
+        // was fresh when the list loaded.
+        let bad = h.app.bad_streams.as_mut().expect("read at the start");
+        bad.mark(c, now_unix() - 8 * 24 * 3600);
+        h.app.catalog.set_defect(bad.marks().clone());
+        assert!(h.app.catalog.is_defect(c));
+        let log = LogCapture::start();
+        h.press(&[Key::F5]);
+        assert!(!h.app.catalog.is_defect(c), "the old mark goes");
+        assert!(h.app.catalog.is_defect(b), "a fresh one stays");
+        assert!(
+            log.text().contains("m3u: 1 defect marks expired"),
+            "{}",
+            log.text()
+        );
+        let kept: Vec<i64> = marks_in(dir.path()).keys().copied().collect();
+        assert_eq!(kept, [b], "written");
+    }
+
+    /// B at `address` fails and C plays, with the checks answered: the app, and
+    /// what it logged.
+    async fn b_at_fails_and_c_plays(
+        root: &std::path::Path,
+        address: &str,
+    ) -> (Harness, LogCapture) {
+        let list = RING.replace("https://b.example/b.m3u8", address);
+        let mut h = m3u_app(root, &list);
+        let log = LogCapture::start();
+        h.app.zap_by_id(m3u_sid("Kanaal B"));
+        start_fails(&mut h);
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        picture_comes(&mut h);
+        checks_answered(&mut h).await;
+        (h, log)
+    }
+
+    #[tokio::test]
+    async fn a_dead_channel_whose_address_cannot_be_asked_is_not_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, log) = b_at_fails_and_c_plays(dir.path(), "rtmp://b.example/live/b").await;
+        let b = m3u_sid("Kanaal B");
+        assert!(!h.app.catalog.is_defect(b), "no check, no mark");
+        assert!(!dir.path().join("bad_streams.json").exists());
+        let kind = "an address it cannot ask or a certificate it could not verify";
+        let line = format!("m3u: Kanaal B (stream_id {b}) not checked ({kind}), not marked");
+        assert!(log.text().contains(&line), "{}", log.text());
+        assert!(
+            !log.text().contains("rtmp://"),
+            "no address:\n{}",
+            log.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_channel_whose_server_hangs_up_is_not_marked_and_is_not_said_to_answer() {
+        // The request is read and the connection closed with no reply: not proof
+        // of a dead stream (the check cannot tell), and no answer either.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                let _ = std::io::Read::read(&mut stream, &mut [0u8; 4096]);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let address = format!("http://127.0.0.1:{port}/b.m3u8");
+        let (h, log) = b_at_fails_and_c_plays(dir.path(), &address).await;
+        let b = m3u_sid("Kanaal B");
+        assert!(!h.app.catalog.is_defect(b), "no proof, no mark");
+        assert!(!dir.path().join("bad_streams.json").exists());
+        let text = log.text();
+        let line =
+            format!("m3u: Kanaal B (stream_id {b}) not checked (request failed), not marked");
+        assert!(text.contains(&line), "{text}");
+        assert!(
+            !text.contains("answers again"),
+            "it answered nothing:\n{text}"
+        );
+        assert!(!text.contains(&address), "no address:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_channel_is_named_by_the_list_when_its_mark_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = m3u_sid("Kanaal B");
+        write_marks(dir.path(), &[(b, now_unix() - 60)]);
+        write_last_watched(dir.path(), &ring_url('b'), true, Some(false));
+        let log = LogCapture::start();
+        let mut h = m3u_app(dir.path(), RING);
+        assert_eq!(h.app.current_name, None, "a resume names nothing itself");
+        picture_comes(&mut h);
+        let line = format!("m3u: Kanaal B (stream_id {b}) plays again, mark cleared");
+        assert!(log.text().contains(&line), "{}", log.text());
+    }
+
+    #[tokio::test]
+    async fn an_xtream_catalog_is_never_handed_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        write_marks(dir.path(), &[(3, now_unix() - 60)]);
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        h.app.zap_by_id(3);
+        start_fails(&mut h);
+        picture_comes(&mut h);
+        // What F5 does, and what every frame does.
+        h.app.expire_defects();
+        h.app.refresh_defects();
+        h.frame(&[]);
+        assert_eq!(h.app.catalog.defect_revision(), 0, "set_defect never ran");
+        assert!(h.app.bad_streams.is_none());
+    }
+
+    /// An app on source 1, the list in a file `oud.m3u` (a second one,
+    /// `nieuw.m3u`, is in `dir` too), whose Kanaal B is marked defect. The
+    /// list and the marks are read already.
+    fn marked_list_in_use(dir: &std::path::Path) -> (Harness, i64) {
+        let (old, new) = (dir.join("oud.m3u"), dir.join("nieuw.m3u"));
+        std::fs::write(&old, RING).unwrap();
+        std::fs::write(&new, RING).unwrap();
+        let b = m3u_sid("Kanaal B");
+        write_marks(dir, &[(b, now_unix() - 60)]);
+        let sources = Sources::parse(&format!("source=1;m3u;Lijst;{}\nactive=1\n", old.display()));
+        let (portal, catalog) = M3uPortal::from_text(RING).unwrap();
+        let store = Arc::new(CatalogStore::from_catalog(Arc::new(portal), catalog));
+        let h = Harness::start_with(
+            dir,
+            store,
+            PortalState::Configured,
+            None,
+            None,
+            sources,
+            None,
+        );
+        assert!(h.app.catalog.is_defect(b), "read at the start");
+        (h, b)
+    }
+
+    /// The list in use is saved with `address`, and its catalog is read again.
+    async fn list_saved_at(h: &mut Harness, address: &std::path::Path) {
+        let draft = list_draft(Editing::Saved(1), "Lijst", &address.display().to_string());
+        {
+            // The variable is the whole process's: held for the save only.
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("BONGO_INI", h.app.storage.config_dir().join("test.ini"));
+            h.app
+                .apply_settings_action(SettingsAction::SaveSource(draft));
+            std::env::remove_var("BONGO_INI");
+        }
+        wait_until("the list", || h.app.catalog.is_loaded()).await;
+        h.frame(&[]);
+    }
+
+    #[tokio::test]
+    async fn a_list_saved_under_another_address_loses_its_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut h, b) = marked_list_in_use(dir.path());
+        list_saved_at(&mut h, &dir.path().join("nieuw.m3u")).await;
+        // The old list's stream ids mean nothing in another list: its marks
+        // would hide working channels of the new one for a week.
+        assert!(!h.app.catalog.is_defect(b), "no channel is marked");
+        let marks = h.app.bad_streams.as_ref().map(|bad| bad.marks().len());
+        assert_eq!(marks, Some(0), "read again, and none");
+        let file = dir.path().join("bad_streams.json");
+        assert!(!file.exists(), "the file is gone");
+    }
+
+    #[tokio::test]
+    async fn a_list_saved_again_under_its_own_address_keeps_its_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut h, b) = marked_list_in_use(dir.path());
+        let generation = h.app.catalog_generation;
+        list_saved_at(&mut h, &dir.path().join("oud.m3u")).await;
+        assert_eq!(h.app.catalog_generation, generation + 1, "read again");
+        let marked = h.app.catalog.is_defect(b);
+        assert!(marked, "the same list: its marks are read from the file");
+        assert!(marks_in(dir.path()).contains_key(&b));
+    }
+
+    #[test]
+    fn another_address_for_a_list_not_in_use_drops_the_marks_of_that_list_only() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        // Source 1, the portal, is in use; source 2 is a list on the web.
+        let mut h = portal_and_list(dir.path());
+        let (one, mut two) = (
+            Storage::with_root(dir.path().to_path_buf()),
+            Storage::with_root(dir.path().to_path_buf()),
+        );
+        two.set_source(2);
+        for path in [one.bad_streams_path(), two.bad_streams_path()] {
+            std::fs::write(path, "x").unwrap();
+        }
+        let draft = list_draft(Editing::Saved(2), "Lijst", "https://b.example/ander.m3u");
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(draft));
+        std::env::remove_var("BONGO_INI");
+        assert!(!two.bad_streams_path().exists(), "the list's own marks");
+        assert!(
+            one.bad_streams_path().exists(),
+            "the source in use keeps its own"
+        );
+    }
+
     // ---- the picture of the channel before ----
 
     /// An app on `TEST_LIST`, on its second channel, whose picture (4 x 2) is on
@@ -10579,6 +11680,7 @@ https://c.example/twee-nieuws.m3u8\n";
             two.favorites_path(),
             two.presets_path(),
             two.last_watched_path(),
+            two.bad_streams_path(),
             two.m3u_cache_path(2),
         ] {
             std::fs::write(path, "x").unwrap();
@@ -10587,7 +11689,11 @@ https://c.example/twee-nieuws.m3u8\n";
         assert!(h.app.sources.get(1).is_some(), "the source in use stays");
         h.app.apply_settings_action(SettingsAction::DeleteSource(2));
         assert!(h.app.sources.get(2).is_none());
-        assert!(!two.favorites_path().exists() && !two.m3u_cache_path(2).exists());
+        assert!(
+            !two.favorites_path().exists()
+                && !two.bad_streams_path().exists()
+                && !two.m3u_cache_path(2).exists()
+        );
         assert_eq!(
             std::fs::read_to_string(&ini).unwrap(),
             "portal=u:p@h:80\n",

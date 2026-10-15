@@ -116,6 +116,13 @@ impl Storage {
             remove_file(&path);
         }
     }
+
+    /// Removes source `id`'s defect marks: another address makes its list
+    /// another one, whose working channels the old list's stream ids would hide
+    /// for seven days.
+    pub fn remove_bad_streams(&self, id: SourceId) {
+        remove_file(&self.source_file("bad_streams", id));
+    }
 }
 
 /// Removes the file at `path`; whether it was there. A failure other than its

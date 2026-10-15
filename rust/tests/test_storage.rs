@@ -182,3 +182,24 @@ fn a_saved_list_goes_with_the_temp_file_a_cut_off_write_of_it_left() {
     assert!(!list.exists() && !temp.exists());
     assert!(storage.favorites_path().exists());
 }
+
+#[test]
+fn a_sources_defect_marks_go_by_its_id_and_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut storage = Storage::with_root(dir.path().to_path_buf());
+    for id in [1, 2] {
+        storage.set_source(id);
+        std::fs::write(storage.bad_streams_path(), "x").unwrap();
+        std::fs::write(storage.favorites_path(), "x").unwrap();
+    }
+    // Source 2's list gets another address while source 1 is in use: the marks
+    // are stream ids of the old list, and nothing else goes with them.
+    storage.set_source(1);
+    storage.remove_bad_streams(2);
+    assert!(storage.bad_streams_path().exists(), "source 1's marks stay");
+    storage.set_source(2);
+    assert!(!storage.bad_streams_path().exists(), "source 2's marks");
+    assert!(storage.favorites_path().exists(), "its favorites stay");
+    // Marks that are not there are no failure.
+    storage.remove_bad_streams(2);
+}

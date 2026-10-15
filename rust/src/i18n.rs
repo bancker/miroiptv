@@ -188,6 +188,7 @@ texts! {
     SourceSaved => ["bron opgeslagen: {0}", "source saved: {0}", "Quelle gespeichert: {0}"],
     SourceInUse => ["bron in gebruik: {0}", "now using: {0}", "Quelle in Verwendung: {0}"],
     SourceDeleted => ["bron verwijderd: {0}", "source deleted: {0}", "Quelle gelöscht: {0}"],
+    DefectLabel => ["defect", "broken", "defekt"],
     // Help
     HelpTitle => ["{0} v{1}  -  sneltoetsen", "{0} v{1}  -  hotkeys", "{0} v{1}  -  Tastenkürzel"],
     HelpFooter => ["(c) 2026 Bart    -    druk ? of Esc om te sluiten", "(c) 2026 Bart    -    press ? or Esc to close", "(c) 2026 Bart    -    ? oder Esc zum Schließen"],
