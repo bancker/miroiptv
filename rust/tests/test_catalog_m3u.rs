@@ -363,8 +363,8 @@ fn print_timing(what: &str, n: usize, mut work: impl FnMut()) {
 
 /// Timed by hand: what an M3U catalog of iptv-org's size costs where it is
 /// stored (the guide's merge, once for every catalog put: the saved list and
-/// the fresh one) and per up/down press (the zap list: every key repeat clones
-/// the whole list).
+/// the fresh one) and per up/down press (the zap ring, an `Arc`: nothing is
+/// copied; `zap_channels` is a copy, for tests and tools).
 /// `cargo test --release --test test_catalog_m3u -- --ignored --nocapture`
 #[test]
 #[ignore]
@@ -378,5 +378,11 @@ fn an_eleven_thousand_channel_m3u_catalog_timed() {
     let store = CatalogStore::from_catalog(Arc::new(portal), catalog);
     print_timing("zap_channels", 100, || {
         assert_eq!(std::hint::black_box(store.zap_channels()).len(), 11_262);
+    });
+    print_timing("zap_ring (a press)", 100, || {
+        assert_eq!(
+            std::hint::black_box(store.zap_ring()).map(|r| r.len()),
+            Some(11_262)
+        );
     });
 }

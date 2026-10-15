@@ -138,11 +138,19 @@ pub fn guide_channels_of(live: &[LiveChannel]) -> Vec<GuideChannel> {
 /// where the catalog is stored: a lookup by stream id is one probe of a set, not
 /// a scan of ~13,000 channels. Reads as the catalog itself (`Deref`).
 struct StoredCatalog {
+    /// The films and series; its `live` is empty (see `live`).
     catalog: PortalCatalog,
+    /// The live channels, taken out of `catalog`: what is worked out from them
+    /// (the zap ring, the channel list's groups) holds this `Arc` and positions
+    /// in it, never copies of the channels. `c.live` reads this field, not the
+    /// catalog's empty one.
+    live: Arc<Vec<LiveChannel>>,
     /// Stream ids of the adult live channels (see `adult_live`).
     adult_live_ids: HashSet<i64>,
     /// The guide's columns (see `guide_channels_of`), adult ones included.
     guide: Vec<GuideChannel>,
+    /// The zap ring last asked for, with the lock and the marks it was made for.
+    zap: Mutex<Option<Arc<ZapRing>>>,
 }
 
 impl StoredCatalog {
@@ -160,11 +168,41 @@ impl StoredCatalog {
         for c in &mut catalog.live {
             c.stream_icon = None;
         }
+        let live = Arc::new(std::mem::take(&mut catalog.live));
         Self {
             catalog,
+            live,
             adult_live_ids,
             guide,
+            zap: Mutex::new(None),
         }
+    }
+
+    /// The zap ring for this lock and these marks: the one made last when it was
+    /// made for them, else a new one, kept for the next press.
+    fn zap_ring(
+        &self,
+        kind: SourceKind,
+        unlocked: bool,
+        defect: &HashMap<i64, i64>,
+        defect_revision: u64,
+    ) -> Arc<ZapRing> {
+        let mut slot = self.zap.lock();
+        if let Some(ring) = slot
+            .as_ref()
+            .filter(|r| r.unlocked == unlocked && r.defect_revision == defect_revision)
+        {
+            return ring.clone();
+        }
+        let ring = Arc::new(ZapRing::build(
+            &self.live,
+            kind,
+            unlocked,
+            defect,
+            defect_revision,
+        ));
+        *slot = Some(ring.clone());
+        ring
     }
 }
 
@@ -422,14 +460,13 @@ pub fn fallback_variant(
         .cloned()
 }
 
-/// Collapse a live-channel list to ONE entry per distinct channel (keyed by
-/// [`normalize_channel_name`]), keeping the highest-scoring variant so the
-/// user doesn't zap through NPO1 HD / UHD / FHD / catch-up duplicates. Order
-/// follows each channel's first appearance in the portal list.
-pub fn dedupe_zap<'a>(channels: impl IntoIterator<Item = &'a LiveChannel>) -> Vec<LiveChannel> {
+/// The positions (as `channels` numbers them) of the entries [`dedupe_zap`]
+/// keeps: ONE per distinct channel ([`normalize_channel_name`]), the
+/// highest-scoring variant, in the order of each channel's first appearance.
+fn dedupe<'a>(channels: impl IntoIterator<Item = (usize, &'a LiveChannel)>) -> Vec<usize> {
     let mut order: Vec<String> = Vec::new();
-    let mut best: HashMap<String, LiveChannel> = HashMap::new();
-    for ch in channels {
+    let mut best: HashMap<String, (usize, &LiveChannel)> = HashMap::new();
+    for (i, ch) in channels {
         let key = normalize_channel_name(&ch.name);
         if key.is_empty() {
             continue;
@@ -437,15 +474,180 @@ pub fn dedupe_zap<'a>(channels: impl IntoIterator<Item = &'a LiveChannel>) -> Ve
         match best.get(&key) {
             None => {
                 order.push(key.clone());
-                best.insert(key, ch.clone());
+                best.insert(key, (i, ch));
             }
-            Some(cur) if variant_score(ch) > variant_score(cur) => {
-                best.insert(key, ch.clone());
+            Some((_, cur)) if variant_score(ch) > variant_score(cur) => {
+                best.insert(key, (i, ch));
             }
             Some(_) => {}
         }
     }
-    order.into_iter().filter_map(|k| best.remove(&k)).collect()
+    order
+        .into_iter()
+        .filter_map(|k| best.remove(&k))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Collapse a live-channel list to ONE entry per distinct channel (keyed by
+/// [`normalize_channel_name`]), keeping the highest-scoring variant so the
+/// user doesn't zap through NPO1 HD / UHD / FHD / catch-up duplicates. Order
+/// follows each channel's first appearance in the portal list.
+pub fn dedupe_zap<'a>(channels: impl IntoIterator<Item = &'a LiveChannel>) -> Vec<LiveChannel> {
+    let channels: Vec<&LiveChannel> = channels.into_iter().collect();
+    dedupe(channels.iter().copied().enumerate())
+        .into_iter()
+        .map(|i| channels[i].clone())
+        .collect()
+}
+
+/// What up/down zapping steps through: one entry per channel the user zaps to,
+/// in zap order. An Xtream portal's variants of a channel are one entry, its
+/// best ([`dedupe_zap`]); an M3U list's entries are all there, in the file's
+/// order. Adult channels while locked and channels marked defect are out.
+/// Worked out once per catalog, lock and marks ([`CatalogStore::zap_ring`]), it
+/// holds the catalog's channels and positions in them, never copies: a press
+/// copies nothing.
+pub struct ZapRing {
+    live: Arc<Vec<LiveChannel>>,
+    /// Indexes into `live`, in zap order.
+    order: Vec<u32>,
+    /// An M3U list's ring: `order` keeps the file's order and ascends.
+    file_order: bool,
+    /// The lock state and the marks revision it was made for.
+    unlocked: bool,
+    defect_revision: u64,
+}
+
+/// Where a zap step starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZapFrom {
+    /// Nothing plays: the step counts from the ring's first entry.
+    Start,
+    /// Ring position `pos`, which held channel `sid` when it was taken. When it
+    /// holds another one now (the ring changed), as `Channel(sid)`.
+    Pos { pos: usize, sid: i64 },
+    /// Channel `sid`, wherever it is.
+    Channel(i64),
+}
+
+/// Where a channel sits in the ring.
+enum Place {
+    /// Its entry, or the one that stands for it.
+    At(usize),
+    /// Out of the ring (an M3U channel marked defect): just before this ring
+    /// position, which may be the ring's length.
+    Before(usize),
+    /// Not in the catalog, or hidden.
+    Unknown,
+}
+
+impl ZapRing {
+    fn build(
+        live: &Arc<Vec<LiveChannel>>,
+        kind: SourceKind,
+        unlocked: bool,
+        defect: &HashMap<i64, i64>,
+        defect_revision: u64,
+    ) -> Self {
+        let shows =
+            |c: &LiveChannel| (unlocked || !adult_live(c)) && !defect.contains_key(&c.stream_id);
+        let entries = live.iter().enumerate().filter(|(_, c)| shows(c));
+        let order: Vec<usize> = match kind {
+            SourceKind::Xtream => dedupe(entries),
+            // Every entry, in the file's order: merging variants is made for the
+            // Xtream portal's names.
+            SourceKind::M3u => entries.map(|(i, _)| i).collect(),
+        };
+        Self {
+            live: live.clone(),
+            order: order.into_iter().map(|i| i as u32).collect(),
+            file_order: kind == SourceKind::M3u,
+            unlocked,
+            defect_revision,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    /// The channel at ring position `pos`.
+    pub fn get(&self, pos: usize) -> Option<&LiveChannel> {
+        self.order.get(pos).and_then(|&i| self.live.get(i as usize))
+    }
+
+    /// The ring's channels, in zap order.
+    pub fn channels(&self) -> impl Iterator<Item = &LiveChannel> + '_ {
+        self.order.iter().filter_map(|&i| self.live.get(i as usize))
+    }
+
+    /// Where channel `sid` sits: its own entry, else (on an Xtream portal) the
+    /// entry that stands for its channel. None for a channel out of the ring.
+    pub fn position_of(&self, sid: i64) -> Option<usize> {
+        match self.place_of(sid) {
+            Place::At(pos) => Some(pos),
+            Place::Before(_) | Place::Unknown => None,
+        }
+    }
+
+    /// The ring position `delta` entries on from `from`, round the ring; None
+    /// for an empty ring. A channel out of the ring (an M3U channel marked
+    /// defect) steps from its place in the file: on to the first entry after
+    /// it, back to the last one before it. With nothing known the step counts
+    /// from the start, as zapping always did ([`crate::shortcuts::next_live_idx`]).
+    pub fn step(&self, from: ZapFrom, delta: i32) -> Option<usize> {
+        let len = self.order.len();
+        if len == 0 {
+            return None;
+        }
+        let place = match from {
+            ZapFrom::Start => Place::Unknown,
+            ZapFrom::Pos { pos, sid } if self.get(pos).is_some_and(|c| c.stream_id == sid) => {
+                Place::At(pos)
+            }
+            ZapFrom::Pos { sid, .. } | ZapFrom::Channel(sid) => self.place_of(sid),
+        };
+        match place {
+            Place::At(pos) => crate::shortcuts::next_live_idx(Some(pos), len, delta),
+            Place::Before(pos) => {
+                // One step on lands on `pos`, one back on the entry before it.
+                let to = pos as i64 + i64::from(delta) - i64::from(delta > 0);
+                Some(to.rem_euclid(len as i64) as usize)
+            }
+            Place::Unknown => crate::shortcuts::next_live_idx(None, len, delta),
+        }
+    }
+
+    fn place_of(&self, sid: i64) -> Place {
+        let Some(file) = self.live.iter().position(|c| c.stream_id == sid) else {
+            return Place::Unknown;
+        };
+        let own = if self.file_order {
+            self.order.binary_search(&(file as u32)).ok()
+        } else {
+            self.order.iter().position(|&i| i as usize == file)
+        };
+        if let Some(pos) = own {
+            return Place::At(pos);
+        }
+        let channel = &self.live[file];
+        if !self.unlocked && adult_live(channel) {
+            return Place::Unknown;
+        }
+        if self.file_order {
+            return Place::Before(self.order.partition_point(|&i| (i as usize) < file));
+        }
+        let key = normalize_channel_name(&channel.name);
+        self.order
+            .iter()
+            .position(|&i| normalize_channel_name(&self.live[i as usize].name) == key)
+            .map_or(Place::Unknown, Place::At)
+    }
 }
 
 #[cfg(test)]
@@ -577,7 +779,7 @@ mod zap_tests {
         let mut adult: Vec<i64> = stored.adult_live_ids.iter().copied().collect();
         adult.sort();
         assert_eq!(adult, [2, 4]);
-        // The rest of the catalog reads through it.
+        // Its live channels are kept apart, in `live`.
         assert_eq!(stored.live.len(), 4);
     }
 }
@@ -612,6 +814,13 @@ pub struct CatalogStore {
     revision: Arc<AtomicU64>,
     /// What the last fetch has to tell the user, until the app takes it.
     notice: Arc<Mutex<Option<CatalogNotice>>>,
+    /// The M3U channels marked defect: stream id → when it failed, unix seconds
+    /// (spec 2026-10-15 §4). The zap ring and the channel list's groups leave
+    /// them out; the search and the favorites still name them. The app sets them
+    /// (`set_defect`); an Xtream catalog has none.
+    defect: RwLock<Arc<HashMap<i64, i64>>>,
+    /// Counts every `set_defect`: what is worked out from the marks follows it.
+    defect_revision: AtomicU64,
 }
 
 /// Puts a catalog in its slot and counts it. The count moves after the catalog
@@ -630,6 +839,8 @@ impl CatalogStore {
             adult_unlocked: AtomicBool::new(false),
             revision: Arc::new(AtomicU64::new(0)),
             notice: Arc::new(Mutex::new(None)),
+            defect: RwLock::new(Arc::new(HashMap::new())),
+            defect_revision: AtomicU64::new(0),
         }
     }
 
@@ -813,25 +1024,61 @@ impl CatalogStore {
             .unwrap_or_default()
     }
 
-    /// Channel list for up/down zapping. An Xtream portal's is deduplicated: one
-    /// entry per distinct channel, highest-quality live variant (see
-    /// [`dedupe_zap`]). An M3U list's is every entry, in the file's order.
+    /// What up/down zapping steps through ([`ZapRing`]), `None` until a catalog
+    /// has loaded. Worked out once per catalog, lock and marks: a press asks
+    /// again and gets the same ring, an `Arc`, with nothing copied.
+    pub fn zap_ring(&self) -> Option<Arc<ZapRing>> {
+        let unlocked = self.adult_unlocked();
+        // The revision before the marks: marks set in between are noticed next time.
+        let defect_revision = self.defect_revision();
+        let defect = self.defect_marks();
+        let g = self.inner.read();
+        Some(
+            g.as_ref()?
+                .zap_ring(self.kind(), unlocked, &defect, defect_revision),
+        )
+    }
+
+    /// The zap ring's channels as a list: a copy, for tests and tools. The app
+    /// steps through [`CatalogStore::zap_ring`].
     pub fn zap_channels(&self) -> Vec<LiveChannel> {
-        // An M3U list zaps in its own order, every entry: merging variants is
-        // made for the Xtream portal's names.
-        let merge = self.kind() == SourceKind::Xtream;
-        self.inner
-            .read()
-            .as_ref()
-            .map(|c| {
-                let shown = c.live.iter().filter(|x| self.shows_live(x));
-                if merge {
-                    dedupe_zap(shown)
-                } else {
-                    shown.cloned().collect()
-                }
-            })
+        self.zap_ring()
+            .map(|ring| ring.channels().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// The name of live channel `sid` when it shows: adult ones while locked do
+    /// not; a defect one does (a preset, a favorite or the search still plays
+    /// it). One read lock and a scan, no copy of the list.
+    pub fn live_name(&self, sid: i64) -> Option<String> {
+        let g = self.inner.read();
+        g.as_ref()?
+            .live
+            .iter()
+            .find(|c| c.stream_id == sid && self.shows_live(c))
+            .map(|c| c.name.clone())
+    }
+
+    /// The M3U channels marked defect from now on: stream id → when it failed,
+    /// unix seconds. The app hands over every change of its marks.
+    pub fn set_defect(&self, marks: HashMap<i64, i64>) {
+        *self.defect.write() = Arc::new(marks);
+        self.defect_revision.fetch_add(1, Ordering::Release);
+    }
+
+    /// Whether channel `sid` is marked defect.
+    pub fn is_defect(&self, sid: i64) -> bool {
+        self.defect.read().contains_key(&sid)
+    }
+
+    /// The marks, as an `Arc`: no copy of the map.
+    pub fn defect_marks(&self) -> Arc<HashMap<i64, i64>> {
+        self.defect.read().clone()
+    }
+
+    /// How many times the marks were set: 0 until the first `set_defect`.
+    pub fn defect_revision(&self) -> u64 {
+        self.defect_revision.load(Ordering::Acquire)
     }
 
     /// The guide's columns ([`guide_channels_of`]), without the adult ones while
@@ -918,7 +1165,7 @@ impl CatalogStore {
             return Vec::new();
         };
         let mut v = Vec::with_capacity(c.live.len() + c.movies.len() + c.series.len());
-        for x in &c.live {
+        for x in c.live.iter() {
             if self.shows_live(x) {
                 v.push(SearchItem {
                     id: x.stream_id,
