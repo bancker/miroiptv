@@ -153,9 +153,11 @@ impl M3uPortal {
         if answer.content_length().is_some_and(|n| n > max) {
             return Err(too_big(self.id, max));
         }
-        // Room at once for what the server says comes (within the cap, as
-        // checked): no copy on the way.
-        let mut body = Vec::with_capacity(answer.content_length().unwrap_or(0) as usize);
+        // What the server says comes (within the cap, as checked) gets its room
+        // at once, so there is no copy on the way, but only once the first KB
+        // has passed: what that refuses takes no room.
+        let announced = answer.content_length().unwrap_or(0) as usize;
+        let mut body = Vec::new();
         while let Some(chunk) = answer
             .chunk()
             .await
@@ -166,8 +168,13 @@ impl M3uPortal {
             if !append_within(&mut body, &chunk, max as usize) {
                 return Err(too_big(self.id, max));
             }
-            if in_head && !is_text(&body) {
-                return Err(not_text(self.id));
+            if in_head {
+                if !is_text(&body) {
+                    return Err(not_text(self.id));
+                }
+                if body.len() >= NUL_SCAN_BYTES {
+                    body.reserve_exact(announced.saturating_sub(body.len()));
+                }
             }
         }
         Ok(body)
@@ -594,17 +601,23 @@ mod tests {
         assert_eq!(body.len(), 1024, "as it was");
     }
 
-    /// A server that answers one GET with `first` as a chunk of its body and
-    /// then holds the connection open, sending nothing more: a live stream's
-    /// server, as far as the first bytes go. Its URL.
-    async fn stalling(first: &[u8]) -> String {
+    /// A server that answers one GET with `chunks`, each a chunk of its body
+    /// (with a pause between them, so that each comes on its own), and then
+    /// holds the connection open, sending nothing more: a live stream's server,
+    /// as far as the first bytes go. Its URL.
+    async fn stalling(chunks: &[&[u8]]) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/live.ts", listener.local_addr().unwrap());
-        let mut answer = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
-        answer.extend_from_slice(format!("{:x}\r\n", first.len()).as_bytes());
-        answer.extend_from_slice(first);
-        answer.extend_from_slice(b"\r\n");
+        let chunks: Vec<Vec<u8>> = chunks
+            .iter()
+            .map(|chunk| {
+                let mut framed = format!("{:x}\r\n", chunk.len()).into_bytes();
+                framed.extend_from_slice(chunk);
+                framed.extend_from_slice(b"\r\n");
+                framed
+            })
+            .collect();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
@@ -615,24 +628,46 @@ mod tests {
                 }
                 request.push(byte[0]);
             }
-            socket.write_all(&answer).await.unwrap();
+            let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+            socket.write_all(head).await.unwrap();
+            for chunk in chunks {
+                socket.write_all(&chunk).await.unwrap();
+                socket.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             // No more, and no end: the socket stays open with this task.
             std::future::pending::<()>().await;
         });
         url
     }
 
-    #[tokio::test]
-    async fn a_download_with_a_nul_in_its_first_kb_stops_there() {
-        // A live stream's address taken for a list's: it never ends. The client
-        // would wait for its time-out (30 s), the test waits 5.
-        let mut first = vec![b'x'; NUL_SCAN_BYTES];
-        first[..8].copy_from_slice(b"G\0\x11\x10\0\0\xb0\x0d");
-        let url = stalling(&first).await;
+    /// What `download` makes of a stalling server's `chunks`, waiting 5 s at
+    /// most (the client itself would wait for its time-out, 30 s).
+    async fn download_stalling(chunks: &[&[u8]]) -> Result<usize, PortalError> {
+        let url = stalling(chunks).await;
         let portal = M3uPortal::new(2, &url, PathBuf::new());
         let read = tokio::time::timeout(Duration::from_secs(5), portal.download(&url)).await;
-        let read = read.expect("it stops at the first KB");
-        let read = read.map(|bytes| bytes.len());
+        read.expect("it stops in the first KB")
+            .map(|bytes| bytes.len())
+    }
+
+    #[tokio::test]
+    async fn a_download_with_a_nul_in_its_first_kb_stops_there() {
+        // A live stream's address taken for a list's: it never ends.
+        let mut first = vec![b'x'; NUL_SCAN_BYTES];
+        first[..8].copy_from_slice(b"G\0\x11\x10\0\0\xb0\x0d");
+        let read = download_stalling(&[&first]).await;
+        assert!(matches!(read, Err(PortalError::NotAList)), "{read:?}");
+    }
+
+    #[tokio::test]
+    async fn a_nul_in_a_later_chunk_of_the_first_kb_stops_the_download_too() {
+        // The first chunk is text; the NUL comes in the second, still inside the
+        // first KB.
+        let first = vec![b'x'; 512];
+        let mut second = vec![b'x'; 512];
+        second[0] = 0;
+        let read = download_stalling(&[&first, &second]).await;
         assert!(matches!(read, Err(PortalError::NotAList)), "{read:?}");
     }
 
