@@ -1,7 +1,9 @@
 use clap::Parser;
 use thiserror::Error;
 
-#[derive(Parser, Debug)]
+/// The command line. `Debug` for the tests only: `--xtream` holds the password.
+#[derive(Parser)]
+#[cfg_attr(test, derive(Debug))]
 #[command(
     name = "BongoPlayer",
     display_name = "Bongo Player",
