@@ -23,9 +23,10 @@ end, as the real portal sends it; channel 2 sends no `has_archive`.
 "M3U 01".."M3U 18" play `/m3uplay/k.m3u8`, a live playlist on the test segments.
 "M3U UA" plays only with the User-Agent `BongoTest/1.0`, which the list's
 `#EXTVLCOPT` names. "M3U DOOD" answers 404. "M3U REF", the last, plays only with
-the Referer `http://ref.test/`, which its `#EXTVLCOPT` names; any other
+the Referer `http://ref.test/`, which its `#EXTVLCOPT` names; any other playable
 `/m3uplay/` request that carries a `Referer` answers 400, a referrer that leaked
-from an earlier load (scenario `M-ref`). `MOCK_M3U_BIG=N` serves `/m3u/big.m3u`
+from an earlier load (scenario `M-ref`); "M3U DOOD" and `/m3uplay/none/...` answer
+404 first. `MOCK_M3U_BIG=N` serves `/m3u/big.m3u`
 with N channels, for `measure-startup.ps1 -M3u`. An M3U scenario starts with
 `-NoPortal` and an ini in its config folder that names the list as a source.
 
@@ -71,9 +72,12 @@ and the values of `username`, `user`, `password`, `pass` and `token`. Values und
 have to be named: `-Group R,B,C,N,X,G,M` is everything. A full run opens the app's window about 110
 times (once per scenario, more for re-runs), so start it when nobody minds windows coming and going.
 `M-restart` goes on in the config folder `M-zap` left (the saved list, the last channel): run the two
-together. `M-zap`, `M-add`, `M-switch` and `M-getphp` change what is in their folder, so the second
-attempt of one that failed starts from the changed folder: run it again with `-Only`, which makes
-the folders anew.
+together. `M-zap`, `M-add`, `M-switch` and `M-getphp` change what is in their folder, so each has a
+`-Before` (`Scn`'s optional fourth argument) that runs before every attempt, the second one too, and
+makes the folder anew with its first ini: a re-run starts where the first attempt did. `M-restart`
+has none; it starts from what `M-zap`'s last attempt left. `M-add` and `M-getphp` type a lot (35 and
+62 characters that matter), so one doubled character fails them now and then: run a failed one once
+more by hand before suspecting the app.
 
 `-Group` picks groups, `-Only` scenario ids (wildcards), `-DryRun` prints the commands, `-Summary`
 sums up the last results. Results go to `-Results` (default `%TEMP%\bongo-regression`): one JSON line

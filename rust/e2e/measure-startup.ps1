@@ -16,9 +16,12 @@
 # channels in use (MOCK_M3U_BIG), the baseline as before on the Xtream portal: the
 # spec's "not slower than 0.6.1, with an M3U source in use". Its config folder is
 # kept between runs, so from the second run on the saved list is there, as on a
-# real machine. MOCK_LATENCY slows only /live/ and /edge/ requests and an M3U
-# resume makes none of them, so against a baseline the new exe is favoured a
-# little: read both numbers as they come.
+# real machine. MOCK_LATENCY makes the mock sleep 0.30 s on /live/, 0.12 s on
+# /edge/ and 0.05 s on every other path (/m3uplay/, /seg/ and /m3u/big.m3u too).
+# An M3U resume skips the 0.42 s that the Xtream baseline pays on /live/ and
+# /edge/ before its first frame; its own playlist, /m3uplay/, costs 0.05 s. So it
+# starts about 0.4 s ahead for that reason alone: report both numbers as they
+# come, and read the -M3u comparison with that in mind.
 param(
     [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\BongoPlayer.exe'),
     [int]$Runs = 10,

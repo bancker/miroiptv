@@ -192,7 +192,7 @@ $log = Get-ChildItem (Join-Path $ConfigDir 'log') -Filter 'BongoPlayer.log.*' -E
 $lines = if ($log) { Get-Content $log.FullName -Encoding UTF8 } else { @() }
 "config folder: $ConfigDir"
 '=== app log (zaps, loads, settings, adult, news, pause, errors) ==='
-$lines | Where-Object { $_ -match 'zap: |source: |m3u: |loadfile|resuming|resume:|settings:|adult:|news picker|pause:|player: stop|toast:|relay: (first bytes|the portal)|end-file \(reason=(eof|error)\)|ERROR' } |
+$lines | Where-Object { $_ -match 'zap: |source: |m3u: |mpv: file-loaded|guide: opened|portal: |loadfile|resuming|resume:|settings:|adult:|news picker|pause:|player: stop|toast:|relay: (first bytes|the portal)|end-file \(reason=(eof|error)\)|ERROR' } |
     ForEach-Object { '  ' + (($_ -replace '^\d{4}-\d\d-\d\dT(\d\d:\d\d:\d\d\.\d{3})\d*Z', '$1') -replace '\s+(main|mpv-player|tokio-rt-worker)\s+\S+: ', ' ') }
 '=== mock portal: live requests ==='
 if (Test-Path $reqLog) { Get-Content $reqLog | Where-Object { $_ -match '/live/' } | ForEach-Object { '  ' + $_ } }

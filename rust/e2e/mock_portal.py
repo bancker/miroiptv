@@ -45,9 +45,10 @@ Environment:
                      User-Agent BongoTest/1.0, which its #EXTVLCOPT line names (403
                      otherwise); "M3U DOOD" (/m3uplay/dead.m3u8) is 404; "M3U REF"
                      (/m3uplay/ref.m3u8, last) plays only with the Referer http://ref.test/,
-                     which its #EXTVLCOPT line names (403 otherwise). Any other /m3uplay/
-                     request that carries a Referer header answers 400: a referrer that
-                     leaked from an earlier load
+                     which its #EXTVLCOPT line names (403 otherwise). Any other playable
+                     /m3uplay/ request that carries a Referer header answers 400: a
+                     referrer that leaked from an earlier load. (M3U DOOD and
+                     /m3uplay/none/... are not playable: they answer 404 first.)
   MOCK_M3U_BIG=N     /m3u/big.m3u: N channels "GROOT nnnnn" in iptv-org's form (logos, groups,
                      an x-tvg-url); the first 18 play like M3U 01..18 (the startup measurement)
 """

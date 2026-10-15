@@ -85,10 +85,12 @@ function Invoke-Harness([hashtable]$P) {
 }
 
 # A scenario: PASS when the harness exits 0 and $Check (if any) holds.
+#  - $Before (if any) runs before every attempt, the second one too: it makes the scenario's starting state
+#    anew (its config folder with its first ini), so a re-run does not start from what the attempt before it left;
 #  - the held-key guard refused (the user may be typing): wait 10 s and retry, up to 3 times; those are
 #    counted as "refused", not as fails;
 #  - a fail is re-run once; it passes (on re-run) or fails for good, with both outputs kept.
-function Scn([string]$Id, [hashtable]$P, [scriptblock]$Check = $null) {
+function Scn([string]$Id, [hashtable]$P, [scriptblock]$Check = $null, [scriptblock]$Before = $null) {
     if ($DryRun) {
         # (not .Keys: run-scenario.ps1 has a parameter called Keys)
         $known = (Get-Command $runScenario).Parameters.GetEnumerator() | ForEach-Object { $_.Key }
@@ -104,6 +106,7 @@ function Scn([string]$Id, [hashtable]$P, [scriptblock]$Check = $null) {
     $t0 = Get-Date
     $refused = 0; $attempts = 0; $pass = $false; $exit = $null; $checked = $true; $why = ''; $ran = $false
     while ($true) {
+        if ($Before) { & $Before }
         $r = Invoke-Harness $P
         if ($r.Refused) {
             $refused++
@@ -349,26 +352,36 @@ function Group-G {
 
 # ---- M: M3U sources ----------------------------------------------------------------------------
 # Each scenario starts with -NoPortal and an ini in its own config folder that names the sources; the mock's list
-# (MOCK_M3U) has 21 channels. M-add, M-switch and M-getphp press the keys that settings_ui's and app's keyboard tests
-# press (the Bronnen pane's Tab order, pinned there). The SLEEPs after a Save or a Use are margin, the tests need none;
-# an Xtream Save gets a long one, because its answer comes whenever the mock's login is over and a Tab in that frame is lost.
+# (MOCK_M3U) has 21 channels. M-zap, M-add, M-switch and M-getphp change what is in their folder, so each has a -Before:
+# every attempt, the second one too, makes the folder anew with its first ini. M-restart has none: it goes on from the
+# folder that M-zap's last attempt left. M-add, M-switch and M-getphp press the keys that settings_ui's and app's
+# keyboard tests press (the Bronnen pane's Tab order, pinned there). The SLEEPs after M-add's Save and after a Use are
+# margin, the tests need none. M-getphp's first SLEEP:300, after the Save that opens the question, is needed: its test
+# has a quiet frame there (a_get_php_link_by_keyboard_becomes_an_xtream_source_to_save). An Xtream Save gets a long
+# SLEEP, because its answer comes whenever the mock's login is over and a Tab in that frame is lost.
 function Group-M {
     'M: M3U sources (MOCK_M3U)'
     $M = @{ MOCK_M3U = '1' }
     $list = 'http://127.0.0.1:18080/m3u/list.m3u'
-    # A fresh config folder whose ini holds these lines.
+    # A fresh config folder whose ini holds these lines: Fresh removes the old folder with everything in it (cache\,
+    # last_watched.json, favorites), so what comes back holds this ini alone. Returns the folder.
     function IniDir([string]$name, [string]$ini) {
         $d = Fresh $name
         New-Item -ItemType Directory -Force $d | Out-Null
         [IO.File]::WriteAllText((Join-Path $d 'BongoPlayer.ini'), $ini)
         $d
     }
+    # The first ini of each scenario that has a -Before, in one variable: the first making of its folder and the
+    # -Before make the same one.
     $onlyList = "source=1;m3u;Testlijst;$list`nactive=1`n"
     $portal = "portal=tester:secret@127.0.0.1:18080`n"
-    # The list comes in the background; a zap plays straight from its server, not through the relay.
+    $switchIni = "portal=tester:secret@127.0.0.1:18080`nsource=1;xtream;;tester:secret@127.0.0.1:18080`nsource=2;m3u;Testlijst;$list`nactive=1`n"
+    # The list comes in the background; a zap plays straight from its server, not through the relay. Nothing plays at
+    # first, so DOWN starts from index 0 (shortcuts::next_live_idx) and the first zap lands on index 1, M3U 02.
     $dz = IniDir 'm-zap' $onlyList
-    Scn 'M-zap' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $dz; Seconds = 14; Keys = 'SLEEP:1500;DOWN;SLEEP:3000'; Expect = 'source: m3u 1 \(127\.0\.0\.1\)', 'm3u: list of source 1 read \(21 channels', 'zap: -> M3U 02', 'loadfile http://127\.0\.0\.1:18080/m3uplay/2\.m3u8', 'mpv: file-loaded'; Forbid = 'relay: first bytes', 'portal: no credentials' }
-    # The next start shows the saved list at once, resumes M3U 02 from it, and finds the download the same.
+    Scn 'M-zap' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $dz; Seconds = 14; Keys = 'SLEEP:1500;DOWN;SLEEP:3000'; Expect = 'source: m3u 1 \(127\.0\.0\.1\)', 'm3u: list of source 1 read \(21 channels', 'zap: -> M3U 02', 'loadfile http://127\.0\.0\.1:18080/m3uplay/2\.m3u8', 'mpv: file-loaded'; Forbid = 'relay: first bytes', 'portal: no credentials' } -Before { $null = IniDir 'm-zap' $onlyList }
+    # The next start shows the saved list at once, resumes M3U 02 from it, and finds the download the same. No
+    # -Before: it goes on from the folder that M-zap's last attempt left.
     Scn 'M-restart' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $dz; Seconds = 10; Expect = 'm3u: saved list of source 1 \(21 channels', 'resuming last watched', 'loadfile http://127\.0\.0\.1:18080/m3uplay/2\.m3u8', 'm3u: list of source 1 unchanged' }
     # The channel that plays only with its own User-Agent.
     Scn 'M-ua' @{ MockEnv = $M; NoPortal = $true; ConfigDir = (IniDir 'm-ua' $onlyList); Seconds = 16; Keys = 'SLEEP:1500;f;SLEEP:400;TEXT:m3u ua;SLEEP:800;ENTER;SLEEP:3000'; Expect = 'loadfile http://127\.0\.0\.1:18080/m3uplay/ua\.m3u8 \(user-agent\)', 'mpv: file-loaded'; Forbid = 'end-file \(reason=error\)' }
@@ -386,20 +399,20 @@ function Group-M {
     Scn 'M-add' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $da; Resume = 3; Seconds = 26; Keys = "o;DOWN;ENTER;TAB;TAB;TAB;TAB;TAB;TAB;ENTER;TAB;ENTER;TAB;TEXT:$list;TAB;ENTER;SLEEP:800;TAB;TAB;TAB;TAB;TAB;ENTER;SLEEP:3000;ESC;ESC"; Expect = 'settings: source 2 saved \(m3u\)', 'source: active 2 \(m3u\)', 'player: stop', 'source: m3u 2 \(127\.0\.0\.1\)', 'm3u: list of source 2 read \(21 channels' } {
         $ini = Get-Content -Raw (Join-Path $da 'BongoPlayer.ini')
         ($ini -match [regex]::Escape("source=2;m3u;;$list")) -and ($ini -match 'active=2')
-    }
+    } -Before { $null = IniDir 'm-add' $portal }
     # From the saved portal (source 1, in use) to the list (source 2): the keys of settings_ui's
     # the_list_marks_the_source_in_use_and_use_sends_the_chosen_one.
-    $ds = IniDir 'm-switch' "portal=tester:secret@127.0.0.1:18080`nsource=1;xtream;;tester:secret@127.0.0.1:18080`nsource=2;m3u;Testlijst;$list`nactive=1`n"
+    $ds = IniDir 'm-switch' $switchIni
     Scn 'M-switch' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $ds; Resume = 3; Seconds = 24; Keys = 'o;DOWN;ENTER;TAB;TAB;TAB;TAB;TAB;TAB;ENTER;SLEEP:300;TAB;TAB;TAB;TAB;TAB;ENTER;SLEEP:3000;ESC;ESC'; Expect = 'portal: xtream <user>@127\.0\.0\.1:18080', 'source: active 2 \(m3u\)', 'source: m3u 2 \(127\.0\.0\.1\)', 'player: stop', 'm3u: list of source 2 read \(21 channels' } {
         (Get-Content -Raw (Join-Path $ds 'BongoPlayer.ini')) -match 'active=2'
-    }
+    } -Before { $null = IniDir 'm-switch' $switchIni }
     # An Xtream portal's get.php link typed as a list: offered, and saved as an Xtream source (the keys of
     # settings_ui's a_get_php_link_by_keyboard_becomes_an_xtream_source_to_save). Its password never reaches the log.
     $getphp = 'http://127.0.0.1:18080/get.php?username=tester&password=secret&type=m3u_plus'
     $dg = IniDir 'm-getphp' $portal
     Scn 'M-getphp' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $dg; Resume = 3; Seconds = 26; Keys = "o;DOWN;ENTER;TAB;TAB;TAB;TAB;TAB;TAB;ENTER;TAB;ENTER;TAB;TEXT:$getphp;TAB;ENTER;SLEEP:300;TAB;ENTER;SLEEP:300;TAB;TAB;TAB;TAB;ENTER;SLEEP:3000;ESC;ESC"; Expect = 'settings: connection check Ok', 'settings: source 2 saved \(xtream\)'; Forbid = 'password=secret', 'get\.php\?username' } {
         (Get-Content -Raw (Join-Path $dg 'BongoPlayer.ini')) -match [regex]::Escape('source=2;xtream;;tester:secret@127.0.0.1:18080')
-    }
+    } -Before { $null = IniDir 'm-getphp' $portal }
 }
 
 # ====================================================================================================
