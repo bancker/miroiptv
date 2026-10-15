@@ -285,6 +285,23 @@ fn an_xtream_get_php_link_gives_its_credentials() {
 }
 
 #[test]
+fn an_https_get_php_link_is_no_xtream_link_the_client_speaks_plain_http_only() {
+    // The Xtream client builds `http://host:port`, so `user:pass@host:443`
+    // would be a source that never connects: the link stays an M3U list.
+    for link in [
+        "https://srv.example.net/get.php?username=u&password=p",
+        "HTTPS://srv.example.net:8443/get.php?username=u&password=p&type=m3u_plus",
+    ] {
+        assert_eq!(xtream_link(link), None, "{link}");
+    }
+    assert_eq!(
+        xtream_link("HTTP://srv.example.net/get.php?username=u&password=p").as_deref(),
+        Some("u:p@srv.example.net:80"),
+        "the scheme counts in any case, and only http is offered"
+    );
+}
+
+#[test]
 fn read_gives_the_catalog_in_file_order_with_headers_in_the_urls() {
     let playlist = read(LIST).expect("a list");
     let names: Vec<&str> = playlist.live.iter().map(|c| c.name.as_str()).collect();

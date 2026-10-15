@@ -3,19 +3,19 @@
 //! right. Both draw themselves and report what the user did as actions;
 //! app.rs carries those out.
 
-use crate::args::{credentials_line, without_newlines, XtreamCreds};
+use crate::args::{credentials_line, parse_xtream_creds, without_newlines, XtreamCreds};
 use crate::i18n::{t, tr, Lang, T};
 use crate::news::{default_rules, NewsRule};
 use crate::pin::valid_pin;
 use crate::portal::xtream::ConnCheck;
 use crate::settings::Settings;
-use crate::sources::{SourceDraft, SourceId};
+use crate::sources::{is_web_address, Editing, SourceDraft, SourceId, SourceKind, Sources};
 use egui::{Color32, Key, Modifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Language,
-    Portal,
+    Sources,
     Controls,
     Adult,
     News,
@@ -24,7 +24,7 @@ pub enum Section {
 impl Section {
     pub const ALL: [Section; 5] = [
         Section::Language,
-        Section::Portal,
+        Section::Sources,
         Section::Controls,
         Section::Adult,
         Section::News,
@@ -33,7 +33,7 @@ impl Section {
     fn title(self) -> T {
         match self {
             Section::Language => T::SectionLanguage,
-            Section::Portal => T::SectionPortal,
+            Section::Sources => T::SectionSources,
             Section::Controls => T::SectionControls,
             Section::Adult => T::SectionAdult,
             Section::News => T::SectionNews,
@@ -44,6 +44,12 @@ impl Section {
 /// The id of the overlay's Area. Everything it draws lies on the layer built
 /// from it (see `overlay_layer`).
 const AREA_ID: &str = "__settings__";
+
+/// The ids of the sources section's name, server and address fields: the
+/// keyboard is sent to them by id (see `SettingsUi::sources_pane`).
+const SOURCE_NAME_ID: &str = "__source_name__";
+const SOURCE_SERVER_ID: &str = "__source_server__";
+const SOURCE_ADDRESS_ID: &str = "__source_address__";
 
 /// Room the overlay keeps between its frame and the window's edge.
 const OVERLAY_SCREEN_MARGIN: f32 = 12.0;
@@ -93,9 +99,6 @@ pub enum SettingsAction {
     SetSwapZap(bool),
     /// Try these credentials (`user:pass@host:port`) without keeping them.
     TestConnection(String),
-    /// Try these credentials (`user:pass@host:port`); keep and use them if
-    /// they work.
-    SavePortal(String),
     /// Keep a source (see `SourceDraft`): an Xtream one is tested first and
     /// kept only if it logs in.
     SaveSource(SourceDraft),
@@ -129,6 +132,11 @@ pub struct SettingsView<'a> {
     /// They came from `--xtream`, which beats the ini on every start: the portal
     /// section says that a Save only counts when the app starts without it.
     pub creds_from_command_line: bool,
+    /// The saved sources.
+    pub sources: &'a Sources,
+    /// The one in use: `None` while the portal of `--xtream` runs (then
+    /// `creds` are its credentials).
+    pub active_source: Option<SourceId>,
     /// How the connection test stands.
     pub conn: &'a ConnState,
     /// Adult content shows now (the catalog's state; the section keeps no copy).
@@ -209,11 +217,182 @@ pub fn conn_rich_text(lang: Lang, conn: &ConnState) -> Option<egui::RichText> {
 }
 
 /// The portal fields while the section is open.
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct PortalForm {
     host: String,
     user: String,
     pass: String,
+}
+
+impl PortalForm {
+    fn of_creds(c: &XtreamCreds) -> Self {
+        PortalForm {
+            host: format!("{}:{}", c.host, c.port),
+            user: c.username.clone(),
+            pass: c.password.clone(),
+        }
+    }
+
+    /// The fields of a saved credentials line; all of it in the server field
+    /// when it is no such line (a hand-edited ini).
+    fn of_line(line: &str) -> Self {
+        match parse_xtream_creds(line) {
+            Ok(c) => Self::of_creds(&c),
+            Err(_) => PortalForm {
+                host: line.to_owned(),
+                ..PortalForm::default()
+            },
+        }
+    }
+}
+
+/// The Sources section's form while the overlay is open: the source it shows,
+/// and what is typed in it.
+#[derive(Debug, Clone)]
+struct SourceForm {
+    editing: Editing,
+    kind: SourceKind,
+    name: String,
+    /// The Xtream fields.
+    portal: PortalForm,
+    /// The M3U list's URL or file.
+    address: String,
+    /// Why the last Save went nowhere: no name, no usable address.
+    problem: Option<T>,
+    /// The M3U address is an Xtream portal's link: the credentials line the
+    /// question offers to save as an Xtream source instead.
+    xtream_offer: Option<String>,
+    /// Delete was pressed once; the second press deletes.
+    confirm_delete: bool,
+    /// The keyboard goes to the form's first control next frame (the kind of a
+    /// new source, else the name).
+    focus_form: bool,
+    /// The keyboard goes to the server or address field next frame.
+    focus_address: bool,
+}
+
+/// What the Sources section shows the next time it draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextForm {
+    Source(Editing),
+    /// A new M3U list, the keyboard in its address field.
+    NewList,
+}
+
+impl SourceForm {
+    /// An empty form for `editing`, named after its kind's default.
+    fn blank(editing: Editing, kind: SourceKind, lang: Lang) -> Self {
+        SourceForm {
+            editing,
+            kind,
+            name: kind.default_name(lang).to_owned(),
+            portal: PortalForm::default(),
+            address: String::new(),
+            problem: None,
+            xtream_offer: None,
+            confirm_delete: false,
+            focus_form: false,
+            focus_address: false,
+        }
+    }
+
+    /// The form of what `editing` names, as the view has it. A saved source
+    /// that is gone gives a new one.
+    fn of(editing: Editing, view: &SettingsView) -> Self {
+        let lang = view.lang;
+        match editing {
+            Editing::New => Self::blank(Editing::New, SourceKind::Xtream, lang),
+            Editing::CommandLine => SourceForm {
+                // Save keeps the portal as the first saved one: under its name.
+                name: view.sources.first_xtream().map_or_else(
+                    || SourceKind::Xtream.default_name(lang).to_owned(),
+                    |s| s.display_name(lang),
+                ),
+                portal: view.creds.map(PortalForm::of_creds).unwrap_or_default(),
+                ..Self::blank(Editing::CommandLine, SourceKind::Xtream, lang)
+            },
+            Editing::Saved(id) => match view.sources.get(id) {
+                Some(s) => {
+                    let mut form = Self::blank(editing, s.kind, lang);
+                    form.name = s.display_name(lang);
+                    match s.kind {
+                        SourceKind::Xtream => form.portal = PortalForm::of_line(&s.address),
+                        SourceKind::M3u => form.address = s.address.clone(),
+                    }
+                    form
+                }
+                None => Self::blank(Editing::New, SourceKind::Xtream, lang),
+            },
+        }
+    }
+
+    /// The form the section opens with: the portal of `--xtream` when it runs,
+    /// else the source in use, else the first saved one, else a new one,
+    /// filled in from the credentials in use if there are any.
+    fn first(view: &SettingsView) -> Self {
+        if view.creds_from_command_line {
+            return Self::of(Editing::CommandLine, view);
+        }
+        let saved = view
+            .active_source
+            .filter(|id| view.sources.get(*id).is_some())
+            .or_else(|| view.sources.list().first().map(|s| s.id));
+        match saved {
+            Some(id) => Self::of(Editing::Saved(id), view),
+            None => SourceForm {
+                portal: view.creds.map(PortalForm::of_creds).unwrap_or_default(),
+                ..Self::blank(Editing::New, SourceKind::Xtream, view.lang)
+            },
+        }
+    }
+
+    /// What Save hands the app, or why it cannot: no name, or for a list an
+    /// address that is no http(s) URL or file that exists.
+    fn draft(&self) -> Result<SourceDraft, T> {
+        let name = without_newlines(&self.name).trim().to_owned();
+        if name.is_empty() {
+            return Err(T::SourceNameMissing);
+        }
+        let address = match self.kind {
+            SourceKind::Xtream => {
+                credentials_line(&self.portal.user, &self.portal.pass, &self.portal.host)
+            }
+            SourceKind::M3u => {
+                let address = without_newlines(&self.address).trim().to_owned();
+                if !is_web_address(&address) && !std::path::Path::new(&address).is_file() {
+                    return Err(T::SourceAddressInvalid);
+                }
+                address
+            }
+        };
+        Ok(SourceDraft {
+            editing: self.editing,
+            kind: self.kind,
+            name,
+            address,
+        })
+    }
+
+    /// Save: the draft, or why not. On a list whose address is an Xtream
+    /// portal's link the question comes first.
+    fn save(&mut self, actions: &mut Vec<SettingsAction>) {
+        self.problem = None;
+        self.xtream_offer = None;
+        if self.kind == SourceKind::M3u {
+            if let Some(line) = crate::m3u::xtream_link(&self.address) {
+                self.xtream_offer = Some(line);
+                return;
+            }
+        }
+        self.push_draft(actions);
+    }
+
+    fn push_draft(&mut self, actions: &mut Vec<SettingsAction>) {
+        match self.draft() {
+            Ok(draft) => actions.push(SettingsAction::SaveSource(draft)),
+            Err(problem) => self.problem = Some(problem),
+        }
+    }
 }
 
 /// The PIN dialog that is open in the adult section, with its fields.
@@ -281,9 +460,12 @@ pub struct SettingsUi {
     /// The list rows' widget ids from the last frame: they tell a focused row
     /// from a focused control.
     list_ids: Vec<egui::Id>,
-    /// The portal form: made when the section is first shown, from the
-    /// credentials in use, and kept while the overlay is open.
-    portal: Option<PortalForm>,
+    /// The sources form: made when the section is first shown, kept while the
+    /// overlay is open.
+    sources: Option<SourceForm>,
+    /// What the section shows the next time it draws (the app asks after a
+    /// save or a switch; the setup prompt's link asks for a new list).
+    show_next: Option<NextForm>,
     /// The PIN dialog of the adult section, if one is open.
     adult: AdultDialog,
     /// The field of the dialog (0 is the first) that takes the focus on the next
@@ -312,6 +494,32 @@ impl SettingsUi {
     /// it (which channel each rule found) can wait until then.
     pub fn shows_news(&self) -> bool {
         Section::ALL[self.section] == Section::News
+    }
+
+    /// The sources section shows this source next, the keyboard on the first
+    /// control of its form (its name; the Xtream kind of a new source) when the
+    /// user is in the section, not in the list of sections.
+    pub fn show_source(&mut self, editing: Editing) {
+        self.show_next = Some(NextForm::Source(editing));
+    }
+
+    /// Opens on the sources section with a new M3U list in the form, the
+    /// keyboard in its address field: the setup prompt's link.
+    pub fn open_new_list(&mut self) {
+        self.section = Section::ALL
+            .iter()
+            .position(|s| *s == Section::Sources)
+            .unwrap_or(0);
+        self.in_pane = true;
+        self.show_next = Some(NextForm::NewList);
+    }
+
+    /// The kind and the address of the source the form shows, if it is open.
+    pub fn form_address(&self) -> Option<(SourceKind, String)> {
+        self.sources.as_ref().map(|f| match f.kind {
+            SourceKind::Xtream => (f.kind, f.portal.host.clone()),
+            SourceKind::M3u => (f.kind, f.address.clone()),
+        })
     }
 
     pub fn show(&mut self, ctx: &egui::Context, view: &SettingsView) -> Vec<SettingsAction> {
@@ -433,9 +641,13 @@ impl SettingsUi {
                                     Section::Language => {
                                         language_pane(ui, view, focus_first, &mut actions)
                                     }
-                                    Section::Portal => {
-                                        self.portal_pane(ui, view, focus_first, &mut actions)
-                                    }
+                                    Section::Sources => self.sources_pane(
+                                        ui,
+                                        view,
+                                        focus_first,
+                                        &mut actions,
+                                        section_height,
+                                    ),
                                     Section::Controls => {
                                         controls_pane(ui, view, focus_first, &mut actions)
                                     }
@@ -469,76 +681,320 @@ impl SettingsUi {
         actions
     }
 
-    /// Server, user and password, then the test and save buttons and how the
-    /// test went. Test and Save hand app.rs the credentials as one string.
-    fn portal_pane(
+    /// The sources: the form of the chosen one (the one in use at first), then
+    /// the list to choose another, use it, add one or delete one. Test hands
+    /// app.rs the credentials as one string; Save hands it the source.
+    ///
+    /// Where the keyboard goes when the form changes (`SourceForm::focus_form`
+    /// and `focus_address`, `focus_first`) is settled so that a Tab pressed
+    /// right after moves on from there, in whichever frame it comes. In egui
+    /// 0.27 a Tab gives the focus to the widget after the one that has it, as
+    /// that one is drawn. A text field is drawn twice (its box, its text) and
+    /// takes that Tab itself when it only just got the focus. So the field a
+    /// click or Enter makes the first of the form (the name, the server) gets
+    /// the focus then, by its id, though it is not drawn yet. Any other
+    /// control (the Xtream radio) gets it in the frame after, just before it
+    /// is drawn.
+    fn sources_pane(
         &mut self,
         ui: &mut egui::Ui,
         view: &SettingsView,
         focus_first: bool,
         actions: &mut Vec<SettingsAction>,
+        max_height: f32,
     ) {
         let lang = view.lang;
-        let form = self.portal.get_or_insert_with(|| match view.creds {
-            Some(c) => PortalForm {
-                host: format!("{}:{}", c.host, c.port),
-                user: c.username.clone(),
-                pass: c.password.clone(),
+        // A source the app asks for takes the keyboard only from someone who
+        // is in the form: not from the list of sections, e.g. when a test of
+        // credentials ends while the user is looking at another section.
+        let in_form = self.in_pane;
+        let next = self.show_next.take().map(|next| match next {
+            NextForm::Source(editing) => SourceForm {
+                focus_form: in_form,
+                ..SourceForm::of(editing, view)
             },
-            None => PortalForm::default(),
+            NextForm::NewList => SourceForm {
+                focus_address: true,
+                ..SourceForm::blank(Editing::New, SourceKind::M3u, lang)
+            },
         });
-        ui.label(t(lang, T::ServerLabel));
-        let first = ui.add(
-            egui::TextEdit::singleline(&mut form.host)
-                .hint_text("server.example.com:8080")
-                .desired_width(320.0),
+        // A form of a source that is gone (deleted) starts again from the view.
+        let gone = matches!(
+            self.sources.as_ref().map(|f| f.editing),
+            Some(Editing::Saved(id)) if view.sources.get(id).is_none()
         );
-        if focus_first {
-            first.request_focus();
+        if let Some(form) = next {
+            self.sources = Some(form);
+        } else if gone || self.sources.is_none() {
+            self.sources = Some(SourceForm::first(view));
         }
-        ui.label(t(lang, T::UserLabel));
-        ui.add(
-            egui::TextEdit::singleline(&mut form.user)
-                .hint_text(t(lang, T::UserHint))
-                .desired_width(320.0),
-        );
-        ui.label(t(lang, T::PasswordLabel));
-        ui.add(
-            egui::TextEdit::singleline(&mut form.pass)
-                .password(true)
-                .desired_width(320.0),
-        );
-        if view.creds_from_command_line {
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(t(lang, T::PortalFromCommandLine))
-                    .small()
-                    .color(NOTE_AMBER),
-            );
-        }
-        let ready = !form.host.trim().is_empty()
-            && !form.user.trim().is_empty()
-            && !form.pass.is_empty()
-            && *view.conn != ConnState::Testing;
-        // Built when a button is pressed, not every frame.
-        let creds = || credentials_line(&form.user, &form.pass, &form.host);
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(ready, egui::Button::new(t(lang, T::TestConnection)))
-                .clicked()
-            {
-                actions.push(SettingsAction::TestConnection(creds()));
+        let form = self.sources.as_mut().expect("made above");
+        let scrolled = marker_scroll_area("__sources__")
+            .max_height(max_height)
+            .auto_shrink([false, true])
+            // Tab jumps to a row; no gliding there.
+            .animated(false)
+            .show(ui, |ui| {
+                // Both taken every frame: a request left standing would pull the
+                // focus back here in the next one. The form's first control
+                // wins over the address field. The overlay's first frame is a
+                // sizing pass in which everything is disabled and drops the
+                // focus it is given: a request waits for the frame after it.
+                let (to_form, to_address) = if ui.is_enabled() {
+                    let form_flag = std::mem::take(&mut form.focus_form);
+                    let address_flag = std::mem::take(&mut form.focus_address);
+                    (form_flag, (address_flag || focus_first) && !form_flag)
+                } else {
+                    (false, false)
+                };
+                let name_id = egui::Id::new(SOURCE_NAME_ID);
+                ui.label(t(lang, T::SourceNameLabel));
+                if to_form && form.editing != Editing::New {
+                    ui.memory_mut(|m| m.request_focus(name_id));
+                }
+                let name = ui.add(
+                    egui::TextEdit::singleline(&mut form.name)
+                        .id(name_id)
+                        .desired_width(320.0),
+                );
+                reveal_on_focus(&name);
+                if to_form && form.editing != Editing::New {
+                    name.scroll_to_me(None);
+                }
+                if form.editing == Editing::New {
+                    let before = form.kind;
+                    let (xtream, m3u) = ui
+                        .horizontal(|ui| {
+                            let xtream_id = ui.next_auto_id();
+                            if to_form {
+                                ui.memory_mut(|m| m.request_focus(xtream_id));
+                            }
+                            let x = ui.radio_value(
+                                &mut form.kind,
+                                SourceKind::Xtream,
+                                t(lang, T::KindXtream),
+                            );
+                            let m = ui.radio_value(
+                                &mut form.kind,
+                                SourceKind::M3u,
+                                t(lang, T::KindM3u),
+                            );
+                            (x, m)
+                        })
+                        .inner;
+                    reveal_on_focus(&xtream);
+                    reveal_on_focus(&m3u);
+                    if to_form {
+                        xtream.scroll_to_me(None);
+                    }
+                    if form.kind != before {
+                        // A name that is still the old kind's default follows the kind.
+                        if form.name.trim() == before.default_name(lang) {
+                            form.name = form.kind.default_name(lang).to_owned();
+                        }
+                        form.problem = None;
+                        form.xtream_offer = None;
+                    }
+                }
+                let address_id = egui::Id::new(match form.kind {
+                    SourceKind::Xtream => SOURCE_SERVER_ID,
+                    SourceKind::M3u => SOURCE_ADDRESS_ID,
+                });
+                let address_field = match form.kind {
+                    SourceKind::Xtream => {
+                        ui.label(t(lang, T::ServerLabel));
+                        if to_address {
+                            ui.memory_mut(|m| m.request_focus(address_id));
+                        }
+                        let server = ui.add(
+                            egui::TextEdit::singleline(&mut form.portal.host)
+                                .id(address_id)
+                                .hint_text("server.example.com:8080")
+                                .desired_width(320.0),
+                        );
+                        ui.label(t(lang, T::UserLabel));
+                        let user = ui.add(
+                            egui::TextEdit::singleline(&mut form.portal.user)
+                                .hint_text(t(lang, T::UserHint))
+                                .desired_width(320.0),
+                        );
+                        ui.label(t(lang, T::PasswordLabel));
+                        let pass = ui.add(
+                            egui::TextEdit::singleline(&mut form.portal.pass)
+                                .password(true)
+                                .desired_width(320.0),
+                        );
+                        reveal_on_focus(&user);
+                        reveal_on_focus(&pass);
+                        server
+                    }
+                    SourceKind::M3u => {
+                        ui.label(t(lang, T::SourceAddressLabel));
+                        if to_address {
+                            ui.memory_mut(|m| m.request_focus(address_id));
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.address)
+                                .id(address_id)
+                                .hint_text(t(lang, T::SourceAddressHint))
+                                .desired_width(320.0),
+                        )
+                    }
+                };
+                reveal_on_focus(&address_field);
+                if to_address {
+                    address_field.scroll_to_me(None);
+                }
+                if view.creds_from_command_line && form.editing == Editing::CommandLine {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(t(lang, T::PortalFromCommandLine))
+                            .small()
+                            .color(NOTE_AMBER),
+                    );
+                }
+                ui.add_space(6.0);
+                let testing = *view.conn == ConnState::Testing;
+                ui.horizontal(|ui| match form.kind {
+                    SourceKind::Xtream => {
+                        let filled = !form.portal.host.trim().is_empty()
+                            && !form.portal.user.trim().is_empty()
+                            && !form.portal.pass.is_empty();
+                        let test =
+                            action_button(ui, filled && !testing, t(lang, T::TestConnection));
+                        reveal_on_focus(&test);
+                        if test.clicked() {
+                            let p = &form.portal;
+                            actions.push(SettingsAction::TestConnection(credentials_line(
+                                &p.user, &p.pass, &p.host,
+                            )));
+                        }
+                        let save = action_button(ui, filled && !testing, t(lang, T::Save));
+                        reveal_on_focus(&save);
+                        if save.clicked() {
+                            form.save(actions);
+                        }
+                    }
+                    SourceKind::M3u => {
+                        let save =
+                            action_button(ui, !form.address.trim().is_empty(), t(lang, T::Save));
+                        reveal_on_focus(&save);
+                        if save.clicked() {
+                            form.save(actions);
+                        }
+                    }
+                });
+                if let Some(problem) = form.problem {
+                    ui.label(egui::RichText::new(t(lang, problem)).color(FAILURE_RED));
+                } else if form.kind == SourceKind::Xtream {
+                    if let Some(text) = conn_rich_text(lang, view.conn) {
+                        ui.label(text);
+                    }
+                }
+                if let Some(line) = form.xtream_offer.clone() {
+                    ui.label(egui::RichText::new(t(lang, T::XtreamLinkFound)).color(NOTE_AMBER));
+                    ui.horizontal(|ui| {
+                        let as_xtream = ui.button(t(lang, T::UseAsXtream));
+                        let as_list = ui.button(t(lang, T::KeepAsM3u));
+                        reveal_on_focus(&as_xtream);
+                        reveal_on_focus(&as_list);
+                        if as_xtream.clicked() {
+                            if form.name.trim() == SourceKind::M3u.default_name(lang) {
+                                form.name = SourceKind::Xtream.default_name(lang).to_owned();
+                            }
+                            form.kind = SourceKind::Xtream;
+                            // A saved list stays a list, as it was saved: the
+                            // portal is a source of its own.
+                            form.editing = Editing::New;
+                            form.portal = PortalForm::of_line(&line);
+                            form.address.clear();
+                            form.xtream_offer = None;
+                            form.focus_address = true;
+                            ui.memory_mut(|m| m.request_focus(egui::Id::new(SOURCE_SERVER_ID)));
+                        }
+                        if as_list.clicked() {
+                            form.xtream_offer = None;
+                            form.push_draft(actions);
+                        }
+                    });
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label(egui::RichText::new(t(lang, T::SourcesListTitle)).strong());
+                let in_use = t(lang, T::SourceActiveMark);
+                let mut chosen = None;
+                if view.creds_from_command_line {
+                    let text = format!("{} · {in_use}", t(lang, T::CommandLineSource));
+                    let row = ui.selectable_label(form.editing == Editing::CommandLine, text);
+                    reveal_on_focus(&row);
+                    if row.clicked() {
+                        chosen = Some(Editing::CommandLine);
+                    }
+                }
+                for s in view.sources.list() {
+                    let kind = match s.kind {
+                        SourceKind::Xtream => t(lang, T::KindXtream),
+                        SourceKind::M3u => t(lang, T::KindM3u),
+                    };
+                    let mut text = format!("{} · {kind}", s.display_name(lang));
+                    if view.active_source == Some(s.id) {
+                        text.push_str(&format!(" · {in_use}"));
+                    }
+                    let row = ui.selectable_label(form.editing == Editing::Saved(s.id), text);
+                    reveal_on_focus(&row);
+                    if row.clicked() {
+                        chosen = Some(Editing::Saved(s.id));
+                    }
+                }
+                // Use and Delete act on the saved source the form shows, never
+                // on the one in use.
+                let other = match form.editing {
+                    Editing::Saved(id) if view.active_source != Some(id) => Some(id),
+                    _ => None,
+                };
+                ui.horizontal(|ui| {
+                    let use_it = action_button(ui, other.is_some(), t(lang, T::ButtonUseSource));
+                    reveal_on_focus(&use_it);
+                    if use_it.clicked() {
+                        if let Some(id) = other {
+                            actions.push(SettingsAction::ActivateSource(id));
+                        }
+                    }
+                    let new = ui.button(t(lang, T::ButtonNewSource));
+                    reveal_on_focus(&new);
+                    if new.clicked() {
+                        chosen = Some(Editing::New);
+                    }
+                    let label = if form.confirm_delete {
+                        T::ButtonConfirmDelete
+                    } else {
+                        T::ButtonDeleteSource
+                    };
+                    let delete = action_button(ui, other.is_some(), t(lang, label));
+                    reveal_on_focus(&delete);
+                    if delete.clicked() {
+                        match other {
+                            Some(id) if form.confirm_delete => {
+                                actions.push(SettingsAction::DeleteSource(id));
+                                form.confirm_delete = false;
+                            }
+                            Some(_) => form.confirm_delete = true,
+                            None => {}
+                        }
+                    }
+                });
+                chosen
+            });
+        paint_scroll_marker(ui, &scrolled);
+        if let Some(editing) = scrolled.inner {
+            *form = SourceForm {
+                focus_form: true,
+                ..SourceForm::of(editing, view)
+            };
+            // A new source starts with a radio, whose id is not known yet.
+            if editing != Editing::New {
+                ui.memory_mut(|m| m.request_focus(egui::Id::new(SOURCE_NAME_ID)));
             }
-            if ui
-                .add_enabled(ready, egui::Button::new(t(lang, T::Save)))
-                .clicked()
-            {
-                actions.push(SettingsAction::SavePortal(creds()));
-            }
-        });
-        if let Some(text) = conn_rich_text(lang, view.conn) {
-            ui.label(text);
         }
     }
 
@@ -948,6 +1404,18 @@ fn news_header(ui: &mut egui::Ui, width: f32, text: &str) {
     );
 }
 
+/// A button that works while `enabled`. Else it is shown faded and is no Tab
+/// stop: egui 0.27 lets a disabled widget take the Tab press and drop the focus
+/// with it, which would leave the keyboard nowhere.
+pub fn action_button(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
+    let button = egui::Button::new(text);
+    if enabled {
+        ui.add(button)
+    } else {
+        ui.add_enabled(false, button.sense(egui::Sense::hover()))
+    }
+}
+
 /// Tab does not scroll to the widget it focuses, so a rule below the fold has to
 /// ask for it.
 fn reveal_on_focus(response: &egui::Response) {
@@ -1123,6 +1591,9 @@ pub fn language_screen(ctx: &egui::Context, selected: &mut Lang) -> Option<Lang>
 mod tests {
     use super::*;
 
+    /// No saved sources: what a view without any shows.
+    static NO_SOURCES: Sources = Sources::EMPTY;
+
     /// The view the overlay is drawn with. Built here only, so a field added
     /// to `SettingsView` is added in one place.
     fn make_view(settings: &Settings) -> SettingsView<'_> {
@@ -1132,6 +1603,8 @@ mod tests {
             creds: None,
             conn: &ConnState::Idle,
             creds_from_command_line: false,
+            sources: &NO_SOURCES,
+            active_source: None,
             adult_unlocked: false,
             has_pin: false,
             pin_wait_secs: None,
@@ -1139,6 +1612,39 @@ mod tests {
             news_rules: settings.news_rules(),
             news_found: &[],
         }
+    }
+
+    /// A new Xtream source's form with these fields, as the section holds it.
+    fn new_portal_form(portal: PortalForm) -> SourceForm {
+        SourceForm {
+            portal,
+            ..SourceForm::blank(Editing::New, SourceKind::Xtream, Lang::En)
+        }
+    }
+
+    /// What Save on a new portal hands the app for this credentials line.
+    fn new_portal(line: &str) -> SettingsAction {
+        SettingsAction::SaveSource(SourceDraft {
+            editing: Editing::New,
+            kind: SourceKind::Xtream,
+            name: "Portal".into(),
+            address: line.into(),
+        })
+    }
+
+    /// Sources 1 (Xtream, no name of its own so the default one, "Portal" in
+    /// English; in use) and 2 ("Gratis", M3U).
+    fn two_sources() -> Sources {
+        Sources::parse(
+            "source=1;xtream;;bob:secret@srv.example.net:8080\n\
+             source=2;m3u;Gratis;https://iptv-org.github.io/iptv/index.m3u\n\
+             active=1\n",
+        )
+    }
+
+    /// The text typed into the focused field in one go, as a paste brings it.
+    fn typed(text: &str) -> egui::Event {
+        egui::Event::Text(text.into())
     }
 
     /// A key press or release as egui gets it from the window.
@@ -1255,8 +1761,13 @@ mod tests {
         settings: Settings,
         /// Draw another default Area before the overlay in every frame.
         other_panel: bool,
-        /// What app.rs would tell the portal section.
+        /// What app.rs would tell the sources section: whether the portal in
+        /// use comes from `--xtream`, the credentials in use, the saved
+        /// sources and the one in use.
         creds_from_command_line: bool,
+        creds: Option<XtreamCreds>,
+        sources: Sources,
+        active_source: Option<SourceId>,
         /// What app.rs would tell the adult section.
         adult_unlocked: bool,
         has_pin: bool,
@@ -1298,6 +1809,9 @@ mod tests {
                 settings: Settings::default(),
                 other_panel,
                 creds_from_command_line: false,
+                creds: None,
+                sources: Sources::default(),
+                active_source: None,
                 adult_unlocked: false,
                 has_pin: false,
                 pin_wait_secs: None,
@@ -1335,6 +1849,9 @@ mod tests {
             let view = SettingsView {
                 lang: self.lang,
                 creds_from_command_line: self.creds_from_command_line,
+                sources: &self.sources,
+                active_source: self.active_source,
+                creds: self.creds.as_ref(),
                 adult_unlocked: self.adult_unlocked,
                 has_pin: self.has_pin,
                 pin_wait_secs: self.pin_wait_secs,
@@ -1702,9 +2219,9 @@ mod tests {
     }
 
     /// What pressing Test and then Save on the keyboard gives, for this portal
-    /// form and test state: into the Portal pane, Tab from the server field to
-    /// the buttons, Enter on each. A disabled button is no Tab stop and takes
-    /// no Enter.
+    /// form and test state: into the Sources pane, on a new Xtream source's
+    /// form, Tab from the server field to the buttons, Enter on each. A
+    /// disabled button is no Tab stop and takes no Enter.
     fn press_test_and_save(form: PortalForm, conn: &ConnState) -> Vec<SettingsAction> {
         let ctx = egui::Context::default();
         let settings = Settings::default();
@@ -1713,7 +2230,7 @@ mod tests {
             ..make_view(&settings)
         };
         let mut ui = SettingsUi::new();
-        ui.portal = Some(form);
+        ui.sources = Some(new_portal_form(form));
         let mut frame = |keys: &[Key]| {
             let mut actions = Vec::new();
             run_frame(&ctx, keys, |ctx| actions = ui.show(ctx, &view));
@@ -1721,7 +2238,7 @@ mod tests {
         };
         frame(&[]);
         frame(&[]);
-        frame(&[Key::ArrowDown]); // Portal
+        frame(&[Key::ArrowDown]); // Sources
         frame(&[Key::Enter]); // into it: the server field has the focus
         let mut pressed = Vec::new();
         for _ in 0..3 {
@@ -1749,7 +2266,7 @@ mod tests {
             ),
             vec![
                 SettingsAction::TestConnection(one_string.clone()),
-                SettingsAction::SavePortal(one_string)
+                new_portal(&one_string)
             ]
         );
         // A test is still running.
@@ -1775,7 +2292,7 @@ mod tests {
     #[test]
     fn keys_typed_into_the_server_field_stay_in_the_field() {
         let mut o = Overlay::new();
-        o.press(Key::ArrowDown, 1); // Portal
+        o.press(Key::ArrowDown, 1); // Sources
         o.press(Key::Enter, 1); // into it: the server field has the focus
         for (key, c) in [
             (Key::O, 'o'),
@@ -1786,7 +2303,7 @@ mod tests {
             let actions = o.type_char(key, c);
             assert!(actions.is_empty(), "typing {c:?} reported {actions:?}");
         }
-        let host = o.ui.portal.as_ref().map(|form| form.host.as_str());
+        let host = o.ui.sources.as_ref().map(|form| form.portal.host.as_str());
         assert_eq!(host, Some("o1 f"));
     }
 
@@ -1813,7 +2330,7 @@ mod tests {
         };
         frame(&[]);
         frame(&[]);
-        frame(&[Key::ArrowDown]); // Portal
+        frame(&[Key::ArrowDown]); // Sources
         frame(&[Key::Enter]); // into it: the server field has the focus
         for _ in 0..3 {
             frame(&[Key::Tab]); // the user, the password, then Test
@@ -1824,10 +2341,7 @@ mod tests {
             vec![SettingsAction::TestConnection(one_string.into())]
         );
         frame(&[Key::Tab]); // Save
-        assert_eq!(
-            frame(&[Key::Enter]),
-            vec![SettingsAction::SavePortal(one_string.into())]
-        );
+        assert_eq!(frame(&[Key::Enter]), vec![new_portal(one_string)]);
         assert_eq!(crate::args::parse_xtream_creds(one_string).unwrap(), creds);
     }
 
@@ -1844,7 +2358,7 @@ mod tests {
             press_test_and_save(pasted, &ConnState::Idle),
             vec![
                 SettingsAction::TestConnection(one_string.clone()),
-                SettingsAction::SavePortal(one_string)
+                new_portal(&one_string)
             ]
         );
     }
@@ -1857,7 +2371,7 @@ mod tests {
                 let mut o = Overlay::new();
                 o.lang = lang;
                 o.creds_from_command_line = from_cli;
-                o.press(Key::ArrowDown, 1); // Portal
+                o.press(Key::ArrowDown, 1); // Sources
                 assert_eq!(o.frame(&[]), vec![]);
                 let shown = o.painted.iter().any(|p| p == note);
                 assert_eq!(shown, from_cli, "{lang:?}, --xtream given: {from_cli}");
@@ -1866,32 +2380,733 @@ mod tests {
     }
 
     #[test]
-    fn the_note_on_the_command_line_portal_adds_no_tab_stop() {
-        // Server, user, password, Test and Save are the section's five stops, with
-        // the note or without it: one Tab past Save is back on the list.
+    fn new_source_is_six_tabs_from_the_server_field_with_the_note_or_without() {
+        // Server, user, password, Test, Save, then one row (the --xtream portal's,
+        // or the saved one in use), then New: the note is no Tab stop, and Use and
+        // Delete, disabled for the source in use, are none either.
         for from_cli in [false, true] {
             let mut o = Overlay::new();
             o.creds_from_command_line = from_cli;
-            o.ui.portal = Some(PortalForm {
-                host: "srv.example.net:8080".into(),
-                user: "bob".into(),
-                pass: "secret".into(),
-            });
+            if from_cli {
+                // Filled in, as --xtream gives them: Test and Save are stops.
+                o.creds = parse_xtream_creds("bob:secret@srv.example.net:8080").ok();
+            } else {
+                o.sources = Sources::parse("portal=bob:secret@srv.example.net:8080\n");
+                o.active_source = Some(1);
+            }
             o.press(Key::ArrowDown, 1);
             o.press(Key::Enter, 1); // into the section: the server field
-            o.press(Key::Tab, 4); // user, password, Test, Save
-            o.press(Key::Tab, 1); // past Save
+            o.press(Key::Tab, 6);
+            assert_eq!(o.frame(&[Key::Enter]), vec![], "--xtream: {from_cli}");
+            o.frame(&[]);
+            let form = o.ui.sources.as_ref().unwrap();
+            assert_eq!(form.editing, Editing::New, "--xtream: {from_cli}");
+        }
+    }
+
+    #[test]
+    fn an_m3u_list_is_added_by_keyboard() {
+        // The keys of the e2e scenario M-add, as far as its Save.
+        let mut o = Overlay::new();
+        // The scenario's ini: the mock's portal saved as source 1, in use.
+        o.sources = Sources::parse("portal=tester:secret@127.0.0.1:18080\n");
+        o.active_source = Some(1);
+        o.press(Key::ArrowDown, 1);
+        o.press(Key::Enter, 1); // source 1's server field
+        o.press(Key::Tab, 6); // past user, password, Test, Save and its row: New
+        o.press(Key::Enter, 1); // a new source: the Xtream radio has the focus
+        o.press(Key::Tab, 1); // the M3U radio
+        o.press(Key::Enter, 1); // M3U: its address field follows the radios
+        o.press(Key::Tab, 1);
+        o.frame_with(vec![typed("https://lists.example/tv.m3u")]);
+        o.press(Key::Tab, 1); // Save
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::SaveSource(SourceDraft {
+                editing: Editing::New,
+                kind: SourceKind::M3u,
+                name: "M3U list".into(),
+                address: "https://lists.example/tv.m3u".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn save_refuses_an_empty_name_and_an_address_that_is_no_url_or_file() {
+        let mut o = Overlay::new();
+        o.ui.sources = Some(SourceForm {
+            name: " ".into(),
+            address: "https://lists.example/tv.m3u".into(),
+            ..SourceForm::blank(Editing::New, SourceKind::M3u, Lang::En)
+        });
+        o.press(Key::ArrowDown, 1);
+        o.press(Key::Enter, 1); // the address field
+        o.press(Key::Tab, 1); // Save
+        assert_eq!(o.frame(&[Key::Enter]), vec![]);
+        o.frame(&[]);
+        assert!(
+            o.painted.iter().any(|p| p == "give the source a name"),
+            "{:?}",
+            o.painted
+        );
+        o.ui.sources.as_mut().unwrap().name = "Lijst".into();
+        o.ui.sources.as_mut().unwrap().address = "no address at all".into();
+        assert_eq!(o.frame(&[Key::Enter]), vec![]);
+        o.frame(&[]);
+        assert!(
+            o.painted
+                .iter()
+                .any(|p| p == "not an http(s) address or an existing file"),
+            "{:?}",
+            o.painted
+        );
+    }
+
+    #[test]
+    fn an_existing_file_is_an_address_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lijst.m3u");
+        std::fs::write(&file, "#EXTM3U\n").unwrap();
+        let mut o = Overlay::new();
+        o.ui.sources = Some(SourceForm {
+            name: "Lijst".into(),
+            address: file.display().to_string(),
+            ..SourceForm::blank(Editing::New, SourceKind::M3u, Lang::En)
+        });
+        o.press(Key::ArrowDown, 1);
+        o.press(Key::Enter, 1);
+        o.press(Key::Tab, 1);
+        let actions = o.frame(&[Key::Enter]);
+        assert!(
+            matches!(actions.as_slice(), [SettingsAction::SaveSource(d)] if d.address == file.display().to_string()),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn a_get_php_link_by_keyboard_becomes_an_xtream_source_to_save() {
+        // The keys of the e2e scenario M-getphp.
+        let link = "http://127.0.0.1:18080/get.php?username=tester&password=secret&type=m3u_plus";
+        let mut o = Overlay::new();
+        // The scenario's ini: the mock's portal saved as source 1, in use.
+        o.sources = Sources::parse("portal=tester:secret@127.0.0.1:18080\n");
+        o.active_source = Some(1);
+        o.press(Key::ArrowDown, 1);
+        o.press(Key::Enter, 1);
+        o.press(Key::Tab, 6);
+        o.press(Key::Enter, 1); // New
+        o.press(Key::Tab, 1);
+        o.press(Key::Enter, 1); // M3U
+        o.press(Key::Tab, 1);
+        o.frame_with(vec![typed(link)]);
+        o.press(Key::Tab, 1); // Save
+        assert_eq!(o.frame(&[Key::Enter]), vec![], "the question first");
+        o.frame(&[]);
+        assert!(o
+            .painted
+            .iter()
+            .any(|p| p.starts_with("This is an Xtream portal's link")));
+        o.press(Key::Tab, 1); // "As an Xtream source"
+        o.press(Key::Enter, 1); // the form is an Xtream one now, the server field focused
+        let form = o.ui.sources.as_ref().unwrap();
+        assert_eq!(form.kind, SourceKind::Xtream);
+        assert_eq!(
+            (
+                form.portal.host.as_str(),
+                form.portal.user.as_str(),
+                form.portal.pass.as_str()
+            ),
+            ("127.0.0.1:18080", "tester", "secret")
+        );
+        o.press(Key::Tab, 4); // user, password, Test, Save
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![new_portal("tester:secret@127.0.0.1:18080")]
+        );
+    }
+
+    #[test]
+    fn a_get_php_link_kept_as_a_list_is_saved_as_typed() {
+        let link = "http://srv.example.net/get.php?username=u&password=p";
+        let mut o = Overlay::new();
+        o.ui.sources = Some(SourceForm {
+            name: "Lijst".into(),
+            address: link.into(),
+            ..SourceForm::blank(Editing::New, SourceKind::M3u, Lang::En)
+        });
+        o.press(Key::ArrowDown, 1);
+        o.press(Key::Enter, 1);
+        o.press(Key::Tab, 1);
+        assert_eq!(o.frame(&[Key::Enter]), vec![]);
+        o.press(Key::Tab, 2); // past "As an Xtream source": "As an M3U list"
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::SaveSource(SourceDraft {
+                editing: Editing::New,
+                kind: SourceKind::M3u,
+                name: "Lijst".into(),
+                address: link.into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn the_list_marks_the_source_in_use_and_use_sends_the_chosen_one() {
+        // The keys of the e2e scenario M-switch.
+        let mut o = Overlay::new();
+        o.sources = two_sources();
+        o.active_source = Some(1);
+        o.press(Key::ArrowDown, 1);
+        o.press(Key::Enter, 1); // source 1's server field
+        o.frame(&[]);
+        assert!(
+            o.painted.iter().any(|p| p == "Portal · Xtream · in use"),
+            "{:?}",
+            o.painted
+        );
+        assert!(
+            o.painted.iter().any(|p| p == "Gratis · M3U"),
+            "{:?}",
+            o.painted
+        );
+        o.press(Key::Tab, 6); // user, password, Test, Save, row 1, row 2
+        o.press(Key::Enter, 1); // row 2 chosen: its form, the keyboard on its name
+        assert_eq!(o.ui.sources.as_ref().unwrap().editing, Editing::Saved(2));
+        o.press(Key::Tab, 5); // address, Save, row 1, row 2, Use this source
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::ActivateSource(2)]
+        );
+    }
+
+    #[test]
+    fn delete_asks_twice_and_is_not_there_for_the_source_in_use() {
+        let mut o = Overlay::new();
+        o.sources = two_sources();
+        o.active_source = Some(1);
+        o.press(Key::ArrowDown, 1);
+        o.press(Key::Enter, 1);
+        o.press(Key::Tab, 6);
+        o.press(Key::Enter, 1); // row 2
+        o.press(Key::Tab, 7); // address, Save, row 1, row 2, Use, New, Delete
+        assert_eq!(o.frame(&[Key::Enter]), vec![], "a second press deletes");
+        o.frame(&[]);
+        assert!(o
+            .painted
+            .iter()
+            .any(|p| p == "Really delete (with favorites)?"));
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::DeleteSource(2)]
+        );
+        // Source 1 is in use: past its row and row 2 comes New, not Use.
+        let mut o = Overlay::new();
+        o.sources = two_sources();
+        o.active_source = Some(1);
+        o.press(Key::ArrowDown, 1);
+        o.press(Key::Enter, 1);
+        o.press(Key::Tab, 7);
+        assert_eq!(o.frame(&[Key::Enter]), vec![]);
+        o.frame(&[]);
+        assert_eq!(o.ui.sources.as_ref().unwrap().editing, Editing::New);
+    }
+
+    #[test]
+    fn the_command_line_portal_is_a_row_of_its_own_and_no_saved_one_is_marked() {
+        let mut o = Overlay::new();
+        o.creds_from_command_line = true;
+        o.sources = two_sources();
+        o.active_source = None; // app.rs: the --xtream portal runs
+        o.press(Key::ArrowDown, 1);
+        o.press(Key::Enter, 1);
+        o.frame(&[]);
+        assert!(o
+            .painted
+            .iter()
+            .any(|p| p == "--xtream (command line) · in use"));
+        assert!(
+            o.painted.iter().any(|p| p == "Portal · Xtream"),
+            "{:?}",
+            o.painted
+        );
+    }
+
+    // ---- the sources pane: its Tab stops, focus, texts and limits ----
+
+    /// Twelve saved lists, the first in use: someone who keeps many sources.
+    fn twelve_sources() -> Sources {
+        let lines: String = (1..=12)
+            .map(|i| format!("source={i};m3u;Lijst {i};https://a.example/{i}.m3u\n"))
+            .collect();
+        Sources::parse(&format!("{lines}active=1\n"))
+    }
+
+    /// Into the Sources section: its form's server or address field has the focus.
+    fn open_sources_pane(o: &mut Overlay) {
+        o.press(Key::ArrowDown, 1);
+        o.press(Key::Enter, 1);
+    }
+
+    /// Shift+Tab, and the frame in which egui has moved the focus back.
+    fn tab_back(o: &mut Overlay) {
+        o.frame_with(vec![shift_tab()]);
+        assert_eq!(o.frame(&[]), vec![]);
+    }
+
+    #[test]
+    fn the_section_is_called_bronnen_sources_quellen() {
+        // The Portal row's place: second in the list.
+        assert_eq!(Section::ALL[1], Section::Sources);
+        for (lang, title) in [
+            (Lang::Nl, "Bronnen"),
+            (Lang::En, "Sources"),
+            (Lang::De, "Quellen"),
+        ] {
+            let mut o = Overlay::new();
+            o.lang = lang;
             assert_eq!(o.frame(&[]), vec![]);
-            let row = o
-                .ctx
-                .memory(|m| m.focused())
-                .expect("a widget has the focus");
+            assert!(o.says(title), "{lang:?}: {:?}", o.painted);
+        }
+    }
+
+    #[test]
+    fn an_empty_name_or_address_is_never_handed_to_the_app() {
+        let list = |name: &str, address: &str| SourceForm {
+            name: name.into(),
+            address: address.into(),
+            ..SourceForm::blank(Editing::New, SourceKind::M3u, Lang::En)
+        };
+        assert_eq!(
+            list(" \r\n", "https://lists.example/tv.m3u").draft().err(),
+            Some(T::SourceNameMissing)
+        );
+        for address in ["", "   ", "\r\n", " \t "] {
             assert_eq!(
-                o.ui.list_ids.first(),
-                Some(&row),
-                "--xtream given: {from_cli}"
+                list("Lijst", address).draft().err(),
+                Some(T::SourceAddressInvalid),
+                "{address:?}"
             );
         }
+        // Save is no Tab stop for a list without an address: from the address
+        // field the next stop is New source, which starts the form over.
+        for address in ["", "   "] {
+            let mut o = Overlay::new();
+            o.ui.sources = Some(list("Lijst", address));
+            open_sources_pane(&mut o);
+            o.press(Key::Tab, 1);
+            assert_eq!(o.frame(&[Key::Enter]), vec![], "{address:?}");
+            o.frame(&[]);
+            let form = o.ui.sources.as_ref().unwrap();
+            assert_eq!(form.kind, SourceKind::Xtream, "New source, not Save");
+            assert_eq!(form.problem, None, "{address:?}");
+        }
+    }
+
+    #[test]
+    fn a_disabled_button_is_no_tab_stop() {
+        // A new Xtream source with a name and nothing else: Test and Save are
+        // disabled, and so are Use and Delete. From the password field the next
+        // stop is New source (egui 0.27 would let a disabled button take the
+        // Tab and leave the keyboard nowhere).
+        let mut o = Overlay::new();
+        o.ui.sources = Some(SourceForm {
+            name: "Mijn bron".into(),
+            ..SourceForm::blank(Editing::New, SourceKind::Xtream, Lang::En)
+        });
+        open_sources_pane(&mut o);
+        o.press(Key::Tab, 3); // user, password, New source
+        assert_eq!(o.frame(&[Key::Enter]), vec![]);
+        o.frame(&[]);
+        let form = o.ui.sources.as_ref().unwrap();
+        assert_eq!(form.name, "Portal", "New source started the form over");
+    }
+
+    #[test]
+    fn use_and_delete_are_no_tab_stops_for_the_source_in_use() {
+        let mut o = Overlay::new();
+        o.sources = two_sources();
+        o.active_source = Some(1);
+        open_sources_pane(&mut o);
+        // user, password, Test, Save, row 1, row 2, New: then Delete is disabled
+        // and the next Tab is back on the list.
+        o.press(Key::Tab, 8);
+        assert_eq!(o.frame(&[]), vec![]);
+        let row = o.ctx.memory(|m| m.focused()).expect("a widget has focus");
+        assert_eq!(o.ui.list_ids.first(), Some(&row));
+    }
+
+    #[test]
+    fn a_new_source_starts_with_the_name_the_two_kinds_and_then_the_server_field() {
+        // Backwards from the server field: the M3U radio, the Xtream radio, then
+        // the name, the first stop of the pane.
+        let mut o = Overlay::new();
+        open_sources_pane(&mut o);
+        tab_back(&mut o);
+        assert_eq!(o.frame(&[Key::Space]), vec![]);
+        assert_eq!(o.ui.sources.as_ref().unwrap().kind, SourceKind::M3u);
+        tab_back(&mut o);
+        assert_eq!(o.frame(&[Key::Space]), vec![]);
+        assert_eq!(o.ui.sources.as_ref().unwrap().kind, SourceKind::Xtream);
+        tab_back(&mut o);
+        assert!(o.type_char(Key::X, 'x').is_empty());
+        assert_eq!(o.ui.sources.as_ref().unwrap().name, "Portalx");
+    }
+
+    #[test]
+    fn a_saved_source_has_no_kind_radios_and_its_name_comes_first() {
+        let mut o = Overlay::new();
+        o.sources = two_sources();
+        o.active_source = Some(1);
+        open_sources_pane(&mut o);
+        tab_back(&mut o);
+        assert!(o.type_char(Key::X, 'x').is_empty());
+        let form = o.ui.sources.as_ref().unwrap();
+        assert_eq!(
+            (form.editing, form.name.as_str()),
+            (Editing::Saved(1), "Portalx")
+        );
+    }
+
+    #[test]
+    fn the_name_of_a_new_source_follows_its_kind_until_it_is_a_name_of_its_own() {
+        let mut o = Overlay::new();
+        open_sources_pane(&mut o);
+        let name = |o: &Overlay| o.ui.sources.as_ref().unwrap().name.clone();
+        tab_back(&mut o); // the M3U radio
+        assert_eq!(o.frame(&[Key::Space]), vec![]);
+        assert_eq!(name(&o), "M3U list", "the default name of the kind");
+        tab_back(&mut o); // the Xtream radio
+        tab_back(&mut o); // the name
+        assert!(o.type_char(Key::X, 'x').is_empty());
+        o.press(Key::Tab, 1); // the Xtream radio
+        assert_eq!(o.frame(&[Key::Space]), vec![]);
+        assert_eq!(o.ui.sources.as_ref().unwrap().kind, SourceKind::Xtream);
+        assert_eq!(name(&o), "M3U listx", "a name of its own stays");
+    }
+
+    #[test]
+    fn the_command_line_portal_keeps_the_name_of_the_first_saved_portal_when_saved() {
+        // Save on the --xtream row updates the first saved portal, "Thuis": the
+        // name field shows it, so Save does not rename it to the default.
+        let mut o = Overlay::new();
+        o.creds_from_command_line = true;
+        o.creds = parse_xtream_creds("bob:secret@srv.example.net:8080").ok();
+        o.sources = Sources::parse(
+            "source=1;m3u;Lijst;https://a.example/tv.m3u\n\
+             source=2;xtream;Thuis;u:p@h:80\n\
+             active=2\n",
+        );
+        o.active_source = None; // the --xtream portal runs
+        open_sources_pane(&mut o);
+        o.press(Key::Tab, 4); // user, password, Test, Save
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::SaveSource(SourceDraft {
+                editing: Editing::CommandLine,
+                kind: SourceKind::Xtream,
+                name: "Thuis".into(),
+                address: "bob:secret@srv.example.net:8080".into(),
+            })]
+        );
+        // With no saved portal there is nothing to keep: the default name.
+        let mut o = Overlay::new();
+        o.creds_from_command_line = true;
+        o.creds = parse_xtream_creds("bob:secret@srv.example.net:8080").ok();
+        o.sources = Sources::parse("source=1;m3u;Lijst;https://a.example/tv.m3u\nactive=1\n");
+        open_sources_pane(&mut o);
+        o.press(Key::Tab, 4);
+        let actions = o.frame(&[Key::Enter]);
+        assert!(
+            matches!(actions.as_slice(), [SettingsAction::SaveSource(d)] if d.name == "Portal"),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn an_https_get_php_link_is_saved_as_a_list_without_a_question() {
+        // The Xtream client speaks plain HTTP only: a source made of this link
+        // would never connect, so only an http:// link is offered as Xtream.
+        let link = "https://srv.example.net/get.php?username=u&password=p";
+        let mut o = Overlay::new();
+        o.ui.sources = Some(SourceForm {
+            name: "Lijst".into(),
+            address: link.into(),
+            ..SourceForm::blank(Editing::New, SourceKind::M3u, Lang::En)
+        });
+        open_sources_pane(&mut o);
+        o.press(Key::Tab, 1); // Save
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::SaveSource(SourceDraft {
+                editing: Editing::New,
+                kind: SourceKind::M3u,
+                name: "Lijst".into(),
+                address: link.into(),
+            })]
+        );
+        o.frame(&[]);
+        assert!(!o.says(t(Lang::En, T::XtreamLinkFound)), "{:?}", o.painted);
+    }
+
+    #[test]
+    fn a_get_php_link_typed_into_a_saved_list_becomes_a_new_xtream_source() {
+        // The saved list keeps its kind and its address: the Xtream source the
+        // link is offered as is a new one, or its Save would go to a source that
+        // is not an Xtream one.
+        let mut o = Overlay::new();
+        o.sources = two_sources();
+        o.active_source = Some(1);
+        open_sources_pane(&mut o);
+        o.press(Key::Tab, 6);
+        o.press(Key::Enter, 1); // row 2, "Gratis"
+        o.ui.sources.as_mut().unwrap().address =
+            "http://srv.example.net:8080/get.php?username=u&password=p".into();
+        o.press(Key::Tab, 2); // address, Save
+        assert_eq!(o.frame(&[Key::Enter]), vec![]);
+        o.frame(&[]);
+        o.press(Key::Tab, 1); // "As an Xtream source"
+        o.press(Key::Enter, 1);
+        let form = o.ui.sources.as_ref().unwrap();
+        assert_eq!(
+            (form.editing, form.kind),
+            (Editing::New, SourceKind::Xtream)
+        );
+        assert_eq!(form.name, "Gratis", "a name of its own stays");
+        o.press(Key::Tab, 4); // user, password, Test, Save
+        assert_eq!(
+            o.frame(&[Key::Enter]),
+            vec![SettingsAction::SaveSource(SourceDraft {
+                editing: Editing::New,
+                kind: SourceKind::Xtream,
+                name: "Gratis".into(),
+                address: "u:p@srv.example.net:8080".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn a_second_save_asks_again_instead_of_keeping_an_old_question() {
+        let mut o = Overlay::new();
+        o.ui.sources = Some(SourceForm {
+            name: "Lijst".into(),
+            address: "http://srv.example.net/get.php?username=u&password=p".into(),
+            ..SourceForm::blank(Editing::New, SourceKind::M3u, Lang::En)
+        });
+        open_sources_pane(&mut o);
+        o.press(Key::Tab, 1);
+        assert_eq!(o.frame(&[Key::Enter]), vec![]);
+        assert!(o.ui.sources.as_ref().unwrap().xtream_offer.is_some());
+        // The address is another one by now: the old question goes with Save.
+        o.ui.sources.as_mut().unwrap().address = "https://lists.example/tv.m3u".into();
+        let actions = o.frame(&[Key::Enter]);
+        assert!(matches!(
+            actions.as_slice(),
+            [SettingsAction::SaveSource(_)]
+        ));
+        assert!(o.ui.sources.as_ref().unwrap().xtream_offer.is_none());
+    }
+
+    #[test]
+    fn a_form_whose_source_is_deleted_starts_again_from_the_sources_that_are_left() {
+        let mut o = Overlay::new();
+        o.sources = two_sources();
+        o.active_source = Some(1);
+        open_sources_pane(&mut o);
+        o.press(Key::Tab, 6);
+        o.press(Key::Enter, 1); // row 2
+        assert_eq!(o.ui.sources.as_ref().unwrap().editing, Editing::Saved(2));
+        // The app deletes it.
+        o.sources = Sources::parse("portal=bob:secret@srv.example.net:8080\n");
+        assert_eq!(o.frame(&[]), vec![]);
+        assert_eq!(o.ui.sources.as_ref().unwrap().editing, Editing::Saved(1));
+    }
+
+    #[test]
+    fn a_saved_line_that_is_no_credentials_fills_the_server_field_as_it_is() {
+        // A hand-edited ini: all of the line in the server field, so the user
+        // sees what is there.
+        let mut o = Overlay::new();
+        o.sources = Sources::parse("source=1;xtream;;not credentials at all\nactive=1\n");
+        o.active_source = Some(1);
+        o.frame(&[Key::ArrowDown]);
+        let form = o.ui.sources.as_ref().unwrap();
+        assert_eq!(form.portal.host, "not credentials at all");
+        assert_eq!(
+            (form.portal.user.as_str(), form.portal.pass.as_str()),
+            ("", "")
+        );
+    }
+
+    #[test]
+    fn show_source_puts_the_keyboard_on_the_name_of_that_source() {
+        let mut o = Overlay::new();
+        o.sources = two_sources();
+        o.active_source = Some(1);
+        open_sources_pane(&mut o);
+        // What the app asks after a save or a switch.
+        o.ui.show_source(Editing::Saved(2));
+        assert_eq!(o.frame(&[]), vec![]);
+        assert_eq!(o.ui.sources.as_ref().unwrap().editing, Editing::Saved(2));
+        assert!(o.type_char(Key::X, 'x').is_empty());
+        assert_eq!(o.ui.sources.as_ref().unwrap().name, "Gratisx");
+        // A new source: the keyboard is on its Xtream radio.
+        o.ui.show_source(Editing::New);
+        assert_eq!(o.frame(&[]), vec![]);
+        o.press(Key::Tab, 1); // the M3U radio
+        assert_eq!(o.frame(&[Key::Space]), vec![]);
+        assert_eq!(o.ui.sources.as_ref().unwrap().kind, SourceKind::M3u);
+    }
+
+    #[test]
+    fn a_source_the_app_shows_does_not_take_the_keyboard_from_the_list() {
+        // The user left the form while a test of credentials ran: when it ends,
+        // the form shows the source it kept, and the keyboard stays where the
+        // user put it.
+        let mut o = Overlay::new();
+        o.sources = two_sources();
+        o.active_source = Some(1);
+        o.press(Key::ArrowDown, 1); // Sources, in the list
+        o.ui.show_source(Editing::Saved(2));
+        assert_eq!(o.frame(&[]), vec![]);
+        assert_eq!(o.ui.sources.as_ref().unwrap().editing, Editing::Saved(2));
+        assert_eq!(o.ctx.memory(|m| m.focused()), None);
+        // Enter on the Sources row goes into the form as ever.
+        o.press(Key::Enter, 1);
+        assert!(o.type_char(Key::X, 'x').is_empty());
+        let address = o.ui.sources.as_ref().unwrap().address.clone();
+        assert!(address.contains('x'), "typed into the address: {address}");
+    }
+
+    #[test]
+    fn a_form_shown_by_the_app_takes_a_tab_that_comes_with_it_from_its_first_control() {
+        let mut o = Overlay::new();
+        o.sources = two_sources();
+        o.active_source = Some(1);
+        open_sources_pane(&mut o);
+        o.ui.show_source(Editing::New);
+        // The Tab comes in the very frame the form is made in: it moves the
+        // keyboard from the Xtream radio to the M3U radio.
+        assert_eq!(o.frame(&[Key::Tab]), vec![]);
+        assert_eq!(o.frame(&[Key::Space]), vec![]);
+        assert_eq!(o.ui.sources.as_ref().unwrap().kind, SourceKind::M3u);
+    }
+
+    #[test]
+    fn open_new_list_opens_the_section_on_an_empty_list_with_the_keyboard_in_its_address() {
+        let mut o = Overlay::new();
+        o.ui.open_new_list();
+        assert_eq!(o.frame(&[]), vec![]);
+        assert_eq!(o.ui.form_address(), Some((SourceKind::M3u, String::new())));
+        o.frame_with(vec![typed("x")]);
+        assert_eq!(o.ui.form_address(), Some((SourceKind::M3u, "x".to_owned())));
+        // The section is the one shown, and the keyboard is in it: `o` is a letter.
+        assert_eq!(o.frame(&[Key::O]), vec![]);
+    }
+
+    #[test]
+    fn the_keyboard_asked_for_in_the_overlays_first_frame_comes_a_frame_later() {
+        // The overlay's first frame is a sizing pass in which everything is
+        // disabled and drops the focus it is given. Opened by the setup prompt's
+        // link, the address field has the keyboard once the overlay shows.
+        let ctx = egui::Context::default();
+        let settings = Settings::default();
+        let view = make_view(&settings);
+        let mut ui = SettingsUi::new();
+        ui.open_new_list();
+        for _ in 0..3 {
+            run_frame(&ctx, &[], |ctx| {
+                ui.show(ctx, &view);
+            });
+        }
+        run_events(&ctx, vec![typed("x")], |ctx| {
+            ui.show(ctx, &view);
+        });
+        assert_eq!(ui.form_address(), Some((SourceKind::M3u, "x".to_owned())));
+    }
+
+    #[test]
+    fn the_sources_section_never_makes_the_overlay_bigger_than_its_window() {
+        // The smallest window the app allows, and some bigger ones; German has
+        // the longest texts. Many sources, the --xtream row, and the question
+        // about a get.php link, which has the longest text of all.
+        for lang in Lang::ALL {
+            for (width, height) in [(640.0, 360.0), (800.0, 450.0), (1280.0, 720.0)] {
+                for asking in [false, true] {
+                    let mut o = Overlay::in_window(width, height);
+                    o.lang = lang;
+                    o.creds_from_command_line = true;
+                    o.creds = parse_xtream_creds("bob:secret@srv.example.net:8080").ok();
+                    o.sources = twelve_sources();
+                    if asking {
+                        o.ui.sources = Some(SourceForm {
+                            name: "Lijst".into(),
+                            address: "http://srv.example.net/get.php?username=u&password=p".into(),
+                            xtream_offer: Some("u:p@srv.example.net:80".into()),
+                            ..SourceForm::blank(Editing::New, SourceKind::M3u, lang)
+                        });
+                    }
+                    open_sources_pane(&mut o);
+                    assert_eq!(o.frame(&[]), vec![]);
+                    let (screen, overlay) = (o.screen_rect(), o.overlay_rect());
+                    let name = format!("{width}x{height}, {lang:?}, asking: {asking}");
+                    assert!(
+                        screen.contains_rect(overlay),
+                        "{name}: {overlay:?} is not inside {screen:?}"
+                    );
+                    // The pane fits the overlay: it does not widen it.
+                    let designed = overlay_width(width) + 2.0 * OVERLAY_FRAME_MARGIN;
+                    assert!(
+                        overlay.width() <= designed + 0.5,
+                        "{name}: {} wide, designed for {designed}",
+                        overlay.width()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tab_scrolls_a_source_below_the_fold_into_view() {
+        let mut o = Overlay::in_window(640.0, 360.0);
+        o.sources = twelve_sources();
+        o.active_source = Some(1);
+        open_sources_pane(&mut o); // source 1, a list: the address has the focus
+                                   // Save, then the twelve rows: the last of them is far below the fold.
+        o.press(Key::Tab, 13);
+        assert_eq!(o.frame(&[]), vec![]); // the scroll shows in the frame after the Tab
+        o.assert_focus_in_view("the last source's row");
+        // And it is the last row: Enter chooses it, and the keyboard is on its name.
+        o.press(Key::Enter, 1);
+        assert_eq!(o.ui.sources.as_ref().unwrap().editing, Editing::Saved(12));
+        assert_eq!(o.frame(&[]), vec![]); // the form asks for the scroll ...
+        assert_eq!(o.frame(&[]), vec![]); // ... and shows in the next frame
+        o.assert_focus_in_view("the name of source 12");
+        // The buttons below the rows come into view too: address, Save, twelve
+        // rows, then Use this source, New source and Delete.
+        o.press(Key::Tab, 17);
+        assert_eq!(o.frame(&[]), vec![]);
+        o.assert_focus_in_view("Delete");
+        assert_eq!(o.frame(&[Key::Enter]), vec![], "the first press only asks");
+        o.frame(&[]);
+        assert!(
+            o.says(t(Lang::En, T::ButtonConfirmDelete)),
+            "{:?}",
+            o.painted
+        );
+    }
+
+    #[test]
+    fn the_sources_list_adds_no_tab_stop_of_its_own() {
+        let mut o = Overlay::in_window(640.0, 360.0);
+        o.sources = twelve_sources();
+        o.active_source = Some(1);
+        open_sources_pane(&mut o);
+        // Backwards from the name is the News row of the list, not something the
+        // scroll area put in front of the form.
+        tab_back(&mut o); // the name
+        tab_back(&mut o);
+        let row = o.ctx.memory(|m| m.focused()).expect("a row has the focus");
+        assert_eq!(o.ui.list_ids.last(), Some(&row));
     }
 
     /// The text in the open dialog's first field.

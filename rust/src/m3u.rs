@@ -369,12 +369,15 @@ pub fn split_headers(url: &str) -> (&str, Headers) {
     (address, headers)
 }
 
-/// The credentials (`user:pass@host:port`) of an Xtream portal's M3U link,
-/// `…/get.php?username=…&password=…`; `None` for any other address.
+/// The credentials (`user:pass@host:port`, password included) of an Xtream
+/// portal's M3U link, `http://…/get.php?username=…&password=…`; `None` for any
+/// other address. An `https://` link is none: the Xtream client speaks plain
+/// HTTP only, so `user:pass@host:443` would be a source that never connects;
+/// such a link stays an M3U list.
 pub fn xtream_link(address: &str) -> Option<String> {
     let url = reqwest::Url::parse(address.trim()).ok()?;
     let is_get_php = url.path().to_ascii_lowercase().ends_with("/get.php");
-    if !matches!(url.scheme(), "http" | "https") || !is_get_php {
+    if url.scheme() != "http" || !is_get_php {
         return None;
     }
     let (mut user, mut pass) = (None, None);

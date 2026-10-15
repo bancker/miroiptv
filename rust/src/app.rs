@@ -25,8 +25,8 @@ use crate::portal::{xtream::XtreamPortal, LiveChannel, Portal};
 use crate::search::{self, ItemKind, SearchItem};
 use crate::settings::Settings;
 use crate::settings_ui::{
-    conn_rich_text, marker_scroll_area, paint_scroll_marker, ConnState, SettingsAction, SettingsUi,
-    SettingsView,
+    action_button, conn_rich_text, marker_scroll_area, paint_scroll_marker, ConnState,
+    SettingsAction, SettingsUi, SettingsView,
 };
 use crate::shortcuts;
 use crate::sources::{Editing, Source, SourceDraft, SourceId, SourceKind, Sources};
@@ -1152,9 +1152,6 @@ impl TvApp {
                 tracing::info!("settings: zap keys {}", if on { "reversed" } else { "normal" });
             }
             SettingsAction::TestConnection(s) => self.start_conn_check(s, None),
-            SettingsAction::SavePortal(s) => {
-                self.start_conn_check(s, Some((Editing::CommandLine, String::new())))
-            }
             SettingsAction::SaveSource(draft) => self.save_source(draft),
             SettingsAction::ActivateSource(id) => self.activate_source(id),
             SettingsAction::DeleteSource(id) => self.delete_source(id),
@@ -1283,6 +1280,12 @@ impl TvApp {
             settings: &self.settings,
             creds: self.creds.as_ref(),
             creds_from_command_line: self.creds_from_command_line,
+            sources: &self.sources,
+            active_source: if self.creds_from_command_line {
+                None
+            } else {
+                self.sources.active_id()
+            },
             conn: &self.conn_state,
             adult_unlocked: self.catalog.adult_unlocked(),
             has_pin: self.settings.pin.is_some(),
@@ -2377,6 +2380,7 @@ impl TvApp {
     /// BongoPlayer.ini and connects live.
     fn paint_portal_prompt(&mut self, ctx: &egui::Context) {
         let mut submit: Option<String> = None;
+        let mut open_sources = false;
         let lang = self.lang;
         egui::Area::new(egui::Id::new("__portal_prompt__"))
             // Its default click sense makes the frame a Tab stop that shows
@@ -2431,16 +2435,25 @@ impl TvApp {
                             && !self.cfg_user.trim().is_empty()
                             && !self.cfg_pass.is_empty()
                             && self.conn_state != ConnState::Testing;
-                        let clicked = ui
-                            .add_enabled(
-                                ready,
-                                egui::Button::new(crate::i18n::t(lang, T::ConnectAndSave)),
-                            )
-                            .clicked();
+                        // No Tab stop while it is disabled: the link is the next one.
+                        let clicked =
+                            action_button(ui, ready, crate::i18n::t(lang, T::ConnectAndSave))
+                                .clicked();
                         if let Some(text) = conn_rich_text(lang, &self.conn_state) {
                             ui.label(text.size(12.0));
                         }
-                        let entered = ready && ctx.input(|i| i.key_pressed(Key::Enter));
+                        ui.add_space(8.0);
+                        // `o` does nothing here: typing must fire no hotkey. The link
+                        // is the way to the sources section, its last Tab stop.
+                        let link = ui.link(
+                            egui::RichText::new(crate::i18n::t(lang, T::PortalSetupM3uLink))
+                                .size(12.0),
+                        );
+                        if link.clicked() {
+                            open_sources = true;
+                        }
+                        let entered =
+                            ready && ctx.input(|i| i.key_pressed(Key::Enter)) && !link.has_focus();
                         if clicked || entered {
                             submit = Some(self.prompt_credentials());
                         }
@@ -2448,7 +2461,38 @@ impl TvApp {
             });
         if let Some(s) = submit {
             // Saving tests first: only credentials that log in are kept.
-            self.start_conn_check(s, Some((Editing::CommandLine, String::new())));
+            let (editing, name) = self.prompt_target();
+            self.start_conn_check(s, Some((editing, name)));
+        }
+        if open_sources {
+            self.open_settings();
+            if let Some(ui) = self.settings_ui.as_mut() {
+                ui.open_new_list();
+            }
+            // The Enter or Space that clicked the link is spent: the overlay,
+            // drawn later in this frame, would hand it to the address field it
+            // focuses, and a single-line field lets go of the focus on Enter.
+            ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                i.consume_key(egui::Modifiers::NONE, Key::Space);
+            });
+        }
+    }
+
+    /// Where the setup prompt's login is kept, and under which name: in the
+    /// Xtream source in use (a hand-edited ini can leave the prompt up with a
+    /// placeholder one that is not the first), else it is the command line's
+    /// portal, which goes into the first saved Xtream source or is added. The
+    /// source keeps the name it has.
+    fn prompt_target(&self) -> (Editing, String) {
+        let name_of = |s: &Source| s.display_name(self.lang);
+        let in_use = self.sources.active();
+        match in_use.filter(|s| s.kind == SourceKind::Xtream) {
+            Some(s) => (Editing::Saved(s.id), name_of(s)),
+            None => {
+                let first = self.sources.first_xtream();
+                (Editing::CommandLine, first.map(name_of).unwrap_or_default())
+            }
         }
     }
 
@@ -2660,6 +2704,7 @@ impl TvApp {
         }
         self.write_sources(&sources)?;
         self.sources = sources;
+        self.show_in_settings(Editing::Saved(id));
         if !activate {
             tracing::info!("settings: source {} saved (xtream)", id);
             let shown = self.sources.get(id).map(|s| s.display_name(self.lang));
@@ -2692,7 +2737,12 @@ impl TvApp {
             SourceKind::Xtream => {
                 // No test for a save that has no source to go to.
                 if self.can_keep(draft.editing, SourceKind::Xtream) {
-                    self.start_conn_check(draft.address, Some((draft.editing, draft.name)));
+                    // Tested as it is kept: `Sources::keep` stores the line
+                    // without line breaks and the spaces around it.
+                    let line = crate::args::without_newlines(&draft.address)
+                        .trim()
+                        .to_owned();
+                    self.start_conn_check(line, Some((draft.editing, draft.name)));
                 }
             }
             SourceKind::M3u => {
@@ -2737,6 +2787,7 @@ impl TvApp {
             return;
         }
         self.sources = sources;
+        self.show_in_settings(Editing::Saved(id));
         tracing::info!("settings: source {} saved (m3u)", id);
         let Some(source) = self.sources.get(id).cloned() else {
             return;
@@ -2774,6 +2825,7 @@ impl TvApp {
             return;
         }
         self.sources = sources;
+        self.show_in_settings(Editing::Saved(id));
         self.creds_from_command_line = false;
         tracing::info!("source: active {} ({})", id, source.kind.code());
         let opened = open_source(&source, &self.storage);
@@ -2806,6 +2858,20 @@ impl TvApp {
         };
         tracing::info!("settings: source {} deleted ({} files)", id, files);
         self.set_toast(self.tr(T::SourceDeleted, &[&gone.display_name(self.lang)]));
+        let in_use = self.sources.active_id();
+        let shown = if self.creds_from_command_line {
+            Editing::CommandLine
+        } else {
+            in_use.map_or(Editing::New, Editing::Saved)
+        };
+        self.show_in_settings(shown);
+    }
+
+    /// The settings' sources section shows this source next, if it is open.
+    fn show_in_settings(&mut self, editing: Editing) {
+        if let Some(ui) = self.settings_ui.as_mut() {
+            ui.show_source(editing);
+        }
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -4250,7 +4316,10 @@ impl TvApp {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(Color32::from_rgb(14, 14, 18)))
                 .show(ctx, |_ui| {});
-            self.paint_portal_prompt(ctx);
+            // Under the settings the prompt's fields would be Tab stops too.
+            if self.settings_ui.is_none() {
+                self.paint_portal_prompt(ctx);
+            }
         } else {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(Color32::BLACK))
@@ -10803,5 +10872,279 @@ https://c.example/twee-nieuws.m3u8\n";
         assert!(h.app.keep_xtream(keep).is_ok());
         std::env::remove_var("BONGO_INI");
         assert_eq!(h.app.sources.get(3).map(|s| s.name.as_str()), Some(""));
+    }
+
+    // ---- the settings' sources section, end to end ----
+
+    #[tokio::test]
+    async fn an_m3u_list_is_added_and_used_by_keyboard_alone() {
+        // The keys of the e2e scenario M-add, with a file in place of the mock's URL.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let file = dir.path().join("lijst.m3u");
+        std::fs::write(&file, TEST_LIST).unwrap();
+        // The scenario's ini: the portal saved as source 1, in use.
+        let mut h = Harness::start_with(
+            dir.path(),
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(test_creds()),
+            Sources::parse("portal=u:p@h:80\n"),
+            None,
+        );
+        h.press(&[Key::O, Key::ArrowDown, Key::Enter]);
+        for _ in 0..6 {
+            h.press(&[Key::Tab]);
+        }
+        h.press(&[Key::Enter, Key::Tab, Key::Enter, Key::Tab]);
+        h.type_text(&file.display().to_string());
+        h.press(&[Key::Tab, Key::Enter]);
+        assert_eq!(h.app.sources.list().len(), 2, "saved as source 2");
+        assert_eq!(
+            h.app.catalog.kind(),
+            SourceKind::Xtream,
+            "the portal still runs"
+        );
+        for _ in 0..5 {
+            h.press(&[Key::Tab]);
+        }
+        h.press(&[Key::Enter]);
+        assert_eq!(h.app.sources.active_id(), Some(2));
+        assert_eq!(h.app.catalog.kind(), SourceKind::M3u);
+        std::env::remove_var("BONGO_INI");
+    }
+
+    #[test]
+    fn the_setup_prompts_link_opens_the_sources_section_on_a_new_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(CatalogStore::new(idle_portal()));
+        let mut h = Harness::start(dir.path(), catalog, PortalState::Missing, None);
+        // Server, user, password (Connect is disabled while they are empty), the link.
+        h.press(&[Key::Tab, Key::Tab, Key::Tab, Key::Tab, Key::Enter]);
+        assert!(h.app.settings_ui.is_some(), "the settings opened");
+        h.frame(&[]);
+        assert!(
+            !h.painted.iter().any(|t| t == "Set up your portal"),
+            "the prompt is not drawn under the settings: {:?}",
+            h.painted
+        );
+        h.type_text("x");
+        let form = h.app.settings_ui.as_ref().unwrap().form_address();
+        assert_eq!(form, Some((SourceKind::M3u, "x".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn enter_on_the_setup_prompts_link_does_not_also_submit_the_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(CatalogStore::new(idle_portal()));
+        let mut h = Harness::start(dir.path(), catalog, PortalState::Missing, None);
+        h.app.cfg_host = "127.0.0.1:1".into();
+        h.app.cfg_user = "u".into();
+        h.app.cfg_pass = "p".into();
+        h.frame(&[]);
+        // Filled in: Connect is a stop now, before the link.
+        h.press(&[Key::Tab, Key::Tab, Key::Tab, Key::Tab, Key::Tab, Key::Enter]);
+        assert!(h.app.settings_ui.is_some());
+        assert_eq!(h.app.conn_state, ConnState::Idle, "no test started");
+    }
+
+    #[test]
+    fn the_prompt_is_back_when_the_settings_opened_from_its_link_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(CatalogStore::new(idle_portal()));
+        let mut h = Harness::start(dir.path(), catalog, PortalState::Missing, None);
+        h.press(&[Key::Tab, Key::Tab, Key::Tab, Key::Tab, Key::Enter]);
+        assert!(h.app.settings_ui.is_some());
+        // Esc leaves the section, the next Esc closes the settings.
+        h.press(&[Key::Escape, Key::Escape]);
+        assert!(h.app.settings_ui.is_none());
+        assert!(
+            h.painted.iter().any(|t| t == "Set up your portal"),
+            "{:?}",
+            h.painted
+        );
+    }
+
+    /// A portal that takes every call as a login that works.
+    async fn portal_that_logs_in() -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/player_api.php"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string(r#"{"user_info":{"auth":1}}"#),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The test of a login has come in; the frame that takes it in writes the
+    /// ini, so it points into `dir` (and holds ENV_LOCK for that frame only).
+    async fn take_in_the_login(h: &mut Harness, dir: &std::path::Path) {
+        wait_until("the verdict", || h.app.conn_slot.lock().is_some()).await;
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("BONGO_INI", dir.join("test.ini"));
+        h.frame(&[]);
+        std::env::remove_var("BONGO_INI");
+    }
+
+    #[tokio::test]
+    async fn the_setup_prompts_login_goes_into_the_portal_in_use_under_its_name() {
+        // A hand-edited ini: source 1 is a good portal, source 2, in use, has
+        // the stand-in credentials, so the prompt shows. The login belongs to
+        // source 2, not to the first portal.
+        let dir = tempfile::tempdir().unwrap();
+        let server = portal_that_logs_in().await;
+        let port = server.address().port();
+        let sources = Sources::parse(
+            "source=1;xtream;Thuis;u:p@h:80\n\
+             source=2;xtream;Werk;user:pass@host.example.com:80\n\
+             active=2\n",
+        );
+        let catalog = Arc::new(CatalogStore::new(idle_portal()));
+        let mut h = Harness::start_with(
+            dir.path(),
+            catalog,
+            PortalState::Placeholder,
+            None,
+            None,
+            sources,
+            None,
+        );
+        h.app.cfg_host = format!("127.0.0.1:{port}");
+        h.app.cfg_user = "u2".into();
+        h.app.cfg_pass = "p2".into();
+        h.frame(&[]);
+        h.frame(&[Key::Enter]);
+        assert_eq!(h.app.conn_state, ConnState::Testing);
+        take_in_the_login(&mut h, dir.path()).await;
+        let sources = &h.app.sources;
+        let line = |id| sources.get(id).map(|s| (s.name.clone(), s.address.clone()));
+        assert_eq!(line(1), Some(("Thuis".into(), "u:p@h:80".into())));
+        assert_eq!(
+            line(2),
+            Some(("Werk".into(), format!("u2:p2@127.0.0.1:{port}")))
+        );
+        assert_eq!(h.app.sources.list().len(), 2);
+        assert_eq!(h.app.sources.active_id(), Some(2));
+        assert_eq!(h.app.portal_state, PortalState::Configured);
+        let saved = Sources::load(&dir.path().join("test.ini"));
+        assert_eq!(saved.get(1).map(|s| s.address.as_str()), Some("u:p@h:80"));
+    }
+
+    #[tokio::test]
+    async fn the_setup_prompts_login_without_a_saved_portal_is_the_first_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = portal_that_logs_in().await;
+        let port = server.address().port();
+        let catalog = Arc::new(CatalogStore::new(idle_portal()));
+        let mut h = Harness::start(dir.path(), catalog, PortalState::Missing, None);
+        h.app.cfg_host = format!("127.0.0.1:{port}");
+        h.app.cfg_user = "u2".into();
+        h.app.cfg_pass = "p2".into();
+        h.frame(&[]);
+        h.frame(&[Key::Enter]);
+        take_in_the_login(&mut h, dir.path()).await;
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("test.ini")).unwrap(),
+            format!("portal=u2:p2@127.0.0.1:{port}\n"),
+            "0.6.1's ini"
+        );
+        assert_eq!(h.app.sources.active_id(), Some(1));
+        assert_eq!(h.app.portal_state, PortalState::Configured);
+    }
+
+    #[tokio::test]
+    async fn save_on_the_command_line_row_keeps_the_name_of_the_first_portal() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = portal_that_logs_in().await;
+        let port = server.address().port();
+        let creds = XtreamCreds {
+            username: "u2".into(),
+            password: "p2".into(),
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let sources = Sources::parse("source=1;xtream;Thuis;u:p@h:80\nactive=1\n");
+        let mut h = Harness::start_with(
+            dir.path(),
+            loaded_catalog(),
+            PortalState::Configured,
+            None,
+            Some(creds),
+            sources,
+            None,
+        );
+        h.app.creds_from_command_line = true;
+        // The section opens on the --xtream row; user, password, Test, Save.
+        h.press(&[Key::O, Key::ArrowDown, Key::Enter]);
+        for _ in 0..4 {
+            h.press(&[Key::Tab]);
+        }
+        h.press(&[Key::Enter]);
+        assert_eq!(h.app.conn_state, ConnState::Testing);
+        take_in_the_login(&mut h, dir.path()).await;
+        assert_eq!(h.app.sources.list().len(), 1, "the first portal is updated");
+        let one = h.app.sources.get(1).unwrap();
+        assert_eq!(
+            (one.name.as_str(), one.address.as_str()),
+            ("Thuis", format!("u2:p2@127.0.0.1:{port}").as_str())
+        );
+        assert!(!h.app.creds_from_command_line, "the saved portal runs now");
+    }
+
+    #[tokio::test]
+    async fn an_xtream_line_is_tested_as_it_is_kept() {
+        // `Sources::keep` stores the line without line breaks and the spaces
+        // around it; the test must be of that line, not of the one as typed.
+        let dir = tempfile::tempdir().unwrap();
+        let server = portal_that_logs_in().await;
+        let port = server.address().port();
+        let mut h = portal_and_list(dir.path());
+        h.app
+            .apply_settings_action(SettingsAction::SaveSource(SourceDraft {
+                editing: Editing::New,
+                kind: SourceKind::Xtream,
+                name: "Thuis".into(),
+                address: format!("  u2:p2@127.0.0.1:{port} \r\n"),
+            }));
+        assert_eq!(h.app.conn_state, ConnState::Testing, "a line to test");
+        take_in_the_login(&mut h, dir.path()).await;
+        let kept = h.app.sources.get(3).map(|s| s.address.clone());
+        assert_eq!(kept, Some(format!("u2:p2@127.0.0.1:{port}")));
+        // The login that was tried is the kept one's, not "  u2".
+        let asked = server.received_requests().await.unwrap();
+        let query = asked.first().and_then(|r| r.url.query().map(str::to_owned));
+        assert_eq!(query.as_deref(), Some("username=u2&password=p2"));
+    }
+
+    #[test]
+    fn deleting_a_source_with_the_keyboard_leaves_the_form_on_the_source_in_use() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BONGO_INI", dir.path().join("test.ini"));
+        let mut h = portal_and_list(dir.path());
+        h.press(&[Key::O, Key::ArrowDown, Key::Enter]);
+        for _ in 0..6 {
+            h.press(&[Key::Tab]); // user, password, Test, Save, row 1, row 2
+        }
+        h.press(&[Key::Enter]); // row 2, the list
+        for _ in 0..7 {
+            h.press(&[Key::Tab]); // address, Save, row 1, row 2, Use, New, Delete
+        }
+        h.press(&[Key::Enter]); // asks
+        assert_eq!(h.app.sources.list().len(), 2);
+        h.press(&[Key::Enter]); // deletes
+        std::env::remove_var("BONGO_INI");
+        assert_eq!(h.app.sources.list().len(), 1);
+        // The form shows the portal in use again, the keyboard on its name: the
+        // Delete button it was on is disabled now and keeps no focus.
+        let shown = h.app.settings_ui.as_ref().unwrap().form_address();
+        assert_eq!(shown, Some((SourceKind::Xtream, "h:80".to_owned())));
+        assert!(
+            h.ctx.memory(|m| m.focused()).is_some(),
+            "the keyboard is not left nowhere"
+        );
     }
 }
