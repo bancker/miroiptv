@@ -2,7 +2,7 @@ use crate::args::{
     credentials_line, parse_xtream_creds, resolve_creds, CredsError, CredsSource, XtreamCreds,
 };
 use crate::catalog::GuideChannel;
-use crate::catalog::{fallback_variant, quality_label, quality_rank, CatalogNotice, CatalogStatus, CatalogStore, ZapFrom};
+use crate::catalog::{fallback_variant, quality_label, quality_rank, CatalogNotice, CatalogStatus, CatalogStore, ZapFrom, ZapRing};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::{Entry as FavoriteEntry, Favorites};
 use crate::guide::fetch::EpgFetcher;
@@ -1517,7 +1517,11 @@ impl TvApp {
                     // channel that is really down from reloading on a loop.
                     let live = self.stall_watchdog_armed;
                     if reason == "eof" && live && self.zap_pacer.waiting().is_some() {
-                        continue; // the user is zapping away anyway
+                        // The user is zapping away anyway. The stream has ended
+                        // all the same: it no longer plays (`plays`), so a flip
+                        // back to it loads it again.
+                        self.stall_watchdog_armed = false;
+                        continue;
                     }
                     if reason == "eof" && live {
                         if let Some(url) = self.current_url.clone() {
@@ -1771,11 +1775,10 @@ impl TvApp {
         // to the twin only when the live fetch comes back empty - correct for
         // both portal styles. The result is always stored under the live sid
         // so drain_epg's current_stream_id match still works.
-        let channels = self.catalog.live_channels();
-        let (name, is_archive) = channels
-            .iter()
-            .find(|c| c.stream_id == stream_id)
-            .map(|c| (c.name.clone(), c.tv_archive == 1))
+        // One look at the catalog, no copy of its list.
+        let (name, is_archive) = self
+            .catalog
+            .live_entry(stream_id)
             .unwrap_or_else(|| (String::new(), false));
         let twin_sid = if !is_archive && !name.is_empty() {
             self.catalog
@@ -1926,6 +1929,48 @@ impl TvApp {
         true
     }
 
+    /// Where a zap step starts in `ring`: from the channel a flip waits on, else
+    /// from the one that plays, with its ring position while that still holds it
+    /// (the list may have changed under it); with nothing, from the start. The
+    /// ring finds a channel that moved in it, or one it leaves out (marked
+    /// defect), by its id. A waiting channel that a fresh list dropped has no
+    /// place at all, and the ring would count from its start (Down could move
+    /// backwards): the step goes on from the channel that plays, and when that
+    /// is gone too, from the flip's position kept inside the ring.
+    fn zap_from(&self, ring: &ZapRing) -> ZapFrom {
+        let playing = match (self.current_idx, self.current_stream_id) {
+            (Some(pos), Some(sid)) => ZapFrom::Pos { pos, sid },
+            (None, Some(sid)) => ZapFrom::Channel(sid),
+            (_, None) => ZapFrom::Start,
+        };
+        let Some(&(sid, _, pos)) = self.zap_pacer.waiting() else {
+            return playing;
+        };
+        // One the ring can place: it has an entry for it, or the catalog still
+        // has the channel (a list's own pick, or marked defect).
+        let known =
+            |sid: i64| ring.position_of(sid).is_some() || self.catalog.live_name(sid).is_some();
+        let held = pos.is_some_and(|p| ring.get(p).is_some_and(|c| c.stream_id == sid));
+        if held || known(sid) {
+            return match pos {
+                Some(pos) => ZapFrom::Pos { pos, sid },
+                None => ZapFrom::Channel(sid),
+            };
+        }
+        let playing_sid = match playing {
+            ZapFrom::Pos { sid, .. } | ZapFrom::Channel(sid) => Some(sid),
+            ZapFrom::Start => None,
+        };
+        if playing_sid.is_some_and(known) {
+            return playing;
+        }
+        let at = pos.map(|p| p.min(ring.len().saturating_sub(1)));
+        match at.and_then(|at| ring.get(at).map(|c| (at, c.stream_id))) {
+            Some((pos, sid)) => ZapFrom::Pos { pos, sid },
+            None => ZapFrom::Start,
+        }
+    }
+
     /// Up/down zapping. A lone press zaps at once; while the user flips
     /// (quick presses, a held key) only the channel names show and the one
     /// they stop on loads - a portal session per keypress gets throttled.
@@ -1945,21 +1990,7 @@ impl TvApp {
                 return;
             }
         };
-        // From the channel a flip waits on, else from the one that plays: its
-        // ring position while that still holds it (the list may have changed
-        // under it), else the channel itself; with nothing, from the start.
-        let from = match self.zap_pacer.waiting() {
-            Some((sid, _, Some(pos))) => ZapFrom::Pos {
-                pos: *pos,
-                sid: *sid,
-            },
-            Some((sid, _, None)) => ZapFrom::Channel(*sid),
-            None => match (self.current_idx, self.current_stream_id) {
-                (Some(pos), Some(sid)) => ZapFrom::Pos { pos, sid },
-                (None, Some(sid)) => ZapFrom::Channel(sid),
-                (_, None) => ZapFrom::Start,
-            },
-        };
+        let from = self.zap_from(&ring);
         let Some((pos, channel)) = ring
             .step(from, delta)
             .and_then(|pos| ring.get(pos).map(|c| (pos, c)))
@@ -4391,7 +4422,11 @@ impl TvApp {
         // plays (flipped away and back): a second load would only re-buffer it.
         if let Some((sid, name, idx)) = self.zap_pacer.due(Instant::now()) {
             if self.plays(sid) {
-                tracing::debug!("zap: {} plays already", crate::redact::redact(&name));
+                tracing::debug!(
+                    "zap: {} (stream_id={}) plays already",
+                    crate::redact::redact(&name),
+                    sid
+                );
                 if idx.is_some() {
                     self.current_idx = idx;
                 }
@@ -7871,6 +7906,27 @@ https://c.example/twee-nieuws.m3u8\n";
         }
     }
 
+    #[tokio::test]
+    async fn a_zap_falls_back_to_the_catch_up_twin_only_for_a_channel_that_has_none_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = zap_app(dir.path(), Vec::new());
+        h.frame(&[]);
+        let log = LogCapture::start();
+        // TEST 03 has the catch-up twin 13; 13 is a catch-up channel itself;
+        // TEST 05 has no twin.
+        for sid in [3, 13, 5] {
+            h.app.zap_by_id(sid);
+        }
+        let text = log.text();
+        for said in [
+            "epg fetch starting for sid=3 (twin fallback=Some(13))",
+            "epg fetch starting for sid=13 (twin fallback=None)",
+            "epg fetch starting for sid=5 (twin fallback=None)",
+        ] {
+            assert!(text.contains(said), "{said}\n{text}");
+        }
+    }
+
     // The zap toast gets the guide's EPG from the programme on now, at most 100
     // of them: what the short EPG gave it before.
 
@@ -9813,26 +9869,36 @@ https://c.example/twee-nieuws.m3u8\n";
         assert_eq!(loads(h.sent()), [ring_url('a')], "and back past B");
     }
 
-    #[tokio::test]
-    async fn a_defect_channel_that_plays_zaps_on_from_its_place_in_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut h = m3u_app(dir.path(), RING);
+    /// `RING` with C marked defect, and C playing: the ring is A, B, D and C has
+    /// no place in it, so zapping steps from its place in the file. Counted
+    /// from the ring's start, Down would give B and Up D: wrong both ways.
+    fn playing_a_defect_channel(root: &std::path::Path) -> Harness {
+        let mut h = m3u_app(root, RING);
         h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
-        h.app.catalog.set_defect([(m3u_sid("Kanaal B"), 0)].into());
+        h.app.catalog.set_defect([(m3u_sid("Kanaal C"), 0)].into());
         // A preset, a favorite or the search still plays it.
-        h.app.zap_by_id(m3u_sid("Kanaal B"));
-        assert_eq!(loads(h.sent()), [ring_url('b')]);
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        assert_eq!(loads(h.sent()), [ring_url('c')]);
         assert_eq!(h.app.current_idx, None, "it has no place in the ring");
+        h
+    }
+
+    #[tokio::test]
+    async fn down_from_a_defect_channel_that_plays_goes_to_the_one_after_it_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = playing_a_defect_channel(dir.path());
         h.press(&[Key::ArrowDown]);
-        assert_eq!(
-            loads(h.sent()),
-            [ring_url('c')],
-            "the one after it in the file"
-        );
-        h.app.zap_by_id(m3u_sid("Kanaal B"));
-        h.sent();
+        // The ring's start would give B.
+        assert_eq!(loads(h.sent()), [ring_url('d')]);
+    }
+
+    #[tokio::test]
+    async fn up_from_a_defect_channel_that_plays_goes_to_the_one_before_it_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = playing_a_defect_channel(dir.path());
         h.press(&[Key::ArrowUp]);
-        assert_eq!(loads(h.sent()), [ring_url('a')], "the one before it");
+        // The ring's start would give D.
+        assert_eq!(loads(h.sent()), [ring_url('b')]);
     }
 
     #[tokio::test]
@@ -9917,6 +9983,100 @@ https://c.example/twee-nieuws.m3u8\n";
         h.frame(&[]);
         assert!(loads(h.sent()).is_empty(), "C has no address now");
         assert!(h.painted.iter().any(|t| t == error), "{:?}", h.painted);
+    }
+
+    #[tokio::test]
+    async fn an_eof_while_flipping_then_back_loads_the_channel_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), RING);
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        h.app.zap_by_id(m3u_sid("Kanaal A"));
+        h.sent();
+        // A lone press: B at once. The held key then flips on to C, which waits.
+        h.frame(&[Key::ArrowDown]);
+        h.frame(&[Key::ArrowDown]);
+        assert_eq!(loads(h.sent()), [ring_url('b')]);
+        // B ends meanwhile (nothing reloads it: the user is zapping away anyway)
+        // and the user flips back to it.
+        let ended = Event::EndOfFile {
+            reason: "eof".into(),
+        };
+        h.events.send(ended).unwrap();
+        h.frame(&[]);
+        h.frame(&[Key::ArrowUp]);
+        std::thread::sleep(Duration::from_millis(350));
+        h.frame(&[]);
+        assert_eq!(
+            loads(h.sent()),
+            [ring_url('b')],
+            "B ended: it is tried again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_that_plays_already_is_logged_with_its_stream_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), RING);
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        h.app.zap_by_id(m3u_sid("Kanaal A"));
+        // B at once, on to C, and back to B.
+        h.frame(&[Key::ArrowDown]);
+        h.frame(&[Key::ArrowDown]);
+        h.frame(&[Key::ArrowUp]);
+        let log = LogCapture::start_debug();
+        std::thread::sleep(Duration::from_millis(350));
+        h.frame(&[]);
+        let line = format!(
+            "zap: Kanaal B (stream_id={}) plays already",
+            m3u_sid("Kanaal B")
+        );
+        let text = log.text();
+        assert!(text.contains(&line), "{text}");
+    }
+
+    /// The app on `RING`, on B, with a flip on to C waiting (the held key is
+    /// still down); then a fresh copy of the list lands without the channels
+    /// whose letters are in `dropped`.
+    fn flip_to_c_waits_while_the_fresh_list_drops(
+        root: &std::path::Path,
+        dropped: &str,
+    ) -> Harness {
+        let mut h = m3u_app(root, RING);
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        h.app.zap_by_id(m3u_sid("Kanaal A"));
+        // A lone press: B at once. The held key then flips on to C, which waits.
+        h.frame(&[Key::ArrowDown]);
+        h.frame(&[Key::ArrowDown]);
+        let mut fresh = RING.to_owned();
+        for letter in dropped.chars() {
+            let name = letter.to_ascii_uppercase();
+            let entry = format!("#EXTINF:-1,Kanaal {name}\n{}\n", ring_url(letter));
+            fresh = fresh.replace(&entry, "");
+        }
+        let (portal, catalog) = M3uPortal::from_text(&fresh).unwrap();
+        h.app.catalog = Arc::new(CatalogStore::from_catalog(Arc::new(portal), catalog));
+        h.sent();
+        h
+    }
+
+    #[tokio::test]
+    async fn a_press_after_the_fresh_list_dropped_the_flips_channel_goes_on_from_what_plays() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = flip_to_c_waits_while_the_fresh_list_drops(dir.path(), "c");
+        // The ring is A, B, D now. The held key goes on from B, which plays; the
+        // ring's start would give B again, backwards.
+        h.frame(&[Key::ArrowDown]);
+        assert_eq!(toast_text(&h), "[TV] Kanaal D");
+    }
+
+    #[tokio::test]
+    async fn with_what_plays_dropped_too_a_press_goes_on_from_the_flips_place_in_the_ring() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = flip_to_c_waits_while_the_fresh_list_drops(dir.path(), "bc");
+        // The ring is A, D. The flip sat at 2; the ring ends at 1, D: the step goes
+        // on from there, round to A (the ring's start would give D).
+        h.frame(&[Key::ArrowDown]);
+        assert_eq!(toast_text(&h), "[TV] Kanaal A");
     }
 
     // ---- the picture of the channel before ----

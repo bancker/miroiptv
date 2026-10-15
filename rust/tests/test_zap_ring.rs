@@ -241,6 +241,48 @@ fn a_name_shows_only_when_its_channel_does() {
 }
 
 #[test]
+fn an_entry_is_the_name_and_the_catch_up_flag_of_a_channel_that_shows() {
+    let archive = |stream_id, name: &str, is_adult| LiveChannel {
+        tv_archive: 1,
+        ..ch(stream_id, name, is_adult)
+    };
+    let store = xtream(vec![
+        ch(1, "NL | NPO 1", false),
+        archive(2, "NL | NPO 1 HD", false),
+        archive(9, "XXX | NACHT", true),
+    ]);
+    let entry = |sid| store.live_entry(sid);
+    assert_eq!(entry(1), Some(("NL | NPO 1".to_string(), false)));
+    assert_eq!(entry(2), Some(("NL | NPO 1 HD".to_string(), true)));
+    assert_eq!(entry(9), None, "adult, while locked");
+    assert_eq!(entry(42), None, "not in the catalog");
+    store.set_adult_unlocked(true);
+    assert_eq!(entry(9), Some(("XXX | NACHT".to_string(), true)));
+    // It shows what live_name shows, whatever the lock says.
+    for locked in [true, false] {
+        store.set_adult_unlocked(!locked);
+        for sid in [1, 2, 9, 42] {
+            let name = entry(sid).map(|(name, _)| name);
+            assert_eq!(name, store.live_name(sid), "{sid}, locked: {locked}");
+        }
+    }
+}
+
+#[test]
+fn a_defect_channel_still_has_an_entry_and_an_unloaded_catalog_has_none() {
+    let store = m3u_store();
+    mark(&store, &["Twee"]);
+    assert_eq!(
+        store.live_entry(stream_id("Twee")),
+        Some(("Twee".to_string(), false)),
+        "a preset still plays it"
+    );
+    let (portal, _) = M3uPortal::from_text(LIST).unwrap();
+    let unloaded = CatalogStore::new(Arc::new(portal));
+    assert_eq!(unloaded.live_entry(stream_id("Een")), None);
+}
+
+#[test]
 fn a_hidden_variant_has_no_place_even_when_its_channel_shows_in_the_ring() {
     // Locked, the ring has the plain "NL | FOO"; the flagged HD variant is
     // hidden, so it has no place, not the place of that entry.
