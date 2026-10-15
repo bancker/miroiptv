@@ -123,13 +123,34 @@ Niet verdacht zijn:
 
 ### 4.2 Bevestiging
 
-Een verdachte zender krijgt pas een markering als binnen 2 minuten na zijn fout een **andere**
-zender een eerste beeld geeft. Dan werkte de verbinding, en lag het aan de zender.
+Een verdachte zender is pas bevestigd als binnen 2 minuten na zijn fout een **andere** zender een
+eerste beeld geeft. Dan werkte de verbinding weer. Een markering krijgt hij daarna alleen als de
+controle hieronder het ook vindt.
 
 - Zonder zo'n bevestiging vervalt de verdenking stil. Valt je wifi weg en falen vijf zenders achter
   elkaar, dan wordt er niets gemarkeerd.
 - Geeft de verdachte zender zelf binnen die 2 minuten beeld, dan vervalt de verdenking ook.
 - Verdenkingen staan alleen in het geheugen. Sluit je de app, dan zijn ze weg.
+
+**Controle vóór de markering.** Is een verdachte zender bevestigd, dan vraagt de app zijn adres
+nog één keer op, op de achtergrond, voordat hij de markering krijgt:
+- Eén GET met de eigen headers van de zender (User-Agent en Referer, zoals mpv ze meekrijgt),
+  met een korte time-out: ongeveer 5 seconden voor de verbinding en de headers. Alleen de status
+  telt; de rest van het antwoord wordt niet gelezen, want een live-stream houdt niet op.
+- Een status van 400 of hoger (na doorverwijzingen), geen verbinding of geen antwoord binnen de
+  tijd: dan krijgt hij de markering. Een status 2xx of 3xx: de verdenking vervalt, er komt geen
+  markering.
+- Hooguit één controle per verdachte en hooguit vier tegelijk. Een zender die al gemarkeerd is en
+  opnieuw faalt, krijgt zonder controle een nieuwe termijn. Een wissel van bron laat lopende
+  controles vervallen. Alleen bij M3U-bronnen.
+
+Waarom: valt de wifi korter dan 2 minuten weg, dan geeft de eerste zender daarna weer beeld, en
+zou elke zender die in dat gat faalde een markering krijgen. De controle vraagt hun adres als de
+verbinding er weer is. De gebruiker koos hiervoor: "Ja, met controle".
+
+De grens: een playlist die nog 200 antwoordt terwijl de videosegmenten erachter dood zijn, wordt
+niet gemarkeerd. Die fout valt naar de veilige kant: liever een dode zender te veel in de lijst dan
+een goede kwijt.
 
 ### 4.3 Wat een markering doet
 
@@ -168,7 +189,9 @@ zender een eerste beeld geeft. Dan werkte de verbinding, en lag het aan de zende
 
 Alleen ids en namen, zoals de zap-regel; nooit een URL. De regels:
 - `m3u: <naam> (stream_id <id>) failed before its first picture`
-- `marked defect`
+- `marked defect`, met wat de controle vond (bijvoorbeeld `http 404`, `connect failed`, `timeout`),
+  nooit het adres
+- `answers again, not marked`
 - `plays again, mark cleared`
 - `m3u: <n> defect marks expired`
 
@@ -189,7 +212,8 @@ Alleen ids en namen, zoals de zap-regel; nooit een URL. De regels:
 **Tekenen:**
 - Alleen de zichtbare regels worden getekend.
 - Een gesloten lijst kost per frame niets: geen werk, geen geheugen.
-- Er is geen netwerk en geen nieuwe thread.
+- Er is geen nieuwe thread, en geen netwerk, behalve één controle per bevestigde verdachte (alleen
+  bij M3U-bronnen).
 
 **Opstarten:**
 - Het enige nieuwe is het lezen van een klein bestand bij het laden van de catalogus.
@@ -216,6 +240,9 @@ Alleen ids en namen, zoals de zap-regel; nooit een URL. De regels:
   - weer beeld wist de markering, opnieuw falen vernieuwt de termijn;
   - het verlopen na 7 dagen, met een nepklok;
   - lezen en schrijven, een kapot bestand, de bestandsnaam per bron;
+- de controle vóór de markering: 200 geeft geen markering, 404, een gesloten poort of een
+  time-out wel; de eigen User-Agent en Referer gaan mee; een wissel van bron tijdens een controle
+  laat geen markering na; de markering komt pas als het antwoord binnen is;
 - de zaplijst zonder gemarkeerde zenders.
 
 **App-tests** (de bestaande Harness, headless). Ze laten zien dat:
