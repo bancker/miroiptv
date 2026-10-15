@@ -77,8 +77,9 @@ fn a_channel_without_catch_up_is_no_column() {
 ///
 /// This pins the RESULT that early exit must not change, not the speed: it
 /// passed before the exit was there. It fails when a list without catch-up
-/// gets a column, e.g. an exit that returns the entries, or
-/// `best(true).or_else(|| best(false))?` in the grouping.
+/// gets a column, e.g. from an exit that returns the entries. (Before the exit
+/// existed, `best(true).or_else(|| best(false))?` in the grouping failed it
+/// too; with the exit there, a list without catch-up never reaches that line.)
 #[test]
 fn a_list_without_catch_up_has_no_guide_columns() {
     let (portal, catalog) = M3uPortal::from_text(
