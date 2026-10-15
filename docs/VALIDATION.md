@@ -52,6 +52,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] An M3U address with a password (`https://user:pass@…`): nothing of it in the log (`%APPDATA%\BongoPlayer\config\log\`), only `source: m3u <id> (<host>)`
 - [ ] A `http://…/get.php?username=…&password=…` link typed as an M3U address, then Opslaan: the question offers an Xtream source; "Als Xtream-bron" fills Server, User and Password. The same link with `https://` stays an M3U list, with no question
 - [ ] A list in a file (`C:\…\lijst.m3u`) loads; remove the file and start again: the empty state says "zenderlijst ophalen mislukt" with its path
+- [ ] A video file (over 128 MB, or any with a NUL byte in its first KB) saved as an M3U address: "dit is geen zenderlijst", at once; the next start is as quick as ever
 - [ ] Verwijderen is disabled for the source in use; for another source it asks twice ("Echt verwijderen (met favorieten)?") and takes that source's favorites, presets, last channel and saved list along
 - [ ] First start without any source: the setup prompt's last line is a link to Bronnen with a new M3U list ready; typing there types, it fires no hotkey. With a 0.6.1 `favorites.json` in the config folder, a list saved there is source 2 (`source=2;m3u;…` in the ini) and shows none of those favorites
 - [ ] Downgrade check: with a portal and an M3U list saved, BongoPlayer 0.6.1 still starts on the portal
