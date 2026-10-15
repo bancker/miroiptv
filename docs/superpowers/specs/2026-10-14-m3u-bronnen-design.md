@@ -347,8 +347,9 @@ komma", §3.5: "een positieve i64"), gaan ze voor:
   van een paniek, want de release-build breekt bij een paniek af. De zender krijgt de melding van een dode
   zender.
 - Een M3U-zender die mpv weigert, of die met een fout eindigt voordat hij een beeld heeft getoond, laat het
-  scherm zwart (de lege toestand). Het beeld van de zender ervoor blijft dus niet bevroren onder de nieuwe
-  naam staan. Heeft de zender al gespeeld, dan blijft zijn eigen laatste beeld staan. Xtream houdt het
+  scherm zwart (de lege toestand). Zo ook een zender die steeds eindigt (eof) voordat hij een beeld toont,
+  zodra het automatisch herladen opgeeft; zolang dat herladen loopt, blijft alles zoals het was. Het beeld
+  van de zender ervoor blijft dus niet bevroren onder de nieuwe naam staan. Heeft de zender al gespeeld, dan blijft zijn eigen laatste beeld staan. Xtream houdt het
   gedrag van 0.6.1.
 - De vraag of een `…/get.php?username=…&password=…`-link een Xtream-bron moet worden, komt alleen bij een
   `http://`-link: de Xtream-client spreekt alleen gewoon HTTP, dus een `https://`-link zou een bron worden

@@ -1552,6 +1552,7 @@ impl TvApp {
                         };
                         self.set_toast(text);
                         // A channel of a list that dies before it shows a picture
+                        // (an error, or an end the reloads above did not get past)
                         // shows the empty state, not the picture of the channel
                         // before: that would look like this one, frozen. Once it
                         // has shown its own, that last frame stays, as on Xtream.
@@ -1560,10 +1561,7 @@ impl TvApp {
                         // Frames from now on still show, so a load that is on its
                         // way already does (as in `end_catchup_wait`).
                         let no_picture_yet = self.stream_starting_since.is_some();
-                        if reason == "error"
-                            && no_picture_yet
-                            && self.catalog.kind() == SourceKind::M3u
-                        {
+                        if no_picture_yet && self.catalog.kind() == SourceKind::M3u {
                             self.frame_fence.stop();
                             self.frame_fence.load(self.player.frames.version());
                             self.video_tex = None;
@@ -9815,6 +9813,34 @@ https://c.example/twee-nieuws.m3u8\n";
         h.frame(&[]);
         let video = h.app.video_tex.as_ref().expect("the next picture");
         assert_eq!(video.size(), [12, 6]);
+    }
+
+    #[tokio::test]
+    async fn an_m3u_channel_that_keeps_ending_before_its_first_picture_takes_the_one_before_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app_with_a_picture(dir.path());
+        h.press(&[Key::ArrowDown]);
+        assert!(
+            h.app.stream_starting_since.is_some(),
+            "no picture of its own"
+        );
+        let eof = || Event::EndOfFile {
+            reason: "eof".into(),
+        };
+        // The first ends are reloaded, as before; the picture stays meanwhile.
+        for _ in 0..3 {
+            h.events.send(eof()).unwrap();
+            h.frame(&[]);
+            assert!(h.app.video_tex.is_some(), "a reload keeps going");
+        }
+        assert_eq!(loads(h.sent()).len(), 4, "the zap and three reloads");
+        // The reloads are spent: this end is the channel's last.
+        h.events.send(eof()).unwrap();
+        h.frame(&[]);
+        assert!(h.app.video_tex.is_none(), "the picture goes at once");
+        the_old_picture_stays_away(&mut h);
+        let named = "stream error on Kanaal Twee - zap up or down to retry";
+        assert!(h.painted.iter().any(|t| t == named), "{:?}", h.painted);
     }
 
     #[tokio::test]
