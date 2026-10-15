@@ -71,15 +71,10 @@ fn a_channel_without_catch_up_is_no_column() {
 }
 
 /// An M3U list has no catch-up (`tv_archive` 0 on every entry), so it has no
-/// guide columns, however many entries share a name or a quality.
-/// `guide_channels_of` leaves such a list at once; it used to group the names of
-/// 11,000 entries to find nothing (about 6 ms in a release build, twice a start).
-///
-/// This pins the RESULT that early exit must not change, not the speed: it
-/// passed before the exit was there. It fails when a list without catch-up
-/// gets a column, e.g. from an exit that returns the entries. (Before the exit
-/// existed, `best(true).or_else(|| best(false))?` in the grouping failed it
-/// too; with the exit there, a list without catch-up never reaches that line.)
+/// guide columns, however many entries share a name or a quality, and the PIN
+/// changes nothing. This pins that result, which the early exit in
+/// `guide_channels_of` must not change; it fails when a list without catch-up
+/// gets a column, e.g. from an early exit that returns the entries.
 #[test]
 fn a_list_without_catch_up_has_no_guide_columns() {
     let (portal, catalog) = M3uPortal::from_text(

@@ -307,7 +307,7 @@ geheugenvoetafdruk vraagt een eigen aanpak.
 ## 10. Uitwerking in het bouwplan
 
 Het bouwplan (`docs/superpowers/plans/2026-10-14-m3u-bronnen.md`, "Rulings") legt vast wat dit ontwerp
-openliet. Kort:
+openliet. Kort, en waar deze sectie afwijkt van die Rulings, gaat deze sectie voor:
 
 - `o` werkt niet in het startscherm (typen mag nooit een sneltoets zijn). Daarom is de nieuwe regel een
   link naar Bronnen met een nieuwe M3U-lijst klaar.
@@ -333,8 +333,8 @@ openliet. Kort:
 - Logregels noemen een M3U-bron bij id en host, nooit bij adres.
 - De versie gaat in dit plan niet omhoog.
 
-Tijdens het bouwen kwamen er besluiten bij. Waar ze afwijken van de paragrafen hierboven (§3.4: "de laatste
-komma", §3.5: "een positieve i64"), gaan ze voor:
+Tijdens het bouwen kwamen er besluiten bij die de paragrafen hierboven aanvullen of corrigeren (§3.4: "de
+laatste komma"). Ze gaan voor:
 
 - De `stream_id` volgt uit de eerste 8 bytes van de SHA-256 van de sleutel (big-endian), één bit naar rechts
   geschoven (`>> 1`), zodat hij nooit negatief is. Opgeslagen favorieten en presets bevatten deze id's, dus
@@ -349,8 +349,8 @@ komma", §3.5: "een positieve i64"), gaan ze voor:
 - Een M3U-zender die mpv weigert, of die met een fout eindigt voordat hij een beeld heeft getoond, laat het
   scherm zwart (de lege toestand). Zo ook een zender die steeds eindigt (eof) voordat hij een beeld toont,
   zodra het automatisch herladen opgeeft; zolang dat herladen loopt, blijft alles zoals het was. Het beeld
-  van de zender ervoor blijft dus niet bevroren onder de nieuwe naam staan. Heeft de zender al gespeeld, dan blijft zijn eigen laatste beeld staan. Xtream houdt het
-  gedrag van 0.6.1.
+  van de zender ervoor blijft dus niet bevroren onder de nieuwe naam staan. Heeft de zender al gespeeld,
+  dan blijft zijn eigen laatste beeld staan. Xtream houdt het gedrag van 0.6.1.
 - De vraag of een `…/get.php?username=…&password=…`-link een Xtream-bron moet worden, komt alleen bij een
   `http://`-link: de Xtream-client spreekt alleen gewoon HTTP, dus een `https://`-link zou een bron worden
   die nooit verbindt. Een `https://`-link blijft een M3U-lijst, zonder vraag. De vraag hoort bij het adres:
@@ -382,3 +382,5 @@ komma", §3.5: "een positieve i64"), gaan ze voor:
   `o`, ↓, Enter zet de cursor in het veld Server (bij een lijst: Adres) van de bron in gebruik, zodat de
   Tab-tellingen naar Test en Opslaan gelijk blijven. Na een antwoord van de app (opslaan, wisselen,
   verwijderen) staat de cursor in de naam van het formulier dat dan verschijnt.
+- De tekstvelden houden hun cursor en hun ongedaan-maken-geschiedenis per formulier: Ctrl+Z in het
+  wachtwoord van de ene bron brengt nooit terug wat in die van een andere werd getypt.
