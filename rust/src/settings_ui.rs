@@ -126,8 +126,10 @@ fn overlay_layer() -> egui::LayerId {
     egui::LayerId::new(egui::Order::Foreground, egui::Id::new(AREA_ID))
 }
 
-/// What the user did in the overlay.
-#[derive(Debug, Clone, PartialEq)]
+/// What the user did in the overlay. `Debug` for the tests only: a PIN, a
+/// password or a source's address rides in some of them.
+#[derive(Clone, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
 pub enum SettingsAction {
     Close,
     SetLanguage(Lang),
@@ -478,8 +480,10 @@ fn absolute(path: String) -> String {
     std::path::absolute(&path).map_or(path, |p| p.to_string_lossy().into_owned())
 }
 
-/// The PIN dialog that is open in the adult section, with its fields.
-#[derive(Debug, Clone, Default)]
+/// The PIN dialog that is open in the adult section, with its fields. `Debug`
+/// for the tests only: it holds the PINs and the portal password as typed.
+#[derive(Clone, Default)]
+#[cfg_attr(test, derive(Debug))]
 enum AdultDialog {
     #[default]
     Idle,

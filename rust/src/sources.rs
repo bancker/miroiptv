@@ -59,7 +59,10 @@ impl SourceKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` for the tests only: it would print the address, a credential, so a
+/// `{:?}` of it in a log line or a toast does not build.
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 pub struct Source {
     pub id: SourceId,
     pub kind: SourceKind,
@@ -91,8 +94,10 @@ pub enum Editing {
     New,
 }
 
-/// What a Save in the settings' sources section hands the app.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a Save in the settings' sources section hands the app. `Debug` for the
+/// tests only, as for [`Source`].
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 pub struct SourceDraft {
     pub editing: Editing,
     pub kind: SourceKind,
@@ -103,7 +108,9 @@ pub struct SourceDraft {
 }
 
 /// Every saved source, in the order they were added, and the one in use.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// `Debug` for the tests only, as for [`Source`].
+#[derive(Clone, Default, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 pub struct Sources {
     list: Vec<Source>,
     active: Option<SourceId>,

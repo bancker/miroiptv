@@ -22,17 +22,40 @@ fn m3u(id: u32, name: &str, address: &str) -> Source {
     }
 }
 
+/// A source as a tuple, to compare and to print: outside the crate's own tests
+/// `Source` has no `Debug`, which would print its address.
+type Row<'a> = (u32, SourceKind, &'a str, &'a str);
+
+fn row(s: &Source) -> Row<'_> {
+    (s.id, s.kind, s.name.as_str(), s.address.as_str())
+}
+
+fn rows(list: &[Source]) -> Vec<Row<'_>> {
+    list.iter().map(row).collect()
+}
+
+/// What `Sources` holds: its sources and the one in use.
+fn content(s: &Sources) -> (Vec<Row<'_>>, Option<u32>) {
+    (rows(s.list()), s.active_id())
+}
+
 #[test]
 fn a_0_6_1_ini_is_one_xtream_source_in_use() {
     let s = Sources::parse("portal=u:p@h.example.com:80\n");
-    assert_eq!(s.list(), [xtream(1, "", "u:p@h.example.com:80")]);
+    assert_eq!(
+        rows(s.list()),
+        rows(&[xtream(1, "", "u:p@h.example.com:80")])
+    );
     assert_eq!(s.active_id(), Some(1));
 }
 
 #[test]
 fn a_bare_credentials_line_a_comment_and_a_bom_still_read() {
     let s = Sources::parse("\u{feff}# my portal\r\n; old\r\nu:pa=ss@h.example.com:80\r\n");
-    assert_eq!(s.list(), [xtream(1, "", "u:pa=ss@h.example.com:80")]);
+    assert_eq!(
+        rows(s.list()),
+        rows(&[xtream(1, "", "u:pa=ss@h.example.com:80")])
+    );
 }
 
 #[test]
@@ -54,14 +77,14 @@ fn sources_and_the_one_in_use_go_round() {
             "portal=u:p@h:80\nsource=1;xtream;;u:p@h:80\nsource=2;m3u;Gratis;{IPTV_ORG}\nactive=2\n"
         )
     );
-    assert_eq!(Sources::parse(&text), s);
+    assert_eq!(content(&Sources::parse(&text)), content(&s));
     assert_eq!(s.active().map(|a| a.name.as_str()), Some("Gratis"));
 }
 
 #[test]
 fn with_source_lines_the_portal_line_is_only_a_copy() {
     let s = Sources::parse("portal=old:p@h:80\nsource=1;xtream;;new:p@h:80\n");
-    assert_eq!(s.list(), [xtream(1, "", "new:p@h:80")]);
+    assert_eq!(rows(s.list()), rows(&[xtream(1, "", "new:p@h:80")]));
 }
 
 #[test]
@@ -88,7 +111,7 @@ fn the_portal_line_is_the_first_xtream_source_so_0_6_1_starts_on_it() {
         read_ini_creds(&ini).as_deref(),
         Some("u:p@portal.example:8080")
     );
-    assert_eq!(Sources::load(&ini), s);
+    assert_eq!(content(&Sources::load(&ini)), content(&s));
 }
 
 #[test]
@@ -111,7 +134,10 @@ fn broken_source_lines_are_skipped() {
          source=4;M3U;Goed;http://a.example/4\n\
          source=4;m3u;Dubbel;http://a.example/5\n",
     );
-    assert_eq!(s.list(), [m3u(4, "Goed", "http://a.example/4")]);
+    assert_eq!(
+        rows(s.list()),
+        rows(&[m3u(4, "Goed", "http://a.example/4")])
+    );
 }
 
 #[test]
@@ -132,7 +158,10 @@ fn keep_changes_a_saved_one_adds_a_new_one_and_numbers_from_the_highest() {
         ),
         2
     );
-    assert_eq!(s.get(2), Some(&m3u(2, "B2", "http://b.example/3")));
+    assert_eq!(
+        s.get(2).map(row),
+        Some(row(&m3u(2, "B2", "http://b.example/3")))
+    );
     // The command line's portal is the first Xtream source...
     assert_eq!(
         s.keep(Editing::CommandLine, SourceKind::Xtream, "", "x:y@h:81"),
@@ -156,7 +185,10 @@ fn names_lose_semicolons_and_line_breaks_addresses_their_spaces() {
         " A;B\r\nC ",
         " http://a.example/1 \n",
     );
-    assert_eq!(s.get(id), Some(&m3u(id, "A,BC", "http://a.example/1")));
+    assert_eq!(
+        s.get(id).map(row),
+        Some(row(&m3u(id, "A,BC", "http://a.example/1")))
+    );
 }
 
 #[test]
@@ -184,7 +216,7 @@ fn a_save_replaces_the_ini_and_leaves_no_temp_file() {
     let mut s = Sources::load(&ini);
     s.keep(Editing::New, SourceKind::M3u, "Gratis", IPTV_ORG);
     s.save(&ini).unwrap();
-    assert_eq!(Sources::load(&ini), s);
+    assert_eq!(content(&Sources::load(&ini)), content(&s));
     let files: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
