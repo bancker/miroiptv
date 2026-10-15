@@ -9890,6 +9890,26 @@ https://c.example/twee-nieuws.m3u8\n";
     }
 
     #[tokio::test]
+    async fn an_m3u_pick_that_never_played_takes_off_the_picture_of_one_that_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app_with_a_picture(dir.path());
+        // The channel on the screen showed its picture: its first frame came.
+        h.events.send(Event::PlaybackStarted).unwrap();
+        h.frame(&[]);
+        // The next one is a new pick that shows nothing, and its reloads fail.
+        h.press(&[Key::ArrowDown]);
+        let eof = || Event::EndOfFile {
+            reason: "eof".into(),
+        };
+        for _ in 0..4 {
+            h.events.send(eof()).unwrap();
+            h.frame(&[]);
+        }
+        assert!(h.app.video_tex.is_none(), "the picture goes at once");
+        the_old_picture_stays_away(&mut h);
+    }
+
+    #[tokio::test]
     async fn an_m3u_channel_that_showed_its_own_picture_keeps_its_last_frame_when_it_errors() {
         let dir = tempfile::tempdir().unwrap();
         let mut h = m3u_app_with_a_picture(dir.path());
