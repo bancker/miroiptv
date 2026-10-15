@@ -2,18 +2,20 @@
 //! failed before its first picture, and that another channel's picture then
 //! confirmed, is not marked at once: its address is asked once more. One GET
 //! with the channel's own headers, the status only, a short limit, and as mpv
-//! asks: header values as bytes. A dead answer (a status of 400 or more after
-//! redirects, no connection, no answer in time) marks it; a live one (2xx,
-//! 3xx) drops the suspicion, so a Wi-Fi drop of under two minutes marks no
-//! good channel. What it cannot find out is not marked either: no check, no
-//! mark. That is an address it cannot ask, and a certificate or TLS handshake
-//! it could not verify: the check verifies certificates (reqwest's default),
-//! a failure is no proof of a dead stream, so it marks nothing. The M3U
-//! maturity round turns verification on for mpv too. At most one check per
-//! channel and [`AT_ONCE`] at a time, on the app's tokio runtime; the answers
-//! wait in a slot the app drains once per frame. The app never asks the server
-//! of the stream that plays ([`same_server`]). An address never reaches a log
-//! line or a `Debug` print: a paid list's addresses hold credentials.
+//! asks: header values as bytes. Only proof of a dead stream marks it: a
+//! status of 400 or more after redirects, no connection, no answer in time. A
+//! live one (2xx, 3xx) drops the suspicion, so a Wi-Fi drop of under two
+//! minutes marks no good channel. What it cannot find out is not marked
+//! either (better a dead channel too many in the list than a good one lost):
+//! an address it cannot ask, a reply it cannot use (a redirect that never
+//! ends, an `ICY 200 OK`, a hang-up), and a certificate or TLS handshake it
+//! could not verify. The check verifies certificates (reqwest's default); a
+//! failure there is no proof of a dead stream. The M3U maturity round turns
+//! verification on for mpv too. At most one check per channel and [`AT_ONCE`]
+//! at a time, on the app's tokio runtime; the answers wait in a slot the app
+//! drains once per frame. The app never asks the server of the stream that
+//! plays ([`same_server`]). An address never reaches a log line or a `Debug`
+//! print: a paid list's addresses hold credentials.
 
 use parking_lot::Mutex;
 use reqwest::header::HeaderValue;
@@ -40,29 +42,42 @@ pub enum Answer {
     Answers(u16),
     /// A status of 400 or more after the redirects.
     Status(u16),
-    /// No connection: refused, reset, a name that does not resolve. (A failed
-    /// TLS handshake is [`Answer::Unchecked`], no connection failure.)
+    /// No connection: refused, reset while connecting, a name that does not
+    /// resolve. (A failed TLS handshake is [`Answer::Unchecked`], no connection
+    /// failure; a hang-up after the connection is [`Answer::Failed`].)
     ConnectFailed,
     /// No headers within [`CHECK_TIMEOUT`].
     TimedOut,
-    /// The request failed otherwise (an address it cannot send).
+    /// A reply it could not use: a redirect that never ends, an answer that is
+    /// no HTTP it reads (Shoutcast's `ICY 200 OK`), a hang-up before any
+    /// reply. Not found out, so no mark: the server did answer, or may have,
+    /// and what the check cannot read is no proof of a dead stream.
     Failed,
-    /// Not found out, so no mark then (spec §4.2): no http(s) address, or no
-    /// HTTP client; a header value that cannot be sent (a control character);
-    /// or a certificate or TLS handshake it could not verify.
+    /// Not asked, or not found out, so no mark then (spec §4.2): no http(s)
+    /// address, or no HTTP client; an address it cannot build a request for (a
+    /// bad host or port) or a redirect to one that is no http(s); a header
+    /// value that cannot be sent (a control character); or a certificate or
+    /// TLS handshake it could not verify.
     Unchecked,
 }
 
 impl Answer {
-    /// Whether the channel gets the mark: not when it answers again, and not
-    /// when it was not asked.
+    /// Whether the channel gets the mark: only on proof that its stream is
+    /// dead (a status of 400 or more, no connection, no answer in time). Not
+    /// when it answers again, and not when the check could not find out
+    /// ([`Answer::Failed`], [`Answer::Unchecked`]): better a dead channel too
+    /// many in the list than a good one lost (spec §4.2).
     pub fn is_dead(self) -> bool {
-        !matches!(self, Answer::Answers(_) | Answer::Unchecked)
+        matches!(
+            self,
+            Answer::Status(_) | Answer::ConnectFailed | Answer::TimedOut
+        )
     }
 
     /// What the log says of it, never the address: "http 404", "connect
-    /// failed", "timeout". `Unchecked` names both of its causes, as one answer
-    /// cannot tell them apart.
+    /// failed", "timeout". `Unchecked` names both kinds of its causes (an
+    /// address it cannot ask, a certificate it could not verify), as one
+    /// answer cannot tell them apart.
     pub fn kind(self) -> String {
         match self {
             Answer::Answers(status) | Answer::Status(status) => format!("http {status}"),
@@ -135,19 +150,22 @@ impl StreamChecker {
     /// Asks the address of `check` once, in the background: now when fewer
     /// than [`AT_ONCE`] run, else when a place frees. Not a second time while
     /// a check of that channel runs or waits.
+    ///
+    /// Needs a tokio runtime context, as it spawns the check: the app's main
+    /// thread holds `rt.enter()` (`main.rs`), and a headless test enters one.
     pub fn start(&mut self, check: Check) {
         if self.checking(check.stream_id) {
             return;
         }
-        if self.in_flight.len() < AT_ONCE {
-            self.launch(check);
-        } else {
-            self.waiting.push_back(check);
-        }
+        self.waiting.push_back(check);
+        self.fill();
     }
 
     /// The answers that came since the last call, of the checks not dropped
     /// since; their places go to checks that wait. Once per frame.
+    ///
+    /// Needs a tokio runtime context, as it spawns the checks that wait (see
+    /// [`StreamChecker::start`]).
     pub fn drain(&mut self) -> Vec<Checked> {
         let arrived = std::mem::take(&mut *self.done.lock());
         let mut answers = Vec::new();
@@ -161,22 +179,22 @@ impl StreamChecker {
                 answers.push(checked);
             }
         }
-        while self.in_flight.len() < AT_ONCE {
-            let Some(next) = self.waiting.pop_front() else {
-                break;
-            };
-            self.launch(next);
-        }
+        self.fill();
         answers
     }
 
     /// Drops channel `stream_id`'s check: it showed a picture, and its answer
-    /// means nothing now.
+    /// means nothing now. A place it held goes to the check that waits at
+    /// once.
+    ///
+    /// Needs a tokio runtime context, as it may spawn that check (see
+    /// [`StreamChecker::start`]).
     pub fn forget(&mut self, stream_id: i64) {
         if let Some((_, task)) = self.in_flight.remove(&stream_id) {
             task.abort();
         }
         self.waiting.retain(|c| c.stream_id != stream_id);
+        self.fill();
     }
 
     /// Drops every check: another source is in use, and their answers are
@@ -197,6 +215,18 @@ impl StreamChecker {
     /// Checks on their way, not counting the ones that wait.
     pub fn in_flight(&self) -> usize {
         self.in_flight.len()
+    }
+
+    /// Starts the checks that wait while a place is free, so between two calls
+    /// no check waits while a place is free, and the checks go in the order
+    /// they were started.
+    fn fill(&mut self) {
+        while self.in_flight.len() < AT_ONCE {
+            let Some(next) = self.waiting.pop_front() else {
+                break;
+            };
+            self.launch(next);
+        }
     }
 
     fn launch(&mut self, check: Check) {
@@ -245,14 +275,24 @@ impl StreamChecker {
 /// followed, and no `Referer` of its own on a redirect (that would hand a
 /// tokenized address on to another server). It verifies certificates
 /// (reqwest's default). A failure is no proof of a dead stream, so it marks
-/// nothing ([`Answer::Unchecked`]). The M3U maturity round turns verification
-/// on for mpv too.
+/// nothing ([`Answer::Unchecked`]).
 pub fn http_client() -> reqwest::Result<reqwest::Client> {
+    client_with(CHECK_TIMEOUT)
+}
+
+/// [`http_client`] with a wait of `limit` for the connection and the headers:
+/// a test makes it short.
+fn client_with(limit: Duration) -> reqwest::Result<reqwest::Client> {
+    builder(limit).build()
+}
+
+/// The check's client builder. Apart so that a test can read its two limits
+/// off it: reqwest has no getter for them, but its `Debug` output names them.
+fn builder(limit: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
-        .connect_timeout(CHECK_TIMEOUT)
-        .timeout(CHECK_TIMEOUT)
+        .connect_timeout(limit)
+        .timeout(limit)
         .referer(false)
-        .build()
 }
 
 /// Asks `url` once, with the headers its `|…` suffix names
@@ -290,15 +330,20 @@ pub async fn ask(client: &reqwest::Client, url: &str) -> Answer {
     }
 }
 
-/// What a request that failed answers. No headers in time is `TimedOut`. A
-/// certificate or TLS handshake it could not verify is no proof of a dead
-/// stream (mpv does not verify certificates yet), so `Unchecked`; that holds
-/// for a TLS error after the handshake too. Without a connection otherwise it
-/// is `ConnectFailed` (refused, reset, a name that does not resolve), and any
-/// other failure is `Failed`.
+/// What a request that failed answers. No headers in time is `TimedOut`. An
+/// address it could not build the request for (a bad host or port) or a
+/// redirect to one that is no http(s) (reqwest's "builder" errors) was not
+/// asked: `Unchecked`. So is a certificate or TLS handshake it could not
+/// verify, which is no proof of a dead stream; that holds for a TLS error
+/// after the handshake too. Without a connection otherwise it is
+/// `ConnectFailed` (refused, reset, a name that does not resolve), and any
+/// other failure is `Failed`: a redirect that never ends, a reply that is no
+/// HTTP it reads, a hang-up before any reply.
 fn answer_of_error(err: &reqwest::Error) -> Answer {
     if err.is_timeout() {
         Answer::TimedOut
+    } else if err.is_builder() {
+        Answer::Unchecked
     } else {
         answer_of_failure(err, err.is_connect())
     }
@@ -461,5 +506,107 @@ mod tests {
         // stream either.
         let alert = Link::ending_in(ErrorKind::InvalidData, "received fatal alert");
         assert_eq!(answer_of_failure(&alert, false), Answer::Unchecked);
+    }
+
+    /// A server that answers every request with `status`, after `delay`.
+    async fn answering(status: u16, delay: Duration) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(status).set_delay(delay))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn check(stream_id: i64, url: String) -> Check {
+        Check {
+            stream_id,
+            name: format!("K{stream_id}"),
+            failed_unix: 0,
+            url,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_in_the_slot_of_a_forgotten_check_never_lands() {
+        // The one case the ticket decides, and aborting the task cannot: the
+        // first check's answer is in the slot when its channel is forgotten and
+        // started again, so the stale answer is there to be taken for the
+        // second check's.
+        let first = answering(200, Duration::ZERO).await;
+        let second = answering(404, Duration::from_millis(300)).await;
+        let mut checker = StreamChecker::new();
+        checker.start(check(1, format!("{}/1", first.uri())));
+        // Wait until its answer is in the slot, without draining it.
+        for _ in 0..1000 {
+            if !checker.done.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            checker.done.lock().len(),
+            1,
+            "the first answer is in the slot"
+        );
+        checker.forget(1);
+        checker.start(check(1, format!("{}/1", second.uri())));
+        assert!(
+            checker.drain().is_empty(),
+            "the answer of the forgotten check landed"
+        );
+        assert!(checker.checking(1), "the second check is still on its way");
+        // Its own answer follows.
+        let mut got = Vec::new();
+        for _ in 0..1000 {
+            got.extend(checker.drain());
+            if !got.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].answer, Answer::Status(404));
+        assert_eq!(checker.in_flight(), 0);
+    }
+
+    // ---- the 5 s limit is the real client's ----
+
+    #[test]
+    fn the_client_waits_check_timeout_for_the_connection_and_for_the_headers() {
+        // reqwest has no getter for its limits, but its Debug output names
+        // them: both calls must be there, with the limit that was handed in.
+        let limit = format!("{CHECK_TIMEOUT:?}");
+        let pretty = format!("{:#?}", builder(CHECK_TIMEOUT));
+        for name in ["connect_timeout", "timeout"] {
+            let field = format!("{name}: {limit},");
+            assert!(
+                pretty.lines().any(|l| l.trim() == field),
+                "{field}\n{pretty}"
+            );
+        }
+        // And http_client() is that client.
+        let built = builder(CHECK_TIMEOUT).build().unwrap();
+        assert_eq!(
+            format!("{:?}", http_client().unwrap()),
+            format!("{built:?}")
+        );
+    }
+
+    #[tokio::test]
+    async fn no_headers_within_the_clients_limit_is_a_timeout() {
+        let server = answering(200, Duration::from_secs(3)).await;
+        // The check's client waits CHECK_TIMEOUT (5 s); this one, made the same
+        // way, 200 ms.
+        let client = client_with(Duration::from_millis(200)).unwrap();
+        let started = std::time::Instant::now();
+        let answer = ask(&client, &format!("{}/slow", server.uri())).await;
+        assert_eq!(answer, Answer::TimedOut);
+        assert!(answer.is_dead());
+        assert_eq!(answer.kind(), "timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the limit did not end the wait"
+        );
     }
 }
