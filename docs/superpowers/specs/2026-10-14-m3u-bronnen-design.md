@@ -374,7 +374,9 @@ komma", §3.5: "een positieve i64"), gaan ze voor:
 - Het pad van een lokaal bestand is geen inlogkenmerk: de lege toestand en het log mogen het noemen.
 - Het resultaat van een verbindingstest of van een Opslaan staat alleen onder het formulier dat erom vroeg.
   Komt de uitslag van een Opslaan nadat de gebruiker naar een ander formulier is gegaan, dan blijft dat
-  formulier staan en is de bron toch bewaard.
+  formulier staan en is de bron toch bewaard. Mislukt dat Opslaan terwijl het formulier niet meer te zien
+  is (een ander formulier, of de instellingen dicht), dan zegt een toast het, zoals een toast een gelukt
+  Opslaan meldt.
 - Bronnen houdt de plek van het oude Portaal (tweede in de lijst). Een uitgeschakelde knop is geen Tab-stop.
   `o`, ↓, Enter zet de cursor in het veld Server (bij een lijst: Adres) van de bron in gebruik, zodat de
   Tab-tellingen naar Test en Opslaan gelijk blijven. Na een antwoord van de app (opslaan, wisselen,

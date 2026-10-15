@@ -623,6 +623,18 @@ impl SettingsUi {
         }
     }
 
+    /// Whether the verdict of a connection test shows: the sources section is
+    /// on show, with the Xtream form that asked for the test (`owns_verdict`),
+    /// no problem of its own in the verdict's place, and no other form on its
+    /// way. The app says in a toast what does not show.
+    pub fn shows_verdict(&self) -> bool {
+        Section::ALL[self.section] == Section::Sources
+            && self.show_next.is_none()
+            && self.sources.as_ref().is_some_and(|form| {
+                form.kind == SourceKind::Xtream && form.owns_verdict && form.problem.is_none()
+            })
+    }
+
     /// Whether the keyboard goes to the name of the form of `editing` when it
     /// is shown: the user is in the sources section, and the form starts with a
     /// name (a new source starts with its kind).

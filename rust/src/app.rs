@@ -2549,6 +2549,7 @@ impl TvApp {
             return;
         };
         tracing::info!("settings: connection check {:?}", check);
+        let saving = keep.is_some();
         self.conn_state = match (check, keep) {
             (check @ ConnCheck::Ok { .. }, Some(keep)) => match self.keep_xtream(keep) {
                 Ok(()) => ConnState::Done(check),
@@ -2556,6 +2557,29 @@ impl TvApp {
             },
             (check, _) => ConnState::Done(check),
         };
+        // A Save whose login failed while its form is no longer on show (the
+        // user went to another one, or closed the settings): a toast says so,
+        // as one says that a Save went through.
+        let login_failed =
+            matches!(&self.conn_state, ConnState::Done(c) if !matches!(c, ConnCheck::Ok { .. }));
+        if saving && login_failed && !self.verdict_on_show() {
+            if let Some(text) = crate::settings_ui::conn_text(self.lang, &self.conn_state) {
+                self.set_toast(text);
+            }
+        }
+    }
+
+    /// Whether the verdict of a connection test shows: under the setup
+    /// prompt's button, which shows it whenever the prompt is drawn, or under
+    /// the form in the settings that asked for the test.
+    fn verdict_on_show(&self) -> bool {
+        match &self.settings_ui {
+            Some(settings) => settings.shows_verdict(),
+            None => matches!(
+                self.portal_state,
+                PortalState::Missing | PortalState::Placeholder
+            ),
+        }
     }
 
     /// What the last fetch of the M3U list has to tell, as a toast: it was not
@@ -11638,6 +11662,33 @@ https://c.example/twee-nieuws.m3u8\n";
         let shown = h.app.settings_ui.as_ref().unwrap().form_address();
         assert_eq!(shown, Some((SourceKind::Xtream, "h:80".to_owned())));
         assert!(!says(&h), "{:?}", h.painted);
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_whose_form_is_no_longer_on_show_says_so_in_a_toast() {
+        let failure = "Wrong username or password";
+        let server = portal_answering(401).await;
+        let port = server.address().port();
+        // Where the user is when the answer comes: under the form that asked,
+        // in another form, or out of the settings.
+        for moved in ["stays", "another form", "settings closed"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut h = portal_and_list(dir.path());
+            save_a_new_portal(&mut h, port);
+            match moved {
+                "another form" => {
+                    // Shift+Tab from nowhere goes to the last stop, New source.
+                    press_shift_tab(&mut h);
+                    h.press(&[Key::Enter]);
+                }
+                "settings closed" => h.press(&[Key::Escape, Key::Escape]),
+                _ => {}
+            }
+            take_in_the_login(&mut h, dir.path()).await;
+            assert_eq!(h.app.conn_state, ConnState::Done(ConnCheck::BadLogin));
+            let toasted = toast_text(&h) == failure;
+            assert_eq!(toasted, moved != "stays", "{moved}: {}", toast_text(&h));
+        }
     }
 
     #[tokio::test]
