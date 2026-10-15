@@ -214,12 +214,13 @@ fn redact_path(s: &str, kind: &str) -> String {
 /// In `tail`, the place of the '/' that closes a `<user>/<pass>` at its start:
 /// the second '/'. The closing slashes are looked for in the rest of the line,
 /// not only up to the first space or quote: the stream URLs hold the raw user
-/// name and password, which may contain either.
+/// name and password, which may contain either. The slashes are found first,
+/// and only the text up to them is checked for a line break: looking for the
+/// end of the line first would read the rest of it for every URL in it.
 fn credentials_end(tail: &str) -> Option<usize> {
-    let end_of_line = tail.find(['\n', '\r']).unwrap_or(tail.len());
-    let line = &tail[..end_of_line];
-    line.find('/')
-        .and_then(|a| line[a + 1..].find('/').map(|b| a + 1 + b))
+    let a = tail.find('/')?;
+    let b = a + 1 + tail[a + 1..].find('/')?;
+    (!tail[..b].contains(['\n', '\r'])).then_some(b)
 }
 
 /// `key<value>` → `key<mask>`; the value ends at '&', whitespace, a quote or
@@ -641,6 +642,15 @@ mod tests {
         ] {
             assert_eq!(redact(line), want, "{line}");
         }
+    }
+
+    // Every `://` looks for the slashes after it. Looking for the end of the
+    // line first, as it once did, read the rest of the line from each one: a
+    // line of nothing but `://` took a second on the mpv thread's log path.
+    #[test]
+    fn a_long_line_of_url_marks_is_masked_in_one_pass() {
+        let line = "://".repeat(64 * 1024 / 3);
+        assert_eq!(redact(&line), line.as_str());
     }
 
     // The logger redacts a text that an error type has redacted already.
