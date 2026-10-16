@@ -209,31 +209,83 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     compare_folded(&sort_key(a), &sort_key(b))
 }
 
-/// A name as a sort key: lower case, and a Latin-1 letter with an accent as its
-/// plain letter ("een" for "Één", "o1" for "Ö1"), so it sorts where a Dutch
-/// reader looks for it and not after the z. An accent written as a mark of its
-/// own (an "e" and U+0301) goes. A name in plain ASCII, nearly every name, is
-/// only lower-cased, with one allocation.
+/// A name as a sort key: lower case, and every letter of Latin-1 and of Latin
+/// Extended-A as the plain letter or letters it is read as ("een" for "Één",
+/// "o1" for "Ö1", "sok" for "Şok", "lodz" for "Łódź", "strasse" for "Straße"),
+/// so it sorts where a Dutch, Turkish, Polish, Czech or Nordic reader looks for
+/// it and not after the z. A ligature, or a letter the plain alphabet writes
+/// with two, is spelled out (ß ss, æ ae, œ oe, ĳ ij, þ th); ð is a d. An accent
+/// written as a mark of its own (an "e" and U+0301) goes. A name in plain ASCII,
+/// nearly every name, is only lower-cased, with one allocation.
 fn sort_key(name: &str) -> String {
     if name.is_ascii() {
         return name.to_ascii_lowercase();
     }
     let mut key = String::with_capacity(name.len());
-    for c in name.chars().flat_map(char::to_lowercase) {
-        match c {
-            '\u{300}'..='\u{36f}' => {}
-            'à'..='å' => key.push('a'),
-            'ç' => key.push('c'),
-            'è'..='ë' => key.push('e'),
-            'ì'..='ï' => key.push('i'),
-            'ñ' => key.push('n'),
-            'ò'..='ö' | 'ø' => key.push('o'),
-            'ù'..='ü' => key.push('u'),
-            'ý' | 'ÿ' => key.push('y'),
-            c => key.push(c),
+    for c in name.chars() {
+        // The ASCII letters of a name that has others need no table.
+        if c.is_ascii() {
+            key.push(c.to_ascii_lowercase());
+            continue;
+        }
+        for lower in c.to_lowercase() {
+            match plain_letters(lower) {
+                Some(plain) => key.push_str(plain),
+                None => key.push(lower),
+            }
         }
     }
     key
+}
+
+/// The plain letters a lower-case character is read as, or `None` when it is
+/// read as itself: a letter of Latin-1 or of Latin Extended-A without its
+/// accent, spelled out where the plain alphabet writes it with two (ß ss, æ ae,
+/// œ oe, ĳ ij, þ th), ð as d, and nothing for an accent written as a mark of its
+/// own. The Latin Extended-A ranges take both cases of a letter at a time, so
+/// that each can be read against the Unicode chart.
+fn plain_letters(c: char) -> Option<&'static str> {
+    Some(match c {
+        // An accent written as a mark of its own.
+        '\u{300}'..='\u{36f}' => "",
+        // Latin-1.
+        'à'..='å' => "a",
+        'æ' => "ae",
+        'ç' => "c",
+        'è'..='ë' => "e",
+        'ì'..='ï' => "i",
+        'ð' => "d",
+        'ñ' => "n",
+        'ò'..='ö' | 'ø' => "o",
+        'ù'..='ü' => "u",
+        'ý' | 'ÿ' => "y",
+        'þ' => "th",
+        'ß' => "ss",
+        // Latin Extended-A (U+0100 to U+017F), a letter in both cases at a
+        // time: Ā ā Ă ă Ą ą are an a, Ć ć Ĉ ĉ Ċ ċ Č č a c, and so on.
+        '\u{100}'..='\u{105}' => "a",
+        '\u{106}'..='\u{10d}' => "c",
+        '\u{10e}'..='\u{111}' => "d",
+        '\u{112}'..='\u{11b}' => "e",
+        '\u{11c}'..='\u{123}' => "g",
+        '\u{124}'..='\u{127}' => "h",
+        '\u{128}'..='\u{131}' => "i", // İ and the dotless ı too
+        '\u{132}'..='\u{133}' => "ij",
+        '\u{134}'..='\u{135}' => "j",
+        '\u{136}'..='\u{138}' => "k", // the kra ĸ too
+        '\u{139}'..='\u{142}' => "l",
+        '\u{143}'..='\u{14b}' => "n", // ŉ and Ŋ ŋ too
+        '\u{14c}'..='\u{151}' => "o",
+        '\u{152}'..='\u{153}' => "oe",
+        '\u{154}'..='\u{159}' => "r",
+        '\u{15a}'..='\u{161}' | '\u{17f}' => "s", // the long ſ too
+        '\u{162}'..='\u{167}' => "t",
+        '\u{168}'..='\u{173}' => "u",
+        '\u{174}'..='\u{175}' => "w",
+        '\u{176}'..='\u{178}' => "y",
+        '\u{179}'..='\u{17e}' => "z",
+        _ => return None,
+    })
 }
 
 /// [`natural_cmp`] of texts as [`sort_key`] made them. Bytewise, which for UTF-8

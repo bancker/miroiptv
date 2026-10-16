@@ -593,3 +593,151 @@ fn a_list_without_channels_is_one_empty_all_group_and_nothing_moves() {
     );
     assert_eq!(summary(&hidden), ["ALL 0"]);
 }
+
+// ---- fix round 1b: the letters of Latin Extended-A, and the ligatures ----
+
+/// Every letter of Latin Extended-A (U+0100 to U+017F), in both cases, sorts as
+/// the plain letter or letters it is read as: Turkish, Polish, Czech, Hungarian,
+/// Nordic and Baltic names find their place among the plain ones.
+#[test]
+fn every_letter_of_latin_extended_a_sorts_as_its_plain_letters() {
+    const LETTERS: [(&str, &str); 21] = [
+        ("a", "ĀāĂăĄą"),
+        ("c", "ĆćĈĉĊċČč"),
+        ("d", "ĎďĐđ"),
+        ("e", "ĒēĔĕĖėĘęĚě"),
+        ("g", "ĜĝĞğĠġĢģ"),
+        ("h", "ĤĥĦħ"),
+        ("i", "ĨĩĪīĬĭĮįİı"),
+        ("ij", "Ĳĳ"),
+        ("j", "Ĵĵ"),
+        ("k", "Ķķĸ"),
+        ("l", "ĹĺĻļĽľĿŀŁł"),
+        ("n", "ŃńŅņŇňŉŊŋ"),
+        ("o", "ŌōŎŏŐő"),
+        ("oe", "Œœ"),
+        ("r", "ŔŕŖŗŘř"),
+        ("s", "ŚśŜŝŞşŠšſ"),
+        ("t", "ŢţŤťŦŧ"),
+        ("u", "ŨũŪūŬŭŮůŰűŲų"),
+        ("w", "Ŵŵ"),
+        ("y", "ŶŷŸ"),
+        ("z", "ŹźŻżŽž"),
+    ];
+    // The table holds the whole block, each letter once.
+    let mut block: Vec<char> = LETTERS
+        .iter()
+        .flat_map(|(_, letters)| letters.chars())
+        .collect();
+    block.sort_unstable();
+    assert_eq!(block, ('\u{100}'..='\u{17f}').collect::<Vec<char>>());
+    for (plain, letters) in LETTERS {
+        for c in letters.chars() {
+            assert_eq!(
+                natural_cmp(&format!("{c}!"), &format!("{plain}!")),
+                Ordering::Equal,
+                "{c} (U+{:04X})",
+                c as u32
+            );
+        }
+    }
+}
+
+/// A letter that is two letters, or another one, in the plain alphabet sorts as
+/// those: ß as ss, æ as ae, œ as oe, ĳ as ij, þ as th, ð as d. Numbers still go
+/// by their value.
+#[test]
+fn ligatures_and_nordic_letters_sort_as_the_letters_they_are_written_with() {
+    for (written, plain) in [
+        ("Straße 1", "Strasse 1"),
+        ("STRAẞE 1", "strasse 1"),
+        ("Ægir TV", "Aegir TV"),
+        ("Þáttur", "Thattur"),
+        ("Ðorgi", "Dorgi"),
+        ("Øresund TV", "Oresund TV"),
+        ("Œuvre", "Oeuvre"),
+        ("Ĳssel TV", "IJssel TV"),
+    ] {
+        assert_eq!(natural_cmp(written, plain), Ordering::Equal, "{written}");
+    }
+    assert_eq!(
+        natural_cmp("Straße 2", "Strasse 10"),
+        Ordering::Less,
+        "numbers by value"
+    );
+    // Sorted with their plain letter, so all of them before "Zender 1".
+    for (written, plain) in [
+        ("Şok TV", "Sok TV"),
+        ("Łódź TV", "Lodz TV"),
+        ("Šport", "Sport"),
+        ("Straße 1", "Strasse 1"),
+    ] {
+        assert_eq!(natural_cmp(written, plain), Ordering::Equal, "{written}");
+        assert_eq!(
+            natural_cmp(written, "Zender 1"),
+            Ordering::Less,
+            "{written}"
+        );
+    }
+}
+
+/// A name in another script is only lower-cased: its letters go by their code
+/// points, after the Latin ones.
+#[test]
+fn other_scripts_are_only_lower_cased() {
+    assert_eq!(natural_cmp("Первый Канал", "первый канал"), Ordering::Equal);
+    assert_eq!(natural_cmp("ΑΛΦΑ", "αλφα"), Ordering::Equal);
+    assert_eq!(natural_cmp("Аист", "Бобёр"), Ordering::Less);
+    assert_eq!(natural_cmp("Zender 1", "Первый"), Ordering::Less);
+}
+
+/// A list with Turkish, Polish, Czech, Hungarian, German, Icelandic and Nordic
+/// names, in the order its reader looks for a channel in.
+#[test]
+fn a_list_of_many_languages_is_in_the_order_its_reader_looks_for_a_channel() {
+    let unsorted = [
+        "Žižkov TV",
+        "Zender 1",
+        "Ülke TV",
+        "Þáttur",
+        "Straße 1",
+        "Sport 1",
+        "Šport",
+        "Şok TV",
+        "Őrség TV",
+        "Øresund TV",
+        "Łódź TV",
+        "Işık TV",
+        "Česká TV",
+        "Canvas",
+        "Ålesund TV",
+        "Ægir TV",
+    ];
+    let live = unsorted
+        .iter()
+        .zip(1..)
+        .map(|(name, id)| ch(id, name, None))
+        .collect();
+    let g = build(live, &[], &[]);
+    assert_eq!(
+        names(&g, 0),
+        [
+            "Ægir TV",
+            "Ålesund TV",
+            "Canvas",
+            "Česká TV",
+            "Işık TV",
+            "Łódź TV",
+            "Øresund TV",
+            "Őrség TV",
+            "Şok TV",
+            "Šport",
+            "Sport 1",
+            "Straße 1",
+            "Þáttur",
+            "Ülke TV",
+            "Zender 1",
+            "Žižkov TV"
+        ]
+    );
+}
