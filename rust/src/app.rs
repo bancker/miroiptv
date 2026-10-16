@@ -178,6 +178,16 @@ fn preset_target(presets: &Presets, digit: u8, catalog: &CatalogStore) -> Option
         .map(|p| p.stream_id)
 }
 
+/// What the empty screen says once the catalog has loaded: the keys to start
+/// with, `g` among them.
+fn loaded_hint(kind: SourceKind) -> T {
+    match kind {
+        SourceKind::Xtream => T::CatalogLoadedHint,
+        // `g` opens the channel list there.
+        SourceKind::M3u => T::CatalogLoadedHintM3u,
+    }
+}
+
 /// Writes the guide's cache file and says so in the log. Whether it was written.
 fn write_epg_cache(path: &std::path::Path, channels: &[crate::guide::cache::ToSave]) -> bool {
     match crate::guide::cache::save(path, channels, chrono::Utc::now()) {
@@ -830,6 +840,22 @@ fn spend_key_repeats(ctx: &egui::Context, key: Key) {
             _ => true,
         })
     });
+}
+
+/// Whether `key` was pressed in this frame and not as a held key's repeat:
+/// what `key_pressed` says, minus the repeats it counts too.
+fn fresh_press(i: &egui::InputState, key: Key) -> bool {
+    i.events.iter().any(|e| {
+        matches!(
+            e,
+            egui::Event::Key {
+                key: pressed_key,
+                pressed: true,
+                repeat: false,
+                ..
+            } if *pressed_key == key
+        )
+    })
 }
 
 /// The translated text for a credentials error.
@@ -1613,8 +1639,11 @@ impl TvApp {
                         // (`plays`), so a flip back to it loads it again; the stall
                         // watchdog stays armed for a flip that is dropped without a
                         // load. A start that ended without a picture is a failed
-                        // start all the same (spec §4.1).
+                        // start all the same (spec §4.1), and takes the picture of
+                        // the channel before it off at once: the flip may yet be
+                        // dropped. Before `note_start_failure`, which ends the start.
                         self.ended = true;
+                        self.drop_the_picture_before_it();
                         self.note_start_failure();
                         continue;
                     }
@@ -1663,25 +1692,8 @@ impl TvApp {
                             None => self.t(T::StreamErrorRetry).to_owned(),
                         };
                         self.set_toast(text);
-                        // A channel of a list that dies before it shows a picture
-                        // (an error, or an end the reloads above did not get past)
-                        // shows the empty state, not the picture of the channel
-                        // before: that would look like this one, frozen. Once it
-                        // has shown its own, that last frame stays, as on Xtream,
-                        // also when its reloads fail. "Before a picture" is
-                        // `stream_starting_since`, which every load sets and the
-                        // first `PlaybackStarted` clears, while the channel has not
-                        // played since it was picked (`current_has_played`; a
-                        // reload sets `stream_starting_since` again). Frames from
-                        // now on still show, so a load that is on its way already
-                        // does (as in `end_catchup_wait`).
-                        let no_picture_yet =
-                            self.stream_starting_since.is_some() && !self.current_has_played;
-                        if no_picture_yet && self.catalog.kind() == SourceKind::M3u {
-                            self.frame_fence.stop();
-                            self.frame_fence.load(self.player.frames.version());
-                            self.video_tex = None;
-                        }
+                        // An error, or an end the reloads above did not get past.
+                        self.drop_the_picture_before_it();
                         // A start that ended without a picture: a suspect (spec §4.1).
                         self.note_start_failure();
                     } else {
@@ -1731,6 +1743,26 @@ impl TvApp {
                     }
                 }
             }
+        }
+    }
+
+    /// A channel of a list that ends before it shows a picture shows the empty
+    /// state, not the picture of the channel before: that would look like this
+    /// one, frozen. Once it has shown its own, that last frame stays, as on
+    /// Xtream, also when its reloads fail. "Before a picture" is
+    /// `stream_starting_since`, which every load sets and the first
+    /// `PlaybackStarted` clears, while the channel has not played since it was
+    /// picked (`current_has_played`; a reload sets `stream_starting_since`
+    /// again). Frames from now on still show, so a load that is on its way
+    /// already does (as in `end_catchup_wait`). The `Event::EndOfFile` arm runs
+    /// it for an error, for the eof that ends the reloads, and for an eof while
+    /// the user flips on.
+    fn drop_the_picture_before_it(&mut self) {
+        let no_picture_yet = self.stream_starting_since.is_some() && !self.current_has_played;
+        if no_picture_yet && self.catalog.kind() == SourceKind::M3u {
+            self.frame_fence.stop();
+            self.frame_fence.load(self.player.frames.version());
+            self.video_tex = None;
         }
     }
 
@@ -2536,6 +2568,12 @@ impl TvApp {
         // must not appear beneath it (see close_panels_under_settings).
         if self.settings_ui.is_some() {
             tracing::info!("news picker: list dropped, the settings are open");
+            return;
+        }
+        // Nor over the channel list, which has the keyboard: no hotkey works
+        // while it is open, and the user has moved on.
+        if self.channel_list.is_some() {
+            tracing::info!("news picker: list dropped, the channel list is open");
             return;
         }
         if !keep_news_result(result.stamp, self.news_stamp()) {
@@ -3440,17 +3478,7 @@ impl TvApp {
                 i.key_pressed(Key::F5),
                 // Its first press only: a held g opens the guide or the channel
                 // list once (see `spend_key_repeats`).
-                i.events.iter().any(|e| {
-                    matches!(
-                        e,
-                        egui::Event::Key {
-                            key: Key::G,
-                            pressed: true,
-                            repeat: false,
-                            ..
-                        }
-                    )
-                }),
+                fresh_press(i, Key::G),
                 i.key_pressed(Key::T),
                 i.events
                     .iter()
@@ -4254,7 +4282,7 @@ impl TvApp {
                 }
                 CatalogStatus::Loaded => {
                     ui.label(
-                        egui::RichText::new(self.t(T::CatalogLoadedHint))
+                        egui::RichText::new(self.t(loaded_hint(self.catalog.kind())))
                             .color(Color32::from_white_alpha(140))
                             .size(18.0),
                     );
@@ -4888,7 +4916,8 @@ impl TvApp {
     /// The wait screen takes Esc and g only: the load stops and the guide comes
     /// back as it was left.
     fn handle_wait_keys(&mut self, ctx: &egui::Context) {
-        let (esc, g) = ctx.input(|i| (i.key_pressed(Key::Escape), i.key_pressed(Key::G)));
+        // A g held since the pick is no g: only a fresh press ends the wait.
+        let (esc, g) = ctx.input(|i| (i.key_pressed(Key::Escape), fresh_press(i, Key::G)));
         if esc || g {
             self.pending_catchup = None;
             self.stop_playback();
@@ -5547,6 +5576,17 @@ https://c.example/twee-nieuws.m3u8\n";
             key,
             physical_key: None,
             pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// A key let go, as egui gets it from the window.
+    fn key_release(key: Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         }
@@ -11674,16 +11714,11 @@ https://c.example/twee-nieuws.m3u8\n";
 #EXTINF:-1 group-title=\"Nieuws;Sport\",Kanaal C\nhttps://c.example/c.m3u8\n\
 #EXTINF:-1,Kanaal A\nhttps://a.example/a.m3u8\n";
 
-    /// `g` as a keyboard makes it (pressed, typed, let go: a held g's repeats
-    /// open nothing), and the frame after it drawn: egui keeps the list's new
-    /// area invisible in its first frame.
+    /// `g` as a keyboard makes it (`g_tapped`: a held g's repeats open nothing),
+    /// and the frame after it drawn: egui keeps the list's new area invisible in
+    /// its first frame.
     fn open_list(h: &mut Harness) {
-        h.frame_with(vec![
-            key_press(Key::G),
-            egui::Event::Text("g".into()),
-            key_release(Key::G),
-        ]);
-        h.frame(&[]);
+        g_tapped(h);
     }
 
     fn list(h: &Harness) -> &ChannelListView {
@@ -12079,17 +12114,6 @@ https://c.example/twee-nieuws.m3u8\n";
     }
 
     // ---- `g` on an Xtream portal: the guide on the channel that plays ----
-
-    /// A key let go, as egui gets it from the window.
-    fn key_release(key: Key) -> egui::Event {
-        egui::Event::Key {
-            key,
-            physical_key: None,
-            pressed: false,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        }
-    }
 
     /// `g` as a keyboard makes it, pressed and let go, and the frame after it.
     fn g_tapped(h: &mut Harness) {
@@ -12533,6 +12557,127 @@ https://c.example/twee-nieuws.m3u8\n";
         h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
         h.press(&[Key::ArrowDown]);
         assert_eq!(loads(h.sent()), [ring_url('c')]);
+    }
+
+    // ---- the channel list: fix round 1 ----
+
+    #[tokio::test]
+    async fn a_held_g_never_ends_a_catch_up_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        // TEST 03's catch-up twin has programmes, one of them over.
+        let now = chrono::Utc::now();
+        h.app
+            .epg_store
+            .insert(13, ChannelEpg::new(programmes_around(now), now));
+        // g, held: it opens the guide, and a programme is picked while it is down.
+        h.frame_with(g_held());
+        h.frame(&[]);
+        assert!(h.app.guide_open);
+        h.press(&[Key::ArrowUp, Key::Enter]);
+        assert!(h.app.pending_catchup.is_some(), "the wait screen");
+        h.sent();
+        for _ in 0..5 {
+            h.frame_with(g_held());
+        }
+        assert!(h.app.pending_catchup.is_some(), "the wait stays");
+        let stopped = h.sent().iter().any(|c| matches!(c, Cmd::Stop));
+        assert!(!stopped, "nothing is stopped");
+        assert!(!h.app.guide_open, "and the guide does not come back");
+        // Let go and pressed again: the wait ends, as ever.
+        h.frame_with(vec![key_release(Key::G)]);
+        h.frame_with(g_held());
+        assert!(h.app.pending_catchup.is_none());
+        assert!(h.sent().iter().any(|c| matches!(c, Cmd::Stop)));
+        assert!(h.app.guide_open, "the guide is back");
+    }
+
+    #[tokio::test]
+    async fn a_news_list_that_lands_while_the_channel_list_is_open_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), TEST_LIST);
+        // A rule that names a channel of the list.
+        h.app.settings.news_rules = Some(vec![news_rule("Kanaal Een")]);
+        h.press(&[Key::N]);
+        assert!(h.app.news_fetching, "the news is on its way");
+        // The list opens before the news is in: the fetch runs at the next await.
+        open_list(&mut h);
+        assert!(h.app.channel_list.is_some());
+        let log = LogCapture::start();
+        let slot = h.app.news_picker_slot.clone();
+        wait_until("the news list", || slot.lock().is_some()).await;
+        h.frame(&[]);
+        assert!(h.app.news_picker.is_none(), "no picker over the list");
+        assert!(h.app.channel_list.is_some(), "the list stays open");
+        assert!(!h.app.news_fetching, "n works again");
+        let text = log.text();
+        let said = "news picker: list dropped, the channel list is open";
+        assert!(text.contains(said), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_m3u_start_that_ends_while_a_flip_waits_takes_the_picture_before_it_off_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        // Kanaal A plays, with its picture on the screen.
+        h.app.zap_by_id(m3u_sid("Kanaal A"));
+        picture_comes(&mut h);
+        h.put_frame(4, 2);
+        h.frame(&[]);
+        assert!(h.app.video_tex.is_some(), "A's picture");
+        open_list(&mut h);
+        h.frame(&[Key::ArrowDown]); // B, at once
+        h.frame(&[Key::ArrowDown]); // on to C, which waits
+        assert!(h.app.zap_pacer.waiting().is_some());
+        // B ends before its first picture.
+        let ended = Event::EndOfFile {
+            reason: "eof".into(),
+        };
+        h.events.send(ended).unwrap();
+        h.frame(&[]);
+        assert!(h.app.video_tex.is_none(), "A's picture goes at once");
+        // The flip is dropped: nothing loads, and the screen stays black.
+        h.press(&[Key::Escape]);
+        assert!(h.app.channel_list.is_none());
+        the_old_picture_stays_away(&mut h);
+    }
+
+    #[tokio::test]
+    async fn an_xtream_stream_that_ends_while_a_flip_waits_keeps_its_picture() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(
+            dir.path(),
+            variants_catalog(),
+            PortalState::Configured,
+            None,
+        );
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        h.app.zap_by_id(3);
+        picture_comes(&mut h);
+        h.put_frame(4, 2);
+        h.frame(&[]);
+        h.frame(&[Key::ArrowDown]); // RTL 4, at once
+        h.frame(&[Key::ArrowDown]); // on to NOS, which waits
+        assert!(h.app.zap_pacer.waiting().is_some());
+        let ended = Event::EndOfFile {
+            reason: "eof".into(),
+        };
+        h.events.send(ended).unwrap();
+        h.frame(&[]);
+        assert!(h.app.video_tex.is_some(), "its frame is untouched");
+    }
+
+    #[test]
+    fn the_empty_screen_names_the_channel_list_on_an_m3u_source() {
+        assert_eq!(loaded_hint(SourceKind::M3u), T::CatalogLoadedHintM3u);
+        assert_eq!(loaded_hint(SourceKind::Xtream), T::CatalogLoadedHint);
+        // And it is what the empty screen of a list says.
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), TEST_LIST);
+        h.frame(&[]);
+        let hint = "catalog loaded  -  f = search, g = channel list, 0-9 = presets, o = settings";
+        assert!(h.painted.iter().any(|t| t == hint), "{:?}", h.painted);
     }
 
     // ---- the picture of the channel before ----

@@ -176,6 +176,7 @@ texts! {
     Connecting => ["verbinden...", "connecting...", "Verbindung wird hergestellt..."],
     FetchingCatalog => ["catalogus ophalen...", "fetching catalog...", "Katalog wird abgerufen..."],
     CatalogLoadedHint => ["catalogus geladen  -  f = zoeken, g = gids, 0-9 = sneltoetsen, o = instellingen", "catalog loaded  -  f = search, g = guide, 0-9 = presets, o = settings", "Katalog geladen  -  f = Suche, g = Programm, 0-9 = Senderspeicher, o = Einstellungen"],
+    CatalogLoadedHintM3u => ["catalogus geladen  -  f = zoeken, g = zenderlijst, 0-9 = sneltoetsen, o = instellingen", "catalog loaded  -  f = search, g = channel list, 0-9 = presets, o = settings", "Katalog geladen  -  f = Suche, g = Senderliste, 0-9 = Senderspeicher, o = Einstellungen"],
     PortalFetchFailed => ["portal ophalen mislukt", "portal fetch failed", "Portal-Abruf fehlgeschlagen"],
     PressF5 => ["druk F5 om opnieuw te proberen", "press F5 to retry", "F5 drücken für einen neuen Versuch"],
     EpgTitle => ["Gids", "Guide", "Programm"],
