@@ -79,8 +79,10 @@ pub fn pick_next(tracks: &[AudioTrack]) -> Pick {
 /// Whether `a` or `s` chose a track for the stream that plays. mpv keeps such
 /// a choice for every later file, so the load of another stream puts `aid` and
 /// `sid` back to `auto` first (`load` says so, once); a reload of the same
-/// stream keeps the choice.
-#[derive(Debug, Default)]
+/// stream keeps the choice. `Debug` for the tests only: it holds the URL of
+/// the last load, an Xtream account's in it.
+#[derive(Default)]
+#[cfg_attr(test, derive(Debug))]
 pub struct TrackChoice {
     chosen: bool,
     url: Option<String>,
