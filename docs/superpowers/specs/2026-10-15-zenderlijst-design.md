@@ -140,6 +140,10 @@ nog één keer op, op de achtergrond, voordat hij de markering krijgt:
 - Een status van 400 of hoger (na doorverwijzingen), geen verbinding of geen antwoord binnen de
   tijd: dan krijgt hij de markering. Een status 2xx of 3xx: de verdenking vervalt, er komt geen
   markering.
+  - *Aanvulling (2026-10-16, beslissing van de gebruiker):* 429, 503 en 509 tellen niet mee. Dat
+    zijn antwoorden van een drukke server ("probeer later"), geen bewijs van een dode stream. De
+    verdenking vervalt, er komt geen markering. Ook een https-server die tijdens de TLS-handshake
+    ophangt, markeert niets, net als een http-server die ophangt voor zijn antwoord.
 - Hooguit één controle per verdachte en hooguit vier tegelijk. Een zender die al gemarkeerd is en
   opnieuw faalt, krijgt zonder controle een nieuwe termijn. Een wissel van bron laat lopende
   controles vervallen. Alleen bij M3U-bronnen.
