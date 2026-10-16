@@ -667,3 +667,19 @@ fn a_number_in_brackets_in_a_categorys_name_is_a_label_not_a_year() {
     assert!(category_labels("Films (2160)").has(Labels::UHD));
     assert!(category_labels("Films [2160]").has(Labels::UHD));
 }
+
+#[test]
+fn a_year_after_a_categorys_labels_still_leaves_its_end() {
+    use bongo_player::vod::genres::category_labels;
+    for (name, label) in [
+        ("Films NL (2019)", Labels::NL),
+        ("Films NL 2019", Labels::NL),
+        ("Netflix NL 2020", Labels::NL),
+        ("Actie NL [2019]", Labels::NL),
+        ("Series EN (2018)", Labels::EN),
+        ("Films 4K (2021)", Labels::UHD),
+        ("Films 4K (2100)", Labels::UHD),
+    ] {
+        assert!(category_labels(name).has(label), "{name}");
+    }
+}

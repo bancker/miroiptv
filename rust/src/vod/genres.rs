@@ -786,10 +786,11 @@ fn group_of(folded: &str, max_year: u16) -> Group {
 /// words the name starts with ("Nederlands", "NL FILMS", "NL Gesproken Kids"):
 /// a portal names a section after its language, with or without a bar. A
 /// title's name of one label keeps it as its title. A category's year means
-/// nothing: no year is allowed (`parse_name`'s latest is 0), so a number in
-/// brackets such as "(2160)" is a label, never a year.
+/// nothing, but it still leaves the end of the name, so the labels before it
+/// are read ("Films NL (2019)"); no year after 2100 is one, so a number in
+/// brackets such as "(2160)" is a label (UHD), never a year.
 pub fn category_labels(name: &str) -> Labels {
-    let mut labels = parse_name(name, 0).labels;
+    let mut labels = parse_name(name, 2100).labels;
     let folded = fold(name);
     let mut words = folded.split(' ').filter(|w| !w.is_empty()).peekable();
     while let Some(w) = words.next() {
