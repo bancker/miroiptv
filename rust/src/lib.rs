@@ -12,6 +12,7 @@ pub mod args;
 pub mod bad_streams;
 pub mod catalog;
 pub mod channel_list;
+pub mod channel_list_ui;
 pub mod epg;
 pub mod favorites;
 pub mod guide;

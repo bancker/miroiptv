@@ -609,9 +609,10 @@ pub fn filter_id() -> egui::Id {
     egui::Id::new("__guide_filter__")
 }
 
-/// A click target the keyboard never reaches: the guide's keys are its own,
-/// and a focused widget would take Enter or Space for a click.
-const CLICK: Sense = Sense {
+/// A click target the keyboard never reaches: the guide's keys are its own
+/// (the channel list's too), and a focused widget would take Enter or Space
+/// for a click.
+pub(crate) const CLICK: Sense = Sense {
     click: true,
     drag: false,
     focusable: false,
@@ -1411,13 +1412,22 @@ fn paint_row(
                 LIVE_GREEN,
             );
         }
-        Playable::Replay => play_mark(p, Pos2::new(row.right() - 14.0, row.center().y)),
+        Playable::Replay => play_mark(
+            p,
+            Pos2::new(row.right() - 14.0, row.center().y),
+            REPLAY_BLUE,
+        ),
         Playable::Unavailable | Playable::Future => {}
     }
 }
 
 /// One line of text, cut off with "…" at `width`.
-fn single_line(text: &str, font: FontId, color: Color32, width: f32) -> egui::text::LayoutJob {
+pub(crate) fn single_line(
+    text: &str,
+    font: FontId,
+    color: Color32,
+    width: f32,
+) -> egui::text::LayoutJob {
     few_rows(text, font, color, width, 1)
 }
 
@@ -1440,19 +1450,16 @@ fn few_rows(
     job
 }
 
-/// ▶: a past programme that can be watched back.
-fn play_mark(p: &egui::Painter, center: Pos2) {
+/// ▶: a past programme that can be watched back (the guide); the channel that
+/// plays (the channel list).
+pub(crate) fn play_mark(p: &egui::Painter, center: Pos2, color: Color32) {
     let s = 6.0;
     let points = vec![
         center + Vec2::new(-s * 0.6, -s),
         center + Vec2::new(-s * 0.6, s),
         center + Vec2::new(s, 0.0),
     ];
-    p.add(egui::Shape::convex_polygon(
-        points,
-        REPLAY_BLUE,
-        Stroke::NONE,
-    ));
+    p.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
 }
 
 /// ▾ beside the date.
