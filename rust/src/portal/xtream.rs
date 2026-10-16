@@ -71,6 +71,32 @@ impl XtreamPortal {
         format!("http://{}:{}", self.creds.host, self.creds.port)
     }
 
+    /// The JSON answer to an API call; a refusal is its status. Its error
+    /// names no address: the URL holds the account, and the error is logged.
+    async fn api_json(&self, params: &[(&str, &str)]) -> Result<serde_json::Value, PortalError> {
+        let no_url = |e: reqwest::Error| PortalError::Http(e.without_url());
+        let url = self.api_url(params);
+        let answer = self.client.get(url).send().await.map_err(no_url)?;
+        if !answer.status().is_success() {
+            return Err(PortalError::Status(answer.status().as_u16()));
+        }
+        answer.json().await.map_err(no_url)
+    }
+
+    /// One of the two category lists. An entry that is no object is left out;
+    /// an answer that is no list is an error.
+    async fn category_list(&self, action: &str) -> Result<Vec<Category>, PortalError> {
+        let answer = self.api_json(&[("action", action)]).await?;
+        let list = answer
+            .as_array()
+            .ok_or_else(|| PortalError::Shape(format!("{action}: no list")))?;
+        Ok(list
+            .iter()
+            .filter(|v| v.is_object())
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect())
+    }
+
     async fn parse_epg(&self, url: &str) -> Result<Epg, PortalError> {
         let resp = self.client.get(url).send().await?;
         let status = resp.status();
@@ -523,6 +549,29 @@ impl Portal for XtreamPortal {
             }
         }
         Ok(out)
+    }
+
+    async fn fetch_categories(&self) -> Result<Categories, PortalError> {
+        Ok(Categories {
+            vod: self.category_list("get_vod_categories").await?,
+            series: self.category_list("get_series_categories").await?,
+        })
+    }
+
+    async fn fetch_vod_info(&self, vod_id: i64) -> Result<VodDetails, PortalError> {
+        let id = vod_id.to_string();
+        let answer = self
+            .api_json(&[("action", "get_vod_info"), ("vod_id", &id)])
+            .await?;
+        super::vod_info::parse_vod_info(&answer)
+    }
+
+    async fn fetch_series_info(&self, series_id: i64) -> Result<VodDetails, PortalError> {
+        let id = series_id.to_string();
+        let answer = self
+            .api_json(&[("action", "get_series_info"), ("series_id", &id)])
+            .await?;
+        super::vod_info::parse_series_info(&answer)
     }
 
     fn live_stream_url(&self, stream_id: i64) -> String {

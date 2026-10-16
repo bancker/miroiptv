@@ -59,6 +59,7 @@ fn movie(id: i64, name: &str, adult: bool) -> Movie {
         name: name.into(),
         container_extension: Some("mp4".into()),
         is_adult: adult,
+        ..Movie::default()
     }
 }
 
@@ -97,6 +98,7 @@ fn series(id: i64, name: &str, adult: bool) -> Series {
         series_id: id,
         name: name.into(),
         is_adult: adult,
+        ..Series::default()
     }
 }
 

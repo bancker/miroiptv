@@ -1,5 +1,6 @@
 pub mod m3u;
 pub mod types;
+pub mod vod_info;
 pub mod xtream;
 
 use crate::epg::Epg;
@@ -28,6 +29,9 @@ pub enum PortalError {
     /// An M3U file that cannot be read: its path and the system's words.
     #[error("cannot read {0}")]
     File(String),
+    /// This source has no films or series to tell about (an M3U list).
+    #[error("no film or series details on this source")]
+    NoDetails,
 }
 
 #[async_trait::async_trait]
@@ -55,6 +59,28 @@ pub trait Portal: Send + Sync {
     /// we want the catch-up history visible.
     async fn fetch_day_epg(&self, stream_id: i64) -> Result<Epg, PortalError>;
     async fn fetch_series_episodes(&self, series_id: i64) -> Result<Vec<Episode>, PortalError>;
+    /// The portal's categories of films and of series (spec 2026-10-15 §4.1),
+    /// fetched in the catalog's round, beside its lists. A source without
+    /// films or series has none.
+    // `double_must_use` (clippy 1.99) flags the boxed future that `async_trait`
+    // makes of every `async fn` here; the three new methods carry the allow so
+    // that they add none to the warnings the older ones already draw.
+    #[allow(clippy::double_must_use)]
+    async fn fetch_categories(&self) -> Result<Categories, PortalError> {
+        Ok(Categories::default())
+    }
+    /// What a film's page shows (`get_vod_info`). A source without films has
+    /// nothing to tell.
+    #[allow(clippy::double_must_use)]
+    async fn fetch_vod_info(&self, _vod_id: i64) -> Result<VodDetails, PortalError> {
+        Err(PortalError::NoDetails)
+    }
+    /// What a series' page shows: its info, seasons and episodes
+    /// (`get_series_info`). A source without series has nothing to tell.
+    #[allow(clippy::double_must_use)]
+    async fn fetch_series_info(&self, _series_id: i64) -> Result<VodDetails, PortalError> {
+        Err(PortalError::NoDetails)
+    }
     fn live_stream_url(&self, stream_id: i64) -> String;
     /// The stream id of a URL from [`Portal::live_stream_url`]; `None` for
     /// anything else (catch-up, VOD).

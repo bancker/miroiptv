@@ -6465,11 +6465,13 @@ https://c.example/twee-nieuws.m3u8\n";
                 name: "Zebra Film".into(),
                 container_extension: Some("mp4".into()),
                 is_adult: false,
+                ..Default::default()
             }],
             series: vec![crate::portal::Series {
                 series_id: 71,
                 name: "Zebra Serie".into(),
                 is_adult: false,
+                ..Default::default()
             }],
         };
         Arc::new(CatalogStore::from_catalog(idle_portal(), catalog))
