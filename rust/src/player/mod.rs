@@ -82,6 +82,9 @@ pub enum Event {
         index: usize,
         label: String,
     },
+    /// What a `Cmd::LoadVod` reports while it plays (`VodEvent`). A report
+    /// sent before the player took a later load reaches the app after that
+    /// load; the old file's reports end with its end-file.
     Vod(VodEvent),
 }
 
@@ -155,6 +158,17 @@ pub struct PlayerHandle {
 }
 
 pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
+    spawn_with(initial_w, initial_h, Vec::new())
+}
+
+/// `spawn`, with mpv's properties `props` set right after `Mpv::new()`: a seam
+/// for the smoke tests, which run the player with `ao` `null` (no sound card).
+/// A property mpv does not take ends the thread with an `Event::Error`.
+pub fn spawn_with(
+    initial_w: u32,
+    initial_h: u32,
+    props: Vec<(String, String)>,
+) -> anyhow::Result<PlayerHandle> {
     let (cmd_tx, mut cmd_rx) = unbounded_channel::<Cmd>();
     let (evt_tx, evt_rx) = unbounded_channel::<Event>();
     let frames = Arc::new(FrameBus::new());
@@ -172,6 +186,14 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                     return;
                 }
             };
+            for (name, value) in &props {
+                if let Err(e) = mpv.set_property(name, value) {
+                    let _ = evt_tx.send(Event::Error {
+                        msg: format!("mpv {name}={value}: {e}"),
+                    });
+                    return;
+                }
+            }
             let mut rctx =
                 match RenderCtx::new(&mpv, frames_for_thread, initial_w.max(1), initial_h.max(1)) {
                     Ok(r) => r,
@@ -194,12 +216,8 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
 
             info!("mpv player thread started");
             let mut choice = tracks::TrackChoice::new();
-            // A VOD load is playing: its properties are observed and reported.
-            let mut vod = false;
-            // Its file has started (`MPV_EVENT_START_FILE`): what the properties
-            // say is its own from then on, not the file before it's.
-            let mut vod_started = false;
-            let (mut seconds, mut lengths) = (SecondGate::default(), SecondGate::default());
+            // What a VOD load reports, and when (`VodFollow`).
+            let mut follow = VodFollow::default();
 
             loop {
                 loop {
@@ -207,10 +225,7 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                         Ok(
                             load @ (Cmd::LoadUrl(_) | Cmd::LoadWithHeaders(_) | Cmd::LoadVod(_)),
                         ) => {
-                            follow_vod(&mpv, &mut vod, matches!(load, Cmd::LoadVod(_)));
-                            vod_started = false;
-                            seconds.reset();
-                            lengths.reset();
+                            follow_vod(&mpv, follow.load(matches!(load, Cmd::LoadVod(_))));
                             if let Some((args, line)) = loadfile_command(&load) {
                                 if choice.load(&args[1]) {
                                     reset_tracks(&mpv);
@@ -228,8 +243,7 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                         }
                         Ok(Cmd::Stop) => {
                             info!("stop");
-                            follow_vod(&mpv, &mut vod, false);
-                            vod_started = false;
+                            follow_vod(&mpv, follow.stop());
                             let _ = mpv.command(&["stop"]);
                         }
                         Ok(Cmd::SetAudio(id)) => {
@@ -283,9 +297,7 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                     }
                     mpv_sys::MPV_EVENT_START_FILE => {
                         // What the VOD properties say from here on is this load's.
-                        vod_started = true;
-                        seconds.reset();
-                        lengths.reset();
+                        follow.start_file();
                     }
                     mpv_sys::MPV_EVENT_FILE_LOADED => {
                         info!("mpv: file-loaded");
@@ -296,7 +308,7 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                         let _ = evt_tx.send(Event::PlaybackStarted);
                     }
                     mpv_sys::MPV_EVENT_END_FILE => {
-                        vod_started = false;
+                        follow.end_file();
                         let reason = unsafe { events::end_file_reason(evt) };
                         warn!("mpv: end-file (reason={})", reason);
                         let _ = evt_tx.send(Event::EndOfFile { reason });
@@ -318,17 +330,8 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                     {
                         // A late change of a load that is no VOD load any more,
                         // or of the file before this one, says nothing.
-                        let report = match vod && vod_started {
-                            true => unsafe { events::vod_report(evt) },
-                            false => None,
-                        };
-                        let news = match &report {
-                            Some(VodEvent::Position(pos)) => seconds.pass(*pos),
-                            Some(VodEvent::Duration(length)) => lengths.pass(*length),
-                            Some(_) => true,
-                            None => false,
-                        };
-                        if let (true, Some(report)) = (news, report) {
+                        let read = || unsafe { events::vod_report(evt) };
+                        if let Some(report) = follow.report(read) {
                             let _ = evt_tx.send(Event::Vod(report));
                         }
                     }
@@ -433,25 +436,105 @@ fn set_track(
     }
 }
 
-/// Starts or stops observing a VOD load's properties when what loads is or is
-/// no VOD load: live TV reports nothing of them, so it costs nothing.
-fn follow_vod(mpv: &Mpv, vod: &mut bool, now_vod: bool) {
-    if now_vod == *vod {
-        return;
-    }
-    *vod = now_vod;
-    if now_vod {
-        for (name, format) in [
-            ("time-pos", mpv_sys::MPV_FORMAT_DOUBLE),
-            ("duration", mpv_sys::MPV_FORMAT_DOUBLE),
-            ("track-list", mpv_sys::MPV_FORMAT_STRING),
-        ] {
-            if let Err(e) = mpv.observe_property(name, format, OBSERVE_VOD) {
-                warn!("observe {} failed: {}", name, e);
+/// Starts or stops observing a VOD load's properties, as `VodFollow` says:
+/// live TV reports nothing of them, so it costs nothing.
+fn follow_vod(mpv: &Mpv, observe: Observe) {
+    match observe {
+        Observe::Keep => {}
+        Observe::Start => {
+            for (name, format) in [
+                ("time-pos", mpv_sys::MPV_FORMAT_DOUBLE),
+                ("duration", mpv_sys::MPV_FORMAT_DOUBLE),
+                ("track-list", mpv_sys::MPV_FORMAT_STRING),
+            ] {
+                if let Err(e) = mpv.observe_property(name, format, OBSERVE_VOD) {
+                    warn!("observe {} failed: {}", name, e);
+                }
             }
         }
-    } else if let Err(e) = mpv.unobserve_property(OBSERVE_VOD) {
-        warn!("unobserve failed: {}", e);
+        Observe::Stop => {
+            if let Err(e) = mpv.unobserve_property(OBSERVE_VOD) {
+                warn!("unobserve failed: {}", e);
+            }
+        }
+    }
+}
+
+/// What a load or a stop asks of mpv's observers of a VOD load's properties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Observe {
+    Start,
+    Stop,
+    Keep,
+}
+
+/// What the player thread knows of a VOD load (Ruling 47), apart from mpv so
+/// that its rules are tested without libmpv: whether its properties are
+/// observed, whether its file has started, and a gate per kind of report.
+#[derive(Default)]
+struct VodFollow {
+    /// A VOD load is playing: its properties are observed and reported.
+    vod: bool,
+    /// Its file has started (`MPV_EVENT_START_FILE`): what the properties say
+    /// is its own from then on, not the file before it's.
+    started: bool,
+    seconds: SecondGate,
+    lengths: SecondGate,
+}
+
+impl VodFollow {
+    /// A load (`vod`: a `Cmd::LoadVod`): what it reports is dropped until
+    /// mpv's start of its file.
+    fn load(&mut self, vod: bool) -> Observe {
+        self.started = false;
+        self.seconds.reset();
+        self.lengths.reset();
+        self.observe(vod)
+    }
+
+    /// A stop: nothing is observed any more.
+    fn stop(&mut self) -> Observe {
+        self.started = false;
+        self.observe(false)
+    }
+
+    fn observe(&mut self, vod: bool) -> Observe {
+        if vod == self.vod {
+            return Observe::Keep;
+        }
+        self.vod = vod;
+        if vod {
+            Observe::Start
+        } else {
+            Observe::Stop
+        }
+    }
+
+    /// mpv's `MPV_EVENT_START_FILE`.
+    fn start_file(&mut self) {
+        self.started = true;
+        self.seconds.reset();
+        self.lengths.reset();
+    }
+
+    /// mpv's `MPV_EVENT_END_FILE`.
+    fn end_file(&mut self) {
+        self.started = false;
+    }
+
+    /// A change observed under `OBSERVE_VOD`, read through `read` only while
+    /// a VOD load's own file plays: what to report of it, if anything.
+    fn report(&mut self, read: impl FnOnce() -> Option<VodEvent>) -> Option<VodEvent> {
+        if !(self.vod && self.started) {
+            return None;
+        }
+        let report = read()?;
+        let news = match &report {
+            VodEvent::Position(pos) => self.seconds.pass(*pos),
+            VodEvent::Duration(length) => self.lengths.pass(*length),
+            VodEvent::Tracks(_) => true,
+        };
+        news.then_some(report)
     }
 }
 
@@ -542,6 +625,10 @@ pub fn vod_loadfile_args(load: &VodLoad) -> Vec<String> {
         options.push(format!("start={}", load.start));
     }
     if let Some(audio) = &load.audio_file {
+        // The file's query reaches mpv's own log lines and the track's title
+        // (mpv names an external track by the last part of its URL). Phase 3
+        // masks it: it drops an external track's title and masks the file's
+        // query in the `[mpv:…]` lines.
         options.push(format!("audio-file={}", option_value(audio)));
     }
     let mut args = vec!["loadfile".to_owned(), load.url.clone()];
@@ -847,5 +934,49 @@ mod tests {
             Err(super::MpvError::NullHandle)
         });
         assert!(!choice.load(channel));
+    }
+
+    #[test]
+    fn what_a_vod_load_reports_and_from_when_on() {
+        // Ruling 47 without libmpv: observed only while a VOD load plays, its
+        // reports from mpv's start of its own file on, a gate per kind.
+        use super::{Observe, VodEvent::*, VodFollow};
+        let report = |f: &mut VodFollow, e: super::VodEvent| f.report(|| Some(e));
+        let mut f = VodFollow::default();
+        // Live TV observes nothing and reports nothing.
+        assert_eq!(f.load(false), Observe::Keep);
+        f.start_file();
+        assert_eq!(report(&mut f, Position(3.0)), None);
+        // A VOD load observes at once and reports from its START_FILE on.
+        assert_eq!(f.load(true), Observe::Start);
+        assert_eq!(report(&mut f, Position(3.4)), None, "live TV's, before it");
+        f.end_file();
+        f.start_file();
+        assert_eq!(report(&mut f, Position(0.2)), Some(Position(0.2)));
+        assert_eq!(
+            report(&mut f, Duration(0.7)),
+            Some(Duration(0.7)),
+            "own gate"
+        );
+        assert_eq!(report(&mut f, Position(0.9)), None, "the same second");
+        assert_eq!(report(&mut f, Tracks(vec![])), Some(Tracks(vec![])));
+        // Another VOD load keeps the observers; the old file's changes up to
+        // the new START_FILE say nothing; the new file's first is news.
+        assert_eq!(f.load(true), Observe::Keep);
+        assert_eq!(report(&mut f, Position(2.0)), None, "the old file's");
+        f.end_file();
+        f.start_file();
+        assert_eq!(report(&mut f, Position(0.3)), Some(Position(0.3)));
+        // After the end of the file, nothing.
+        f.end_file();
+        assert_eq!(report(&mut f, Tracks(vec![])), None);
+        // A stop unobserves, once; a late change says nothing.
+        assert_eq!(f.stop(), Observe::Stop);
+        assert_eq!(f.stop(), Observe::Keep);
+        f.start_file();
+        assert_eq!(report(&mut f, Position(1.0)), None);
+        // Live TV after a VOD load unobserves.
+        assert_eq!(f.load(true), Observe::Start);
+        assert_eq!(f.load(false), Observe::Stop);
     }
 }

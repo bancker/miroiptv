@@ -1,5 +1,6 @@
 //! The audio tracks of what plays, read from mpv's `track-list`; which one `a`
-//! picks next; and when a choice made with `a` or `s` goes back to mpv's own.
+//! picks next; and when a choice made with `a`, `s`, `Cmd::SetAudio` or
+//! `Cmd::SetSubtitles` goes back to mpv's own.
 //!
 //! mpv's `cycle audio` passes through "no audio", and an `aid` set at runtime
 //! outlives the file (measured on the vendored libmpv, `tests/test_mpv_smoke.rs`):
@@ -76,11 +77,12 @@ pub fn pick_next(tracks: &[AudioTrack]) -> Pick {
     }
 }
 
-/// Whether `a` or `s` chose a track for the stream that plays. mpv keeps such
-/// a choice for every later file, so the load of another stream puts `aid` and
-/// `sid` back to `auto` first (`load` says so, once); a reload of the same
-/// stream keeps the choice. `Debug` for the tests only: it holds the URL of
-/// the last load, an Xtream account's in it.
+/// Whether `a`, `s`, `Cmd::SetAudio` or `Cmd::SetSubtitles` chose a track for
+/// the stream that plays. mpv keeps such a choice for every later file, so the
+/// load of another stream puts `aid` and `sid` back to `auto` first (`load`
+/// says so, once); a reload of the same stream keeps the choice. `Debug` for
+/// the tests only: it holds the URL of the last load, an Xtream account's in
+/// it.
 #[derive(Default)]
 #[cfg_attr(test, derive(Debug))]
 pub struct TrackChoice {
@@ -93,7 +95,8 @@ impl TrackChoice {
         Self::default()
     }
 
-    /// `a` or `s` changed a track of what plays.
+    /// `a`, `s`, `Cmd::SetAudio` or `Cmd::SetSubtitles` changed a track of what
+    /// plays.
     pub fn chosen(&mut self) {
         self.chosen = true;
     }
