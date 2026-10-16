@@ -306,12 +306,12 @@ fn the_selection_follows_groups_made_anew() {
     let mut more = sample();
     more.push(ch(7, "Aaa", Some("Sport")));
     let new = build(more.clone(), &[], &[]);
-    c.follow(&old, &new);
+    c.follow(&old, &new, None);
     assert_eq!(c.channel(&new).map(|ch| ch.name.as_str()), Some("sport 2"));
     assert_eq!(c.row, 2);
     // It is marked: the same row, its neighbour now.
     let marked = build(more, &[2], &[]);
-    c.follow(&new, &marked);
+    c.follow(&new, &marked, None);
     assert_eq!(c.group, group_of(&marked, "Sport"));
     assert_eq!(
         c.channel(&marked).map(|ch| ch.name.as_str()),
@@ -319,8 +319,70 @@ fn the_selection_follows_groups_made_anew() {
     );
     // Its group is gone: All, on the channel.
     let gone = build(vec![ch(1, "Sport 10", None)], &[], &[]);
-    c.follow(&marked, &gone);
+    c.follow(&marked, &gone, None);
     assert_eq!(c, Cursor { group: 0, row: 0 });
+}
+
+/// Kanaal A to D, without a group, and the selection on Kanaal C in Defect
+/// channels, where B, C and D are.
+fn on_c_in_defect_channels() -> (ChannelGroups, Cursor) {
+    let marked = build(four(), &[2, 3, 4], &[]);
+    assert_eq!(summary(&marked), ["ALL 1", "NONE 1", "DEFECT 3"]);
+    let mut c = Cursor::open(&marked, Some(&GroupKey::Defect), None);
+    assert!(c.step(&marked, 1));
+    let name = c.channel(&marked).map(|ch| ch.name.as_str());
+    assert_eq!(name, Some("Kanaal C"));
+    (marked, c)
+}
+
+fn four() -> Vec<LiveChannel> {
+    ["Kanaal A", "Kanaal B", "Kanaal C", "Kanaal D"]
+        .into_iter()
+        .zip(1..)
+        .map(|(name, id)| ch(id, name, None))
+        .collect()
+}
+
+/// A retry in Defect channels that works: the channel's first picture clears
+/// its mark, so it leaves Defect channels, which B and D keep, for All
+/// channels. The selection is on it and it plays: it follows it there.
+#[test]
+fn the_selected_channel_that_plays_follows_into_all_channels_when_its_mark_goes() {
+    let (marked, mut c) = on_c_in_defect_channels();
+    let cleared = build(four(), &[2, 4], &[]);
+    c.follow(&marked, &cleared, Some(3));
+    assert_eq!(c, Cursor { group: 0, row: 1 }, "All channels: A, C");
+    assert_eq!(
+        c.channel(&cleared).map(|ch| ch.name.as_str()),
+        Some("Kanaal C")
+    );
+}
+
+/// Ruling 21 for every other channel that leaves its group: the same row, as
+/// far as the group goes.
+#[test]
+fn a_selected_channel_that_leaves_its_group_and_does_not_play_keeps_the_row() {
+    let cleared = build(four(), &[2, 4], &[]);
+    // C's mark goes while D plays, or while nothing does: the row of C in
+    // Defect channels, D's now.
+    for playing in [Some(4), None] {
+        let (marked, mut c) = on_c_in_defect_channels();
+        c.follow(&marked, &cleared, playing);
+        let defect = cleared.find(&GroupKey::Defect).unwrap();
+        assert_eq!((c.group, c.row), (defect, 1), "{playing:?}");
+        let name = c.channel(&cleared).map(|ch| ch.name.as_str());
+        assert_eq!(name, Some("Kanaal D"), "{playing:?}");
+    }
+    // The channel that plays, marked: All channels no longer shows it, so the
+    // selection is not followed anywhere either. The same row of All channels.
+    let all = build(four(), &[], &[]);
+    let mut c = Cursor::open(&all, None, Some(3));
+    assert_eq!(c, Cursor { group: 0, row: 2 });
+    let c_marked = build(four(), &[3], &[]);
+    c.follow(&all, &c_marked, Some(3));
+    assert_eq!(c, Cursor { group: 0, row: 2 });
+    let name = c.channel(&c_marked).map(|ch| ch.name.as_str());
+    assert_eq!(name, Some("Kanaal D"));
 }
 
 #[test]
@@ -577,11 +639,11 @@ fn a_list_without_channels_is_one_empty_all_group_and_nothing_moves() {
     assert!(!c.select_row(&g, 0));
     assert!(!c.select_group(&g, 0, Some(5)), "the group it is in");
     assert!(!c.select_group(&g, 1, None), "there is no other");
-    c.follow(&g, &g);
+    c.follow(&g, &g, None);
     assert_eq!(c, Cursor { group: 0, row: 0 });
     // Followed into a list that has channels: its first.
     let full = build(sample(), &[], &[]);
-    c.follow(&g, &full);
+    c.follow(&g, &full, None);
     assert_eq!(c, Cursor { group: 0, row: 0 });
     assert_eq!(c.channel(&full).map(|ch| ch.name.as_str()), Some("Alpha"));
     // A catalog that hides every channel gives the same list.

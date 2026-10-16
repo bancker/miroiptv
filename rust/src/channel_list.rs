@@ -417,17 +417,25 @@ impl Cursor {
 
     /// The same place in groups made anew while the list is open (another copy
     /// of the list, a channel marked or cleared): the same group by its key,
-    /// else All; the same channel when the group still holds it, else the same
-    /// row, as far as the group goes.
-    pub fn follow(&mut self, old: &ChannelGroups, new: &ChannelGroups) {
+    /// else All; the same channel when the group still holds it. A selected
+    /// channel that left the group is followed into All channels when it is
+    /// `playing` and All shows it: a retry in Defect channels that works (its
+    /// first picture clears its mark) keeps the channel that plays selected.
+    /// Else the same row, as far as the group goes.
+    pub fn follow(&mut self, old: &ChannelGroups, new: &ChannelGroups, playing: Option<i64>) {
         let selected = old.channel(self.group, self.row).map(|c| c.stream_id);
         let group = old
             .key(self.group)
             .and_then(|key| new.find(key))
             .unwrap_or(0);
-        let row = selected
-            .and_then(|sid| new.row_of(group, sid))
-            .unwrap_or(self.row);
+        let kept = selected.and_then(|sid| new.row_of(group, sid).map(|row| (group, row)));
+        let followed = || {
+            selected
+                .filter(|&sid| playing == Some(sid))
+                .and_then(|sid| new.row_of(0, sid))
+                .map(|row| (0, row))
+        };
+        let (group, row) = kept.or_else(followed).unwrap_or((group, self.row));
         self.group = group;
         self.row = row.min(new.rows(group).saturating_sub(1));
     }

@@ -57,7 +57,7 @@ const ROW_SELECTED: Color32 = Color32::from_rgb(40, 55, 80);
 const ROW_HOVER: Color32 = Color32::from_rgb(30, 30, 38);
 const GROUP_OPEN: Color32 = Color32::from_rgb(34, 34, 46);
 const ACCENT: Color32 = Color32::from_rgb(255, 80, 140);
-const PLAYING: Color32 = Color32::from_rgb(120, 230, 100);
+pub(crate) const PLAYING: Color32 = Color32::from_rgb(120, 230, 100);
 const BROKEN: Color32 = Color32::from_rgb(230, 120, 110);
 
 /// Where the parts of the list go in a window `screen`.
@@ -154,10 +154,11 @@ impl ChannelListView {
     }
 
     /// Groups made anew while the list is open (another copy of the list, a
-    /// channel marked or cleared): the selection keeps its place
-    /// ([`Cursor::follow`]).
-    pub fn replace_groups(&mut self, groups: ChannelGroups) {
-        self.cursor.follow(&self.groups, &groups);
+    /// channel marked or cleared): the selection keeps its place, and follows
+    /// `playing`, the channel that plays, into All channels when that left its
+    /// group ([`Cursor::follow`]).
+    pub fn replace_groups(&mut self, groups: ChannelGroups, playing: Option<i64>) {
+        self.cursor.follow(&self.groups, &groups, playing);
         self.groups = groups;
         self.follow = true;
     }
@@ -986,7 +987,7 @@ mod tests {
     fn groups_made_anew_keep_the_selection_on_its_channel() {
         let mut v = ChannelListView::new(groups(5, &[]), None, Some(3));
         assert_eq!(v.cursor(), Cursor { group: 0, row: 2 });
-        v.replace_groups(groups(5, &[(1, NOW)]));
+        v.replace_groups(groups(5, &[(1, NOW)]), Some(3));
         assert_eq!(
             v.cursor(),
             Cursor { group: 0, row: 1 },

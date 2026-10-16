@@ -736,9 +736,10 @@ pub struct TvApp {
     stall_watchdog_armed: bool,
     /// The stream that plays ended while the user flipped on (an eof, which
     /// nothing reloads then): it is no stream that plays any more (`plays`),
-    /// but the stall watchdog stays armed, so a flip that is dropped without a
-    /// load (its channel has no address; the channel list's Esc, g or another
-    /// group) leaves the dead stream to it. Every load clears it.
+    /// but the stall watchdog stays armed. A flip that is then dropped without
+    /// a load (`drop_flip`) gives an M3U start that had not played up at once,
+    /// and leaves a stream that has played, and Xtream, to the watchdog. Every
+    /// load clears it.
     ended: bool,
     /// Caps the auto-reloads after a live stream ends unexpectedly (eof).
     reload_budget: ReloadBudget,
@@ -1637,11 +1638,13 @@ impl TvApp {
                         // The user is zapping away anyway: nothing reloads it. The
                         // stream has ended all the same: it no longer plays
                         // (`plays`), so a flip back to it loads it again; the stall
-                        // watchdog stays armed for a flip that is dropped without a
-                        // load. A start that ended without a picture is a failed
-                        // start all the same (spec §4.1), and takes the picture of
-                        // the channel before it off at once: the flip may yet be
-                        // dropped. Before `note_start_failure`, which ends the start.
+                        // watchdog stays armed for a stream that has played when
+                        // the flip is dropped without a load (`drop_flip` gives an
+                        // M3U start that had not played up then). A start that
+                        // ended without a picture is a failed start all the same
+                        // (spec §4.1), and takes the picture of the channel before
+                        // it off at once: the flip may yet be dropped. Before
+                        // `note_start_failure`, which ends the start.
                         self.ended = true;
                         self.drop_the_picture_before_it();
                         self.note_start_failure();
@@ -1775,7 +1778,8 @@ impl TvApp {
     /// whether it has played (`current_has_played`) only of a start that ended
     /// while the user flipped on (`ended`: that eof took `stream_starting_since`
     /// already): the `Event::Error` arm calls it for a refused load either way,
-    /// and `check_stall` only for a start that has not played.
+    /// `check_stall` only for a start that has not played, and `drop_flip` for
+    /// a start that ended without a picture while the flip it drops waited.
     /// `note_start_failure` then makes the channel a suspect unless it has
     /// played. True when it was dealt with so. (M3U only: an Xtream portal's
     /// loads go through the relay, with nothing in them mpv can refuse, and its
@@ -2201,15 +2205,13 @@ impl TvApp {
         }
         let url = self.catalog.portal().live_stream_url(sid);
         // An M3U list has no address for an id it does not hold: a target the
-        // zap pacer held while a fresh list dropped it. What plays stays, and so
-        // would the flip's toast that named the target, over the channel that
-        // plays on: it goes.
+        // zap pacer held while a fresh list dropped it. Nothing loads: the flip
+        // is dropped (`drop_flip`). The flip's toast that named the target would
+        // stay over the channel that plays on: it goes.
         if url.is_empty() {
             tracing::warn!("zap: stream_id={} has no address - not loaded", sid);
-            let flip = format!("[TV] {}", name);
-            if self.toast.as_ref().is_some_and(|t| t.0 == flip) {
-                self.toast = None;
-            }
+            self.forget_flip_toast(name);
+            self.drop_flip();
             return;
         }
         // A channel of an M3U list that has no name is named after its address.
@@ -2265,6 +2267,36 @@ impl TvApp {
     /// the channel list, tries it again.
     fn plays(&self, sid: i64) -> bool {
         self.current_stream_id == Some(sid) && self.stall_watchdog_armed && !self.ended
+    }
+
+    /// The flip that waits is dropped, and nothing loads in its place: the
+    /// channel list's Esc or g, another group in it, `g` opening the list over
+    /// a flip on the main screen (opening starts nothing, spec §3.3), or a
+    /// target without an address (`zap_to`, after the pacer handed it on).
+    /// Every way to drop a flip goes through here. The flip's "[TV] …" toast
+    /// goes with it. A start of an M3U channel that ended without a picture
+    /// while the flip waited (`ended`, and not `current_has_played`) is given
+    /// up now (`stop_failed_start`: "streamfout op …"), not when the stall
+    /// watchdog fires, up to 25 s after its load. A stream that has played is
+    /// left to the watchdog, which reloads it, and so is Xtream:
+    /// `stop_failed_start` is M3U only.
+    fn drop_flip(&mut self) {
+        if let Some(name) = self.zap_pacer.waiting().map(|(_, name, _)| name.clone()) {
+            self.forget_flip_toast(&name);
+        }
+        self.zap_pacer.cancel();
+        // `ended` is an eof's: a start still on its way is never stopped here.
+        if self.ended && !self.current_has_played {
+            self.stop_failed_start();
+        }
+    }
+
+    /// The toast of a flip on to channel `name` goes: no load follows it.
+    fn forget_flip_toast(&mut self, name: &str) {
+        let flip = format!("[TV] {}", name);
+        if self.toast.as_ref().is_some_and(|t| t.0 == flip) {
+            self.toast = None;
+        }
     }
 
     /// Play the channel's best variant the portal does not refuse instead of
@@ -4433,12 +4465,15 @@ impl TvApp {
 
     /// `g` on an M3U source (spec §3.1, §3.3): the channel list, in the group
     /// open last this session, on the channel that plays. Opening starts
-    /// nothing. While the catalog loads, the guide's word for that.
+    /// nothing: a flip on the main screen that waits is dropped, as the list's
+    /// Esc drops one of its own. While the catalog loads, the guide's word for
+    /// that.
     fn open_channel_list(&mut self) {
         if !self.catalog.is_loaded() {
             self.set_toast(self.t(T::GuideCatalogLoading));
             return;
         }
+        self.drop_flip();
         let key = self.channel_list_key();
         let Some(groups) = self.catalog.channel_groups(&self.favorite_ids()) else {
             return;
@@ -4485,7 +4520,7 @@ impl TvApp {
             return;
         };
         if let Some(view) = self.channel_list.as_mut() {
-            view.replace_groups(groups);
+            view.replace_groups(groups, self.current_stream_id);
         }
         self.channel_list_for = Some(key);
     }
@@ -4562,9 +4597,9 @@ impl TvApp {
                 }
             }
             // The selection left the channel that waited: nothing starts.
-            ListAction::GroupChanged => self.zap_pacer.cancel(),
+            ListAction::GroupChanged => self.drop_flip(),
             ListAction::Close => {
-                self.zap_pacer.cancel();
+                self.drop_flip();
                 self.close_channel_list();
             }
         }
@@ -5605,6 +5640,8 @@ https://c.example/twee-nieuws.m3u8\n";
         painted: Vec<String>,
         /// Every texture the last frame drew (the video is one).
         drawn: Vec<egui::TextureId>,
+        /// Everything the last frame drew.
+        shapes: Vec<egui::epaint::ClippedShape>,
         /// What the window tells egui about itself in every frame: where it is,
         /// the scale of its screen, whether it is full screen. Unknown until a
         /// test says.
@@ -5724,6 +5761,7 @@ https://c.example/twee-nieuws.m3u8\n";
                 events,
                 painted: Vec::new(),
                 drawn: Vec::new(),
+                shapes: Vec::new(),
                 viewport: egui::ViewportInfo::default(),
                 focused: true,
                 window_cmds: Vec::new(),
@@ -5805,6 +5843,7 @@ https://c.example/twee-nieuws.m3u8\n";
                     _ => None,
                 })
                 .collect();
+            self.shapes = output.shapes;
         }
 
         /// One frame in which these keys are pressed.
@@ -12276,19 +12315,29 @@ https://c.example/twee-nieuws.m3u8\n";
         G,
         /// Another group in the channel list.
         Group,
+        /// g on the main screen: the channel list opens, and opening starts
+        /// nothing.
+        ListOpens,
     }
 
-    const EVERY_DROP: [Dropped; 4] = [Dropped::NoAddress, Dropped::Esc, Dropped::G, Dropped::Group];
+    const EVERY_DROP: [Dropped; 5] = [
+        Dropped::NoAddress,
+        Dropped::Esc,
+        Dropped::G,
+        Dropped::Group,
+        Dropped::ListOpens,
+    ];
 
     /// B plays (it showed its first picture when `played`), a flip on to C
     /// waits, and B's stream ends (an eof); then the flip is dropped as `how`
-    /// says. On the main screen for `NoAddress`, in the channel list else.
+    /// says: what the frames of the drop sent the player. On the main screen
+    /// for `NoAddress` and `ListOpens`, in the channel list else.
     fn b_ends_and_the_flip_is_dropped(
         root: &std::path::Path,
         how: Dropped,
         played: bool,
-    ) -> Harness {
-        let in_list = !matches!(how, Dropped::NoAddress);
+    ) -> (Harness, Vec<Cmd>) {
+        let in_list = !matches!(how, Dropped::NoAddress | Dropped::ListOpens);
         let mut h = m3u_app(root, if in_list { LISTED } else { RING });
         h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
         if in_list {
@@ -12320,12 +12369,17 @@ https://c.example/twee-nieuws.m3u8\n";
             Dropped::Esc => h.frame(&[Key::Escape]),
             Dropped::G => h.frame_with(vec![key_press(Key::G), egui::Event::Text("g".into())]),
             Dropped::Group => h.frame(&[Key::ArrowRight]),
+            Dropped::ListOpens => {
+                open_list(&mut h);
+                assert!(h.app.channel_list.is_some(), "the list opens");
+            }
         }
+        let sent = h.sent();
         let waits = h.app.zap_pacer.waiting().is_some();
         assert!(!waits, "{how:?}: no flip waits");
-        assert!(loads(h.sent()).is_empty(), "{how:?}: nothing loaded");
+        assert!(!zapped(&sent), "{how:?}: nothing loaded: {sent:?}");
         assert_eq!(h.app.current_name.as_deref(), Some("Kanaal B"), "{how:?}");
-        h
+        (h, sent)
     }
 
     /// Longer without a new picture than the stall watchdog gives a stream.
@@ -12337,19 +12391,25 @@ https://c.example/twee-nieuws.m3u8\n";
     }
 
     #[tokio::test]
-    async fn a_start_that_ends_while_a_flip_waits_is_given_up_once_the_flip_is_dropped() {
+    async fn a_start_that_ends_while_a_flip_waits_is_given_up_the_moment_the_flip_is_dropped() {
         for how in EVERY_DROP {
             let dir = tempfile::tempdir().unwrap();
-            let mut h = b_ends_and_the_flip_is_dropped(dir.path(), how, false);
+            let (mut h, sent) = b_ends_and_the_flip_is_dropped(dir.path(), how, false);
             assert!(!h.app.plays(m3u_sid("Kanaal B")), "{how:?}: B ended");
-            the_watchdogs_turn(&mut h);
-            let sent = h.sent();
+            // In the frame of the drop, with no time gone by: B stops, and the
+            // toast names it.
             let stopped = sent.iter().any(|c| matches!(c, Cmd::Stop));
             assert!(stopped, "{how:?}: {sent:?}");
-            assert!(loads(sent).is_empty(), "{how:?}: no reload, no reconnect");
             let named = "stream error on Kanaal B - zap up or down to retry";
             assert_eq!(toast_text(&h), named, "{how:?}");
             assert!(!h.app.stall_watchdog_armed, "{how:?}");
+            // The watchdog's turn later adds nothing: no second toast, no
+            // reload, no reconnect.
+            h.app.toast = None;
+            the_watchdogs_turn(&mut h);
+            let later = h.sent();
+            assert!(later.is_empty(), "{how:?}: {later:?}");
+            assert_eq!(toast_text(&h), "", "{how:?}: a second toast");
         }
     }
 
@@ -12357,7 +12417,9 @@ https://c.example/twee-nieuws.m3u8\n";
     async fn a_stream_that_played_and_ends_while_a_flip_waits_is_reloaded_once_it_is_dropped() {
         for how in EVERY_DROP {
             let dir = tempfile::tempdir().unwrap();
-            let mut h = b_ends_and_the_flip_is_dropped(dir.path(), how, true);
+            let (mut h, sent) = b_ends_and_the_flip_is_dropped(dir.path(), how, true);
+            // Left to the watchdog: the drop stops nothing.
+            assert!(sent.is_empty(), "{how:?}: {sent:?}");
             the_watchdogs_turn(&mut h);
             assert_eq!(loads(h.sent()), [ring_url('b')], "{how:?}: reloaded");
             assert_eq!(toast_text(&h), "reconnecting...", "{how:?}");
@@ -12637,9 +12699,11 @@ https://c.example/twee-nieuws.m3u8\n";
         h.events.send(ended).unwrap();
         h.frame(&[]);
         assert!(h.app.video_tex.is_none(), "A's picture goes at once");
+        h.sent();
         // The flip is dropped: nothing loads, and the screen stays black.
         h.press(&[Key::Escape]);
         assert!(h.app.channel_list.is_none());
+        assert!(loads(h.sent()).is_empty(), "nothing loads");
         the_old_picture_stays_away(&mut h);
     }
 
@@ -12678,6 +12742,111 @@ https://c.example/twee-nieuws.m3u8\n";
         h.frame(&[]);
         let hint = "catalog loaded  -  f = search, g = channel list, 0-9 = presets, o = settings";
         assert!(h.painted.iter().any(|t| t == hint), "{:?}", h.painted);
+    }
+
+    // ---- the channel list: the final fix wave ----
+
+    /// Where the last frame drew the channel list's ▶ (the channel that plays).
+    fn list_play_marks(h: &Harness) -> Vec<egui::Rect> {
+        h.shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Path(path)
+                    if path.closed && path.fill == crate::channel_list_ui::PLAYING =>
+                {
+                    Some(egui::Rect::from_points(&path.points))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_retry_in_broken_channels_that_works_keeps_its_channel_selected_in_all_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let [b, c, d] = ["Kanaal B", "Kanaal C", "Kanaal D"].map(m3u_sid);
+        let failed = now_unix() - 60;
+        write_marks(dir.path(), &[(b, failed), (c, failed), (d, failed)]);
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        open_list(&mut h);
+        // All channels (A), No group (A), Broken channels (B, C, D).
+        h.press(&[Key::ArrowRight, Key::ArrowRight]);
+        assert_eq!(list(&h).group_key(), Some(&GroupKey::Defect));
+        assert_eq!(selected(&h).as_deref(), Some("Kanaal B"));
+        h.sent();
+        // A move to C starts it, and it plays: its first picture clears its mark,
+        // and the groups are made anew without it in Broken channels.
+        h.press(&[Key::ArrowDown]);
+        assert_eq!(loads(h.sent()), [ring_url('c')]);
+        picture_comes(&mut h);
+        assert!(!h.app.catalog.is_defect(c), "C's mark went");
+        h.frame(&[]);
+        assert_eq!(list(&h).group_key(), Some(&GroupKey::All), "followed");
+        assert_eq!(selected(&h).as_deref(), Some("Kanaal C"));
+        // Its row has the ▶: All channels is A, C.
+        let marks = list_play_marks(&h);
+        assert_eq!(marks.len(), 1, "{marks:?}");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let layout = crate::channel_list_ui::Layout::of(screen);
+        let row = crate::channel_list_ui::Layout::row(layout.rows, 1);
+        assert!(row.contains_rect(marks[0]), "{marks:?} not in {row:?}");
+        // Enter keeps it: the list closes, and nothing loads.
+        h.press(&[Key::Enter]);
+        assert!(h.app.channel_list.is_none(), "closed");
+        assert!(loads(h.sent()).is_empty(), "nothing loads");
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal C"));
+    }
+
+    #[tokio::test]
+    async fn g_while_a_flip_waits_opens_the_list_on_what_plays_and_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), RING);
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        h.app.zap_by_id(m3u_sid("Kanaal A"));
+        h.frame(&[Key::ArrowDown]); // B, at once
+        h.frame(&[Key::ArrowDown]); // on to C, which waits
+        assert!(h.app.zap_pacer.waiting().is_some());
+        assert_eq!(toast_text(&h), "[TV] Kanaal C", "the flip names C");
+        h.sent();
+        // g within the settle.
+        open_list(&mut h);
+        assert_eq!(selected(&h).as_deref(), Some("Kanaal B"), "on what plays");
+        std::thread::sleep(Duration::from_millis(350));
+        h.frame(&[]);
+        assert!(loads(h.sent()).is_empty(), "opening starts nothing");
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal B"));
+        assert!(h.app.channel_list.is_some(), "the list stays open");
+        assert_eq!(toast_text(&h), "", "C's name went with the flip");
+    }
+
+    #[tokio::test]
+    async fn an_m3u_stream_that_played_and_ends_while_a_flip_waits_keeps_its_last_picture() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), RING);
+        // Long: the flip never comes due in this test.
+        h.app.zap_pacer = ZapPacer::new(Duration::from_secs(10));
+        h.app.zap_by_id(m3u_sid("Kanaal A"));
+        // B, at once, and it plays: its first picture is on the screen.
+        h.frame(&[Key::ArrowDown]);
+        picture_comes(&mut h);
+        h.put_frame(4, 2);
+        h.frame(&[]);
+        assert!(h.app.video_tex.is_some(), "B's picture");
+        h.frame(&[Key::ArrowDown]); // on to C, which waits
+        assert!(h.app.zap_pacer.waiting().is_some());
+        // B's stream ends while the flip waits.
+        let ended = Event::EndOfFile {
+            reason: "eof".into(),
+        };
+        h.events.send(ended).unwrap();
+        h.frame(&[]);
+        assert!(!h.app.plays(m3u_sid("Kanaal B")), "B ended");
+        // Its own last picture stays, as on Xtream.
+        for _ in 0..3 {
+            h.frame(&[]);
+        }
+        assert!(h.app.video_tex.is_some(), "B's last picture went");
     }
 
     // ---- the picture of the channel before ----
