@@ -1,14 +1,18 @@
 use crate::channel_list::ChannelGroups;
 use crate::news::{resolve_channels, NewsRule};
 use crate::portal::xtream::{stream_ref, StreamKind};
-use crate::portal::{Catalog as PortalCatalog, LiveChannel, Movie, Portal, PortalError, Series};
+use crate::portal::{
+    Catalog as PortalCatalog, Categories, LiveChannel, Movie, Portal, PortalError, Series,
+};
 use crate::search::{rank, ItemKind, SearchItem};
 use crate::sources::SourceKind;
+use crate::vod::index::{CategoryInfo, Extras, Learned, Query, Results, Title, TitleIndex};
+use crate::vod::TitleId;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 /// Canonical channel-name key for cross-variant matching. Live and
@@ -147,8 +151,10 @@ pub fn guide_channels_of(live: &[LiveChannel]) -> Vec<GuideChannel> {
 /// a scan of ~13,000 channels. Reads as the catalog (`Deref`), except `live`,
 /// which has a field of its own.
 struct StoredCatalog {
-    /// The films and series; its `live` is empty (see `live`).
-    catalog: PortalCatalog,
+    /// The films and series; its `live` is empty (see `live`). Shared with the
+    /// build of their titles, which reads them once the catalog is in
+    /// (`TitleInput`).
+    catalog: Arc<PortalCatalog>,
     /// The live channels, taken out of `catalog`: what is worked out from them
     /// (the zap ring, the channel list's groups) holds this `Arc` and positions
     /// in it, never copies of the channels. `c.live` reads this field, not the
@@ -164,8 +170,10 @@ struct StoredCatalog {
 
 impl StoredCatalog {
     /// The one way a catalog gets stored: the fetch and `from_catalog` both come
-    /// through here, so what is worked out cannot differ between them.
-    fn new(mut catalog: PortalCatalog) -> Self {
+    /// through here, so what is worked out cannot differ between them. What only
+    /// the title index reads leaves the lists here, and comes back as the
+    /// [`TitleInput`] of their titles, which are built once the catalog is in.
+    fn new(mut catalog: PortalCatalog) -> (Self, TitleInput) {
         let adult_live_ids = catalog
             .live
             .iter()
@@ -178,13 +186,22 @@ impl StoredCatalog {
             c.stream_icon = None;
         }
         let live = Arc::new(std::mem::take(&mut catalog.live));
-        Self {
+        // The covers, a series' genre and release date are the index's alone
+        // (Ruling 22): they move out of the stored lists, to its build.
+        let extras = Extras::take(&mut catalog.movies, &mut catalog.series);
+        let catalog = Arc::new(catalog);
+        let titles = TitleInput {
+            lists: catalog.clone(),
+            extras,
+        };
+        let stored = Self {
             catalog,
             live,
             adult_live_ids,
             guide,
             zap: Mutex::new(None),
-        }
+        };
+        (stored, titles)
     }
 
     /// The zap ring for this lock and these marks: the one made last when it was
@@ -220,6 +237,129 @@ impl std::ops::Deref for StoredCatalog {
 
     fn deref(&self) -> &PortalCatalog {
         &self.catalog
+    }
+}
+
+/// What the titles of a stored catalog are built from ([`TitleInput::build`]):
+/// its lists, shared with it through their `Arc`, and what only the index
+/// reads, which the lists gave up before they were stored, so that no address
+/// is held twice once the index has it (Ruling 22).
+struct TitleInput {
+    lists: Arc<PortalCatalog>,
+    extras: Extras,
+}
+
+impl TitleInput {
+    /// The title index of these lists, with the portal's `categories`, and its
+    /// `vod:` line: on the blocking pool in the fetch, once the catalog is put
+    /// and its categories are in (up to ~150 ms for a big portal); in place in
+    /// `from_catalog`. It reads the stored lists and copies none of them.
+    fn build(self, categories: &Categories) -> TitleIndex {
+        let t0 = Instant::now();
+        let titles = TitleIndex::build_with(
+            &self.lists.movies,
+            &self.lists.series,
+            &self.extras,
+            categories,
+            latest_year(),
+        );
+        if !titles.is_empty() {
+            log_titles(&titles, categories, t0.elapsed());
+        }
+        titles
+    }
+}
+
+/// The latest year a title's name may give: the year after this one ("Blade
+/// Runner 2049" is no film of 2049).
+fn latest_year() -> u16 {
+    use chrono::Datelike;
+    (chrono::Utc::now().year() + 1).clamp(1900, u16::MAX as i32) as u16
+}
+
+/// What the lists gave the title index, in one line (spec 2026-10-15 §11: the
+/// quality of the portal's data shows only with real titles).
+fn log_titles(titles: &TitleIndex, categories: &Categories, took: std::time::Duration) {
+    let s = titles.stats();
+    let n = titles.len().max(1);
+    let pct = |part: usize| part * 100 / n;
+    info!(
+        "vod: {} titles ({} series, {} films in {} versions, at most {} in one film, {} left out), {} categories - cover {} %, rating {} %, year {} %, genre {} %, Dutch {} %, English {} % - index {} KB, covers {} KB, built in {} ms",
+        titles.len(),
+        s.series,
+        s.films,
+        s.versions,
+        s.most_versions,
+        s.skipped,
+        categories.vod.len() + categories.series.len(),
+        pct(s.with_cover),
+        pct(s.with_rating),
+        pct(s.with_year),
+        pct(s.with_genre),
+        pct(s.dutch),
+        pct(s.english),
+        titles.heap_bytes() / 1024,
+        titles.cover_bytes() / 1024,
+        took.as_millis()
+    );
+}
+
+/// The thuisbioscoop's titles as the adult lock lets them show (spec
+/// 2026-10-15 §4.2). Every answer leaves the adult titles out while locked:
+/// this is the only way out of the catalog for the index, so nothing else
+/// filters. Asked again after the lock changes.
+#[derive(Clone)]
+pub struct Titles {
+    index: Arc<TitleIndex>,
+    unlocked: bool,
+}
+
+impl Titles {
+    /// The titles that answer `query`, with the counts of its filters.
+    pub fn search(&self, query: &Query) -> Results {
+        self.index.search(query, self.unlocked)
+    }
+
+    /// The title at `pos`; none for an adult one while locked.
+    pub fn title(&self, pos: usize) -> Option<Title<'_>> {
+        self.index.title(pos).filter(|t| self.unlocked || !t.adult)
+    }
+
+    /// Where title `id` is, when it shows.
+    pub fn find(&self, id: TitleId) -> Option<usize> {
+        self.index.find(id).filter(|&pos| self.title(pos).is_some())
+    }
+
+    /// The film title a version plays, when it shows.
+    pub fn title_of_version(&self, stream_id: i64) -> Option<usize> {
+        self.index
+            .title_of_version(stream_id)
+            .filter(|&pos| self.title(pos).is_some())
+    }
+
+    /// Titles like the one at `pos` ([`TitleIndex::more_like`]).
+    pub fn more_like(
+        &self,
+        pos: usize,
+        limit: usize,
+        watched: &HashSet<TitleId>,
+        disliked: &HashSet<TitleId>,
+    ) -> Vec<u32> {
+        if self.title(pos).is_none() {
+            return Vec::new();
+        }
+        self.index
+            .more_like(pos, limit, self.unlocked, watched, disliked)
+    }
+
+    /// What title `pos`'s details tell the index ([`TitleIndex::learn`]).
+    pub fn learn(&self, pos: usize, learned: Learned) {
+        self.index.learn(pos, learned);
+    }
+
+    /// The portal's categories.
+    pub fn categories(&self) -> impl Iterator<Item = CategoryInfo<'_>> + '_ {
+        self.index.categories()
     }
 }
 
@@ -743,7 +883,7 @@ mod zap_tests {
 
     #[test]
     fn a_stored_catalog_knows_its_adult_channels_by_the_portals_flag_alone() {
-        let stored = StoredCatalog::new(PortalCatalog {
+        let (stored, _) = StoredCatalog::new(PortalCatalog {
             live: vec![
                 ch(1, "NL | NPO 1", 0),
                 LiveChannel {
@@ -803,13 +943,71 @@ pub struct CatalogStore {
     defect: RwLock<Arc<HashMap<i64, i64>>>,
     /// Counts every `set_defect`: what is worked out from the marks follows it.
     defect_revision: AtomicU64,
+    /// The thuisbioscoop's titles (`vod::index`), adult ones included: they
+    /// leave the store only as `Titles`, which apply the lock. Put after the
+    /// catalog they come from (`put_titles`).
+    titles: Arc<RwLock<Option<Arc<TitleIndex>>>>,
+    /// How many times `titles` was put (see [`CatalogStore::titles_revision`]).
+    titles_revision: Arc<AtomicU64>,
+    /// How long the titles wait for the category lists once the catalog is in
+    /// ([`CatalogStore::with_categories_wait`]).
+    categories_wait: Duration,
 }
 
 /// Puts a catalog in its slot and counts it. The count moves after the catalog
-/// is in, so whoever sees the new count finds the new catalog.
-fn put_catalog(slot: &RwLock<Option<StoredCatalog>>, revision: &AtomicU64, stored: StoredCatalog) {
+/// is in, so whoever sees the new count finds the new catalog. The count it put
+/// the catalog at: its titles are put for that one ([`put_titles`]).
+fn put_catalog(
+    slot: &RwLock<Option<StoredCatalog>>,
+    revision: &AtomicU64,
+    stored: StoredCatalog,
+) -> u64 {
     *slot.write() = Some(stored);
-    revision.fetch_add(1, Ordering::Release);
+    revision.fetch_add(1, Ordering::Release) + 1
+}
+
+/// Puts the titles built from the catalog put at count `of` in their slot and
+/// counts them, as `put_catalog` does, when that catalog is still the store's
+/// (`revision`): a newer one's own titles come after it.
+fn put_titles(
+    slot: &RwLock<Option<Arc<TitleIndex>>>,
+    titles_revision: &AtomicU64,
+    revision: &AtomicU64,
+    of: u64,
+    titles: Arc<TitleIndex>,
+) {
+    let mut held = slot.write();
+    if revision.load(Ordering::Acquire) != of {
+        return;
+    }
+    *held = Some(titles);
+    titles_revision.fetch_add(1, Ordering::Release);
+}
+
+/// How long the titles wait for the portal's category lists once the catalog
+/// is in: then they are built without them (spec 2026-10-15 §5: the channels
+/// wait for none of it, and the titles not for long).
+const CATEGORIES_WAIT: Duration = Duration::from_secs(15);
+
+/// The category lists the fetch asked beside the three lists, once its catalog
+/// is in: what they brought; none when they fail or have not come within
+/// `wait`, and then their request stops. The warn line names no address
+/// (`api_json`).
+async fn categories_after(
+    mut asked: tokio::task::JoinHandle<Result<Categories, PortalError>>,
+    wait: Duration,
+) -> Categories {
+    let why = match tokio::time::timeout(wait, &mut asked).await {
+        Ok(Ok(Ok(categories))) => return categories,
+        Ok(Ok(Err(e))) => e.to_string(),
+        Ok(Err(e)) => e.to_string(),
+        Err(_) => {
+            asked.abort();
+            format!("none within {wait:?}")
+        }
+    };
+    warn!("catalog: no categories ({why}) - the titles go without");
+    Categories::default()
 }
 
 impl CatalogStore {
@@ -823,13 +1021,33 @@ impl CatalogStore {
             notice: Arc::new(Mutex::new(None)),
             defect: RwLock::new(Arc::new(HashMap::new())),
             defect_revision: AtomicU64::new(0),
+            titles: Arc::new(RwLock::new(None)),
+            titles_revision: Arc::new(AtomicU64::new(0)),
+            categories_wait: CATEGORIES_WAIT,
         }
     }
 
-    /// A store with a catalog already loaded (tests, tools).
+    /// How long this store's titles wait for the portal's category lists once
+    /// its catalog is in: 15 s, a test less. Then they are built without them.
+    pub fn with_categories_wait(mut self, wait: Duration) -> Self {
+        self.categories_wait = wait;
+        self
+    }
+
+    /// A store with a catalog already loaded (tests, tools), and its titles,
+    /// built in place. It has no categories: its films take no genre from them.
     pub fn from_catalog(portal: Arc<dyn Portal>, catalog: PortalCatalog) -> Self {
         let store = Self::new(portal);
-        put_catalog(&store.inner, &store.revision, StoredCatalog::new(catalog));
+        let (stored, input) = StoredCatalog::new(catalog);
+        let of = put_catalog(&store.inner, &store.revision, stored);
+        let titles = Arc::new(input.build(&Categories::default()));
+        put_titles(
+            &store.titles,
+            &store.titles_revision,
+            &store.revision,
+            of,
+            titles,
+        );
         *store.status.write() = CatalogStatus::Loaded;
         store
     }
@@ -842,6 +1060,14 @@ impl CatalogStore {
     /// then noticed next time, not missed.
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
+    }
+
+    /// How many times this store's titles were put: 0 until the first
+    /// catalog's are built, then one more with every build. Whatever is worked
+    /// out from the titles compares this per frame, an atomic load, as the
+    /// guide does [`CatalogStore::revision`].
+    pub fn titles_revision(&self) -> u64 {
+        self.titles_revision.load(Ordering::Acquire)
     }
 
     /// What kind of source this catalog is of.
@@ -914,6 +1140,9 @@ impl CatalogStore {
         let portal = self.portal.clone();
         let status = self.status.clone();
         let notice = self.notice.clone();
+        let titles = self.titles.clone();
+        let titles_revision = self.titles_revision.clone();
+        let categories_wait = self.categories_wait;
         *status.write() = CatalogStatus::Connecting;
 
         tokio::spawn(async move {
@@ -923,7 +1152,10 @@ impl CatalogStore {
             let mut showing_saved = false;
             if inner.read().is_none() {
                 if let Some(saved) = portal.saved_catalog().await {
-                    put_catalog(&inner, &revision, StoredCatalog::new(saved));
+                    // An M3U list has no films or series: its titles come with
+                    // the fresh list's.
+                    let (stored, _) = StoredCatalog::new(saved);
+                    put_catalog(&inner, &revision, stored);
                     *status.write() = CatalogStatus::Loaded;
                     showing_saved = true;
                 }
@@ -933,6 +1165,11 @@ impl CatalogStore {
             }
             info!("catalog: starting fetch");
 
+            // The two category lists are asked beside the three lists (spec
+            // 2026-10-15 §4.1, §5), in a task of their own: only the titles
+            // wait for them.
+            let asker = portal.clone();
+            let categories = tokio::spawn(async move { asker.fetch_categories().await });
             match portal.fetch_catalog().await {
                 Ok(c) => {
                     let elapsed_ms = t0.elapsed().as_millis();
@@ -957,13 +1194,31 @@ impl CatalogStore {
                         );
                     }
                     // Worked out before the lock is taken: readers never wait for it.
-                    let stored = StoredCatalog::new(c);
-                    put_catalog(&inner, &revision, stored);
+                    let (stored, input) = StoredCatalog::new(c);
+                    let of = put_catalog(&inner, &revision, stored);
+                    *status.write() = CatalogStatus::Loaded;
+                    // The channels, zapping, `f` and the guide work from here on,
+                    // whatever the categories do. The titles wait for them (15 s
+                    // at most), then take up to ~150 ms for a big portal on the
+                    // blocking pool: off the screen and off the async workers,
+                    // where the relay runs.
+                    let categories = categories_after(categories, categories_wait).await;
+                    let build = move || input.build(&categories);
+                    match tokio::task::spawn_blocking(build).await {
+                        Ok(built) => {
+                            put_titles(&titles, &titles_revision, &revision, of, Arc::new(built));
+                        }
+                        Err(e) => warn!("vod: titles not built ({e})"),
+                    }
+                }
+                // The same list as the one that shows: it stays as it is, and
+                // no titles wait for the categories.
+                Err(PortalError::Unchanged) => {
+                    categories.abort();
                     *status.write() = CatalogStatus::Loaded;
                 }
-                // The same list as the one that shows: it stays as it is.
-                Err(PortalError::Unchanged) => *status.write() = CatalogStatus::Loaded,
                 Err(e) => {
+                    categories.abort();
                     let msg = format!("{}", e);
                     warn!("catalog: fetch failed after {} ms: {}", t0.elapsed().as_millis(), msg);
                     // An M3U source keeps the list it shows, and says why it did
@@ -1210,6 +1465,17 @@ impl CatalogStore {
     pub fn search(&self, query: &str) -> Vec<SearchItem> {
         let items = self.search_items();
         rank(query, &items).into_iter().cloned().collect()
+    }
+
+    /// The thuisbioscoop's titles as the lock stands now ([`Titles`]): those of
+    /// the store's catalog once they are built (`put_titles`); none before.
+    pub fn titles(&self) -> Option<Titles> {
+        let unlocked = self.adult_unlocked();
+        let held = self.titles.read();
+        held.as_ref().map(|index| Titles {
+            index: index.clone(),
+            unlocked,
+        })
     }
 
     pub fn portal(&self) -> &Arc<dyn Portal> {

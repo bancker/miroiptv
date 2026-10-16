@@ -190,6 +190,9 @@ pub struct Stats {
     pub series: usize,
     pub films: usize,
     pub versions: usize,
+    /// The most versions one title holds: a slip in reading names that folds
+    /// many films into one title shows here, and hardly in the shares.
+    pub most_versions: usize,
     pub with_cover: usize,
     pub with_rating: usize,
     pub with_year: usize,
@@ -258,12 +261,71 @@ fn day_of(secs: i64) -> u16 {
 /// The bits of the genres there are: what `learn` lets in.
 const GENRE_BITS: u32 = (1 << Genre::ALL.len()) - 1;
 
+/// What a catalog's lists give up for its title index (Ruling 22): a film's
+/// cover, and a series' cover, genre field and release year, moved out of
+/// their records ([`Extras::take`]). The catalog keeps the lists without them
+/// and builds its titles from both ([`TitleIndex::build_with`]): no list is
+/// copied for the build, and no address is held twice once the index has it.
+#[derive(Default)]
+pub struct Extras {
+    /// The films' covers, in the films' order.
+    film_covers: Vec<Option<String>>,
+    /// The series' own, in the series' order.
+    series: Vec<SeriesExtras>,
+}
+
+/// A series' share of [`Extras`].
+struct SeriesExtras {
+    cover: Option<String>,
+    genre: Option<String>,
+    /// The year of its release date; 0 for none.
+    released: u16,
+}
+
+impl Extras {
+    /// Moves them out of the records of these lists: the strings move, and
+    /// none is copied. A series' release dates go; their year stays.
+    pub fn take(movies: &mut [Movie], series: &mut [Series]) -> Self {
+        let film_covers = movies.iter_mut().map(|m| m.stream_icon.take()).collect();
+        let series = series
+            .iter_mut()
+            .map(|s| {
+                let released = s.released().map_or(0, crate::portal::vod_info::year_of);
+                s.release_date = None;
+                s.release_date_camel = None;
+                SeriesExtras {
+                    cover: s.cover.take(),
+                    genre: s.genre.take(),
+                    released,
+                }
+            })
+            .collect();
+        Self {
+            film_covers,
+            series,
+        }
+    }
+}
+
 impl TitleIndex {
     /// The titles of these lists. `max_year` is the latest year a name may
     /// give: the year after this one.
     pub fn build(
         movies: &[Movie],
         series: &[Series],
+        categories: &Categories,
+        max_year: u16,
+    ) -> Self {
+        Self::build_with(movies, series, &Extras::default(), categories, max_year)
+    }
+
+    /// [`TitleIndex::build`] for lists whose records gave up what `extras`
+    /// holds: the catalog's build, which reads its stored lists and copies
+    /// none of them. A record that `extras` does not cover keeps its own.
+    pub fn build_with(
+        movies: &[Movie],
+        series: &[Series],
+        extras: &Extras,
         categories: &Categories,
         max_year: u16,
     ) -> Self {
@@ -330,7 +392,11 @@ impl TitleIndex {
                 entry.english |= v.labels.has(Labels::EN) || language == Language::English;
                 entry.adult |= m.is_adult;
                 if entry.cover.is_empty() {
-                    entry.cover = m.stream_icon.as_deref().map_or("", str::trim);
+                    let cover = match extras.film_covers.get(v.index as usize) {
+                        Some(given_up) => given_up.as_deref(),
+                        None => m.stream_icon.as_deref(),
+                    };
+                    entry.cover = cover.map_or("", str::trim);
                 }
                 if entry.rating == 0 {
                     entry.rating = m.rating;
@@ -355,7 +421,8 @@ impl TitleIndex {
         }
         // Series name the same few genre fields over and over.
         let mut genres_of_field: HashMap<&str, u32> = HashMap::new();
-        for s in series {
+        for (n, s) in series.iter().enumerate() {
+            let given_up = extras.series.get(n);
             let Some(id) = fit_id(s.series_id) else {
                 skipped += 1;
                 continue;
@@ -364,21 +431,28 @@ impl TitleIndex {
             let category = category_of(Kind::Series, s.category_id);
             let in_category = cat_recs.get(usize::from(category).wrapping_sub(1));
             // Its genre field; when that names none, its category's, as a film's.
-            let field = s.genre.as_deref().unwrap_or("");
+            let field = given_up
+                .map_or(s.genre.as_deref(), |x| x.genre.as_deref())
+                .unwrap_or("");
             let mut genres = *genres_of_field
                 .entry(field)
                 .or_insert_with(|| genres_in(field));
             if genres == 0 {
                 genres = in_category.map_or(0, |c| c.genres);
             }
-            let released = s.released().map_or(0, crate::portal::vod_info::year_of);
+            let released = match given_up {
+                Some(x) => x.released,
+                None => s.released().map_or(0, crate::portal::vod_info::year_of),
+            };
             let language = in_category.map_or(Language::Unknown, |c| c.language);
             entries.push(Entry {
                 kind: Kind::Series,
                 id,
                 name: parts.title,
                 key: None,
-                cover: s.cover.as_deref().map_or("", str::trim),
+                cover: given_up
+                    .map_or(s.cover.as_deref(), |x| x.cover.as_deref())
+                    .map_or("", str::trim),
                 year: if released > 0 { released } else { parts.year },
                 rating: s.rating,
                 added: day_of(s.last_modified),
@@ -636,6 +710,7 @@ impl TitleIndex {
                 Kind::Film => s.films += 1,
                 Kind::Series => s.series += 1,
             }
+            s.most_versions = s.most_versions.max(t.versions.len());
             s.with_cover += usize::from(t.cover.is_some());
             s.with_rating += usize::from(t.rating > 0);
             s.with_year += usize::from(t.year > 0);
