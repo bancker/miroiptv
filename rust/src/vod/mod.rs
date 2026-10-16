@@ -1,0 +1,104 @@
+//! The thuisbioscoop's data (spec 2026-10-15 §7): titles, genres, versions,
+//! details, covers and what was watched. It draws nothing.
+
+pub mod genres;
+
+/// What a title is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Kind {
+    Series,
+    Film,
+}
+
+/// A title of the thuisbioscoop: a series by its `series_id`, a film by the
+/// `stream_id` of its default version (`versions`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TitleId {
+    pub kind: Kind,
+    pub id: i64,
+}
+
+/// `text` as the search compares it: lower case, accents off ("Pokémon" is
+/// "pokemon", "ß" is "ss"), every run of other characters one space, no space
+/// at either end. Letters of other scripts stay, in lower case.
+pub fn fold(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    fold_into(text, &mut out);
+    out
+}
+
+/// [`fold`], appended to `out`.
+pub fn fold_into(text: &str, out: &mut String) {
+    let start = out.len();
+    let mut space = true;
+    for c in text.chars() {
+        if c.is_ascii() {
+            if c.is_ascii_alphanumeric() {
+                out.push(c.to_ascii_lowercase());
+                space = false;
+            } else if !space {
+                out.push(' ');
+                space = true;
+            }
+            continue;
+        }
+        for lower in c.to_lowercase() {
+            match plain(lower) {
+                Some(ascii) => {
+                    out.push_str(ascii);
+                    space = false;
+                }
+                None if lower.is_alphanumeric() => {
+                    out.push(lower);
+                    space = false;
+                }
+                // A combining accent (a decomposed é) belongs to the letter
+                // before it: it adds nothing.
+                None if is_combining(lower) => {}
+                None if !space => {
+                    out.push(' ');
+                    space = true;
+                }
+                None => {}
+            }
+        }
+    }
+    if out.len() > start && out.ends_with(' ') {
+        out.pop();
+    }
+}
+
+/// The plain letters of a lower-case letter with an accent; none for any other.
+fn plain(c: char) -> Option<&'static str> {
+    Some(match c {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => "a",
+        'æ' => "ae",
+        'ç' | 'ć' | 'č' | 'ĉ' | 'ċ' => "c",
+        'ď' | 'đ' | 'ð' => "d",
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => "e",
+        'ğ' | 'ĝ' | 'ġ' | 'ģ' => "g",
+        'ĥ' | 'ħ' => "h",
+        'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => "i",
+        'ĵ' => "j",
+        'ķ' => "k",
+        'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => "l",
+        'ñ' | 'ń' | 'ņ' | 'ň' => "n",
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => "o",
+        'œ' => "oe",
+        'ŕ' | 'ŗ' | 'ř' => "r",
+        'ś' | 'ŝ' | 'ş' | 'š' | 'ș' => "s",
+        'ß' => "ss",
+        'ţ' | 'ť' | 'ŧ' | 'ț' => "t",
+        'þ' => "th",
+        'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => "u",
+        'ŵ' => "w",
+        'ý' | 'ÿ' | 'ŷ' => "y",
+        'ź' | 'ż' | 'ž' => "z",
+        _ => return None,
+    })
+}
+
+/// Unicode's combining diacritical marks (U+0300 to U+036F).
+fn is_combining(c: char) -> bool {
+    ('\u{0300}'..='\u{036f}').contains(&c)
+}
