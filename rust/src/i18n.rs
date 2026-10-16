@@ -195,7 +195,7 @@ texts! {
     ListNoGroup => ["Zonder groep", "No group", "Ohne Gruppe"],
     ListDefect => ["Defecte zenders", "Broken channels", "Defekte Sender"],
     ListEmptyGroup => ["geen zenders in deze groep", "no channels in this group", "keine Sender in dieser Gruppe"],
-    ChannelListFooter => ["Omhoog / Omlaag = kiezen  ·  Links / Rechts = groep  ·  PgUp / PgDn, Home / End = verder  ·  Enter = afspelen  ·  Esc of g = sluiten", "Up / Down = choose  ·  Left / Right = group  ·  PgUp / PgDn, Home / End = jump  ·  Enter = play  ·  Esc or g = close", "Hoch / Runter = wählen  ·  Links / Rechts = Gruppe  ·  PgUp / PgDn, Home / End = springen  ·  Enter = abspielen  ·  Esc oder g = schließen"],
+    ChannelListFooter => ["Esc of g = sluiten  ·  Enter = afspelen  ·  Omhoog / Omlaag = kiezen  ·  Links / Rechts = groep  ·  PgUp / PgDn, Home / End = verder", "Esc or g = close  ·  Enter = play  ·  Up / Down = choose  ·  Left / Right = group  ·  PgUp / PgDn, Home / End = jump", "Esc oder g = schließen  ·  Enter = abspielen  ·  Hoch / Runter = wählen  ·  Links / Rechts = Gruppe  ·  PgUp / PgDn, Home / End = springen"],
     AgoJustNow => ["zojuist", "just now", "gerade eben"],
     AgoMinutes => ["{0} min geleden", "{0} min ago", "vor {0} Min."],
     AgoHour => ["1 uur geleden", "1 hour ago", "vor 1 Stunde"],

@@ -113,11 +113,15 @@ pub struct ChannelListView {
     /// The first group row and the first channel row on screen.
     group_top: usize,
     row_top: usize,
-    /// How many channel rows the last frame had room for: a page.
-    page: usize,
+    /// What the wheel has turned that is not a whole row yet, in rows: at most
+    /// half a row, either way. One for both columns.
+    wheel: f32,
     /// The selection moved by a key or a click: it is brought on screen.
     follow: bool,
-    /// The list opened, or the group changed: the selection goes to the middle.
+    /// The list opened, or the group changed: the selection goes to the middle
+    /// of the channels. The groups column follows only when the group is off
+    /// screen: a click on a group that shows must not scroll it from under the
+    /// pointer.
     center: bool,
 }
 
@@ -130,7 +134,7 @@ impl ChannelListView {
             cursor,
             group_top: 0,
             row_top: 0,
-            page: 10,
+            wheel: 0.0,
             follow: true,
             center: true,
         }
@@ -162,9 +166,8 @@ impl ChannelListView {
     /// screen, the clicks. What the user did, in the order they did it.
     pub fn show(&mut self, ctx: &egui::Context, data: &ListData) -> Vec<ListAction> {
         let layout = Layout::of(ctx.screen_rect());
-        self.page = layout.visible;
         let mut actions = Vec::new();
-        let closing = self.keys(ctx, data.playing, &mut actions);
+        let closing = self.keys(ctx, layout.visible, data.playing, &mut actions);
         self.wheel(ctx, &layout);
         self.bring_on_screen(layout.visible);
         let mut clicked = None;
@@ -182,11 +185,13 @@ impl ChannelListView {
         actions
     }
 
-    /// The keys of this frame, in the order they came. True when one closed the
-    /// list: what comes after it is not the list's.
+    /// The keys of this frame, in the order they came; `page` is how many rows
+    /// the screen holds. True when one closed the list: what comes after it is
+    /// not the list's.
     fn keys(
         &mut self,
         ctx: &egui::Context,
+        page: usize,
         playing: Option<i64>,
         actions: &mut Vec<ListAction>,
     ) -> bool {
@@ -204,7 +209,7 @@ impl ChannelListView {
                 })
                 .collect()
         });
-        let page = self.page as isize;
+        let page = page as isize;
         for (key, repeat) in presses {
             let moved = match key {
                 Key::ArrowUp => self.cursor.step(&self.groups, -1),
@@ -251,42 +256,49 @@ impl ChannelListView {
         false
     }
 
-    /// The wheel scrolls the column under the pointer by whole rows; the
-    /// selection stays and nothing starts.
+    /// The wheel scrolls the column under the pointer; the selection stays and
+    /// nothing starts. A turn is worked out in rows, and what is not a whole row
+    /// yet is kept for the next turn (at most half a row), so small turns add up
+    /// and the list follows a touchpad. A mouse notch (50 points) is two rows.
     fn wheel(&mut self, ctx: &egui::Context, layout: &Layout) {
         let (pointer, delta) = ctx.input(|i| (i.pointer.hover_pos(), i.raw_scroll_delta.y));
-        let Some(at) = pointer.filter(|_| delta != 0.0) else {
+        // What is not a number would stay in the remainder and stop the wheel.
+        let Some(at) = pointer.filter(|_| delta != 0.0 && delta.is_finite()) else {
             return;
         };
-        let rows = (-delta / ROW_H).round() as isize;
-        // A small turn (a touchpad's) is still a row.
-        let rows = if rows == 0 {
-            -(delta.signum() as isize)
-        } else {
-            rows
-        };
-        if layout.rows.contains(at) {
+        let (top, most) = if layout.rows.contains(at) {
             let most = self
                 .groups
                 .rows(self.cursor.group)
                 .saturating_sub(layout.visible);
-            self.row_top = self.row_top.saturating_add_signed(rows).min(most);
+            (&mut self.row_top, most)
         } else if layout.groups.contains(at) {
             let most = self.groups.group_count().saturating_sub(layout.visible);
-            self.group_top = self.group_top.saturating_add_signed(rows).min(most);
-        }
+            (&mut self.group_top, most)
+        } else {
+            return;
+        };
+        let total = self.wheel - delta / ROW_H;
+        let rows = total.round();
+        self.wheel = total - rows;
+        *top = top.saturating_add_signed(rows as isize).min(most);
     }
 
     /// The selection on screen after a key or a click moved it (in the middle
-    /// when the list opened or the group changed), the selected group too. A
-    /// turn of the wheel alone leaves the rows where it put them.
+    /// when the list opened or the group changed), the selected group too: its
+    /// column moves for a group that is off screen only. A turn of the wheel
+    /// alone leaves the rows where it put them.
     fn bring_on_screen(&mut self, visible: usize) {
         let rows_most = self.groups.rows(self.cursor.group).saturating_sub(visible);
         let groups_most = self.groups.group_count().saturating_sub(visible);
         let (row, group) = (self.cursor.row, self.cursor.group);
         if self.center {
             self.row_top = row.saturating_sub(visible / 2);
-            self.group_top = group.saturating_sub(visible / 2);
+            // The groups column moves only when the group is off screen: a click
+            // on a group that shows must not scroll it from under the pointer.
+            if group < self.group_top || group >= self.group_top + visible {
+                self.group_top = group.saturating_sub(visible / 2);
+            }
         } else if self.follow {
             if row < self.row_top {
                 self.row_top = row;
@@ -805,7 +817,8 @@ mod tests {
         let mut s = Screen::new();
         let mut v = open(5, &[], None, None, &mut s, &d);
         let (_, painted) = s.frame(&mut v, &d, vec![]);
-        let footer = "Up / Down = choose  ·  Left / Right = group  ·  PgUp / PgDn, Home / End = jump  ·  Enter = play  ·  Esc or g = close";
+        // The close hint leads: a window too narrow for the line loses its end.
+        let footer = "Esc or g = close  ·  Enter = play  ·  Up / Down = choose  ·  Left / Right = group  ·  PgUp / PgDn, Home / End = jump";
         for text in [
             "Channel list",
             "All channels",
@@ -1089,20 +1102,83 @@ mod tests {
         assert!(painted.iter().any(|t| t == "All channels"));
     }
 
+    /// A list of 100 channels with the pointer over its rows, ready for the wheel.
+    fn ready_for_the_wheel(s: &mut Screen, d: &ListData) -> ChannelListView {
+        let mut v = open(100, &[], None, None, s, d);
+        let over = Layout::row(Screen::layout().rows, 3).center();
+        s.frame(&mut v, d, vec![Event::PointerMoved(over)]);
+        v
+    }
+
+    /// One frame in which the wheel turns by `points` (negative: down the list).
+    fn turn(s: &mut Screen, v: &mut ChannelListView, d: &ListData, points: f32) -> Vec<String> {
+        s.frame(v, d, vec![Event::Scroll(Vec2::new(0.0, points))]).1
+    }
+
     #[test]
-    fn a_small_turn_of_the_wheel_is_still_a_row() {
-        // A touchpad turns by a few points, not by a notch.
+    fn small_turns_of_the_wheel_add_up_to_whole_rows() {
+        // A touchpad turns by a few points a frame, and the list follows it:
+        // what is not a whole row yet is kept for the next turn.
         let marks = HashMap::new();
         let d = data(None, &marks);
         let mut s = Screen::new();
-        let mut v = open(100, &[], None, None, &mut s, &d);
-        let over = Layout::row(Screen::layout().rows, 3).center();
-        s.frame(&mut v, &d, vec![Event::PointerMoved(over)]);
-        let (_, painted) = s.frame(&mut v, &d, vec![Event::Scroll(Vec2::new(0.0, -5.0))]);
-        assert!(!painted.iter().any(|t| t == "Kanaal 001"), "one row down");
-        assert!(painted.iter().any(|t| t == "Kanaal 002"));
-        let (_, painted) = s.frame(&mut v, &d, vec![Event::Scroll(Vec2::new(0.0, 5.0))]);
-        assert!(painted.iter().any(|t| t == "Kanaal 001"), "and one row up");
+        let mut v = ready_for_the_wheel(&mut s, &d);
+        // 3 points are a tenth of a row.
+        let painted = turn(&mut s, &mut v, &d, -3.0);
+        assert!(painted.iter().any(|t| t == "Kanaal 001"), "no row yet");
+        // 20 turns of 3 points are 60 points: two rows in all, not twenty.
+        for _ in 0..19 {
+            turn(&mut s, &mut v, &d, -3.0);
+        }
+        let (_, painted) = s.frame(&mut v, &d, vec![]);
+        assert!(!painted.iter().any(|t| t == "Kanaal 002"), "two rows down");
+        assert!(painted.iter().any(|t| t == "Kanaal 003"));
+        // The same turns the other way bring the list back.
+        for _ in 0..20 {
+            turn(&mut s, &mut v, &d, 3.0);
+        }
+        let (_, painted) = s.frame(&mut v, &d, vec![]);
+        assert!(painted.iter().any(|t| t == "Kanaal 001"), "and back");
+        assert_eq!(v.cursor().row, 0, "the selection never moved");
+    }
+
+    #[test]
+    fn a_notch_of_the_wheel_is_two_rows_and_three_notches_are_five() {
+        // A mouse turns by 50 points a notch: a row and two thirds, two on the
+        // screen; the third of a row that is over is paid back by the next notch.
+        let marks = HashMap::new();
+        let d = data(None, &marks);
+        let mut s = Screen::new();
+        let mut v = ready_for_the_wheel(&mut s, &d);
+        let painted = turn(&mut s, &mut v, &d, -50.0);
+        assert!(!painted.iter().any(|t| t == "Kanaal 002"), "{painted:?}");
+        assert!(painted.iter().any(|t| t == "Kanaal 003"), "two rows");
+        turn(&mut s, &mut v, &d, -50.0);
+        let painted = turn(&mut s, &mut v, &d, -50.0);
+        assert!(!painted.iter().any(|t| t == "Kanaal 005"), "{painted:?}");
+        assert!(
+            painted.iter().any(|t| t == "Kanaal 006"),
+            "150 points: five rows"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_is_not_a_number_does_not_stop_the_wheel() {
+        // The part of a turn that is not a whole row is kept: a NaN kept would
+        // keep every turn after it from scrolling.
+        let marks = HashMap::new();
+        let d = data(None, &marks);
+        let mut s = Screen::new();
+        let mut v = ready_for_the_wheel(&mut s, &d);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            turn(&mut s, &mut v, &d, bad);
+        }
+        let painted = turn(&mut s, &mut v, &d, -90.0);
+        assert!(
+            !painted.iter().any(|t| t == "Kanaal 003"),
+            "three rows down"
+        );
+        assert!(painted.iter().any(|t| t == "Kanaal 004"), "{painted:?}");
     }
 
     #[test]
@@ -1143,6 +1219,87 @@ mod tests {
         assert_eq!(s.click(&mut v, &d, ander), [ListAction::GroupChanged]);
         let (_, painted) = s.frame(&mut v, &d, vec![]);
         assert!(painted.iter().any(|t| t == "Kanaal 003"), "{painted:?}");
+    }
+
+    #[test]
+    fn a_click_on_a_group_on_screen_leaves_the_groups_column_where_it_is() {
+        let marks = HashMap::new();
+        let d = data(None, &marks);
+        let mut s = Screen::new();
+        let mut v = ChannelListView::new(many_groups(33), None, None);
+        s.frame(&mut v, &d, vec![]);
+        let at = Layout::row(Screen::layout().groups, 15).center();
+        let (_, before) = s.frame(&mut v, &d, vec![]);
+        assert_eq!(s.click(&mut v, &d, at), [ListAction::GroupChanged]);
+        let (_, after) = s.frame(&mut v, &d, vec![]);
+        let names = |painted: &[String]| -> Vec<String> {
+            painted
+                .iter()
+                .filter(|t| t.starts_with("Groep ") || *t == "All channels")
+                .cloned()
+                .collect()
+        };
+        assert_eq!(names(&before), names(&after), "the column did not move");
+        // A second click at the same place (a double click) opens nothing else.
+        assert_eq!(s.click(&mut v, &d, at), []);
+        assert_eq!(v.group_key(), Some(&GroupKey::Named("Groep 15".into())));
+    }
+
+    #[test]
+    fn a_group_that_is_off_screen_is_brought_into_view() {
+        // 34 groups, 18 of them on screen. The column moves for the group that
+        // leaves the screen, and only then.
+        let marks = HashMap::new();
+        let d = data(None, &marks);
+        let named = |painted: &[String], name: &str| painted.iter().any(|t| t == name);
+        // The list opens on a group far down.
+        let mut s = Screen::new();
+        let far = GroupKey::Named("Groep 30".into());
+        let mut v = ChannelListView::new(many_groups(33), Some(&far), None);
+        s.frame(&mut v, &d, vec![]);
+        let (_, painted) = s.frame(&mut v, &d, vec![]);
+        assert!(named(&painted, "Groep 30"), "{painted:?}");
+        assert_eq!(v.group_key(), Some(&far));
+        // Right, group by group: the column stays while the group shows ...
+        let mut s = Screen::new();
+        let mut v = ChannelListView::new(many_groups(33), None, None);
+        s.frame(&mut v, &d, vec![]);
+        for _ in 0..17 {
+            s.keys(&mut v, &d, &[Key::ArrowRight]);
+        }
+        assert_eq!(v.cursor().group, 17, "the last group on screen");
+        let (_, painted) = s.frame(&mut v, &d, vec![]);
+        assert!(named(&painted, "All channels"), "{painted:?}");
+        // ... and goes for the group that does not.
+        let (actions, painted) = s.frame(&mut v, &d, vec![press(Key::ArrowRight)]);
+        assert_eq!(actions, [ListAction::GroupChanged]);
+        assert_eq!(v.cursor().group, 18);
+        assert!(named(&painted, "Groep 18"), "{painted:?}");
+        assert!(!named(&painted, "All channels"));
+    }
+
+    #[test]
+    fn a_group_the_wheel_scrolled_away_is_brought_back_by_a_key() {
+        let marks = HashMap::new();
+        let d = data(None, &marks);
+        let mut s = Screen::new();
+        let mut v = ChannelListView::new(many_groups(33), None, None);
+        s.frame(&mut v, &d, vec![]);
+        for _ in 0..5 {
+            s.keys(&mut v, &d, &[Key::ArrowRight]);
+        }
+        assert_eq!(v.cursor().group, 5);
+        // Ten rows down the groups column: the selected group is above it.
+        let over = Layout::row(Screen::layout().groups, 3).center();
+        s.frame(&mut v, &d, vec![Event::PointerMoved(over)]);
+        let (_, painted) = s.frame(&mut v, &d, vec![Event::Scroll(Vec2::new(0.0, -300.0))]);
+        assert!(painted.iter().any(|t| t == "Groep 10"), "{painted:?}");
+        assert!(!painted.iter().any(|t| t == "Groep 05"));
+        // Left is the group above the selected one, and it is off screen too.
+        let (actions, painted) = s.frame(&mut v, &d, vec![press(Key::ArrowLeft)]);
+        assert_eq!(actions, [ListAction::GroupChanged]);
+        assert_eq!(v.cursor().group, 4);
+        assert!(painted.iter().any(|t| t == "Groep 04"), "{painted:?}");
     }
 
     #[test]
@@ -1209,6 +1366,8 @@ mod tests {
                     v.show(ctx, &d);
                 });
             }
+            // This holds by construction (`Layout::of` ends in `.max(1)`): the
+            // point of the test is that none of the frames above panics.
             let page = Layout::of(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))).visible;
             assert!(page >= 1, "{w} x {h}");
         }
@@ -1248,6 +1407,36 @@ mod tests {
         let shapes = hover(layout.groups, 0);
         assert_eq!(filled(&shapes, ROW_HOVER), 0);
         assert_eq!(filled(&shapes, GROUP_OPEN), 1);
+    }
+
+    #[test]
+    fn keys_that_are_not_the_lists_do_nothing() {
+        // The player's other keys are not the list's while it is open.
+        let marks = HashMap::new();
+        let d = data(Some(2), &marks);
+        let mut s = Screen::new();
+        let mut v = open(5, &[], None, Some(2), &mut s, &d);
+        let before = v.cursor();
+        for key in [
+            Key::Space,
+            Key::F,
+            Key::N,
+            Key::O,
+            Key::D,
+            Key::E,
+            Key::A,
+            Key::S,
+            Key::T,
+            Key::Num0,
+            Key::Num5,
+            Key::F5,
+            Key::F11,
+            Key::Tab,
+            Key::Backspace,
+        ] {
+            assert_eq!(s.keys(&mut v, &d, &[key]), [], "{key:?}");
+        }
+        assert_eq!(v.cursor(), before);
     }
 
     #[test]
