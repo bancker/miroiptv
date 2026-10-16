@@ -6528,6 +6528,206 @@ https://c.example/twee-nieuws.m3u8\n";
         assert!(!text.contains("zebra"), "{text}");
     }
 
+    // ---- Task 11's review: what the line of `f` may say, what it times, and when ----
+
+    /// The line of the plan, `search: <n> results in <t.t> ms`, and nothing
+    /// but the capture's own time, level and target in front of it (three
+    /// words, as `LogCapture` writes them): no word, length or hash of what
+    /// was typed before it, in it or behind it, in no span and no field.
+    fn is_the_search_line(line: &str) -> bool {
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        let tenths = |s: &str| {
+            s.split_once('.')
+                .is_some_and(|(whole, one)| digits(whole) && one.len() == 1 && digits(one))
+        };
+        let Some((head, tail)) = line.split_once("search: ") else {
+            return false;
+        };
+        let head: Vec<&str> = head.split_whitespace().collect();
+        let words: Vec<&str> = tail.split(' ').collect();
+        head.len() == 3
+            && head[1] == "INFO"
+            && head[2].ends_with(':')
+            && matches!(words[..], [n, "results", "in", t, "ms"] if digits(n) && tenths(t))
+    }
+
+    /// The milliseconds a search line says.
+    fn said_ms(line: &str) -> f64 {
+        line.rsplit(' ').nth(1).unwrap().parse().unwrap()
+    }
+
+    /// The lines of a capture that speak of a search, in any case.
+    fn search_lines(log: &LogCapture) -> Vec<String> {
+        log.text()
+            .lines()
+            .filter(|l| l.to_lowercase().contains("search"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Kills (alive under the plan's test and the second one): the level
+    /// turned to warn or error; a length, a hash or a field of the query in a
+    /// prefix, a span or the message; the ms printed whole, with three
+    /// decimals or with no rounding.
+    #[tokio::test]
+    async fn every_search_line_is_one_info_line_of_one_shape_with_nothing_else_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        let log = LogCapture::start();
+        h.frame_with(f_pressed());
+        h.type_text("zebra f");
+        let lines = search_lines(&log);
+        assert_eq!(lines.len(), 8, "{}", log.text());
+        for line in &lines {
+            assert!(is_the_search_line(line), "not the line of the plan: {line}");
+        }
+    }
+
+    /// Kills (alive under the plan's test and the second one): a closed box
+    /// that still writes its line, every frame. A search hoisted above the
+    /// closed box's return is killed by those two as well, but only because
+    /// the harness's first frames spend the memo.
+    #[tokio::test]
+    async fn a_closed_search_box_searches_and_logs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        let log = LogCapture::start();
+        h.frame(&[]);
+        h.frame(&[]);
+        assert!(search_lines(&log).is_empty(), "not opened yet");
+        h.frame_with(f_pressed());
+        h.type_text("zeb");
+        assert_eq!(search_lines(&log).len(), 4);
+        h.frame(&[Key::Escape]);
+        h.frame(&[]);
+        h.frame(&[]);
+        assert!(!h.app.show_search, "Esc closed it");
+        assert_eq!(search_lines(&log).len(), 4, "a closed box does nothing");
+    }
+
+    /// Kills (alive under the plan's test and the second one): a second line
+    /// that names the hits ("Zebra Film"), and the query at debug or trace.
+    #[tokio::test]
+    async fn nothing_typed_in_the_search_reaches_the_log_at_any_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        let log = LogCapture::start_at(tracing::Level::TRACE);
+        h.frame_with(f_pressed());
+        h.type_text("zebra f");
+        h.frame(&[]);
+        let text = log.text().to_lowercase();
+        assert!(
+            text.contains("search: "),
+            "the capture sees the line: {text}"
+        );
+        // Not the query, nor its words, nor what it found ("Zebra Film").
+        assert!(!text.contains("zebra"), "{text}");
+    }
+
+    /// The search opened over the guide (`f` in it) logs as the one on the
+    /// main screen does. It kills nothing that the tests on the main screen
+    /// do not: it pins the guide's way in, the only other one.
+    #[tokio::test]
+    async fn the_search_over_the_guide_logs_as_the_one_on_its_own_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        let log = LogCapture::start();
+        search_over_the_guide(&mut h);
+        h.type_text("zeb");
+        let lines = search_lines(&log);
+        let counts: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| Some(l.split_once("search: ")?.1.split_once(" results in ")?.0))
+            .collect();
+        // The empty box once, a line a key; the quiet frame after the open added none.
+        assert_eq!(counts, ["0", "2", "2", "2"], "{}", log.text());
+        assert!(lines.iter().all(|l| is_the_search_line(l)), "{lines:?}");
+    }
+
+    /// A catalog of this many live channels, "NL | Kanaal 0 HD" and on: a
+    /// search over it takes a measurable time.
+    fn crowded_catalog(channels: usize) -> Arc<CatalogStore> {
+        let live: Vec<LiveChannel> = (0..channels as i64)
+            .map(|i| LiveChannel {
+                stream_id: 10_000 + i,
+                name: format!("NL | Kanaal {i} HD"),
+                category_id: None,
+                epg_channel_id: None,
+                tv_archive: 0,
+                tv_archive_duration: 0,
+                is_adult: false,
+                stream_icon: None,
+            })
+            .collect();
+        let catalog = crate::portal::Catalog {
+            live,
+            ..Default::default()
+        };
+        Arc::new(CatalogStore::from_catalog(idle_portal(), catalog))
+    }
+
+    /// Kills (alive under the plan's test and the second one): the clock read
+    /// after the search (a line that says 0.0), seconds or hundredths for
+    /// milliseconds, milliseconds cut to whole ones. The premise (a search of
+    /// 40,000 channels takes some 16 ms in a debug build here; 1 ms is asked)
+    /// and the quarter (no tolerance for a busy machine: only a line that
+    /// timed something else says less than what the same search took) keep
+    /// it from failing on a quick or a loaded one.
+    #[tokio::test]
+    async fn the_time_in_the_search_line_is_the_time_the_search_took() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(
+            dir.path(),
+            crowded_catalog(40_000),
+            PortalState::Configured,
+            None,
+        );
+        let took = (0..3)
+            .map(|_| {
+                let t0 = Instant::now();
+                h.app.catalog.search("kanaal 1");
+                t0.elapsed().as_secs_f64() * 1000.0
+            })
+            .fold(f64::MAX, f64::min);
+        assert!(took >= 1.0, "a search of 40,000 channels took {took} ms");
+        let log = LogCapture::start();
+        h.frame_with(f_pressed());
+        h.type_text("kanaal 1");
+        let lines = search_lines(&log);
+        // A line that cut its milliseconds to whole ones would end in ".0" every time.
+        assert!(lines.iter().any(|l| !l.ends_with(".0 ms")), "{lines:?}");
+        let said = said_ms(lines.last().unwrap());
+        assert!(
+            said >= took / 4.0,
+            "the line says {said} ms, a search took {took} ms"
+        );
+    }
+
+    /// Kills (alive under the plan's test and the second one): the clock read
+    /// before the box is drawn, so that the line holds the drawing of the text
+    /// box too; the query's length for the time. A query of 200,000 letters
+    /// makes laying out the text box take about 90 ms in a debug build here,
+    /// and the search of four items 0.1 ms; the line must say less than a
+    /// quarter of the frame.
+    #[tokio::test]
+    async fn the_time_in_the_search_line_leaves_out_the_drawing_of_the_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        let log = LogCapture::start();
+        h.app.show_search = true;
+        h.app.search_query = "x".repeat(200_000);
+        let t0 = Instant::now();
+        h.frame(&[]);
+        let frame = t0.elapsed().as_secs_f64() * 1000.0;
+        let lines = search_lines(&log);
+        assert_eq!(lines.len(), 1, "{}", log.text());
+        let said = said_ms(&lines[0]);
+        assert!(
+            said * 4.0 < frame,
+            "the frame took {frame} ms, the line says {said} ms"
+        );
+    }
+
     /// The press of `f` as a keyboard makes it: the key and its letter, together.
     fn f_pressed() -> Vec<egui::Event> {
         vec![key_press(Key::F), egui::Event::Text("f".into())]

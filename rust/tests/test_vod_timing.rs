@@ -265,13 +265,17 @@ fn series_list_body(series: &[Series]) -> String {
     serde_json::to_string(&list).unwrap()
 }
 
-/// `work` timed `n` times: the first, best, mean and worst, in ms.
-fn time(n: usize, mut work: impl FnMut()) -> (f64, f64, f64, f64) {
+/// `work` timed `n` times: the first, best, mean and worst, in ms. What it
+/// makes is dropped after the clock has stopped: the app keeps its lists, its
+/// index and its hits, so freeing them is no part of what they cost.
+fn time<T>(n: usize, mut work: impl FnMut() -> T) -> (f64, f64, f64, f64) {
     let ms: Vec<f64> = (0..n)
         .map(|_| {
             let t0 = Instant::now();
-            work();
-            t0.elapsed().as_secs_f64() * 1000.0
+            let made = work();
+            let took = t0.elapsed().as_secs_f64() * 1000.0;
+            drop(black_box(made));
+            took
         })
         .collect();
     let best = ms.iter().copied().fold(f64::MAX, f64::min);
@@ -282,6 +286,21 @@ fn time(n: usize, mut work: impl FnMut()) -> (f64, f64, f64, f64) {
 #[test]
 #[ignore]
 fn a_catalog_of_pandoras_size_timed() {
+    // The instrument first: a Vec grown by push (a run of reallocs) must be
+    // counted at the capacity it ends with.
+    let (grown, _, held) = heap_of(|| {
+        let mut v: Vec<u8> = Vec::new();
+        for i in 0..1_000_000u32 {
+            v.push(i as u8);
+        }
+        v
+    });
+    assert_eq!(
+        held,
+        grown.capacity() as isize,
+        "the counting allocator miscounts"
+    );
+    drop(grown);
     let (movies, series, categories) = (films(), shows(), categories());
     // The lists as the catalog keeps them, and what they give up for the index
     // beside them, as `catalog::StoredCatalog::new` takes it out.
@@ -296,10 +315,11 @@ fn a_catalog_of_pandoras_size_timed() {
             MAX_YEAR,
         )
     };
-    let (first, best, mean, worst) = time(5, || {
-        black_box(build());
-    });
+    let (first, best, mean, worst) = time(5, || black_box(build()));
     let (index, peak, kept) = heap_of(build);
+    let (copy, _, copied) = heap_of(|| (kept_movies.clone(), kept_series.clone()));
+    drop(copy);
+    let no_list_copied = peak - kept < copied;
     let s = index.stats();
     println!(
         "index build: {} titles ({} series, {} films from {} versions): first {first:.1} ms, best {best:.1} ms, mean {mean:.1} ms, worst {worst:.1} ms",
@@ -309,10 +329,16 @@ fn a_catalog_of_pandoras_size_timed() {
         s.versions
     );
     println!(
-        "index build memory: {:.2} MB at its peak, {:.2} MB kept (the index), {:.2} MB passing (its own working lists); no list copied",
+        "index build memory: {:.2} MB at its peak, {:.2} MB kept (the index), {:.2} MB passing (its own working lists, where a copy of the lists alone is {:.2} MB); {}",
         peak as f64 / 1e6,
         kept as f64 / 1e6,
-        (peak - kept) as f64 / 1e6
+        (peak - kept) as f64 / 1e6,
+        copied as f64 / 1e6,
+        if no_list_copied {
+            "no list copied"
+        } else {
+            "A LIST WAS COPIED"
+        }
     );
     println!(
         "what the lists give up for it: {:.2} MB of handles (the strings move), held from the catalog's put until its titles are built",
@@ -332,13 +358,10 @@ fn a_catalog_of_pandoras_size_timed() {
     );
     let (film_body, series_body) = (film_list_body(&movies), series_list_body(&series));
     let (_, film_ms, _, _) = time(5, || {
-        let parsed: Vec<Movie> = serde_json::from_slice(black_box(film_body.as_bytes())).unwrap();
-        black_box(parsed);
+        serde_json::from_slice::<Vec<Movie>>(black_box(film_body.as_bytes())).unwrap()
     });
     let (_, series_ms, _, _) = time(5, || {
-        let parsed: Vec<Series> =
-            serde_json::from_slice(black_box(series_body.as_bytes())).unwrap();
-        black_box(parsed);
+        serde_json::from_slice::<Vec<Series>>(black_box(series_body.as_bytes())).unwrap()
     });
     println!(
         "film list parse: {film_ms:.1} ms, series list parse: {series_ms:.1} ms (on the fetch's worker, as before)"
@@ -365,7 +388,7 @@ fn a_catalog_of_pandoras_size_timed() {
         sort: Sort::Rating,
         ..Query::default()
     };
-    println!("keystroke      | index: text      | index: + filters | f today");
+    println!("keystroke            | index: text      | index: + filters | f today (each the best of 5 runs)");
     let typed = "the matrix pokemon";
     let (mut worst_index, mut worst_f) = (0.0f64, 0.0f64);
     for end in 1..=typed.len() {
@@ -380,20 +403,43 @@ fn a_catalog_of_pandoras_size_timed() {
         };
         let mut n_plain = 0;
         let (_, plain_ms, _, _) = time(5, || {
-            n_plain = black_box(index.search(&plain, false)).titles.len()
+            let found = black_box(index.search(&plain, false));
+            n_plain = found.titles.len();
+            found
         });
         let mut n_filtered = 0;
         let (_, filtered_ms, _, _) = time(5, || {
-            n_filtered = black_box(index.search(&filtered, false)).titles.len()
+            let found = black_box(index.search(&filtered, false));
+            n_filtered = found.titles.len();
+            found
         });
         let mut n_f = 0;
-        let (_, f_ms, _, _) = time(5, || n_f = black_box(store.search(text)).len());
+        let (_, f_ms, _, _) = time(5, || {
+            let found = black_box(store.search(text));
+            n_f = found.len();
+            found
+        });
         worst_index = worst_index.max(plain_ms).max(filtered_ms);
         worst_f = worst_f.max(f_ms);
         println!(
-            "{:<14} | {plain_ms:6.2} ms {n_plain:>6} | {filtered_ms:6.2} ms {n_filtered:>6} | {f_ms:6.2} ms {n_f:>3}",
+            "{:<20} | {plain_ms:6.2} ms {n_plain:>6} | {filtered_ms:6.2} ms {n_filtered:>6} | {f_ms:6.2} ms {n_f:>3}",
             format!("{text:?}")
         );
     }
     println!("worst keystroke: index {worst_index:.2} ms (budget 16 ms, and no slower than f), f {worst_f:.2} ms");
+    // Memory is no speed: it does not depend on how busy the machine is, so
+    // these are asserted, after every number has been printed. The allocator
+    // and the index agree on what the index holds (its sizes were pinned to
+    // the live heap): the figures above are the heap's own.
+    let own = (index.heap_bytes() + index.cover_bytes()) as isize;
+    assert!(
+        (kept - own).abs() * 100 < own,
+        "the allocator counts {kept} B kept, the index says {own} B"
+    );
+    assert!(
+        no_list_copied,
+        "the build's working lists ({:.2} MB) hold more than a copy of the lists would ({:.2} MB): a list was copied",
+        (peak - kept) as f64 / 1e6,
+        copied as f64 / 1e6
+    );
 }
