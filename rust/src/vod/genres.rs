@@ -3,12 +3,16 @@
 //! markers, the quality and language labels of a film's version, and the year
 //! at the end of a name.
 //!
-//! Everything is compared [`fold`]ed (lower case, no accents) and as whole
-//! words. Labels and language markers count only where labels stand: a prefix
-//! before the last `|`, a prefix before ` - ` that holds nothing else, a group
-//! in brackets, and the words at the end; in a category's name also the words
-//! it starts with ("NL FILMS"). So the "en" of "Romeo en Julia" is Dutch for
-//! "and", no English marker, and the "Dual" of "Dual (2022)" is its title.
+//! Everything is compared [`fold`]ed (lower case, no accents, an apostrophe
+//! dropped) and as whole words. Labels and language markers count only where
+//! labels stand: a prefix before the last bar (`|`, `｜`, `┃` or `│`), unless
+//! what follows that bar is labels only, which is read like the words at the
+//! end ("Frozen II (2019) 4K | NL"); a prefix before ` - ` (or ` – `, ` — `)
+//! that holds nothing else; a group in brackets that holds nothing else, which
+//! leaves the title when it stands in front ("[NL] Frozen II"); and the words
+//! at the end; in a category's name also the words it starts with ("NL
+//! FILMS"). So the "en" of "Romeo en Julia" is Dutch for "and", no English
+//! marker, and the "Dual" of "Dual (2022)" or "NL | Dual" is its title.
 
 use super::{fold, fold_into};
 use crate::i18n::T;
@@ -107,7 +111,8 @@ impl Genre {
     }
 
     /// The words portals use for it, folded: Dutch, English and German, and
-    /// the plurals they use.
+    /// the plurals, compounds and inflections they use. The fold drops an
+    /// apostrophe, so "marvels" and "childrens" are "Marvel's" and "Children's".
     pub fn aliases(self) -> &'static [&'static str] {
         match self {
             Genre::Action => &[
@@ -123,12 +128,15 @@ impl Genre {
                 "superheld",
                 "superhelden",
                 "marvel",
+                "marvels",
             ],
             Genre::Adventure => &[
                 "adventure",
                 "adventures",
                 "avontuur",
                 "avonturen",
+                "avonturenfilm",
+                "avonturenfilms",
                 "abenteuer",
             ],
             Genre::Animation => &[
@@ -158,12 +166,28 @@ impl Genre {
                 "x mas",
             ],
             Genre::Comedy => &[
-                "comedy", "comedies", "komedie", "komedies", "komodie", "komodien", "comedie",
-                "humor", "stand up", "standup", "cabaret", "kabarett",
+                "comedy",
+                "comedies",
+                "komedie",
+                "komedies",
+                "komediefilm",
+                "komediefilms",
+                "komodie",
+                "komodien",
+                "komoedie",
+                "komoedien",
+                "comedie",
+                "humor",
+                "stand up",
+                "standup",
+                "cabaret",
+                "kabarett",
             ],
             Genre::Crime => &[
                 "crime",
                 "misdaad",
+                "misdaadfilm",
+                "misdaadfilms",
                 "krimi",
                 "gangster",
                 "detective",
@@ -180,7 +204,7 @@ impl Genre {
                 "dokumentarfilm",
                 "doku",
             ],
-            Genre::Drama => &["drama", "dramas"],
+            Genre::Drama => &["drama", "dramas", "dramafilm", "dramafilms"],
             Genre::Family => &[
                 "family",
                 "familie",
@@ -189,11 +213,12 @@ impl Genre {
                 "familiefilms",
                 "familienfilm",
             ],
-            Genre::Fantasy => &["fantasy"],
+            Genre::Fantasy => &["fantasy", "fantasie"],
             Genre::History => &[
                 "history",
                 "historical",
                 "historisch",
+                "historische",
                 "historie",
                 "geschiedenis",
                 "geschichte",
@@ -210,6 +235,7 @@ impl Genre {
                 "kinderseries",
                 "jeugd",
                 "children",
+                "childrens",
             ],
             Genre::Music => &[
                 "music",
@@ -236,7 +262,14 @@ impl Genre {
                 &["science fiction", "sciencefiction", "sci fi", "scifi", "sf"]
             }
             Genre::Sport => &["sport", "sports", "sporten"],
-            Genre::Thriller => &["thriller", "thrillers", "suspense", "spanning"],
+            Genre::Thriller => &[
+                "thriller",
+                "thrillers",
+                "thrillerfilm",
+                "thrillerfilms",
+                "suspense",
+                "spanning",
+            ],
             Genre::War => &[
                 "war",
                 "oorlog",
@@ -462,8 +495,9 @@ fn as_year(word: &str, max_year: u16) -> Option<u16> {
 /// What a title's name says beside its title.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NameParts<'a> {
-    /// The name without its prefix, and without the labels and the year at its
-    /// end: what a tile shows. At least one word stays.
+    /// The name without its prefix (a group of labels in front is one), and
+    /// without the labels and the year at its end: what a tile shows. At least
+    /// one word stays.
     pub title: &'a str,
     /// "(2024)" anywhere, else " 2024" at the end (before the labels); 0 when
     /// neither, or when it is later than `max_year`.
@@ -501,11 +535,48 @@ thread_local! {
     static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
 }
 
-/// Reads a film's, a series' or a category's name: the prefix before its last
-/// `|` (whatever it holds), a prefix before ` - ` that is labels only, the
-/// groups in brackets that hold a year or labels only, and the labels and the
-/// year at its end. `max_year` is the latest year a name may give, the year
-/// after this one: "Blade Runner 2049" is no film of 2049.
+/// A vertical bar, in any of the spellings portals use: `|`, the fullwidth `｜`
+/// (U+FF5C) and the box-drawing `┃` (U+2503) and `│` (U+2502).
+fn is_bar(c: char) -> bool {
+    matches!(c, '|' | '\u{ff5c}' | '\u{2503}' | '\u{2502}')
+}
+
+/// A dash, in any of the spellings portals use: `-`, the en dash `–` (U+2013)
+/// and the em dash `—` (U+2014).
+fn is_dash(c: char) -> bool {
+    matches!(c, '-' | '\u{2013}' | '\u{2014}')
+}
+
+/// `text` split at the first of ` - `, ` – ` and ` — ` (a dash with a space on
+/// each side), without the dash. One pass that stops at the first, so that a
+/// name of many prefixes ("nl - nl - nl - ...") is read in one pass in all.
+fn split_dash(text: &str) -> Option<(&str, &str)> {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(found) = text[from..].find(is_dash) {
+        let at = from + found;
+        let end = at + text[at..].chars().next().map_or(1, char::len_utf8);
+        if at > 0 && bytes[at - 1] == b' ' && bytes.get(end) == Some(&b' ') {
+            return Some((&text[..at - 1], &text[end + 1..]));
+        }
+        from = end;
+    }
+    None
+}
+
+/// Reads a film's, a series' or a category's name:
+/// - the prefix before its last bar (`|`, `｜`, `┃` or `│`), whatever it holds,
+///   unless what follows that bar is labels only, which is then read like the
+///   words at the end ("Frozen II (2019) 4K | NL");
+/// - every prefix before ` - ` (or ` – `, ` — `) that is labels only;
+/// - a group in brackets in front that is labels only ("[NL] Frozen II"),
+///   which leaves the title like a prefix;
+/// - the groups in brackets anywhere that hold a year or labels only, and the
+///   labels and the year at its end.
+///
+/// At least one word stays the title ("NL | Dual" is the film Dual).
+/// `max_year` is the latest year a name may give, the year after this one:
+/// "Blade Runner 2049" is no film of 2049.
 pub fn parse_name(name: &str, max_year: u16) -> NameParts<'_> {
     SCRATCH.with(|s| read_name(name, max_year, &mut s.borrow_mut()))
 }
@@ -514,7 +585,30 @@ fn read_name<'a>(name: &'a str, max_year: u16, s: &mut Scratch) -> NameParts<'a>
     let mut labels = Labels::default();
     let mut year = 0u16;
     let mut rest = name.trim();
-    if let Some((before, after)) = rest.rsplit_once('|') {
+    // What follows the last bar and holds labels only ("Frozen II (2019) 4K |
+    // NL") is labels at the end, as after ` - `: it is no title, when something
+    // but labels is left before it ("NL | Dual" is still the film Dual). What
+    // is before the bar is looked at first: in the usual "NL | Title" it is
+    // labels only, a few characters, and the title is not folded at all.
+    for _ in 0..8 {
+        let Some((before, after)) = rest.rsplit_once(is_bar) else {
+            break;
+        };
+        s.last.clear();
+        fold_into(before, &mut s.last);
+        if s.last.is_empty() || labels_of_words(&s.last, true).is_some() {
+            break;
+        }
+        s.before.clear();
+        fold_into(after, &mut s.before);
+        let Some(found) = labels_of_words(&s.before, true) else {
+            break;
+        };
+        labels = labels.with(found);
+        rest = before.trim_end();
+    }
+    // The prefix before the last bar: its labels count, whatever else it holds.
+    if let Some((before, after)) = rest.rsplit_once(is_bar) {
         if !after.trim().is_empty() {
             s.before.clear();
             fold_into(before, &mut s.before);
@@ -522,14 +616,38 @@ fn read_name<'a>(name: &'a str, max_year: u16, s: &mut Scratch) -> NameParts<'a>
             rest = after.trim();
         }
     }
-    if let Some((before, after)) = rest.split_once(" - ") {
+    // Every prefix before ` - ` that is labels only, not the first alone.
+    while let Some((before, after)) = split_dash(rest) {
         s.before.clear();
         fold_into(before, &mut s.before);
-        if !after.trim().is_empty() {
-            if let Some(found) = labels_of_words(&s.before, true) {
+        match labels_of_words(&s.before, true) {
+            Some(found) if !after.trim().is_empty() => {
                 labels = labels.with(found);
                 rest = after.trim();
             }
+            _ => break,
+        }
+    }
+    // A group of labels in front ("[NL] Frozen II (2019)") is a prefix like
+    // `NL | `: its labels count and it leaves the title; something stays.
+    while let Some(close) = match rest.as_bytes().first() {
+        Some(b'(') => Some(b')'),
+        Some(b'[') => Some(b']'),
+        _ => None,
+    } {
+        let Some(len) = rest[1..].bytes().position(|b| b == close) else {
+            break;
+        };
+        s.before.clear();
+        fold_into(&rest[1..1 + len], &mut s.before);
+        let after = rest[len + 2..]
+            .trim_start_matches(|c: char| c.is_whitespace() || c == ':' || is_dash(c) || is_bar(c));
+        match labels_of_words(&s.before, true) {
+            Some(found) if !after.is_empty() => {
+                labels = labels.with(found);
+                rest = after;
+            }
+            _ => break,
         }
     }
     tokens(rest, max_year, s);
@@ -583,7 +701,9 @@ fn read_name<'a>(name: &'a str, max_year: u16, s: &mut Scratch) -> NameParts<'a>
         }
     }
     let end = s.tokens.last().map_or(rest.len(), |t| t.end);
-    let title = rest[..end].trim_end_matches([' ', '-', ':', '|', '.', ',', '_']);
+    let title = rest[..end].trim_end_matches(|c: char| {
+        matches!(c, ' ' | ':' | '.' | ',' | '_') || is_dash(c) || is_bar(c)
+    });
     NameParts {
         title: if title.is_empty() { rest } else { title },
         year,
@@ -664,11 +784,12 @@ fn group_of(folded: &str, max_year: u16) -> Group {
 
 /// The labels of a category's name: those [`parse_name`] reads, and the label
 /// words the name starts with ("Nederlands", "NL FILMS", "NL Gesproken Kids"):
-/// a portal names a section after its language, with or without a `|`. A
+/// a portal names a section after its language, with or without a bar. A
 /// title's name of one label keeps it as its title. A category's year means
-/// nothing.
+/// nothing: no year is allowed (`parse_name`'s latest is 0), so a number in
+/// brackets such as "(2160)" is a label, never a year.
 pub fn category_labels(name: &str) -> Labels {
-    let mut labels = parse_name(name, u16::MAX).labels;
+    let mut labels = parse_name(name, 0).labels;
     let folded = fold(name);
     let mut words = folded.split(' ').filter(|w| !w.is_empty()).peekable();
     while let Some(w) = words.next() {

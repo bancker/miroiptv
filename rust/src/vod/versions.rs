@@ -31,6 +31,9 @@ pub struct FilmTitle<'a> {
     pub year: u16,
     /// Its versions, the default one first: the highest quality tier, HDR
     /// before none, then the lowest stream id (the same default on every load).
+    /// A version whose stream id fits no title (not 1 to `u32::MAX`; a portal's
+    /// unreadable id is 0) comes after all the others, whatever its quality:
+    /// the title's id is the default version's stream id.
     pub versions: Vec<FilmVersion>,
 }
 
@@ -75,6 +78,7 @@ pub fn merge(movies: &[Movie], max_year: u16) -> Vec<FilmTitle<'_>> {
             title.versions.sort_by_key(|v| {
                 let id = movies[v.index as usize].stream_id;
                 (
+                    !(1..=i64::from(u32::MAX)).contains(&id),
                     std::cmp::Reverse(v.labels.rank()),
                     !v.labels.has(Labels::HDR),
                     id,

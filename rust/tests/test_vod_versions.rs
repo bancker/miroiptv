@@ -108,3 +108,66 @@ fn titles_keep_the_order_of_their_first_film() {
 fn no_films_no_titles() {
     assert!(merge(&[], 2027).is_empty());
 }
+
+#[test]
+fn the_shapes_a_portal_names_a_film_in_are_one_title() {
+    let movies = [
+        film(1, "Frozen II (2019)"),
+        film(2, "NL | Frozen II (2019) [4K]"),
+        film(3, "[NL] Frozen II (2019)"),
+        film(4, "Frozen II (2019) 4K | NL"),
+        film(5, "Toy Story 4 (2019) | NL"),
+        film(6, "Up (2009) 1080p | NL"),
+    ];
+    let titles = merge(&movies, 2027);
+    assert_eq!(
+        shape(&movies, &titles),
+        [
+            ("Frozen II", 2019, vec![2, 4, 1, 3]),
+            ("Toy Story 4", 2019, vec![5]),
+            ("Up", 2009, vec![6])
+        ]
+    );
+}
+
+#[test]
+fn an_apostrophe_does_not_make_two_titles() {
+    let movies = [
+        film(1, "Ocean's Eleven (2001)"),
+        film(2, "Oceans Eleven (2001)"),
+        film(3, "Ocean\u{2019}s Eleven (2001) 4K"),
+    ];
+    let titles = merge(&movies, 2027);
+    assert_eq!(
+        shape(&movies, &titles),
+        [("Ocean\u{2019}s Eleven", 2001, vec![3, 1, 2])]
+    );
+    assert_eq!(titles[0].key, "oceans eleven");
+}
+
+#[test]
+fn a_version_whose_stream_id_fits_no_title_comes_last() {
+    // A title's id is its default version's stream id, 1 to u32::MAX; an
+    // unreadable id is 0 (Ruling 3). Such a version is never the default,
+    // whatever its quality.
+    let movies = [
+        film(-3, "Frozen II (2019) 4K HDR"),
+        film(0, "Frozen II (2019) 4K"),
+        film(7, "Frozen II (2019) 1080p"),
+    ];
+    let titles = merge(&movies, 2027);
+    assert_eq!(
+        shape(&movies, &titles),
+        [("Frozen II", 2019, vec![7, -3, 0])]
+    );
+    // Too big for a u32 is no fit either; u32::MAX itself is.
+    let movies = [
+        film(4_294_967_296, "Dune (2021) 4K"),
+        film(4_294_967_295, "Dune (2021) HD"),
+    ];
+    let titles = merge(&movies, 2027);
+    assert_eq!(
+        shape(&movies, &titles),
+        [("Dune", 2021, vec![4_294_967_295, 4_294_967_296])]
+    );
+}

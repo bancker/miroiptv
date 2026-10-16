@@ -20,8 +20,9 @@ pub struct TitleId {
 }
 
 /// `text` as the search compares it: lower case, accents off ("Pokémon" is
-/// "pokemon", "ß" is "ss"), every run of other characters one space, no space
-/// at either end. Letters of other scripts stay, in lower case.
+/// "pokemon", "ß" is "ss"), an apostrophe dropped ("Ocean's" is "oceans",
+/// "Don’t" is "dont"), every run of other characters one space, no space at
+/// either end. Letters of other scripts stay, in lower case.
 pub fn fold(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     fold_into(text, &mut out);
@@ -37,7 +38,7 @@ pub fn fold_into(text: &str, out: &mut String) {
             if c.is_ascii_alphanumeric() {
                 out.push(c.to_ascii_lowercase());
                 space = false;
-            } else if !space {
+            } else if !space && !is_apostrophe(c) {
                 out.push(' ');
                 space = true;
             }
@@ -49,6 +50,10 @@ pub fn fold_into(text: &str, out: &mut String) {
                     out.push_str(ascii);
                     space = false;
                 }
+                // An apostrophe joins its word ("Ocean's" is "oceans"): it is
+                // no letter and no space. ʼ (U+02BC) is a letter to Unicode, so
+                // this comes before the letters.
+                None if is_apostrophe(lower) => {}
                 None if lower.is_alphanumeric() => {
                     out.push(lower);
                     space = false;
@@ -67,6 +72,16 @@ pub fn fold_into(text: &str, out: &mut String) {
     if out.len() > start && out.ends_with(' ') {
         out.pop();
     }
+}
+
+/// The apostrophes: `'` and `` ` `` (ASCII), the curly `’` (U+2019) and `‘`
+/// (U+2018), `ʼ` (U+02BC) and the accent `´` (U+00B4), which keyboards and
+/// portals use for one.
+fn is_apostrophe(c: char) -> bool {
+    matches!(
+        c,
+        '\'' | '`' | '\u{2019}' | '\u{2018}' | '\u{2bc}' | '\u{b4}'
+    )
 }
 
 /// The plain letters of a lower-case letter with an accent; none for any other.
