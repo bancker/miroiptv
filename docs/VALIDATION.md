@@ -136,8 +136,9 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] Restart (resumes the last channel) → arrow up/down goes to its neighbour, not to the end of the list
 
 ## Subtitles / audio
-- [ ] On a VOD with multiple audio tracks, press `a` → cycles
-- [ ] On a stream with subtitles, press `s` → cycles / disables
+- [ ] On a live channel with one audio track (Bloomberg on an M3U list), press `a` → "één audiospoor", the sound stays; zap on → the next channel has sound
+- [ ] On a VOD with several audio tracks, press `a` → "audiospoor 2/3: deu", again → the next, after the last the first again, never silent; zap to a live channel → it has sound (a track choice is per stream, log `audio and subtitles back to auto for another stream`); a stream without audio says "geen audiospoor"
+- [ ] On a stream with subtitles, press `s` → cycles / disables; the next channel starts with its own default
 
 ## VOD seek
 - [ ] On a movie (search "matrix" → enter), play

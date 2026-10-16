@@ -178,8 +178,8 @@ function Group-B {
     Scn 'T12-3' @{ Resume = 10; Keys = 'o;DOWN;DOWN;1;f;SPACE;ESC;DOWN'; Expect = 'settings: opened', 'settings: closed', 'zap: -> TEST 11'; Forbid = 'zap: -> TEST 12' }
     Scn 'T12-4' @{ Resume = 10; Keys = 'o;SLEEP:300;o;SLEEP:300;DOWN'; Expect = 'settings: closed', 'zap: -> TEST 11' }
     # Task 13 brief
-    Scn 'T13-1' @{ Settings = '{"language":"de"}'; Resume = 3; Keys = 'a;5'; Expect = 'toast: n.chste Tonspur', 'toast: Taste 5 ist leer' }
-    Scn 'T13-2' @{ Settings = '{"language":"en"}'; Resume = 3; Keys = 'a;5'; Expect = 'toast: next audio track', 'toast: preset 5 is empty' }
+    Scn 'T13-1' @{ Settings = '{"language":"de"}'; Resume = 3; Keys = 'a;5'; Expect = 'toast: eine Tonspur', 'toast: Taste 5 ist leer' }
+    Scn 'T13-2' @{ Settings = '{"language":"en"}'; Resume = 3; Keys = 'a;5'; Expect = 'toast: one audio track', 'toast: preset 5 is empty' }
     Scn 'T13-3' @{ Resume = 10; Keys = 'o;1;SPACE;ESC'; Expect = 'settings: closed'; Forbid = 'toast: sneltoets', 'toast: pauze' }
     # Task 14 brief
     foreach ($lg in 'nl', 'en', 'de') {
@@ -250,6 +250,9 @@ function Group-N {
     Scn 'N-A2' @{ Resume = 10; Seconds = 16; Keys = 'g;SLEEP:2500;?;SLEEP:400;TAB;ENTER;SLEEP:600;TAB;TAB;ENTER;SLEEP:600;ESC;ESC'; Expect = 'settings: opened'; Forbid = 'zap: ->', 'guide: \[' }
     # L: Enter on the help's settings row opens the settings in their list (o closes them; in the Language pane it would be a letter).
     Scn 'N-L' @{ Resume = 10; Seconds = 14; Keys = '?;SLEEP:500;TAB;ENTER;SLEEP:500;o;SLEEP:300;DOWN'; Expect = 'settings: opened', 'settings: closed', 'zap: -> TEST 11' }
+    # K: a on a one-track stream keeps its sound, and so does the next channel: mpv's own cycle went to "no audio", which
+    # outlived the file. mpv lists a file's tracks as it loads it, a selected one with U+25CF, one it leaves off with U+25CB.
+    Scn 'N-K' @{ Resume = 3; Seconds = 14; Keys = 'a;SLEEP:800;DOWN'; Expect = 'audio: one track, kept', 'toast: ..n audiospoor', 'zap: -> TEST 04', '\u25CF Audio'; Forbid = '\u25CB Audio', 'back to auto' }
     # M: only the portal's flag marks adult content.
     Scn 'N-M1' @{ MockEnv = @{ MOCK_XXX = '1' }; Resume = 3; Keys = 'f;SLEEP:400;TEXT:xxx some;SLEEP:800;ENTER'; Expect = 'zap: -> XXX Something' }
     Scn 'N-M2' @{ MockEnv = @{ MOCK_XXX = '1'; MOCK_ADULT = '1' }; Resume = 3; Keys = 'f;SLEEP:400;TEXT:state of the union;SLEEP:800;ENTER'; Expect = 'toast: \[FILM\] xXx: State of the Union' }

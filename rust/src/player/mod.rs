@@ -2,6 +2,7 @@ pub mod events;
 pub mod mpv;
 pub mod mpv_sys;
 pub mod render;
+pub mod tracks;
 
 pub use mpv::{Mpv, MpvError};
 pub use render::{FrameBus, FrameFence, RenderCtx, RgbaFrame};
@@ -36,9 +37,24 @@ pub enum Cmd {
 pub enum Event {
     FileLoaded,
     PlaybackStarted,
-    EndOfFile { reason: String },
-    Error { msg: String },
-    PropertyChanged { name: String, value: String },
+    EndOfFile {
+        reason: String,
+    },
+    Error {
+        msg: String,
+    },
+    PropertyChanged {
+        name: String,
+        value: String,
+    },
+    /// What `a` left selected: track `index` of `count` (both from 1), named
+    /// by its language or title in `label`. `count` 0 means no audio track,
+    /// `index` 0 none selected.
+    AudioTrack {
+        count: usize,
+        index: usize,
+        label: String,
+    },
 }
 
 pub struct PlayerHandle {
@@ -86,12 +102,16 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
             }
 
             info!("mpv player thread started");
+            let mut choice = tracks::TrackChoice::new();
 
             loop {
                 loop {
                     match cmd_rx.try_recv() {
                         Ok(load @ (Cmd::LoadUrl(_) | Cmd::LoadWithHeaders(_))) => {
                             if let Some((args, line)) = loadfile_command(&load) {
+                                if choice.load(&args[1]) {
+                                    reset_tracks(&mpv);
+                                }
                                 info!("{}", line);
                                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                                 if let Err(e) = mpv.command(&args) {
@@ -111,10 +131,12 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                             let _ = mpv.command(&["seek", &s.to_string(), "relative"]);
                         }
                         Ok(Cmd::CycleAudio) => {
-                            let _ = mpv.command(&["cycle", "audio"]);
+                            let _ = evt_tx.send(cycle_audio(&mpv, &mut choice));
                         }
                         Ok(Cmd::CycleSubtitle) => {
-                            let _ = mpv.command(&["cycle", "sub"]);
+                            if mpv.command(&["cycle", "sub"]).is_ok() {
+                                choice.chosen();
+                            }
                         }
                         Ok(Cmd::SetWindowSize(w, h)) => {
                             rctx.resize(w, h);
@@ -202,6 +224,54 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
         evt_rx: parking_lot::Mutex::new(evt_rx),
         frames,
     })
+}
+
+/// `a`: the next audio track of what plays, round to the first, never "no
+/// audio". mpv's own `cycle audio` passes through "no", and an `aid` set at
+/// runtime outlives the file: one press on a one-track stream silenced every
+/// later stream. The event says what is selected now, for the app's toast.
+fn cycle_audio(mpv: &Mpv, choice: &mut tracks::TrackChoice) -> Event {
+    let list = tracks::audio_tracks(|name| mpv.get_property_string(name));
+    let count = list.len();
+    let selected = list.iter().position(|t| t.selected);
+    let answer = |index: Option<usize>| Event::AudioTrack {
+        count,
+        index: index.map_or(0, |i| i + 1),
+        label: index.map(|i| list[i].label()).unwrap_or_default(),
+    };
+    match tracks::pick_next(&list) {
+        tracks::Pick::None => {
+            info!("audio: no track");
+            answer(None)
+        }
+        tracks::Pick::OnlyOne => {
+            info!("audio: one track, kept");
+            answer(selected)
+        }
+        tracks::Pick::Next(i) => match mpv.set_property("aid", &list[i].id.to_string()) {
+            Ok(()) => {
+                choice.chosen();
+                info!("audio: track {}/{} ({})", i + 1, count, list[i].label());
+                answer(Some(i))
+            }
+            Err(e) => {
+                warn!("audio: aid={} failed: {}", list[i].id, e);
+                answer(selected)
+            }
+        },
+    }
+}
+
+/// A track chosen with `a` or `s` is mpv's choice for every later file too
+/// (an `aid` or `sid` set at runtime outlives the file): another stream starts
+/// from mpv's own choice again.
+fn reset_tracks(mpv: &Mpv) {
+    info!("audio and subtitles back to auto for another stream");
+    for name in ["aid", "sid"] {
+        if let Err(e) = mpv.set_property(name, "auto") {
+            warn!("{}=auto failed: {}", name, e);
+        }
+    }
 }
 
 /// What the player thread runs for a load, and the line it logs (`None` for a

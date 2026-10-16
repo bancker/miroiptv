@@ -1745,6 +1745,25 @@ impl TvApp {
                         }
                     }
                 }
+                Event::AudioTrack {
+                    count,
+                    index,
+                    label,
+                } => {
+                    let text = match count {
+                        0 => self.t(T::AudioNone).to_owned(),
+                        1 => self.t(T::AudioOnlyOne).to_owned(),
+                        _ if label.is_empty() => self.tr(
+                            T::AudioTrackNPlain,
+                            &[&index.to_string(), &count.to_string()],
+                        ),
+                        _ => self.tr(
+                            T::AudioTrackN,
+                            &[&index.to_string(), &count.to_string(), &label],
+                        ),
+                    };
+                    self.set_toast(text);
+                }
             }
         }
     }
@@ -3613,8 +3632,9 @@ impl TvApp {
         }
 
         if a_key {
+            // The player answers with the track it left selected
+            // (`Event::AudioTrack`); that answer is the toast.
             let _ = self.player.cmd_tx.send(Cmd::CycleAudio);
-            self.set_toast(self.t(T::CycleAudio));
         }
         if s_key {
             let _ = self.player.cmd_tx.send(Cmd::CycleSubtitle);
@@ -5943,6 +5963,64 @@ https://c.example/twee-nieuws.m3u8\n";
         assert!(!h.app.show_favs, "the favorites list is closed");
         assert!(!zapped(&h.sent()), "nothing was zapped");
         assert!(h.app.favorites.contains(3), "and nothing deleted");
+    }
+
+    #[tokio::test]
+    async fn a_asks_the_player_for_the_next_audio_track_and_its_answer_is_the_toast() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        h.frame(&[]);
+        h.sent();
+        let toast = |h: &Harness| h.app.toast.as_ref().map(|(t, _, _)| t.clone());
+        let before = toast(&h);
+        h.press(&[Key::A]);
+        assert!(
+            h.sent().iter().any(|c| matches!(c, Cmd::CycleAudio)),
+            "the player is asked"
+        );
+        assert_eq!(
+            toast(&h),
+            before,
+            "no toast of its own: the player's answer is the toast"
+        );
+        let answer = |h: &mut Harness, count: usize, index: usize, label: &str| {
+            h.events
+                .send(Event::AudioTrack {
+                    count,
+                    index,
+                    label: label.into(),
+                })
+                .unwrap();
+            h.frame(&[]);
+        };
+        // One track, kept (Bloomberg on an M3U list).
+        answer(&mut h, 1, 1, "eng");
+        assert_eq!(toast(&h).as_deref(), Some(h.app.t(T::AudioOnlyOne)));
+        // Three tracks, the second now.
+        answer(&mut h, 3, 2, "deu (Dolby)");
+        assert_eq!(
+            toast(&h),
+            Some(h.app.tr(T::AudioTrackN, &["2", "3", "deu (Dolby)"]))
+        );
+        // A track without a language or title: the numbers alone.
+        answer(&mut h, 2, 1, "");
+        assert_eq!(toast(&h), Some(h.app.tr(T::AudioTrackNPlain, &["1", "2"])));
+        // No audio at all.
+        answer(&mut h, 0, 0, "");
+        assert_eq!(toast(&h).as_deref(), Some(h.app.t(T::AudioNone)));
+        // As the user reads it.
+        assert_eq!(
+            crate::i18n::tr(crate::i18n::Lang::Nl, T::AudioTrackN, &["2", "3", "deu"]),
+            "audiospoor 2/3: deu"
+        );
+        assert_eq!(
+            crate::i18n::t(crate::i18n::Lang::Nl, T::AudioOnlyOne),
+            "één audiospoor"
+        );
+        // s is unchanged: mpv's own cycle, with the key's toast.
+        h.press(&[Key::S]);
+        assert!(h.sent().iter().any(|c| matches!(c, Cmd::CycleSubtitle)));
+        assert_eq!(toast(&h).as_deref(), Some(h.app.t(T::CycleSubtitle)));
     }
 
     /// An hour-long programme on `now` ("Journaal 0", since 10 minutes), the two
