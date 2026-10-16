@@ -1469,7 +1469,7 @@ pub(crate) fn single_line(
 }
 
 /// Text over at most `rows` rows of `width`, cut off with "…" after the last.
-fn few_rows(
+pub(crate) fn few_rows(
     text: &str,
     font: FontId,
     color: Color32,

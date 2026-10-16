@@ -1,11 +1,13 @@
-//! The channel list over the running picture (`g` on an M3U source; spec
-//! 2026-10-15, §3): the groups on the left, the chosen group's channels on the
-//! right. `ChannelListView` keeps the list's state while it is open; `show`
-//! draws one frame, the rows on screen only, and hands what the user did to
-//! app.rs as [`ListAction`]s, as guide_ui.rs does.
+//! The channel list beside the running picture (`g` on an M3U source; spec
+//! 2026-10-15, §3): the list on the left of the window, its groups and the
+//! chosen group's channels side by side, and the picture of what plays on the
+//! right ([`Layout::picture`], which app.rs draws). `ChannelListView` keeps the
+//! list's state while it is open; `show` draws one frame, the rows on screen
+//! only, and hands what the user did to app.rs as [`ListAction`]s, as
+//! guide_ui.rs does.
 
 use crate::channel_list::{ChannelGroups, Cursor, GroupKey};
-use crate::guide_ui::{play_mark, single_line, CLICK};
+use crate::guide_ui::{few_rows, play_mark, single_line, CLICK};
 use crate::i18n::{self, Lang, T};
 use egui::{Align2, Color32, FontId, Key, Pos2, Rect, Sense, Stroke, Vec2};
 use std::collections::HashMap;
@@ -43,12 +45,19 @@ pub struct ListData<'a> {
 const ROW_H: f32 = 30.0;
 const MARGIN: f32 = 16.0;
 const TITLE_H: f32 = 44.0;
-const FOOTER_H: f32 = 28.0;
+/// Room for the keys: two rows of them in a narrow list.
+const FOOTER_H: f32 = 40.0;
 const GROUPS_W: f32 = 280.0;
 const MIN_W: f32 = 320.0;
-const MAX_W: f32 = 940.0;
-/// Room left under the list: the toast ("streamfout op …") shows there.
+const MAX_W: f32 = 760.0;
+/// The share of the window's width the list takes; the picture of what plays
+/// has the rest (the user, 2026-10-16: more of the picture).
+const LIST_SHARE: f32 = 0.42;
+/// Room left under the list and the picture: the toast ("streamfout op …")
+/// shows there.
 const TOAST_ROOM: f32 = 64.0;
+/// Between two hints of the footer; a row of it breaks only there.
+const HINT_GAP: &str = "  ·  ";
 
 // The list's colours: tokens of its own, as the guide has its own; some have
 // the guide's values (the selected and the hovered row, the accent, the green).
@@ -60,22 +69,26 @@ const ACCENT: Color32 = Color32::from_rgb(255, 80, 140);
 pub(crate) const PLAYING: Color32 = Color32::from_rgb(120, 230, 100);
 const BROKEN: Color32 = Color32::from_rgb(230, 120, 110);
 
-/// Where the parts of the list go in a window `screen`.
+/// Where the parts of the list go in a window `screen`: the list on the left,
+/// the picture of what plays to its right.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Layout {
     pub(crate) panel: Rect,
     pub(crate) groups: Rect,
     pub(crate) rows: Rect,
+    /// The picture of what plays: the window to the right of the list, as
+    /// high as the list. Never inverted; empty in a window too narrow for it.
+    pub(crate) picture: Rect,
     /// How many rows a column has room for: a page.
     pub(crate) visible: usize,
 }
 
 impl Layout {
     pub(crate) fn of(screen: Rect) -> Self {
-        let width = (screen.width() - 2.0 * MARGIN).clamp(MIN_W, MAX_W);
+        let width = (screen.width() * LIST_SHARE).clamp(MIN_W, MAX_W);
         let height = (screen.height() - MARGIN - TOAST_ROOM).max(TITLE_H + FOOTER_H + ROW_H);
         let panel = Rect::from_min_size(
-            Pos2::new(screen.center().x - width / 2.0, screen.top() + MARGIN),
+            Pos2::new(screen.left() + MARGIN, screen.top() + MARGIN),
             Vec2::new(width, height),
         );
         let (top, bottom) = (panel.top() + TITLE_H, panel.bottom() - FOOTER_H);
@@ -83,10 +96,16 @@ impl Layout {
         let groups = Rect::from_min_max(Pos2::new(panel.left(), top), Pos2::new(split, bottom));
         let rows = Rect::from_min_max(Pos2::new(split, top), Pos2::new(panel.right(), bottom));
         let visible = ((rows.height() / ROW_H).floor() as usize).max(1);
+        let left = panel.right() + MARGIN;
+        let picture = Rect::from_min_max(
+            Pos2::new(left, panel.top()),
+            Pos2::new((screen.right() - MARGIN).max(left), panel.bottom()),
+        );
         Self {
             panel,
             groups,
             rows,
+            picture,
             visible,
         }
     }
@@ -98,6 +117,16 @@ impl Layout {
             Vec2::new(column.width() - 12.0, ROW_H - 2.0),
         )
     }
+}
+
+/// The footer's hints with their own spaces made non-breaking, and the gap
+/// before each "·" too: a row breaks after a "·", never inside a hint
+/// ("Home / End").
+fn unbroken_hints(text: &str) -> String {
+    text.split(HINT_GAP)
+        .map(|hint| hint.replace(' ', "\u{a0}"))
+        .collect::<Vec<_>>()
+        .join("\u{a0}\u{a0}·  ")
 }
 
 /// A click in the list, taken in after the frame is drawn.
@@ -460,13 +489,14 @@ impl ChannelListView {
                 });
             }
         }
-        // The keys, one line.
+        // The keys, in two rows at most, broken between two hints only.
         let color = Color32::from_white_alpha(110);
-        let footer = single_line(
-            i18n::t(lang, T::ChannelListFooter),
+        let footer = few_rows(
+            &unbroken_hints(i18n::t(lang, T::ChannelListFooter)),
             FontId::proportional(11.0),
             color,
             layout.panel.width() - 2.0 * MARGIN,
+            2,
         );
         let galley = p.layout_job(footer);
         let y = layout.panel.bottom() - FOOTER_H / 2.0 - galley.size().y / 2.0;
@@ -818,7 +848,9 @@ mod tests {
         let mut s = Screen::new();
         let mut v = open(5, &[], None, None, &mut s, &d);
         let (_, painted) = s.frame(&mut v, &d, vec![]);
-        // The close hint leads: a window too narrow for the line loses its end.
+        // Its hints' spaces are non-breaking (`unbroken_hints`): read as spaces.
+        let painted: Vec<String> = painted.iter().map(|t| t.replace('\u{a0}', " ")).collect();
+        // The close hint leads: a list too narrow for the two rows loses the end.
         let footer = "Esc or g = close  ·  Enter = play  ·  Up / Down = choose  ·  Left / Right = group  ·  PgUp / PgDn, Home / End = jump";
         for text in [
             "Channel list",
@@ -833,6 +865,73 @@ mod tests {
         ] {
             assert!(painted.iter().any(|t| t == text), "{text}: {painted:?}");
         }
+    }
+
+    #[test]
+    fn the_list_is_on_the_left_and_the_picture_beside_it_as_high_as_the_list() {
+        for (w, h) in [(1280.0, 720.0), (1920.0, 1080.0), (960.0, 540.0)] {
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h));
+            let l = Layout::of(screen);
+            assert_eq!(l.panel.left(), MARGIN, "{w} x {h}");
+            assert_eq!(l.panel.top(), MARGIN, "{w} x {h}");
+            assert_eq!(l.picture.left(), l.panel.right() + MARGIN, "{w} x {h}");
+            assert_eq!(l.picture.right(), w - MARGIN, "{w} x {h}");
+            assert_eq!(l.picture.top(), l.panel.top(), "{w} x {h}");
+            assert_eq!(l.picture.bottom(), l.panel.bottom(), "{w} x {h}");
+            assert!(
+                l.panel.bottom() <= h - TOAST_ROOM,
+                "the toast's room: {w} x {h}"
+            );
+            // More of the picture than of the list (the user, 2026-10-16).
+            assert!(l.picture.width() > l.panel.width(), "{w} x {h}: {l:?}");
+        }
+    }
+
+    #[test]
+    fn a_window_too_narrow_for_the_picture_leaves_it_empty_never_inverted() {
+        for w in [100.0, 200.0, 352.0, 400.0, 640.0] {
+            for h in [50.0, 120.0, 720.0] {
+                let l = Layout::of(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h)));
+                let p = l.picture;
+                assert!(p.min.x <= p.max.x && p.min.y <= p.max.y, "{w} x {h}: {p:?}");
+            }
+        }
+        let l = Layout::of(Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 720.0)));
+        assert_eq!(l.picture.width(), 0.0, "the list takes the window");
+    }
+
+    #[test]
+    fn a_row_of_the_keys_breaks_between_two_hints_never_inside_one() {
+        assert_eq!(
+            unbroken_hints("Esc or g = close  ·  Home / End = jump"),
+            "Esc\u{a0}or\u{a0}g\u{a0}=\u{a0}close\u{a0}\u{a0}·  Home\u{a0}/\u{a0}End\u{a0}=\u{a0}jump"
+        );
+        // In the tests' window of 1280 x 720 the keys take two rows, whole.
+        let marks = HashMap::new();
+        let d = data(None, &marks);
+        let mut s = Screen::new();
+        let mut v = open(5, &[], None, None, &mut s, &d);
+        let (_, shapes) = s.run(&mut v, &d, vec![]);
+        let footer = shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text().starts_with("Esc") => {
+                    Some(t.galley.clone())
+                }
+                _ => None,
+            })
+            .expect("the keys are painted");
+        let rows: Vec<String> = footer
+            .rows
+            .iter()
+            .map(|r| r.glyphs.iter().map(|g| g.chr).collect())
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].trim_end().ends_with('·'), "{rows:?}");
+        assert!(
+            !rows.iter().any(|r| r.contains('…')),
+            "nothing cut off: {rows:?}"
+        );
     }
 
     #[test]

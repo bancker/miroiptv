@@ -178,6 +178,16 @@ fn preset_target(presets: &Presets, digit: u8, catalog: &CatalogStore) -> Option
         .map(|p| p.stream_id)
 }
 
+/// Where a picture of `size` goes in `area`: as large as it fits there, in
+/// proportion, in the middle. Nothing at all for a picture without a size.
+fn fit_picture(size: egui::Vec2, area: egui::Rect) -> egui::Rect {
+    if size.x <= 0.0 || size.y <= 0.0 {
+        return egui::Rect::from_center_size(area.center(), egui::Vec2::ZERO);
+    }
+    let scale = (area.width() / size.x).min(area.height() / size.y).max(0.0);
+    egui::Rect::from_center_size(area.center(), size * scale)
+}
+
 /// What the empty screen says once the catalog has loaded: the keys to start
 /// with, `g` among them.
 fn loaded_hint(kind: SourceKind) -> T {
@@ -3871,10 +3881,20 @@ impl TvApp {
         self.pending_catchup = None;
     }
 
+    /// The size mpv renders the picture at: the window's, or while the channel
+    /// list is open the picture's beside it (`Layout::picture`). There mpv
+    /// scales it, letterboxed, and renders, copies and uploads half as many
+    /// pixels per frame as for the window.
     fn forward_window_size(&self, ctx: &egui::Context) {
         if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
-            let w = rect.width().max(1.0) as u32;
-            let h = rect.height().max(1.0) as u32;
+            let size = match self.channel_list {
+                Some(_) => crate::channel_list_ui::Layout::of(ctx.screen_rect())
+                    .picture
+                    .size(),
+                None => rect.size(),
+            };
+            let w = size.x.max(1.0) as u32;
+            let h = size.y.max(1.0) as u32;
             let _ = self.player.cmd_tx.send(Cmd::SetWindowSize(w, h));
         }
     }
@@ -5155,10 +5175,22 @@ impl TvApp {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(Color32::BLACK))
                 .show(ctx, |ui| {
+                    // Beside the open channel list the picture has the window
+                    // to its right; else the whole window. A frame of the size
+                    // before (the list just opened or closed) fits in, in
+                    // proportion, until mpv sends one of the new size.
+                    let open = self.channel_list.is_some();
+                    let area = match open {
+                        true => crate::channel_list_ui::Layout::of(ctx.screen_rect()).picture,
+                        false => ui.max_rect(),
+                    };
                     if let Some(tex) = &self.video_tex {
-                        let avail = ui.available_size();
-                        ui.add(egui::Image::new(tex).fit_to_exact_size(avail));
-                    } else {
+                        let all =
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        let at = fit_picture(tex.size_vec2(), area);
+                        ui.painter().image(tex.id(), at, all, Color32::WHITE);
+                    } else if !open {
+                        // Beside the list the black says it: no picture yet.
                         self.paint_empty_state(ui);
                     }
                 });
@@ -11875,6 +11907,115 @@ https://c.example/twee-nieuws.m3u8\n";
     fn selected(h: &Harness) -> Option<String> {
         let view = list(h);
         view.cursor().channel(view.groups()).map(|c| c.name.clone())
+    }
+
+    /// Where the last frame drew the video texture, if it drew it.
+    fn video_drawn_at(h: &Harness) -> Option<egui::Rect> {
+        let id = h.app.video_tex.as_ref()?.id();
+        h.shapes.iter().find_map(|c| match &c.shape {
+            egui::Shape::Mesh(m) if m.texture_id == id => {
+                let corners: Vec<egui::Pos2> = m.vertices.iter().map(|v| v.pos).collect();
+                Some(egui::Rect::from_points(&corners))
+            }
+            _ => None,
+        })
+    }
+
+    /// The sizes the app asked mpv to render at, in order.
+    fn render_sizes(sent: Vec<Cmd>) -> Vec<(u32, u32)> {
+        sent.into_iter()
+            .filter_map(|c| match c {
+                Cmd::SetWindowSize(w, h) => Some((w, h)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_picture_fits_in_proportion_in_the_middle() {
+        let area = egui::Rect::from_min_size(egui::pos2(100.0, 20.0), egui::vec2(700.0, 640.0));
+        // 16:9 in a taller area: as wide as the area, in its middle.
+        let at = fit_picture(egui::vec2(1280.0, 720.0), area);
+        assert_eq!(at.width(), 700.0);
+        assert_eq!(at.height(), 393.75);
+        assert_eq!(at.center(), area.center());
+        // Of the area's own shape: the area.
+        assert_eq!(fit_picture(area.size(), area), area);
+        // Taller than the area: as high as it.
+        let at = fit_picture(egui::vec2(100.0, 400.0), area);
+        assert_eq!((at.width(), at.height()), (160.0, 640.0));
+        // No size, or no room: nothing.
+        assert_eq!(fit_picture(egui::Vec2::ZERO, area).area(), 0.0);
+        let none = egui::Rect::from_min_size(egui::pos2(5.0, 5.0), egui::Vec2::ZERO);
+        assert_eq!(fit_picture(egui::vec2(16.0, 9.0), none).area(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn the_open_channel_list_has_the_picture_beside_it_rendered_at_its_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        h.viewport.inner_rect = Some(screen);
+        h.app.zap_by_id(m3u_sid("Kanaal A"));
+        picture_comes(&mut h);
+        h.put_frame(1280, 720);
+        h.frame(&[]);
+        assert_eq!(
+            render_sizes(h.sent()).last(),
+            Some(&(1280, 720)),
+            "the window's"
+        );
+        assert_eq!(video_drawn_at(&h), Some(screen), "the whole window");
+        open_list(&mut h);
+        let layout = crate::channel_list_ui::Layout::of(screen);
+        let (picture, list) = (layout.picture, layout.panel);
+        let size = (picture.width() as u32, picture.height() as u32);
+        assert_eq!(render_sizes(h.sent()).last(), Some(&size), "the picture's");
+        // The frame of the window's size, until mpv renders one of the new
+        // size: in proportion, in the picture's place, beside the list.
+        let at = video_drawn_at(&h).expect("the picture is drawn");
+        assert!(picture.contains_rect(at), "{at:?} in {picture:?}");
+        assert!(at.left() > list.right(), "beside the list, never under it");
+        assert!((at.aspect_ratio() - 16.0 / 9.0).abs() < 0.01, "{at:?}");
+        // mpv's frame of that size fills the picture's place.
+        h.put_frame(size.0, size.1);
+        h.frame(&[]);
+        let at = video_drawn_at(&h).unwrap();
+        assert!((at.width() - size.0 as f32).abs() < 1.0, "{at:?}");
+        assert_eq!(at.height(), picture.height());
+        assert!((at.center() - picture.center()).length() < 0.01, "{at:?}");
+        // Closed: the window's size and the whole window again.
+        h.press(&[Key::Escape]);
+        assert!(h.app.channel_list.is_none());
+        assert_eq!(render_sizes(h.sent()).last(), Some(&(1280, 720)));
+        assert!(
+            screen.contains_rect(video_drawn_at(&h).unwrap()),
+            "in proportion"
+        );
+        h.put_frame(1280, 720);
+        h.frame(&[]);
+        assert_eq!(video_drawn_at(&h), Some(screen));
+    }
+
+    #[tokio::test]
+    async fn beside_the_open_list_a_channel_without_a_picture_is_black() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.frame(&[]);
+        assert!(h.app.video_tex.is_none());
+        assert!(
+            h.painted.iter().any(|t| t == crate::APP_NAME),
+            "the empty state"
+        );
+        open_list(&mut h);
+        assert!(h.app.channel_list.is_some());
+        assert!(
+            !h.painted.iter().any(|t| t == crate::APP_NAME),
+            "nothing beside the list: {:?}",
+            h.painted
+        );
+        h.press(&[Key::Escape]);
+        assert!(h.painted.iter().any(|t| t == crate::APP_NAME), "back");
     }
 
     /// The middle of the `k`th channel row on screen, in the tests' window.

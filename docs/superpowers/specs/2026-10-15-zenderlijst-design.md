@@ -47,6 +47,13 @@ Geslaagd is het als:
 De lijst is een venster over het lopende beeld. Het beeld loopt door, want overlays blokkeren
 nooit.
 
+*Aanvulling (2026-10-16, beslissing van de gebruiker):* "bij de m3u gids wil ik dat ik meer van het
+beeld zie dat de actieve zender is. toon de zender groepen en zenders aan linkerkant en toon het
+beeld rechts in het window." De lijst staat daarom links in het venster (ruim 40 % van de breedte,
+hooguit 760 px) en het beeld van de zender die speelt rechts ernaast, heel en op schaal, even hoog
+als de lijst. Zolang de lijst open is, tekent mpv het beeld op die maat: minder pixels per frame
+dan voor het hele venster. De toetsen onderaan de lijst passen in twee regels.
+
 **Links staan de groepen, in deze volgorde:**
 1. **Alle zenders.**
 2. **Favorieten.** Alleen als deze bron favorieten heeft die in de catalogus staan.
@@ -216,6 +223,7 @@ Alleen ids en namen, zoals de zap-regel; nooit een URL. De regels:
 **Tekenen:**
 - Alleen de zichtbare regels worden getekend.
 - Een gesloten lijst kost per frame niets: geen werk, geen geheugen.
+- Een open lijst laat mpv het beeld op de maat naast de lijst tekenen (aanvulling 2026-10-16, §3.2).
 - Er is geen nieuwe thread, en geen netwerk, behalve één controle per bevestigde verdachte (alleen
   bij M3U-bronnen).
 
