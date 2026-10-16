@@ -49,15 +49,24 @@ impl ChannelGroups {
         defect: &HashMap<i64, i64>,
         favorites: &HashSet<i64>,
     ) -> Self {
-        let mut keyed: Vec<(String, u32)> = live
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| shows(c))
-            .map(|(i, c)| (c.name.to_lowercase(), i as u32))
-            .collect();
+        // Room for every channel at once: `collect` over a filter has no size
+        // hint and would grow by doubling, to twice the room the keys need.
+        let mut keyed: Vec<(String, u32)> = Vec::with_capacity(live.len());
+        keyed.extend(
+            live.iter()
+                .enumerate()
+                .filter(|(_, c)| shows(c))
+                .map(|(i, c)| (sort_key(&c.name), i as u32)),
+        );
         keyed.sort_by(|(a, i), (b, j)| compare_folded(a, b).then(i.cmp(j)));
-        let (mut all, mut favs, mut none, mut broken) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // All holds the shown channels but the marked ones, so never more than
+        // `keyed`; the room it asks for is room it keeps while the list is open.
+        let (mut all, mut favs, mut none, mut broken) = (
+            Vec::with_capacity(keyed.len()),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         let mut named: HashMap<&str, Vec<u32>> = HashMap::new();
         for &(_, i) in &keyed {
             let channel = &live[i as usize];
@@ -83,8 +92,12 @@ impl ChannelGroups {
             }
         }
         drop(keyed);
-        let mut named: Vec<(&str, Vec<u32>)> = named.into_iter().collect();
-        named.sort_by(|(a, _), (b, _)| natural_cmp(a, b).then(a.cmp(b)));
+        // A group name's key is worked out once, not at every comparison.
+        let mut named: Vec<(String, &str, Vec<u32>)> = named
+            .into_iter()
+            .map(|(name, members)| (sort_key(name), name, members))
+            .collect();
+        named.sort_by(|(ka, a, _), (kb, b, _)| compare_folded(ka, kb).then(a.cmp(b)));
         let mut groups = vec![Group {
             key: GroupKey::All,
             members: all,
@@ -95,7 +108,7 @@ impl ChannelGroups {
                 members: favs,
             });
         }
-        groups.extend(named.into_iter().map(|(name, members)| Group {
+        groups.extend(named.into_iter().map(|(_, name, members)| Group {
             key: GroupKey::Named(name.to_owned()),
             members,
         }));
@@ -189,15 +202,42 @@ pub fn group_names(category: Option<&str>) -> impl Iterator<Item = &str> {
         .filter(|g| !g.is_empty())
 }
 
-/// A–Z as people read it: case aside, a run of digits by its value ("Sport 2"
-/// before "Sport 10"), digits before letters. Texts that differ only in case or
-/// in leading zeros compare equal.
+/// A–Z as people read it: case and accents aside, a run of digits by its value
+/// ("Sport 2" before "Sport 10"), digits before letters. Texts that differ only
+/// in case, in accents or in leading zeros compare equal.
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
-    compare_folded(&a.to_lowercase(), &b.to_lowercase())
+    compare_folded(&sort_key(a), &sort_key(b))
 }
 
-/// [`natural_cmp`] of texts in lower case already. Bytewise, which for UTF-8 is
-/// the order of the characters; an ASCII digit is never part of another one.
+/// A name as a sort key: lower case, and a Latin-1 letter with an accent as its
+/// plain letter ("een" for "Één", "o1" for "Ö1"), so it sorts where a Dutch
+/// reader looks for it and not after the z. An accent written as a mark of its
+/// own (an "e" and U+0301) goes. A name in plain ASCII, nearly every name, is
+/// only lower-cased, with one allocation.
+fn sort_key(name: &str) -> String {
+    if name.is_ascii() {
+        return name.to_ascii_lowercase();
+    }
+    let mut key = String::with_capacity(name.len());
+    for c in name.chars().flat_map(char::to_lowercase) {
+        match c {
+            '\u{300}'..='\u{36f}' => {}
+            'à'..='å' => key.push('a'),
+            'ç' => key.push('c'),
+            'è'..='ë' => key.push('e'),
+            'ì'..='ï' => key.push('i'),
+            'ñ' => key.push('n'),
+            'ò'..='ö' | 'ø' => key.push('o'),
+            'ù'..='ü' => key.push('u'),
+            'ý' | 'ÿ' => key.push('y'),
+            c => key.push(c),
+        }
+    }
+    key
+}
+
+/// [`natural_cmp`] of texts as [`sort_key`] made them. Bytewise, which for UTF-8
+/// is the order of the characters; an ASCII digit is never part of another one.
 fn compare_folded(a: &str, b: &str) -> Ordering {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     let (mut i, mut j) = (0, 0);
@@ -264,9 +304,7 @@ impl Cursor {
     pub fn step(&mut self, groups: &ChannelGroups, delta: isize) -> bool {
         let last = groups.rows(self.group).saturating_sub(1);
         let to = self.row.saturating_add_signed(delta).min(last);
-        let moved = to != self.row;
-        self.row = to;
-        moved
+        self.move_to(to)
     }
 
     /// The first row (Home) or the last (End). Whether the selection moved.
@@ -276,6 +314,11 @@ impl Cursor {
         } else {
             0
         };
+        self.move_to(to)
+    }
+
+    /// Row `to` of the group the selection is in. Whether it moved.
+    fn move_to(&mut self, to: usize) -> bool {
         let moved = to != self.row;
         self.row = to;
         moved

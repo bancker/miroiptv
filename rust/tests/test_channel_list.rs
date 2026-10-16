@@ -421,3 +421,175 @@ fn all_channels_stays_when_every_channel_is_marked() {
     assert!(c.step_group(&g, 1, Some(1)));
     assert_eq!(c.channel(&g).map(|ch| ch.stream_id), Some(1));
 }
+
+// ---- fix round 1: a Dutch reader's A-Z, the room All keeps, a list without channels ----
+
+/// "Één" is listed with the e's, not after the z's: a letter with an accent sorts
+/// as its plain letter (Latin-1, and an accent written as a mark of its own).
+/// Numbers still go by their value.
+#[test]
+fn accented_letters_sort_with_their_plain_letter() {
+    assert_eq!(natural_cmp("één", "zender"), Ordering::Less);
+    assert_eq!(natural_cmp("Eén", "een"), Ordering::Equal);
+    assert_eq!(natural_cmp("Ö1", "Oz"), Ordering::Less);
+    assert_eq!(natural_cmp("Çanakkale TV", "Canvas"), Ordering::Less);
+    assert_eq!(
+        natural_cmp("e\u{301}en", "een"),
+        Ordering::Equal,
+        "an accent written as a mark of its own"
+    );
+    assert_eq!(
+        natural_cmp("Één 2", "Een 10"),
+        Ordering::Less,
+        "numbers by value"
+    );
+    // Every accented letter of Latin-1, in lower and in upper case.
+    for (plain, accented) in [
+        ('a', "àáâãäå"),
+        ('c', "ç"),
+        ('e', "èéêë"),
+        ('i', "ìíîï"),
+        ('n', "ñ"),
+        ('o', "òóôõöø"),
+        ('u', "ùúûü"),
+        ('y', "ýÿ"),
+    ] {
+        for lower in accented.chars() {
+            for c in [lower, lower.to_uppercase().next().unwrap()] {
+                assert_eq!(
+                    natural_cmp(&format!("{c}!"), &format!("{plain}!")),
+                    Ordering::Equal,
+                    "{c}"
+                );
+            }
+        }
+    }
+}
+
+/// A list in the order its reader looks for a channel in: every name with an
+/// accent among the plain ones, and Kanaal 2 before Kanaal 10.
+#[test]
+fn a_list_is_in_the_order_a_dutch_reader_looks_for_a_channel() {
+    let unsorted = [
+        "Zender 1",
+        "Ö1",
+        "Tele 2",
+        "Télé Québec",
+        "Sat.1",
+        "Südwest",
+        "Oz",
+        "Österreich 1",
+        "NPO 1",
+        "Ketnet",
+        "Kanaal 10",
+        "Kanaal 2",
+        "Eerste",
+        "Eén HD",
+        "Één",
+        "Cartoon Network",
+        "Canvas",
+        "Çanakkale TV",
+        "24 Kitchen",
+    ];
+    let live = unsorted
+        .iter()
+        .zip(1..)
+        .map(|(name, id)| ch(id, name, None))
+        .collect();
+    let g = build(live, &[], &[]);
+    assert_eq!(
+        names(&g, 0),
+        [
+            "24 Kitchen",
+            "Çanakkale TV",
+            "Canvas",
+            "Cartoon Network",
+            "Één",
+            "Eén HD",
+            "Eerste",
+            "Kanaal 2",
+            "Kanaal 10",
+            "Ketnet",
+            "NPO 1",
+            "Ö1",
+            "Österreich 1",
+            "Oz",
+            "Sat.1",
+            "Südwest",
+            "Tele 2",
+            "Télé Québec",
+            "Zender 1"
+        ]
+    );
+}
+
+/// The list's own groups go in the same order.
+#[test]
+fn groups_sort_with_their_plain_letter_too() {
+    let g = build(
+        vec![
+            ch(1, "a", Some("Zender")),
+            ch(2, "b", Some("Één")),
+            ch(3, "c", Some("Eerste")),
+            ch(4, "d", Some("Ö1")),
+            ch(5, "e", Some("Oz")),
+        ],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        summary(&g),
+        ["ALL 5", "Één 1", "Eerste 1", "Ö1 1", "Oz 1", "Zender 1"]
+    );
+}
+
+/// All channels asks for the room of its channels at once and keeps no more:
+/// positions pushed one by one would sit in room for 1,024.
+#[test]
+fn the_all_group_keeps_no_more_room_than_its_channels() {
+    let live = (0..1000)
+        .map(|i| ch(i, &format!("Zender {i}"), None))
+        .collect();
+    let g = build(live, &[], &[]);
+    let all = &g.groups()[0].members;
+    assert_eq!(all.len(), 1000);
+    assert!(all.capacity() <= 1000, "room for {}", all.capacity());
+}
+
+/// A list without a channel: All channels, empty, and no other group; the
+/// selection rests in it and nothing moves, whatever the step.
+#[test]
+fn a_list_without_channels_is_one_empty_all_group_and_nothing_moves() {
+    let g = build(Vec::new(), &[], &[]);
+    assert_eq!(summary(&g), ["ALL 0"]);
+    assert!(g.find(&GroupKey::Defect).is_none());
+    assert_eq!((g.group_count(), g.rows(0), g.channel_count()), (1, 0, 0));
+    assert!(g.channel(0, 0).is_none());
+    let mut c = Cursor::open(&g, Some(&GroupKey::Favorites), Some(5));
+    assert_eq!(c, Cursor { group: 0, row: 0 });
+    assert!(c.channel(&g).is_none(), "nothing to select");
+    for delta in [1, -1, isize::MAX, isize::MIN] {
+        assert!(!c.step(&g, delta));
+        assert!(!c.step_group(&g, delta, Some(5)));
+    }
+    assert!(!c.to_end(&g, true));
+    assert!(!c.to_end(&g, false));
+    assert!(!c.select_row(&g, 0));
+    assert!(!c.select_group(&g, 0, Some(5)), "the group it is in");
+    assert!(!c.select_group(&g, 1, None), "there is no other");
+    c.follow(&g, &g);
+    assert_eq!(c, Cursor { group: 0, row: 0 });
+    // Followed into a list that has channels: its first.
+    let full = build(sample(), &[], &[]);
+    c.follow(&g, &full);
+    assert_eq!(c, Cursor { group: 0, row: 0 });
+    assert_eq!(c.channel(&full).map(|ch| ch.name.as_str()), Some("Alpha"));
+    // A catalog that hides every channel gives the same list.
+    let hidden = ChannelGroups::build(
+        Arc::new(sample()),
+        |_| false,
+        &HashMap::new(),
+        &HashSet::new(),
+    );
+    assert_eq!(summary(&hidden), ["ALL 0"]);
+}
