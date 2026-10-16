@@ -99,6 +99,10 @@ pub struct GuideView {
     page_start: usize,
     /// The cursor's column, counted within the page.
     selected: usize,
+    /// `g` opened the guide on the channel that plays: its column (an index
+    /// into the guide's channels), for the cursor at the next draw, which knows
+    /// how many columns the page has.
+    center: Option<usize>,
     /// Per catch-up id: the programme the cursor is on (an index into its EPG).
     cursor: HashMap<i64, usize>,
     /// Per catch-up id: when that programme starts. A new copy of the EPG moves
@@ -158,6 +162,7 @@ impl GuideView {
             mode: Mode::NowAndNext,
             page_start: 0,
             selected: 0,
+            center: None,
             cursor: HashMap::new(),
             cursor_at: HashMap::new(),
             top: HashMap::new(),
@@ -213,6 +218,26 @@ impl GuideView {
         self.date_pick = None;
         self.filter_had_focus = false;
         self.filter_wanted = false;
+    }
+
+    /// The guide opens on column `column` (an index into the guide's channels),
+    /// the cursor on it, as near the page's middle as the edges allow: worked
+    /// out at the next draw, where the page is known (see `center_column`).
+    pub fn center_on(&mut self, column: usize) {
+        self.center = Some(column);
+    }
+
+    /// The cursor on column `column`, and that column as near the page's
+    /// middle as the edges allow: the page starts half a page before the
+    /// column's place among the shown channels, within the full pages. A filter
+    /// that hides the column leaves the guide where it was.
+    fn center_column(&mut self, page: &Page, column: usize) {
+        let Some(at) = page.shown.iter().position(|&i| i == column) else {
+            return;
+        };
+        let last = page.shown.len().saturating_sub(page.cols);
+        self.page_start = at.saturating_sub(page.cols / 2).min(last);
+        self.selected = at - self.page_start;
     }
 
     /// Every column lines up again as soon as it shows with programmes.
@@ -811,6 +836,13 @@ impl GuideView {
         &self.visible_cols
     }
 
+    /// The guide-list index of the column the cursor is on, as of the last
+    /// frame drawn.
+    #[cfg(test)]
+    pub(crate) fn cursor_column(&self) -> Option<usize> {
+        self.visible_cols.get(self.selected).copied()
+    }
+
     /// One frame of the guide over the whole window. Per frame it works only on
     /// the visible rows of the visible columns.
     pub fn show(
@@ -857,6 +889,11 @@ impl GuideView {
             now: data.now,
             today: data.today,
         };
+        // `g` opened the guide on the channel that plays: its column, now that
+        // the page says how many columns show.
+        if let Some(column) = self.center.take() {
+            self.center_column(&page, column);
+        }
         self.clamp(&page);
         // Before the keys: `refresh_filter` has just made the day, the mode and
         // the matches agree, and a key steps from rows that match the copy of
@@ -2012,6 +2049,59 @@ mod tests {
             v.move_column(&page, false);
         }
         assert_eq!((v.page_start, v.selected), (0, 0));
+    }
+
+    #[test]
+    fn the_column_of_what_plays_goes_to_the_middle_of_the_page() {
+        let f = Fixture::new(9, &[]);
+        let page = f.page();
+        let mut v = GuideView::new(page.today);
+        v.center_column(&page, 4);
+        assert_eq!((v.page_start, v.selected), (3, 1), "a column on each side");
+    }
+
+    #[test]
+    fn near_an_edge_the_column_of_what_plays_keeps_the_page_full() {
+        let f = Fixture::new(9, &[]);
+        let page = f.page();
+        let mut v = GuideView::new(page.today);
+        for (column, place) in [(0, (0, 0)), (1, (0, 1)), (7, (6, 1)), (8, (6, 2))] {
+            v.center_column(&page, column);
+            assert_eq!((v.page_start, v.selected), place, "column {column}");
+        }
+        // Fewer channels than a page has columns: the one page.
+        let few = Fixture::new(2, &[]);
+        v.center_column(&few.page(), 1);
+        assert_eq!((v.page_start, v.selected), (0, 1));
+    }
+
+    #[test]
+    fn under_a_filter_the_column_of_what_plays_is_found_among_the_shown_ones() {
+        let mut f = Fixture::new(9, &[]);
+        f.shown = vec![1, 3, 5, 7, 8];
+        let page = f.page();
+        let mut v = GuideView::new(page.today);
+        v.center_column(&page, 5);
+        assert_eq!((v.page_start, v.selected), (1, 1), "the third one shown");
+        // One the filter hides: the guide stays where it was.
+        v.center_column(&page, 4);
+        assert_eq!((v.page_start, v.selected), (1, 1));
+    }
+
+    #[test]
+    fn the_column_of_what_plays_is_found_at_the_first_draw_and_only_then() {
+        // Twelve channels in a window of 1280: five columns.
+        let f = Fixture::new(12, &[]);
+        let none = HashSet::new();
+        let d = data(&f, &none, true);
+        let (mut s, mut v) = (Screen::new(1280.0), GuideView::new(time::day_of(now())));
+        v.center_on(6);
+        s.frame(&mut v, &d, vec![]);
+        assert_eq!((v.page_start, v.selected), (4, 2));
+        // The keys go on from there: no later frame centres it again.
+        s.frame(&mut v, &d, vec![key(Key::ArrowRight)]);
+        s.frame(&mut v, &d, vec![]);
+        assert_eq!((v.page_start, v.selected), (4, 3));
     }
 
     #[test]

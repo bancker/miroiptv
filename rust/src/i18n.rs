@@ -254,6 +254,7 @@ texts! {
     GuidePrime => ["Primetime", "Primetime", "Primetime"],
     GuideFilterHint => ["zender of programma", "channel or programme", "Sender oder Sendung"],
     GuideNoChannels => ["geen zenders met programma-informatie", "no channels with programme information", "keine Sender mit Programminformationen"],
+    GuideNoChannel => ["{0} heeft geen gids", "{0} has no guide", "{0} hat kein Programm"],
     GuideNothingFound => ["niets gevonden voor '{0}'", "nothing found for '{0}'", "nichts gefunden für '{0}'"],
     GuideLiveBadge => ["LIVE", "LIVE", "LIVE"],
     GuideStartsAt => ["begint om {0}", "starts at {0}", "beginnt um {0}"],

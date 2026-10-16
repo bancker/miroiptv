@@ -4257,8 +4257,9 @@ impl TvApp {
         self.guide_channels_revision += 1;
     }
 
-    /// `g`: the guide opens as it was left (in Nu & straks: on now). From now on
-    /// its EPG is fetched in the background.
+    /// `g`: the guide opens as it was left (in Nu & straks: on now), with the
+    /// cursor on the column of the channel that plays. From now on its EPG is
+    /// fetched in the background.
     fn open_guide(&mut self) {
         // An M3U source has no guide yet: `g` opens its channel list.
         if self.catalog.kind() == SourceKind::M3u {
@@ -4272,9 +4273,47 @@ impl TvApp {
         self.refresh_guide_channels();
         self.guide_view
             .opened(crate::guide::time::day_of(chrono::Utc::now()));
+        self.center_guide_on_what_plays();
         self.guide_open = true;
         self.guide_fetching = true;
         tracing::info!("guide: opened ({} channels)", self.guide_channels.len());
+    }
+
+    /// `g` on an Xtream portal: the cursor goes to the column of the channel
+    /// that plays, as near the page's middle as the edges allow (the guide
+    /// works it out at its next draw, which knows the page). A channel the
+    /// guide has no column for (no catch-up) says so, and the guide opens where
+    /// it was; so it does, without a word, when its filter hides the column.
+    fn center_guide_on_what_plays(&mut self) {
+        let Some(sid) = self.current_stream_id else {
+            return;
+        };
+        if let Some(column) = self.guide_column_of(sid) {
+            self.guide_view.center_on(column);
+            return;
+        }
+        if let Some(name) = self.playing_name() {
+            // On one line, whatever the name holds: the toast is a heading.
+            let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+            self.set_toast(self.tr(T::GuideNoChannel, &[&name]));
+        }
+    }
+
+    /// The guide column of live channel `sid`: by its live or catch-up id,
+    /// else, for another quality variant of the channel, by the name the guide
+    /// merges variants on.
+    fn guide_column_of(&self, sid: i64) -> Option<usize> {
+        let by_id = |c: &GuideChannel| c.live_id == sid || c.archive_id == sid;
+        if let Some(column) = self.guide_channels.iter().position(by_id) {
+            return Some(column);
+        }
+        let key = crate::catalog::normalize_channel_name(&self.catalog.live_name(sid)?);
+        if key.is_empty() {
+            return None;
+        }
+        self.guide_channels
+            .iter()
+            .position(|c| crate::catalog::normalize_channel_name(&c.name) == key)
     }
 
     /// The guide back from the wait screen, as it was left: not lined up on
@@ -11959,6 +11998,167 @@ https://c.example/twee-nieuws.m3u8\n";
         open_list(&mut h);
         h.app.open_settings();
         assert!(h.app.channel_list.is_none());
+    }
+
+    // ---- `g` on an Xtream portal: the guide on the channel that plays ----
+
+    /// A key let go, as egui gets it from the window.
+    fn key_release(key: Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// `g` as a keyboard makes it, pressed and let go, and the frame after it.
+    fn g_tapped(h: &mut Harness) {
+        h.frame_with(vec![
+            key_press(Key::G),
+            egui::Event::Text("g".into()),
+            key_release(Key::G),
+        ]);
+        h.frame(&[]);
+    }
+
+    /// Twelve channels with catch-up, "NL | ZENDER 01 HD" (601) to "NL | ZENDER
+    /// 12 HD" (612): the guide's twelve columns, five on the tests' screen.
+    /// ZENDER 07 has two live variants as well: 7, the one zapping picks, and
+    /// its SD feed, 77. "NL | ZONDER GIDS" (50) has no catch-up: no column.
+    fn twelve_columns() -> Arc<CatalogStore> {
+        let ch = |stream_id: i64, name: &str, archive: i32| LiveChannel {
+            stream_id,
+            name: name.into(),
+            category_id: None,
+            epg_channel_id: None,
+            tv_archive: archive,
+            tv_archive_duration: 7 * archive,
+            is_adult: false,
+            stream_icon: None,
+        };
+        let mut live: Vec<LiveChannel> = (1..=12)
+            .map(|k| ch(600 + k, &format!("NL | ZENDER {k:02} HD"), 1))
+            .collect();
+        live.push(ch(7, "NL | ZENDER 07", 0));
+        live.push(ch(77, "NL | ZENDER 07 SD", 0));
+        live.push(ch(50, "NL | ZONDER GIDS", 0));
+        let catalog = crate::portal::Catalog {
+            live,
+            ..Default::default()
+        };
+        Arc::new(CatalogStore::from_catalog(idle_portal(), catalog))
+    }
+
+    /// Where the open guide is: the leftmost column on screen and the cursor's,
+    /// as places in the guide's channels.
+    fn guide_place(h: &Harness) -> (usize, Option<usize>) {
+        let view = &h.app.guide_view;
+        (view.visible_window().0, view.cursor_column())
+    }
+
+    /// The app on `twelve_columns` with `sid` playing, after a `g`.
+    fn guide_opened_on(root: &std::path::Path, sid: i64) -> Harness {
+        let mut h = Harness::start(root, twelve_columns(), PortalState::Configured, None);
+        h.app.zap_by_id(sid);
+        assert_eq!(h.app.current_stream_id, Some(sid));
+        g_tapped(&mut h);
+        assert!(h.app.guide_open);
+        h
+    }
+
+    #[tokio::test]
+    async fn g_on_an_xtream_portal_opens_the_guide_with_the_channel_that_plays_in_the_middle() {
+        // ZENDER 07 by its live id, ZENDER 09 by its catch-up id.
+        for (sid, place) in [(7, (4, Some(6))), (609, (6, Some(8)))] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = guide_opened_on(dir.path(), sid);
+            assert_eq!(guide_place(&h), place, "{sid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn near_an_edge_of_the_guide_the_channel_that_plays_is_as_near_the_middle_as_it_goes() {
+        for (sid, place) in [(602, (0, Some(1))), (612, (7, Some(11)))] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = guide_opened_on(dir.path(), sid);
+            assert_eq!(guide_place(&h), place, "{sid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn another_quality_of_the_channel_finds_its_column_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // ZENDER 07's SD feed is neither the column's live variant nor its
+        // catch-up one.
+        let h = guide_opened_on(dir.path(), 77);
+        assert_eq!(guide_place(&h), (4, Some(6)));
+    }
+
+    #[tokio::test]
+    async fn a_channel_without_a_guide_column_says_so_and_the_guide_opens_where_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), twelve_columns(), PortalState::Configured, None);
+        // Nothing plays: the guide opens where it was, without a word.
+        g_tapped(&mut h);
+        assert_eq!(guide_place(&h), (0, Some(0)));
+        assert_eq!(toast_text(&h), "");
+        h.app.guide_view.center_on(9);
+        h.frame(&[]);
+        assert_eq!(guide_place(&h), (7, Some(9)), "the guide moved on");
+        g_tapped(&mut h);
+        assert!(!h.app.guide_open);
+        h.app.zap_by_id(50);
+        g_tapped(&mut h);
+        assert!(h.app.guide_open);
+        assert_eq!(guide_place(&h), (7, Some(9)), "where it was");
+        let said = "NL | ZONDER GIDS has no guide";
+        assert_eq!(toast_text(&h), said);
+        assert!(h.painted.iter().any(|t| t == said), "{:?}", h.painted);
+    }
+
+    #[tokio::test]
+    async fn a_guide_filter_that_hides_the_channel_that_plays_stays_and_says_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), twelve_columns(), PortalState::Configured, None);
+        g_tapped(&mut h);
+        // The filter shows ZENDER 10, 11 and 12.
+        h.frame_with(vec![egui::Event::Text("/".into())]);
+        h.frame(&[]);
+        h.type_text("zender 1");
+        h.frame(&[]);
+        assert_eq!(h.app.guide_view.visible_columns(), [9, 10, 11]);
+        h.app.close_guide();
+        h.app.zap_by_id(7);
+        let zapped = toast_text(&h);
+        g_tapped(&mut h);
+        assert!(h.app.guide_open);
+        let shown = h.app.guide_view.visible_columns();
+        assert_eq!(shown, [9, 10, 11], "the filter stays");
+        assert_eq!(guide_place(&h), (9, Some(9)), "where it was");
+        assert_eq!(toast_text(&h), zapped, "no word of it");
+    }
+
+    #[tokio::test]
+    async fn the_guide_back_from_the_wait_screen_is_where_it_was_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), twelve_columns(), PortalState::Configured, None);
+        // ZENDER 09 (609) has programmes, one of them over: catch-up.
+        let now = chrono::Utc::now();
+        h.app
+            .epg_store
+            .insert(609, ChannelEpg::new(programmes_around(now), now));
+        h.app.zap_by_id(7);
+        g_tapped(&mut h);
+        assert_eq!(guide_place(&h), (4, Some(6)));
+        // Two columns on to ZENDER 09, the programme before the one on now.
+        h.press(&[Key::ArrowRight, Key::ArrowRight, Key::ArrowUp, Key::Enter]);
+        assert!(h.app.pending_catchup.is_some(), "the wait screen");
+        h.frame(&[Key::Escape]);
+        assert!(h.app.guide_open, "back");
+        h.frame(&[]);
+        assert_eq!(guide_place(&h), (4, Some(8)), "as it was left");
     }
 
     // ---- the picture of the channel before ----
