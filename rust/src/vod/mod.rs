@@ -2,6 +2,7 @@
 //! details, covers and what was watched. It draws nothing.
 
 pub mod genres;
+pub mod versions;
 
 /// What a title is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
