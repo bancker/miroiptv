@@ -10,11 +10,13 @@ use super::PortalError;
 use serde_json::Value;
 
 /// A film's details from its `get_vod_info` answer. An answer without an
-/// `info` object (portals answer `[]` for an id they do not know) is an error.
+/// `info` (portals answer `[]` for an id they do not know, and an object such
+/// as a login's `user_info` for a refusal) is an error. An `info` that is null,
+/// an empty list or anything else but an object (a film without metadata) gives
+/// empty details, as a series' does.
 pub fn parse_vod_info(answer: &Value) -> Result<VodDetails, PortalError> {
     let info = answer
         .get("info")
-        .filter(|i| i.is_object())
         .ok_or_else(|| PortalError::Shape("no film info".into()))?;
     let mut details = common(info);
     details.duration = seconds(info);
@@ -125,7 +127,10 @@ fn episode(e: &Value, season_of_key: u32) -> Option<EpisodeInfo> {
     })
 }
 
-/// Seconds from `duration_secs`, else from `duration` ("01:47:12").
+/// Seconds from `duration_secs`, else from `duration` ("01:47:12" or "47:12").
+/// A part of the clock is whatever the portal wrote, up to the end of an `i64`:
+/// the sums saturate, as `episode_run_time`'s does, and the result is cut to a
+/// `u32`.
 fn seconds(info: &Value) -> u32 {
     let secs = number(info, &["duration_secs"]);
     if secs > 0 {
@@ -136,9 +141,14 @@ fn seconds(info: &Value) -> u32 {
         .split(':')
         .map(|p| p.trim().parse::<i64>().unwrap_or(-1))
         .collect();
+    let in_seconds = |h: i64, m: i64, s: i64| {
+        h.saturating_mul(3600)
+            .saturating_add(m.saturating_mul(60))
+            .saturating_add(s)
+    };
     match parts.as_slice() {
-        [h, m, s] if *h >= 0 && *m >= 0 && *s >= 0 => clamp_u32(h * 3600 + m * 60 + s),
-        [m, s] if *m >= 0 && *s >= 0 => clamp_u32(m * 60 + s),
+        [h, m, s] if *h >= 0 && *m >= 0 && *s >= 0 => clamp_u32(in_seconds(*h, *m, *s)),
+        [m, s] if *m >= 0 && *s >= 0 => clamp_u32(in_seconds(0, *m, *s)),
         _ => 0,
     }
 }
