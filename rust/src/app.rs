@@ -669,9 +669,10 @@ pub struct TvApp {
     /// An M3U channel that fails while it is set has shown no picture of its
     /// own unless it played since it was picked (`current_has_played`; a reload
     /// sets this one again). The `Event::EndOfFile` arm of `drain_events` and
-    /// `note_start_failure` read both. `stop_failed_start` reads this one only
-    /// (a refused load, played or not), and `check_stall` calls it only for a
-    /// start that has not played.
+    /// `note_start_failure` read both. `stop_failed_start` reads this one (a
+    /// refused load, played or not), or `ended` for a start that ended without
+    /// a picture while the user flipped on, and `check_stall` calls it only for
+    /// a start that has not played.
     stream_starting_since: Option<Instant>,
     /// The stream that plays has shown a picture since it was picked: its
     /// first `PlaybackStarted` sets this, and any load but a reload of it
@@ -723,6 +724,12 @@ pub struct TvApp {
     last_recovery_at: Option<Instant>,
     /// Armed only for live channels (VOD/catch-up can legitimately end).
     stall_watchdog_armed: bool,
+    /// The stream that plays ended while the user flipped on (an eof, which
+    /// nothing reloads then): it is no stream that plays any more (`plays`),
+    /// but the stall watchdog stays armed, so a flip that is dropped without a
+    /// load (its channel has no address; the channel list's Esc, g or another
+    /// group) leaves the dead stream to it. Every load clears it.
+    ended: bool,
     /// Caps the auto-reloads after a live stream ends unexpectedly (eof).
     reload_budget: ReloadBudget,
     /// Local HLS relay for live streams; `None` if it could not start, then
@@ -802,6 +809,24 @@ fn spend_key(ctx: &egui::Context, key: Key) {
                 ..
             } => *event_key != key,
             egui::Event::Text(typed) => !typed.eq_ignore_ascii_case(key.name()),
+            _ => true,
+        })
+    });
+}
+
+/// Spends the repeats of a held `key` in this frame. What its first press
+/// opened (the guide, the channel list) stays open while the key is held: a
+/// repeat would close it again, the next one open it, and so on at the
+/// keyboard's repeat rate.
+fn spend_key_repeats(ctx: &egui::Context, key: Key) {
+    ctx.input_mut(|i| {
+        i.events.retain(|e| match e {
+            egui::Event::Key {
+                key: event_key,
+                pressed: true,
+                repeat: true,
+                ..
+            } => *event_key != key,
             _ => true,
         })
     });
@@ -949,6 +974,7 @@ impl TvApp {
             last_progress_at: Instant::now(),
             last_recovery_at: None,
             stall_watchdog_armed: false,
+            ended: false,
             reload_budget: ReloadBudget::new(3, Duration::from_secs(60)),
             relay,
             // Deliberate taps come >= ~0.5 s apart, flipping taps faster.
@@ -1158,6 +1184,7 @@ impl TvApp {
         self.current_epg = None;
         self.playing_resumed = false;
         self.stall_watchdog_armed = false;
+        self.ended = false;
         self.stream_starting_since = None;
         self.current_has_played = false;
         self.frame_fence.stop();
@@ -1464,6 +1491,7 @@ impl TvApp {
         }
         self.current_url = Some(url);
         self.stall_watchdog_armed = watchdog;
+        self.ended = false;
         // Fresh stream: give it a full window to start before judging it stalled.
         self.last_progress_at = Instant::now();
         // Reset per-stream freeze counters; counting re-arms on the first frame
@@ -1499,7 +1527,8 @@ impl TvApp {
         // reloaded: the app gives its start up (spec 2026-10-15 §4.1), as when
         // mpv refuses a load, and it becomes a suspect. A reload would only start
         // the wait over, with a "herverbinden" toast each time. This is where
-        // `current_has_played` is asked: `stop_failed_start` itself does not.
+        // `current_has_played` is asked: `stop_failed_start` itself asks it only
+        // of a start that ended while the user flipped on (`ended`).
         let waited = self.last_progress_at.elapsed().as_secs();
         if !self.current_has_played && self.stop_failed_start() {
             tracing::warn!("m3u: no picture ~{}s after the start - given up", waited);
@@ -1579,11 +1608,13 @@ impl TvApp {
                     // channel that is really down from reloading on a loop.
                     let live = self.stall_watchdog_armed;
                     if reason == "eof" && live && self.zap_pacer.waiting().is_some() {
-                        // The user is zapping away anyway. The stream has ended
-                        // all the same: it no longer plays (`plays`), so a flip
-                        // back to it loads it again. A start that ended without
-                        // a picture is a failed start all the same (spec §4.1).
-                        self.stall_watchdog_armed = false;
+                        // The user is zapping away anyway: nothing reloads it. The
+                        // stream has ended all the same: it no longer plays
+                        // (`plays`), so a flip back to it loads it again; the stall
+                        // watchdog stays armed for a flip that is dropped without a
+                        // load. A start that ended without a picture is a failed
+                        // start all the same (spec §4.1).
+                        self.ended = true;
                         self.note_start_failure();
                         continue;
                     }
@@ -1625,8 +1656,9 @@ impl TvApp {
                     }
                     if reason == "error" || (reason == "eof" && live) {
                         // Named: on an M3U list many channels are dead or only
-                        // seen in their own country, and the app stays on it.
-                        let text = match self.current_name.clone() {
+                        // seen in their own country, and the app stays on it. A
+                        // resumed channel has no name of its own: the list's.
+                        let text = match self.playing_name() {
                             Some(name) => self.tr(T::StreamErrorOn, &[&name]),
                             None => self.t(T::StreamErrorRetry).to_owned(),
                         };
@@ -1706,16 +1738,20 @@ impl TvApp {
     /// list's address or header holds what it cannot take, a NUL byte), or the
     /// stall watchdog gave it up. What mpv still plays, the stream before it or
     /// the load that hangs, stops, and its picture goes, as a dead channel's
-    /// does; the toast names the channel and the app stays on it. It asks only
-    /// whether the stream is still starting (`stream_starting_since`), never
-    /// whether it has played (`current_has_played`): the `Event::Error` arm
-    /// calls it for a refused load either way, and `check_stall` only for a
-    /// start that has not played. `note_start_failure` then makes the channel a
-    /// suspect unless it has played. True when it was dealt with so. (M3U only:
-    /// an Xtream portal's loads go through the relay, with nothing in them mpv
-    /// can refuse, and its watchdog reloads.)
+    /// does; the toast names the channel and the app stays on it. It asks
+    /// whether the stream is still starting (`stream_starting_since`), and asks
+    /// whether it has played (`current_has_played`) only of a start that ended
+    /// while the user flipped on (`ended`: that eof took `stream_starting_since`
+    /// already): the `Event::Error` arm calls it for a refused load either way,
+    /// and `check_stall` only for a start that has not played.
+    /// `note_start_failure` then makes the channel a suspect unless it has
+    /// played. True when it was dealt with so. (M3U only: an Xtream portal's
+    /// loads go through the relay, with nothing in them mpv can refuse, and its
+    /// watchdog reloads.)
     fn stop_failed_start(&mut self) -> bool {
-        if self.catalog.kind() != SourceKind::M3u || self.stream_starting_since.is_none() {
+        let ended_unseen = self.ended && !self.current_has_played;
+        let starting = self.stream_starting_since.is_some() || ended_unseen;
+        if self.catalog.kind() != SourceKind::M3u || !starting {
             return false;
         }
         let Some(name) = self.playing_name() else {
@@ -1730,6 +1766,7 @@ impl TvApp {
         self.video_tex = None;
         // Nothing plays to watch, and a reload would be refused again.
         self.stall_watchdog_armed = false;
+        self.ended = false;
         // A suspect; the start is over (this clears `stream_starting_since`).
         self.note_start_failure();
         self.set_toast(self.tr(T::StreamErrorOn, &[&name]));
@@ -2189,12 +2226,13 @@ impl TvApp {
             .is_some_and(|r| r.refused(&self.catalog.portal().live_stream_url(sid)))
     }
 
-    /// Whether live channel `sid` is what plays and has not ended with an error:
-    /// a start of it now would only start it over. One that failed is no
-    /// longer playing, so a flip back to it, or Enter in the channel list,
-    /// tries it again.
+    /// Whether live channel `sid` is what plays and has neither failed nor
+    /// ended: a start of it now would only start it over. One that failed (an
+    /// error disarms the stall watchdog) or ended (`ended`: an eof while the
+    /// user flipped on) is no longer playing, so a flip back to it, or Enter in
+    /// the channel list, tries it again.
     fn plays(&self, sid: i64) -> bool {
-        self.current_stream_id == Some(sid) && self.stall_watchdog_armed
+        self.current_stream_id == Some(sid) && self.stall_watchdog_armed && !self.ended
     }
 
     /// Play the channel's best variant the portal does not refuse instead of
@@ -3400,7 +3438,19 @@ impl TvApp {
                     .iter()
                     .any(|e| matches!(e, egui::Event::Text(t) if t == "*")),
                 i.key_pressed(Key::F5),
-                i.key_pressed(Key::G),
+                // Its first press only: a held g opens the guide or the channel
+                // list once (see `spend_key_repeats`).
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key {
+                            key: Key::G,
+                            pressed: true,
+                            repeat: false,
+                            ..
+                        }
+                    )
+                }),
                 i.key_pressed(Key::T),
                 i.events
                     .iter()
@@ -4429,11 +4479,28 @@ impl TvApp {
         let Some(view) = self.channel_list.as_mut() else {
             return;
         };
+        // A held g opened the list: its repeats do not close it.
+        spend_key_repeats(ctx, Key::G);
         let actions = view.show(ctx, &data);
+        self.apply_list_actions(actions);
+    }
+
+    /// What the user did in the list in one frame, in the order they did it. A
+    /// frame that closes the list (Esc, g, Enter, a double click) starts no
+    /// channel on its way: a move before the close in that frame is no choice
+    /// to start. Esc and g keep what plays, Enter and a double click play their
+    /// own channel. Nothing after the close is the list's.
+    fn apply_list_actions(&mut self, actions: Vec<ListAction>) {
+        let closes = actions
+            .iter()
+            .any(|a| matches!(a, ListAction::Close | ListAction::Play { .. }));
         for action in actions {
             // An action that closed the list ends what this frame did in it.
             if self.channel_list.is_none() {
                 break;
+            }
+            if closes && matches!(action, ListAction::Preview { .. }) {
+                continue;
             }
             self.apply_list_action(action);
         }
@@ -4720,6 +4787,8 @@ impl TvApp {
             today: crate::guide::time::day_of(now),
             keys,
         };
+        // A held g opened the guide: its repeats do not close it.
+        spend_key_repeats(ctx, Key::G);
         let action = self.guide_view.show(ctx, &data, &mut self.logos);
         match action {
             Some(GuideAction::Play {
@@ -5906,6 +5975,8 @@ https://c.example/twee-nieuws.m3u8\n";
         assert!(h.app.guide_open, "g opens the guide");
         h.frame(&[]);
         assert!(h.app.guide_open, "and it stays open");
+        // Let go first: a held g's repeats do not close it.
+        h.frame_with(vec![key_release(Key::G)]);
         h.press(&[Key::G]);
         assert!(!h.app.guide_open, "the next g closes it");
     }
@@ -6996,6 +7067,8 @@ https://c.example/twee-nieuws.m3u8\n";
         assert!(h.sent().iter().any(|c| matches!(c, Cmd::Stop)));
         h.frame(&[]);
         assert!(h.app.guide_open, "and it stays");
+        // Let go first: a held g's repeats do not close it.
+        h.frame_with(vec![key_release(Key::G)]);
         h.press(&[Key::G]);
         assert!(!h.app.guide_open, "the next g closes it, as ever");
     }
@@ -11601,10 +11674,15 @@ https://c.example/twee-nieuws.m3u8\n";
 #EXTINF:-1 group-title=\"Nieuws;Sport\",Kanaal C\nhttps://c.example/c.m3u8\n\
 #EXTINF:-1,Kanaal A\nhttps://a.example/a.m3u8\n";
 
-    /// `g` as a keyboard makes it, and the frame after it drawn: egui keeps
-    /// the list's new area invisible in its first frame.
+    /// `g` as a keyboard makes it (pressed, typed, let go: a held g's repeats
+    /// open nothing), and the frame after it drawn: egui keeps the list's new
+    /// area invisible in its first frame.
     fn open_list(h: &mut Harness) {
-        h.frame_with(vec![key_press(Key::G), egui::Event::Text("g".into())]);
+        h.frame_with(vec![
+            key_press(Key::G),
+            egui::Event::Text("g".into()),
+            key_release(Key::G),
+        ]);
         h.frame(&[]);
     }
 
@@ -12159,6 +12237,302 @@ https://c.example/twee-nieuws.m3u8\n";
         assert!(h.app.guide_open, "back");
         h.frame(&[]);
         assert_eq!(guide_place(&h), (4, Some(8)), "as it was left");
+    }
+
+    // ---- a stream that ends while a flip waits ----
+
+    /// How a flip that waits is dropped without a load.
+    #[derive(Debug, Clone, Copy)]
+    enum Dropped {
+        /// Its channel has no address: a fresh copy of the list dropped it.
+        NoAddress,
+        /// Esc in the channel list.
+        Esc,
+        /// g in the channel list.
+        G,
+        /// Another group in the channel list.
+        Group,
+    }
+
+    const EVERY_DROP: [Dropped; 4] = [Dropped::NoAddress, Dropped::Esc, Dropped::G, Dropped::Group];
+
+    /// B plays (it showed its first picture when `played`), a flip on to C
+    /// waits, and B's stream ends (an eof); then the flip is dropped as `how`
+    /// says. On the main screen for `NoAddress`, in the channel list else.
+    fn b_ends_and_the_flip_is_dropped(
+        root: &std::path::Path,
+        how: Dropped,
+        played: bool,
+    ) -> Harness {
+        let in_list = !matches!(how, Dropped::NoAddress);
+        let mut h = m3u_app(root, if in_list { LISTED } else { RING });
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        if in_list {
+            open_list(&mut h); // on Kanaal A: nothing plays
+        } else {
+            h.app.zap_by_id(m3u_sid("Kanaal A"));
+        }
+        h.frame(&[Key::ArrowDown]); // B, at once
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal B"), "{how:?}");
+        if played {
+            picture_comes(&mut h);
+        }
+        h.frame(&[Key::ArrowDown]); // on to C, which waits
+        assert!(h.app.zap_pacer.waiting().is_some(), "{how:?}: C waits");
+        let ended = Event::EndOfFile {
+            reason: "eof".into(),
+        };
+        h.events.send(ended).unwrap();
+        h.frame(&[]);
+        h.sent();
+        match how {
+            Dropped::NoAddress => {
+                let fresh = RING.replace("#EXTINF:-1,Kanaal C\nhttps://c.example/c.m3u8\n", "");
+                let (portal, catalog) = M3uPortal::from_text(&fresh).unwrap();
+                h.app.catalog = Arc::new(CatalogStore::from_catalog(Arc::new(portal), catalog));
+                std::thread::sleep(Duration::from_millis(350));
+                h.frame(&[]);
+            }
+            Dropped::Esc => h.frame(&[Key::Escape]),
+            Dropped::G => h.frame_with(vec![key_press(Key::G), egui::Event::Text("g".into())]),
+            Dropped::Group => h.frame(&[Key::ArrowRight]),
+        }
+        let waits = h.app.zap_pacer.waiting().is_some();
+        assert!(!waits, "{how:?}: no flip waits");
+        assert!(loads(h.sent()).is_empty(), "{how:?}: nothing loaded");
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal B"), "{how:?}");
+        h
+    }
+
+    /// Longer without a new picture than the stall watchdog gives a stream.
+    fn the_watchdogs_turn(h: &mut Harness) {
+        h.app.last_progress_at = Instant::now()
+            .checked_sub(Duration::from_secs(26))
+            .expect("the machine has run for 26 s");
+        h.frame(&[]);
+    }
+
+    #[tokio::test]
+    async fn a_start_that_ends_while_a_flip_waits_is_given_up_once_the_flip_is_dropped() {
+        for how in EVERY_DROP {
+            let dir = tempfile::tempdir().unwrap();
+            let mut h = b_ends_and_the_flip_is_dropped(dir.path(), how, false);
+            assert!(!h.app.plays(m3u_sid("Kanaal B")), "{how:?}: B ended");
+            the_watchdogs_turn(&mut h);
+            let sent = h.sent();
+            let stopped = sent.iter().any(|c| matches!(c, Cmd::Stop));
+            assert!(stopped, "{how:?}: {sent:?}");
+            assert!(loads(sent).is_empty(), "{how:?}: no reload, no reconnect");
+            let named = "stream error on Kanaal B - zap up or down to retry";
+            assert_eq!(toast_text(&h), named, "{how:?}");
+            assert!(!h.app.stall_watchdog_armed, "{how:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_played_and_ends_while_a_flip_waits_is_reloaded_once_it_is_dropped() {
+        for how in EVERY_DROP {
+            let dir = tempfile::tempdir().unwrap();
+            let mut h = b_ends_and_the_flip_is_dropped(dir.path(), how, true);
+            the_watchdogs_turn(&mut h);
+            assert_eq!(loads(h.sent()), [ring_url('b')], "{how:?}: reloaded");
+            assert_eq!(toast_text(&h), "reconnecting...", "{how:?}");
+        }
+    }
+
+    // ---- a resumed channel's error ----
+
+    #[tokio::test]
+    async fn a_resumed_channel_that_fails_is_named_in_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write_last_watched(dir.path(), &ring_url('b'), true, Some(false));
+        let mut h = m3u_app(dir.path(), RING);
+        assert_eq!(h.app.current_name, None, "a resume names nothing itself");
+        start_fails(&mut h);
+        let named = "stream error on Kanaal B - zap up or down to retry";
+        assert_eq!(toast_text(&h), named);
+        assert!(h.painted.iter().any(|t| t == named), "{:?}", h.painted);
+    }
+
+    // ---- the channel list: its groups, its keys, its actions ----
+
+    #[tokio::test]
+    async fn the_lists_groups_are_made_for_what_was_read_before_them_and_again_when_it_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        let before = h.app.channel_list_key();
+        open_list(&mut h);
+        let made_for = h.app.channel_list_for;
+        assert_eq!(made_for, Some(before), "read before the groups");
+        let made = |h: &Harness| list(h).groups().groups().as_ptr();
+        let first = made(&h);
+        h.frame(&[]);
+        assert_eq!(made(&h), first, "nothing moved: the same groups");
+        // A favorite, as `*` adds one: the groups are made again.
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        h.app.toggle_favorite_current();
+        h.frame(&[]);
+        assert_ne!(made(&h), first);
+        assert!(list(&h).groups().find(&GroupKey::Favorites).is_some());
+        // A mark: again.
+        let second = made(&h);
+        let a = m3u_sid("Kanaal A");
+        h.app.catalog.set_defect([(a, now_unix())].into());
+        h.frame(&[]);
+        assert_ne!(made(&h), second);
+        assert!(list(&h).groups().find(&GroupKey::Defect).is_some());
+        assert_eq!(h.app.channel_list_for, Some(h.app.channel_list_key()));
+    }
+
+    #[tokio::test]
+    async fn a_turn_of_the_wheel_over_the_open_list_zaps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        open_list(&mut h);
+        h.sent();
+        h.frame_with(vec![egui::Event::PointerMoved(list_row(1))]);
+        for turn in [-90.0, 90.0, -50.0] {
+            h.frame_with(vec![egui::Event::Scroll(egui::vec2(0.0, turn))]);
+            h.frame(&[]);
+        }
+        assert!(loads(h.sent()).is_empty(), "the wheel zaps nothing");
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal C"));
+        assert_eq!(selected(&h).as_deref(), Some("Kanaal C"), "nor moves it");
+    }
+
+    /// `g` pressed and never let go: egui calls every press after the first a
+    /// repeat, as it does a held key's.
+    fn g_held() -> Vec<egui::Event> {
+        vec![key_press(Key::G), egui::Event::Text("g".into())]
+    }
+
+    #[tokio::test]
+    async fn a_held_g_opens_the_list_once_and_it_stays_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.frame_with(g_held());
+        assert!(h.app.channel_list.is_some(), "the press opens it");
+        for _ in 0..5 {
+            h.frame_with(g_held());
+            assert!(h.app.channel_list.is_some(), "a repeat does not close it");
+        }
+        // Closed another way while g is still held: a repeat opens nothing.
+        h.press(&[Key::Escape]);
+        assert!(h.app.channel_list.is_none());
+        h.frame_with(g_held());
+        h.frame(&[]);
+        assert!(h.app.channel_list.is_none(), "a repeat does not open it");
+    }
+
+    #[tokio::test]
+    async fn a_held_g_opens_the_guide_once_and_it_stays_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        h.frame_with(g_held());
+        assert!(h.app.guide_open, "the press opens it");
+        for _ in 0..5 {
+            h.frame_with(g_held());
+            assert!(h.app.guide_open, "a repeat does not close it");
+        }
+        h.press(&[Key::Escape]);
+        assert!(!h.app.guide_open);
+        h.frame_with(g_held());
+        h.frame(&[]);
+        assert!(!h.app.guide_open, "a repeat does not open it");
+    }
+
+    /// A move in the list to the channel `name`.
+    fn preview(name: &str) -> ListAction {
+        ListAction::Preview {
+            stream_id: m3u_sid(name),
+            name: name.into(),
+            repeat: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_move_and_a_close_in_one_frame_start_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.app.zap_by_id(m3u_sid("Kanaal A"));
+        open_list(&mut h);
+        h.sent();
+        h.app
+            .apply_list_actions(vec![preview("Kanaal B"), ListAction::Close]);
+        assert!(h.app.channel_list.is_none(), "closed");
+        assert!(loads(h.sent()).is_empty(), "B does not start");
+        let playing = h.app.current_name.as_deref();
+        assert_eq!(playing, Some("Kanaal A"), "A plays on");
+        // The keys make that frame: Down and Esc at once.
+        open_list(&mut h);
+        h.frame(&[Key::ArrowDown, Key::Escape]);
+        assert!(h.app.channel_list.is_none());
+        assert!(loads(h.sent()).is_empty());
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal A"));
+    }
+
+    #[tokio::test]
+    async fn a_move_and_a_play_in_one_frame_play_the_channel_of_the_play() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        open_list(&mut h);
+        h.sent();
+        let d = ListAction::Play {
+            stream_id: m3u_sid("Kanaal D"),
+            name: "Kanaal D".into(),
+        };
+        h.app.apply_list_actions(vec![preview("Kanaal B"), d]);
+        assert!(h.app.channel_list.is_none(), "closed");
+        assert_eq!(loads(h.sent()), [ring_url('d')], "D, and no B on the way");
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal D"));
+        // The keys make that frame: Up and Enter at once play the channel Up
+        // moved to, once.
+        open_list(&mut h);
+        h.frame(&[Key::ArrowUp, Key::Enter]);
+        assert!(h.app.channel_list.is_none());
+        assert_eq!(loads(h.sent()), [ring_url('c')]);
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal C"));
+    }
+
+    #[tokio::test]
+    async fn the_list_starts_a_channel_out_of_the_zap_ring_by_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        // B and D are marked defect: out of the zap ring, in Broken channels.
+        let (b, d) = (m3u_sid("Kanaal B"), m3u_sid("Kanaal D"));
+        let marks = [(b, now_unix() - 60), (d, now_unix() - 60)];
+        h.app.catalog.set_defect(marks.into());
+        let ring = h.app.catalog.zap_ring().expect("loaded");
+        assert_eq!(ring.position_of(d), None, "D has no ring position");
+        open_list(&mut h);
+        // Nieuws, Sport, No group, Broken channels.
+        h.press(&[Key::ArrowRight; 4]);
+        assert_eq!(list(&h).group_key(), Some(&GroupKey::Defect));
+        assert_eq!(selected(&h).as_deref(), Some("Kanaal B"));
+        h.sent();
+        // A move to D: it starts by its id.
+        h.frame(&[Key::ArrowDown]);
+        assert_eq!(loads(h.sent()), [ring_url('d')]);
+        assert_eq!(h.app.current_idx, None);
+        assert!(h.app.plays(d));
+        // Up to B and back to D, quicker than the tempo: the start that comes
+        // due is D's, with no ring position, and D plays already.
+        h.frame(&[Key::ArrowUp]);
+        h.frame(&[Key::ArrowDown]);
+        std::thread::sleep(Duration::from_millis(350));
+        h.frame(&[]);
+        assert!(loads(h.sent()).is_empty(), "D plays on");
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal D"));
+        assert_eq!(h.app.current_idx, None);
+        // After the list, Down goes on from D's place in the file (D, B, C, A):
+        // to C, past the marked B.
+        h.press(&[Key::Escape]);
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        h.press(&[Key::ArrowDown]);
+        assert_eq!(loads(h.sent()), [ring_url('c')]);
     }
 
     // ---- the picture of the channel before ----
