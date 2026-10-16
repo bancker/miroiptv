@@ -81,7 +81,7 @@ KEYS
   Shift+F                            favorites list
   *                                  toggle favorite for the current channel
   e / Shift+E                        guide strip (now + next) / guide overview
-  g                                  TV guide
+  g                                  TV guide (Xtream) / channel list (M3U)
   a / s                              next audio track / subtitles
   + / -                              higher / lower quality (live)
   left / right arrow                 seek -30s / +30s (movies, catch-up)

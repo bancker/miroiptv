@@ -106,7 +106,8 @@ impl BadStreams {
 
     /// When each marked channel failed: stream id → unix seconds. A time can lie
     /// after now (a clock that was wrong) until [`BadStreams::expire`] takes it
-    /// as now: an age counted from it is clamped at 0.
+    /// as now: a caller that counts an age from it clamps that at 0 (as the
+    /// channel list's `failed_ago` does).
     pub fn marks(&self) -> &HashMap<i64, i64> {
         &self.marks
     }

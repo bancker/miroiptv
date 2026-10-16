@@ -9,6 +9,7 @@ use bongo_player::portal::xtream::XtreamPortal;
 use bongo_player::portal::{Catalog, LiveChannel};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Four channels; with no tvg-id their keys, and so their stream ids, come
 /// from their names.
@@ -299,5 +300,92 @@ fn a_hidden_variant_has_no_place_even_when_its_channel_shows_in_the_ring() {
         unlocked.position_of(2),
         Some(0),
         "it stands for the plain one"
+    );
+}
+
+// ---- the size of the real portal, timed by hand ----
+
+/// A portal's live list in the real one's shape: 5,000 channels of two or
+/// three quality variants each ("NL | Kanaal 17 HD", "... FHD", and a "... 4K"
+/// for three channels in five), 13,000 entries in all. Every 33rd channel is
+/// flagged adult in all its variants (about 3 %), and the HD variant of every
+/// 24th channel is a catch-up one (209 entries, as on the real portal).
+fn portal_shaped() -> Vec<LiveChannel> {
+    let mut live = Vec::with_capacity(13_000);
+    let mut stream_id = 0;
+    for channel in 0..5_000 {
+        let adult = channel % 33 == 0;
+        let qualities: &[&str] = if channel % 5 < 2 {
+            &["HD", "FHD"]
+        } else {
+            &["HD", "FHD", "4K"]
+        };
+        for quality in qualities {
+            stream_id += 1;
+            let name = format!("NL | Kanaal {channel} {quality}");
+            let catch_up = *quality == "HD" && channel % 24 == 0;
+            live.push(LiveChannel {
+                tv_archive: i32::from(catch_up),
+                tv_archive_duration: if catch_up { 7 } else { 0 },
+                ..ch(stream_id, &name, adult)
+            });
+        }
+    }
+    live
+}
+
+/// Timed by hand: what the first press after a load, a lock change or new
+/// marks costs on a portal of the real one's size (the ring worked out from
+/// scratch, on the thread that asks), and what a press costs after it. It
+/// asserts no speed: a busy machine would fail it, and a debug build means
+/// nothing. `cargo test --release --test test_zap_ring -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn an_xtream_shaped_ring_timed() {
+    let live = portal_shaped();
+    assert_eq!(live.len(), 13_000);
+
+    // Five cold builds, each on a store of its own: the ring is worked out on
+    // the first ask, once per catalog (the store is made outside the timing).
+    let mut cold_ms = Vec::new();
+    let mut built = None;
+    for _ in 0..5 {
+        let store = xtream(live.clone());
+        let t0 = Instant::now();
+        let ring = std::hint::black_box(store.zap_ring());
+        cold_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+        let ring = ring.expect("a loaded catalog");
+        assert!(!ring.is_empty());
+        built = Some(ring);
+    }
+    let best = cold_ms.iter().copied().fold(f64::MAX, f64::min);
+    let mean = cold_ms.iter().sum::<f64>() / cold_ms.len() as f64;
+    println!(
+        "xtream zap_ring cold: first {:.3} ms, best {best:.3} ms, mean {mean:.3} ms",
+        cold_ms[0]
+    );
+
+    // A thousand presses on the built ring: a step from where the channel that
+    // plays sits in it, and the channel the step lands on.
+    let ring = built.expect("five builds");
+    let presses = 1_000;
+    let mut pos = 0;
+    let t0 = Instant::now();
+    for _ in 0..presses {
+        let sid = ring.get(pos).expect("a place in the ring").stream_id;
+        let to = std::hint::black_box(ring.step(ZapFrom::Pos { pos, sid }, 1));
+        pos = to.expect("a ring with channels");
+    }
+    let micros = t0.elapsed().as_secs_f64() * 1e6 / f64::from(presses);
+    assert!(ring.get(pos).is_some(), "a step lands on a channel");
+    println!("xtream zap_ring press: mean {micros:.3} µs");
+
+    // The shape that was timed, for the report.
+    println!(
+        "xtream catalog: {} entries, {} in the ring, {} adult, {} with catch-up",
+        live.len(),
+        ring.len(),
+        live.iter().filter(|c| c.is_adult).count(),
+        live.iter().filter(|c| c.tv_archive == 1).count()
     );
 }

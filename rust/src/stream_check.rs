@@ -8,16 +8,20 @@
 //! minutes marks no good channel. What it cannot find out is not marked
 //! either (better a dead channel too many in the list than a good one lost):
 //! an address it cannot ask, a reply it cannot use (a redirect that never
-//! ends, an `ICY 200 OK`, a hang-up), and a certificate or TLS handshake it
-//! could not verify. The check verifies certificates (reqwest's default); a
-//! failure there is no proof of a dead stream. The M3U maturity round turns
-//! verification on for mpv too. At most one check per channel and [`AT_ONCE`]
-//! at a time, on the app's tokio runtime; the answers wait in a slot the app
-//! drains once per frame. The app never asks the server of the stream that
-//! plays ([`same_server`]): not when a suspect is confirmed, and not later
-//! either, when the user moves to that server while its check waits or is on
-//! its way ([`StreamChecker::forget_server`]). An address never reaches a log
-//! line or a `Debug` print: a paid list's addresses hold credentials.
+//! ends, an `ICY 200 OK`, a hang-up after the connection: for https, after the
+//! handshake), and a certificate or TLS handshake it could not verify. A
+//! hang-up during an https handshake counts as no connection, so it marks,
+//! unless TLS reports it as an error (an alert, a certificate, plain HTTP on a
+//! TLS port): then the handshake could not be verified, and nothing is marked.
+//! The check verifies certificates (reqwest's default); a failure there is no
+//! proof of a dead stream. The M3U maturity round turns verification on for
+//! mpv too. At most one check per channel and [`AT_ONCE`] at a time, on the
+//! app's tokio runtime; the answers wait in a slot the app drains once per
+//! frame. The app never asks the server of the stream that plays
+//! ([`same_server`]): not when a suspect is confirmed, and not later either,
+//! when the user moves to that server while its check waits or is on its way
+//! ([`StreamChecker::forget_server`]). An address never reaches a log line or a
+//! `Debug` print: a paid list's addresses hold credentials.
 
 use parking_lot::Mutex;
 use reqwest::header::HeaderValue;
@@ -45,15 +49,18 @@ pub enum Answer {
     /// A status of 400 or more after the redirects.
     Status(u16),
     /// No connection: refused, reset while connecting, a name that does not
-    /// resolve. (A failed TLS handshake is [`Answer::Unchecked`], no connection
-    /// failure; a hang-up after the connection is [`Answer::Failed`].)
+    /// resolve, a hang-up during an https handshake. (A handshake that fails
+    /// with a TLS error, a certificate it cannot verify or plain HTTP on a TLS
+    /// port, is [`Answer::Unchecked`]; a hang-up after the connection, for
+    /// https after the handshake, is [`Answer::Failed`].)
     ConnectFailed,
     /// No headers within [`CHECK_TIMEOUT`].
     TimedOut,
     /// A reply it could not use: a redirect that never ends, an answer that is
     /// no HTTP it reads (Shoutcast's `ICY 200 OK`), a hang-up before any
-    /// reply. Not found out, so no mark: the server did answer, or may have,
-    /// and what the check cannot read is no proof of a dead stream.
+    /// reply once the connection is made. Not found out, so no mark: the
+    /// server did answer, or may have, and what the check cannot read is no
+    /// proof of a dead stream.
     Failed,
     /// Not asked, or not found out, so no mark then (spec §4.2): no http(s)
     /// address, or no HTTP client; an address it cannot build a request for (a
@@ -404,9 +411,10 @@ pub async fn ask(client: &reqwest::Client, url: &str) -> Answer {
 /// asked: `Unchecked`. So is a certificate or TLS handshake it could not
 /// verify, which is no proof of a dead stream; that holds for a TLS error
 /// after the handshake too. Without a connection otherwise it is
-/// `ConnectFailed` (refused, reset, a name that does not resolve), and any
-/// other failure is `Failed`: a redirect that never ends, a reply that is no
-/// HTTP it reads, a hang-up before any reply.
+/// `ConnectFailed` (refused, reset, a name that does not resolve, a hang-up
+/// during an https handshake), and any other failure is `Failed`: a redirect
+/// that never ends, a reply that is no HTTP it reads, a hang-up before any
+/// reply once the connection is made.
 fn answer_of_error(err: &reqwest::Error) -> Answer {
     if err.is_timeout() {
         Answer::TimedOut

@@ -46,6 +46,14 @@ extraction.
   `favorites.json`, `presets.json`, `last_watched.json`, another source in
   `favorites-<id>.json` and so on. Source 1's files are 0.6.1's portal's, so
   an M3U list never becomes source 1.
+- Defect marks of an M3U source (channels that did not start, see `g`'s
+  channel list): `bad_streams-<id>.json` in the config folder
+  (`bad_streams.json` for a list an older ini has as source 1). They hold
+  stream ids and times only, last 7 days, and go with their source (deleted,
+  or saved with another address). A channel is marked only when a check of its
+  address finds it dead too, and that check never asks the server of the
+  channel that plays: on a paid list one account serves every channel, and its
+  portal allows one session.
 - Preferences: `settings.json` in `%APPDATA%\BongoPlayer\config\`. It holds the
   language, reversed zapping, the adult-content PIN (a salted hash, never the
   PIN) and the news rules; a file that is missing or broken gives the defaults.
