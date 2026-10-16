@@ -155,24 +155,96 @@ async fn a_server_that_speaks_no_tls_on_an_https_address_is_not_a_dead_one() {
     assert!(!answer.is_dead(), "no proof, no mark");
 }
 
+// ---- a hang-up during an https handshake: the server took the connection, so
+// it is there; the check could not find out more ----
+
+#[tokio::test]
+async fn an_https_server_that_hangs_up_after_the_client_hello_is_not_a_dead_stream() {
+    let port = serving(|mut stream| {
+        read_first(&mut stream);
+        // Dropped with the ClientHello read: the handshake ends there.
+    });
+    let client = http_client().unwrap();
+    let answer = ask(&client, &format!("https://127.0.0.1:{port}/live.m3u8")).await;
+    assert_eq!(answer, Answer::Unchecked);
+    assert!(!answer.is_dead(), "reached: no proof, no mark");
+}
+
+#[tokio::test]
+async fn an_https_server_that_hangs_up_at_once_is_not_a_dead_stream() {
+    let port = serving(drop);
+    let client = http_client().unwrap();
+    let answer = ask(&client, &format!("https://127.0.0.1:{port}/live.m3u8")).await;
+    assert_eq!(answer, Answer::Unchecked);
+    assert!(!answer.is_dead(), "reached: no proof, no mark");
+}
+
+#[tokio::test]
+async fn an_http_server_that_hangs_up_at_once_is_a_failed_request() {
+    // The same server over http: the hang-up comes after the connection, as
+    // the one after the request does.
+    let port = serving(drop);
+    let client = http_client().unwrap();
+    let answer = ask(&client, &format!("http://127.0.0.1:{port}/live.m3u8")).await;
+    assert_eq!(answer, Answer::Failed);
+    assert!(!answer.is_dead());
+}
+
+#[tokio::test]
+async fn a_closed_port_over_https_is_a_failed_connection() {
+    let client = http_client().unwrap();
+    let url = format!("https://127.0.0.1:{}/live.m3u8", closed_port());
+    let answer = ask(&client, &url).await;
+    assert_eq!(answer, Answer::ConnectFailed);
+    assert!(answer.is_dead());
+}
+
+// ---- a busy answer (the user, 2026-10-16): 429, 503 and 509 prove nothing ----
+
+#[tokio::test]
+async fn a_busy_answer_is_not_a_dead_stream() {
+    let client = http_client().unwrap();
+    for status in [429, 503, 509] {
+        let server = answering(status, Duration::ZERO).await;
+        let answer = ask(&client, &format!("{}/live.m3u8", server.uri())).await;
+        assert_eq!(answer, Answer::Busy(status), "{status}");
+        assert!(!answer.is_dead(), "{status}: no proof, no mark");
+        assert_eq!(answer.kind(), format!("busy, http {status}"));
+    }
+}
+
+#[tokio::test]
+async fn every_other_status_of_400_or_more_is_still_a_dead_stream() {
+    let client = http_client().unwrap();
+    for status in [400, 403, 404, 410, 500, 502] {
+        let server = answering(status, Duration::ZERO).await;
+        let answer = ask(&client, &format!("{}/live.m3u8", server.uri())).await;
+        assert_eq!(answer, Answer::Status(status), "{status}");
+        assert!(answer.is_dead(), "{status}");
+    }
+}
+
 // ---- only proof of a dead stream marks (spec 4.2: better a dead channel too
 // many in the list than a good one lost) ----
 
 #[test]
 fn only_proof_of_a_dead_stream_is_dead() {
-    // A status of 400 or more, no connection, no answer in time.
+    // A status of 400 or more but a busy one, no connection, no answer in time.
     for proof in [
         Answer::Status(404),
-        Answer::Status(503),
+        Answer::Status(500),
         Answer::ConnectFailed,
         Answer::TimedOut,
     ] {
         assert!(proof.is_dead(), "{proof:?}");
     }
-    // An answer, and every case the check could not find out.
+    // An answer, a busy one, and every case the check could not find out.
     for no_proof in [
         Answer::Answers(200),
         Answer::Answers(302),
+        Answer::Busy(429),
+        Answer::Busy(503),
+        Answer::Busy(509),
         Answer::Failed,
         Answer::Unchecked,
     ] {
@@ -371,6 +443,7 @@ async fn a_redirect_hands_the_address_on_to_nobody() {
 fn what_the_log_says_of_an_answer_names_no_address() {
     assert_eq!(Answer::Status(404).kind(), "http 404");
     assert_eq!(Answer::Answers(302).kind(), "http 302");
+    assert_eq!(Answer::Busy(503).kind(), "busy, http 503");
     assert_eq!(Answer::ConnectFailed.kind(), "connect failed");
     assert_eq!(Answer::TimedOut.kind(), "timeout");
     assert_eq!(Answer::Failed.kind(), "request failed");

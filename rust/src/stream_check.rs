@@ -3,23 +3,23 @@
 //! confirmed, is not marked at once: its address is asked once more. One GET
 //! with the channel's own headers, the status only, a short limit, and as mpv
 //! asks: header values as bytes. Only proof of a dead stream marks it: a
-//! status of 400 or more after redirects, no connection, no answer in time. A
-//! live one (2xx, 3xx) drops the suspicion, so a Wi-Fi drop of under two
-//! minutes marks no good channel. What it cannot find out is not marked
-//! either (better a dead channel too many in the list than a good one lost):
-//! an address it cannot ask, a reply it cannot use (a redirect that never
-//! ends, an `ICY 200 OK`, a hang-up after the connection: for https, after the
-//! handshake), and a certificate or TLS handshake it could not verify. A
-//! hang-up during an https handshake counts as no connection, so it marks,
-//! unless TLS reports it as an error (an alert, a certificate, plain HTTP on a
-//! TLS port): then the handshake could not be verified, and nothing is marked.
-//! The check verifies certificates (reqwest's default); a failure there is no
-//! proof of a dead stream. The M3U maturity round turns verification on for
-//! mpv too. At most one check per channel and [`AT_ONCE`] at a time, on the
-//! app's tokio runtime; the answers wait in a slot the app drains once per
-//! frame. The app never asks the server of the stream that plays
-//! ([`same_server`]): not when a suspect is confirmed, and not later either,
-//! when the user moves to that server while its check waits or is on its way
+//! status of 400 or more after redirects (except 429, 503 and 509, busy
+//! answers that prove nothing), no connection, no answer in time. A live one
+//! (2xx, 3xx) drops the suspicion, so a Wi-Fi drop of under two minutes marks
+//! no good channel. What it cannot find out is not marked either (better a
+//! dead channel too many in the list than a good one lost): a busy answer, an
+//! address it cannot ask, a reply it cannot use (a redirect that never ends,
+//! an `ICY 200 OK`, a hang-up once the connection is made, for https once the
+//! handshake is done), a certificate or TLS handshake it could not verify, and
+//! an https server that takes the connection and hangs up during the
+//! handshake (it is there; the check could not find out more). The check
+//! verifies certificates (reqwest's default); a failure there is no proof of a
+//! dead stream. The M3U maturity round turns verification on for mpv too. At
+//! most one check per channel and [`AT_ONCE`] at a time, on the app's tokio
+//! runtime; the answers wait in a slot the app drains once per frame. The app
+//! never asks the server of the stream that plays ([`same_server`]): not when
+//! a suspect is confirmed, and not later either, when the user moves to that
+//! server while its check waits or is on its way
 //! ([`StreamChecker::forget_server`]). An address never reaches a log line or a
 //! `Debug` print: a paid list's addresses hold credentials.
 
@@ -27,6 +27,7 @@ use parking_lot::Mutex;
 use reqwest::header::HeaderValue;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,36 +47,45 @@ pub const MPV_USER_AGENT: &str = "libmpv";
 pub enum Answer {
     /// 2xx or 3xx after the redirects: it answers again.
     Answers(u16),
-    /// A status of 400 or more after the redirects.
+    /// A status of 400 or more after the redirects, but a busy one.
     Status(u16),
-    /// No connection: refused, reset while connecting, a name that does not
-    /// resolve, a hang-up during an https handshake. (A handshake that fails
+    /// A busy answer after the redirects: 429 (too many requests), 503
+    /// (unavailable) or 509 (bandwidth limit exceeded). The server is there
+    /// and turns the check away for now, which proves nothing (the user,
+    /// 2026-10-16): no mark, and the suspicion goes, as for
+    /// [`Answer::Unchecked`].
+    Busy(u16),
+    /// No connection: refused, a name that does not resolve, no route, and
+    /// any other connection failure of an http address. (An https server that
+    /// takes the connection and hangs up during the handshake, or fails it
     /// with a TLS error, a certificate it cannot verify or plain HTTP on a TLS
-    /// port, is [`Answer::Unchecked`]; a hang-up after the connection, for
-    /// https after the handshake, is [`Answer::Failed`].)
+    /// port, is [`Answer::Unchecked`]; a hang-up once the connection is made,
+    /// for https once the handshake is done, is [`Answer::Failed`].)
     ConnectFailed,
     /// No headers within [`CHECK_TIMEOUT`].
     TimedOut,
     /// A reply it could not use: a redirect that never ends, an answer that is
     /// no HTTP it reads (Shoutcast's `ICY 200 OK`), a hang-up before any
-    /// reply once the connection is made. Not found out, so no mark: the
-    /// server did answer, or may have, and what the check cannot read is no
-    /// proof of a dead stream.
+    /// reply once the connection is made (for https, once the handshake is
+    /// done). Not found out, so no mark: the server did answer, or may have,
+    /// and what the check cannot read is no proof of a dead stream.
     Failed,
     /// Not asked, or not found out, so no mark then (spec §4.2): no http(s)
     /// address, or no HTTP client; an address it cannot build a request for (a
     /// bad host or port) or a redirect to one that is no http(s); a header
-    /// value that cannot be sent (a control character); or a certificate or
-    /// TLS handshake it could not verify.
+    /// value that cannot be sent (a control character); a certificate or TLS
+    /// handshake it could not verify; or an https server that took the
+    /// connection and hung up during the handshake.
     Unchecked,
 }
 
 impl Answer {
     /// Whether the channel gets the mark: only on proof that its stream is
-    /// dead (a status of 400 or more, no connection, no answer in time). Not
-    /// when it answers again, and not when the check could not find out
-    /// ([`Answer::Failed`], [`Answer::Unchecked`]): better a dead channel too
-    /// many in the list than a good one lost (spec §4.2).
+    /// dead (a status of 400 or more but a busy one, no connection, no answer
+    /// in time). Not when it answers again, and not when the check could not
+    /// find out ([`Answer::Busy`], [`Answer::Failed`], [`Answer::Unchecked`]):
+    /// better a dead channel too many in the list than a good one lost (spec
+    /// §4.2).
     pub fn is_dead(self) -> bool {
         matches!(
             self,
@@ -83,13 +93,14 @@ impl Answer {
         )
     }
 
-    /// What the log says of it, never the address: "http 404", "connect
-    /// failed", "timeout". `Unchecked` names both kinds of its causes (an
-    /// address it cannot ask, a certificate it could not verify), as one
-    /// answer cannot tell them apart.
+    /// What the log says of it, never the address: "http 404", "busy, http
+    /// 503", "connect failed", "timeout". `Unchecked` names both kinds of its
+    /// causes (an address it cannot ask, a certificate it could not verify), as
+    /// one answer cannot tell them apart.
     pub fn kind(self) -> String {
         match self {
             Answer::Answers(status) | Answer::Status(status) => format!("http {status}"),
+            Answer::Busy(status) => format!("busy, http {status}"),
             Answer::ConnectFailed => "connect failed".to_owned(),
             Answer::TimedOut => "timeout".to_owned(),
             Answer::Failed => "request failed".to_owned(),
@@ -376,7 +387,8 @@ fn builder(limit: Duration) -> reqwest::ClientBuilder {
 /// their bytes, as mpv sends them, so a "Zürich-TV" User-Agent is no error; a
 /// value that still cannot be sent (a control character) is not asked. Only
 /// the status counts: the body (a live stream never ends) is not read. A
-/// certificate or TLS handshake it could not verify is `Unchecked`, not dead.
+/// certificate or TLS handshake it could not verify is `Unchecked`, and a busy
+/// status `Busy`: neither is dead.
 pub async fn ask(client: &reqwest::Client, url: &str) -> Answer {
     let (address, headers) = crate::m3u::split_headers(url);
     let agent = headers.user_agent.as_deref().unwrap_or(MPV_USER_AGENT);
@@ -393,15 +405,20 @@ pub async fn ask(client: &reqwest::Client, url: &str) -> Answer {
         request = request.header(reqwest::header::REFERER, referrer);
     }
     match request.send().await {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            if status >= 400 {
-                Answer::Status(status)
-            } else {
-                Answer::Answers(status)
-            }
-        }
+        Ok(response) => answer_of_status(response.status().as_u16()),
         Err(e) => answer_of_error(&e),
+    }
+}
+
+/// What the final status after the redirects answers: 2xx and 3xx answer
+/// again; 429 (too many requests), 503 (unavailable) and 509 (bandwidth limit
+/// exceeded) are a busy server, which proves nothing (the user, 2026-10-16);
+/// any other status of 400 or more is a dead stream.
+fn answer_of_status(status: u16) -> Answer {
+    match status {
+        429 | 503 | 509 => Answer::Busy(status),
+        400.. => Answer::Status(status),
+        _ => Answer::Answers(status),
     }
 }
 
@@ -410,26 +427,32 @@ pub async fn ask(client: &reqwest::Client, url: &str) -> Answer {
 /// redirect to one that is no http(s) (reqwest's "builder" errors) was not
 /// asked: `Unchecked`. So is a certificate or TLS handshake it could not
 /// verify, which is no proof of a dead stream; that holds for a TLS error
-/// after the handshake too. Without a connection otherwise it is
-/// `ConnectFailed` (refused, reset, a name that does not resolve, a hang-up
-/// during an https handshake), and any other failure is `Failed`: a redirect
-/// that never ends, a reply that is no HTTP it reads, a hang-up before any
-/// reply once the connection is made.
+/// after the handshake too. So is an https address whose server took the
+/// connection and hung up during the handshake ([`hung_up`]): the server is
+/// there. Without a connection otherwise it is `ConnectFailed` (refused, a
+/// name that does not resolve, any other connection failure of an http
+/// address), and any other failure is `Failed`: a redirect that never ends, a
+/// reply that is no HTTP it reads, a hang-up before any reply once the
+/// connection is made (for https, once the handshake is done). The scheme is
+/// that of the address reqwest names on the error: the address asked (reqwest
+/// 0.12 names it after a redirect too).
 fn answer_of_error(err: &reqwest::Error) -> Answer {
     if err.is_timeout() {
         Answer::TimedOut
     } else if err.is_builder() {
         Answer::Unchecked
     } else {
-        answer_of_failure(err, err.is_connect())
+        let https = err.url().is_some_and(|url| url.scheme() == "https");
+        answer_of_failure(err, err.is_connect(), https)
     }
 }
 
 /// [`answer_of_error`] for a failure that is no timeout, read from its error
-/// chain (`connect`: reqwest calls it a connection failure). Apart so that a
-/// chain made by hand can test it: a `reqwest::Error` cannot be made by hand.
-fn answer_of_failure(err: &(dyn Error + 'static), connect: bool) -> Answer {
-    if tls_problem(err) {
+/// chain (`connect`: reqwest calls it a connection failure; `https`: of an
+/// https address). Apart so that a chain made by hand can test it: a
+/// `reqwest::Error` cannot be made by hand.
+fn answer_of_failure(err: &(dyn Error + 'static), connect: bool, https: bool) -> Answer {
+    if tls_problem(err) || (connect && https && hung_up(err)) {
         Answer::Unchecked
     } else if connect {
         Answer::ConnectFailed
@@ -438,20 +461,41 @@ fn answer_of_failure(err: &(dyn Error + 'static), connect: bool) -> Answer {
     }
 }
 
-/// Whether a TLS problem is in the chain of `err`. tokio-rustls hands every
+/// Whether a TLS problem is in the chain of `err`: tokio-rustls hands every
 /// rustls handshake and certificate error on as an `io::Error` of kind
-/// `InvalidData`. hyper-rustls wraps that one in an `io::Error` of its own
-/// (`io::Error::other`), and `io::Error::source()` skips the error it wraps, so
-/// a walk by `source()` alone never meets it: an `io::Error` is stepped into
-/// through `get_ref()`. (Measured on the real chains of a self-signed
-/// certificate and of plain HTTP where TLS is expected: reqwest, hyper-util's
-/// "client error (Connect)", an `io::Error` of kind `Other`, and in it the
-/// `InvalidData` one.)
+/// `InvalidData`.
 fn tls_problem(err: &(dyn Error + 'static)) -> bool {
+    io_error_in_chain(err, |kind| kind == ErrorKind::InvalidData)
+}
+
+/// Whether the chain of `err` shows a connection that was made and then broke:
+/// an `io::Error` of kind `UnexpectedEof` (tokio-rustls's "tls handshake eof"),
+/// `ConnectionReset` or `ConnectionAborted`. In a connection failure of an
+/// https address that is a hang-up during the TLS handshake: a TCP connection
+/// that is not made fails with a refusal (`ConnectionRefused`), no route or a
+/// timeout instead, and a name that does not resolve is no hang-up either.
+fn hung_up(err: &(dyn Error + 'static)) -> bool {
+    io_error_in_chain(err, |kind| {
+        matches!(
+            kind,
+            ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+        )
+    })
+}
+
+/// Whether an `io::Error` of a kind that `wanted` takes is in the chain of
+/// `err`. hyper-rustls wraps the `io::Error` of a failed TLS handshake in one
+/// of its own (`io::Error::other`), and `io::Error::source()` skips the error
+/// it wraps, so a walk by `source()` alone never meets it: an `io::Error` is
+/// stepped into through `get_ref()`. (Measured on the real chains of a
+/// self-signed certificate and of plain HTTP where TLS is expected: reqwest,
+/// hyper-util's "client error (Connect)", an `io::Error` of kind `Other`, and
+/// in it the `InvalidData` one.)
+fn io_error_in_chain(err: &(dyn Error + 'static), wanted: impl Fn(ErrorKind) -> bool) -> bool {
     let mut link = Some(err);
     while let Some(e) = link {
         link = match e.downcast_ref::<std::io::Error>() {
-            Some(io) if io.kind() == std::io::ErrorKind::InvalidData => return true,
+            Some(io) if wanted(io.kind()) => return true,
             Some(io) => io.get_ref().map(|inner| inner as &(dyn Error + 'static)),
             None => e.source(),
         };
@@ -515,6 +559,13 @@ mod tests {
         }
     }
 
+    /// The flags `answer_of_failure` is handed, by name: a connection failure
+    /// to reqwest or a failed request, and the scheme of the address.
+    const CONNECT: bool = true;
+    const REQUEST: bool = false;
+    const HTTPS: bool = true;
+    const HTTP: bool = false;
+
     #[test]
     fn a_certificate_it_could_not_verify_is_not_a_dead_stream() {
         // tokio-rustls hands every rustls handshake and certificate error on as
@@ -523,7 +574,7 @@ mod tests {
             ErrorKind::InvalidData,
             "invalid peer certificate: UnknownIssuer",
         );
-        let answer = answer_of_failure(&chain, true);
+        let answer = answer_of_failure(&chain, CONNECT, HTTPS);
         assert_eq!(answer, Answer::Unchecked);
         assert!(!answer.is_dead(), "no proof, no mark");
     }
@@ -541,47 +592,97 @@ mod tests {
         );
         let connect = Link(Some(Box::new(IoError::other(tls))));
         let request = Link(Some(Box::new(connect)));
-        assert_eq!(answer_of_failure(&request, true), Answer::Unchecked);
+        assert_eq!(
+            answer_of_failure(&request, CONNECT, HTTPS),
+            Answer::Unchecked
+        );
     }
 
     #[test]
     fn an_io_error_of_kind_invalid_data_needs_no_message_to_count() {
         let chain = Link(Some(Box::new(IoError::from(ErrorKind::InvalidData))));
-        assert_eq!(answer_of_failure(&chain, true), Answer::Unchecked);
+        assert_eq!(answer_of_failure(&chain, CONNECT, HTTPS), Answer::Unchecked);
     }
 
     #[test]
-    fn every_other_connection_failure_is_a_failed_connection() {
+    fn every_other_connection_failure_of_an_http_address_is_a_failed_connection() {
+        // For http, the connection is the TCP connection alone.
         for (kind, what) in [
             (ErrorKind::ConnectionRefused, "connection refused"),
             (ErrorKind::ConnectionReset, "connection reset"),
             (ErrorKind::Other, "failed to lookup address information"),
         ] {
-            let answer = answer_of_failure(&Link::ending_in(kind, what), true);
+            let answer = answer_of_failure(&Link::ending_in(kind, what), CONNECT, HTTP);
             assert_eq!(answer, Answer::ConnectFailed, "{kind:?}");
             assert!(answer.is_dead(), "{kind:?}");
         }
         // An io::Error with nothing wrapped in it ends the walk too.
         let bare = Link(Some(Box::new(IoError::from(ErrorKind::ConnectionRefused))));
-        assert_eq!(answer_of_failure(&bare, true), Answer::ConnectFailed);
+        let answer = answer_of_failure(&bare, CONNECT, HTTP);
+        assert_eq!(answer, Answer::ConnectFailed);
+    }
+
+    #[test]
+    fn an_https_server_that_hangs_up_during_the_handshake_is_not_a_dead_stream() {
+        // The TCP connection was made, then it broke in the TLS handshake: the
+        // server was there. tokio-rustls's "tls handshake eof", a reset, an
+        // abort; as the real chain holds them, inside hyper-rustls's own
+        // io::Error (`io::Error::other`), and bare.
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+        ] {
+            let broke = IoError::new(kind, "tls handshake eof");
+            let connect = Link(Some(Box::new(IoError::other(broke))));
+            let request = Link(Some(Box::new(connect)));
+            let answer = answer_of_failure(&request, CONNECT, HTTPS);
+            assert_eq!(answer, Answer::Unchecked, "{kind:?}");
+            assert!(!answer.is_dead(), "{kind:?}: no proof, no mark");
+            let bare = Link(Some(Box::new(IoError::from(kind))));
+            let answer = answer_of_failure(&bare, CONNECT, HTTPS);
+            assert_eq!(answer, Answer::Unchecked, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn an_https_server_that_is_never_reached_is_a_failed_connection() {
+        // Refused, or a name that does not resolve: no connection was made.
+        for (kind, what) in [
+            (ErrorKind::ConnectionRefused, "connection refused"),
+            (ErrorKind::Other, "failed to lookup address information"),
+        ] {
+            let answer = answer_of_failure(&Link::ending_in(kind, what), CONNECT, HTTPS);
+            assert_eq!(answer, Answer::ConnectFailed, "{kind:?}");
+            assert!(answer.is_dead(), "{kind:?}");
+        }
     }
 
     #[test]
     fn a_chain_with_no_io_error_in_it_is_the_plain_answer() {
         let chain = Link(None);
-        assert_eq!(answer_of_failure(&chain, true), Answer::ConnectFailed);
-        assert_eq!(answer_of_failure(&chain, false), Answer::Failed);
+        for https in [HTTP, HTTPS] {
+            let connect = answer_of_failure(&chain, CONNECT, https);
+            assert_eq!(connect, Answer::ConnectFailed, "https {https}");
+            let request = answer_of_failure(&chain, REQUEST, https);
+            assert_eq!(request, Answer::Failed, "https {https}");
+        }
     }
 
     #[test]
     fn a_failure_that_is_no_connection_failure_is_a_failed_request_unless_it_is_tls() {
+        // A hang-up once the connection is made, for https after the
+        // handshake: no connection failure to reqwest.
         let reset = Link::ending_in(ErrorKind::ConnectionReset, "connection reset");
-        assert_eq!(answer_of_failure(&reset, false), Answer::Failed);
+        for https in [HTTP, HTTPS] {
+            let answer = answer_of_failure(&reset, REQUEST, https);
+            assert_eq!(answer, Answer::Failed, "https {https}");
+        }
         // A TLS alert on the first read, after the handshake (a server that
         // wants a client certificate): no connect error to reqwest, and no dead
         // stream either.
         let alert = Link::ending_in(ErrorKind::InvalidData, "received fatal alert");
-        assert_eq!(answer_of_failure(&alert, false), Answer::Unchecked);
+        assert_eq!(answer_of_failure(&alert, REQUEST, HTTPS), Answer::Unchecked);
     }
 
     /// A server that answers every request with `status`, after `delay`.
@@ -686,10 +787,13 @@ mod tests {
         }
         got.sort_unstable();
         assert_eq!(got, [2, 3, 4, 6]);
-        // Check 5 never started: nothing asked its path.
+        // Check 5 never started: nothing asked its path. Check 1 was on its way,
+        // but its task had not run yet (no await came between its start and the
+        // forget): the abort dropped it before it asked.
         let asked = here.received_requests().await.unwrap();
         let paths: Vec<&str> = asked.iter().map(|request| request.url.path()).collect();
         assert!(!paths.contains(&"/5"), "{paths:?}");
+        assert!(!paths.contains(&"/1"), "check 1 asked: {paths:?}");
     }
 
     #[tokio::test]

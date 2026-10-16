@@ -1975,11 +1975,11 @@ impl TvApp {
     }
 
     /// The verdicts of the checks before a mark (spec §4.2): an address that
-    /// answers with a status of 400 or more, does not connect or does not
-    /// answer in time gets the mark, with the time of its failure; one that
-    /// answers again, or that could not be asked, is no suspect any more. The
-    /// log names the channel and what its address did, never the address.
-    /// Nothing while no check runs.
+    /// answers with a status of 400 or more (but a busy 429, 503 or 509), does
+    /// not connect or does not answer in time gets the mark, with the time of
+    /// its failure; one that answers again, answers busy, or that could not be
+    /// asked, is no suspect any more. The log names the channel and what its
+    /// address did, never the address. Nothing while no check runs.
     fn drain_stream_checks(&mut self) {
         if self.stream_checks.in_flight() == 0 {
             return;
@@ -1987,9 +1987,13 @@ impl TvApp {
         for checked in self.stream_checks.drain() {
             let shown = crate::redact::redact(&checked.name).into_owned();
             let sid = checked.stream_id;
-            if matches!(checked.answer, Answer::Failed | Answer::Unchecked) {
+            if matches!(
+                checked.answer,
+                Answer::Busy(_) | Answer::Failed | Answer::Unchecked
+            ) {
                 // What the check could not find out is no proof of a dead
-                // stream: no mark (spec §4.2, ruling 29).
+                // stream: no mark (spec §4.2, ruling 29), and a busy answer
+                // proves nothing either (the user, 2026-10-16).
                 tracing::info!(
                     "m3u: {} (stream_id {}) not checked ({}), not marked",
                     shown,
@@ -11450,6 +11454,28 @@ https://c.example/twee-nieuws.m3u8\n";
             "it answered nothing:\n{text}"
         );
         assert!(!text.contains(&address), "no address:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn a_dead_channel_whose_server_answers_busy_is_not_marked() {
+        // 429, 503 and 509: the server is there and turns the check away for
+        // now, which proves nothing (the user, 2026-10-16).
+        for status in [429, 503, 509] {
+            let server = list_server(status, "", Duration::ZERO).await;
+            let dir = tempfile::tempdir().unwrap();
+            let address = format!("{}/b.m3u8", server.uri());
+            let (h, log) = b_at_fails_and_c_plays(dir.path(), &address).await;
+            let asked = server.received_requests().await.unwrap_or_default();
+            assert_eq!(asked.len(), 1, "{status}: B's address is asked once");
+            let b = m3u_sid("Kanaal B");
+            assert!(!h.app.catalog.is_defect(b), "{status}: no proof, no mark");
+            assert!(!dir.path().join("bad_streams.json").exists(), "{status}");
+            let text = log.text();
+            let kind = format!("busy, http {status}");
+            let line = format!("m3u: Kanaal B (stream_id {b}) not checked ({kind}), not marked");
+            assert!(text.contains(&line), "{status}: {text}");
+            assert!(!text.contains(&server.uri()), "no address:\n{text}");
+        }
     }
 
     #[tokio::test]

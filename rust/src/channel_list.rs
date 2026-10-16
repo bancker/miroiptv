@@ -210,13 +210,14 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
 }
 
 /// A name as a sort key: lower case, and every letter of Latin-1 and of Latin
-/// Extended-A as the plain letter or letters it is read as ("een" for "Één",
-/// "o1" for "Ö1", "sok" for "Şok", "lodz" for "Łódź", "strasse" for "Straße"),
-/// so it sorts where a Dutch, Turkish, Polish, Czech or Nordic reader looks for
-/// it and not after the z. A ligature, or a letter the plain alphabet writes
-/// with two, is spelled out (ß ss, æ ae, œ oe, ĳ ij, þ th); ð is a d. An accent
-/// written as a mark of its own (an "e" and U+0301) goes. A name in plain ASCII,
-/// nearly every name, is only lower-cased, with one allocation.
+/// Extended-A, and Romanian's Ș and Ț, as the plain letter or letters it is
+/// read as ("een" for "Één", "o1" for "Ö1", "sok" for "Şok", "lodz" for "Łódź",
+/// "stirile" for "Știrile", "strasse" for "Straße"), so it sorts where a Dutch,
+/// Turkish, Polish, Czech, Romanian or Nordic reader looks for it and not after
+/// the z. A ligature, or a letter the plain alphabet writes with two, is
+/// spelled out (ß ss, æ ae, œ oe, ĳ ij, þ th); ð is a d. An accent written as a
+/// mark of its own (an "e" and U+0301) goes. A name in plain ASCII, nearly
+/// every name, is only lower-cased, with one allocation.
 fn sort_key(name: &str) -> String {
     if name.is_ascii() {
         return name.to_ascii_lowercase();
@@ -239,11 +240,12 @@ fn sort_key(name: &str) -> String {
 }
 
 /// The plain letters a lower-case character is read as, or `None` when it is
-/// read as itself: a letter of Latin-1 or of Latin Extended-A without its
-/// accent, spelled out where the plain alphabet writes it with two (ß ss, æ ae,
-/// œ oe, ĳ ij, þ th), ð as d, and nothing for an accent written as a mark of its
-/// own. The Latin Extended-A ranges take both cases of a letter at a time, so
-/// that each can be read against the Unicode chart.
+/// read as itself: a letter of Latin-1 or of Latin Extended-A, or Romanian's
+/// Ș ș Ț ț of Latin Extended-B, without its accent, spelled out where the plain
+/// alphabet writes it with two (ß ss, æ ae, œ oe, ĳ ij, þ th), ð as d, and
+/// nothing for an accent written as a mark of its own. The Latin Extended
+/// ranges take both cases of a letter at a time, so that each can be read
+/// against the Unicode chart.
 fn plain_letters(c: char) -> Option<&'static str> {
     Some(match c {
         // An accent written as a mark of its own.
@@ -284,6 +286,9 @@ fn plain_letters(c: char) -> Option<&'static str> {
         '\u{174}'..='\u{175}' => "w",
         '\u{176}'..='\u{178}' => "y",
         '\u{179}'..='\u{17e}' => "z",
+        // Romanian's comma-below letters, of Latin Extended-B: Ș ș, Ț ț.
+        '\u{218}'..='\u{219}' => "s",
+        '\u{21a}'..='\u{21b}' => "t",
         _ => return None,
     })
 }

@@ -743,6 +743,37 @@ fn ligatures_and_nordic_letters_sort_as_the_letters_they_are_written_with() {
     }
 }
 
+/// Romanian writes s and t with a comma below (Ș ș Ț ț, U+0218 to U+021B, in
+/// Latin Extended-B): they sort as s and t, so "Știrile TV" is among the S's
+/// and "Țara" among the T's, not after the z.
+#[test]
+fn romanian_comma_below_letters_sort_as_s_and_t() {
+    for (written, plain) in [
+        ("Știrile TV", "Stirile TV"),
+        ("ȘTIRILE TV", "stirile tv"),
+        ("Țara", "Tara"),
+        ("ȚARA", "tara"),
+    ] {
+        assert_eq!(natural_cmp(written, plain), Ordering::Equal, "{written}");
+        assert_eq!(
+            natural_cmp(written, "Zender 1"),
+            Ordering::Less,
+            "{written}"
+        );
+    }
+    let unsorted = ["Zender 1", "Țara", "Tele 2", "Știrile TV", "Sport 1", "Uno"];
+    let live = unsorted
+        .iter()
+        .zip(1..)
+        .map(|(name, id)| ch(id, name, None))
+        .collect();
+    let g = build(live, &[], &[]);
+    assert_eq!(
+        names(&g, 0),
+        ["Sport 1", "Știrile TV", "Țara", "Tele 2", "Uno", "Zender 1"]
+    );
+}
+
 /// A name in another script is only lower-cased: its letters go by their code
 /// points, after the Latin ones.
 #[test]
