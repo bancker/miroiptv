@@ -23,14 +23,41 @@ pub enum Cmd {
     /// Load this URL of an M3U list's stream, which may carry its headers:
     /// `url|User-Agent=…&Referer=…` (`loadfile_args`).
     LoadWithHeaders(String),
+    /// Load a film, an episode or a trailer of the thuisbioscoop (spec
+    /// 2026-10-15 §7): its URL byte for byte, with options of that one file.
+    /// While it plays the player reports it (`Event::Vod`).
+    LoadVod(VodLoad),
     Pause(bool),
     /// Stop playing; nothing is loaded afterwards.
     Stop,
     SeekRelative(f64),
     CycleAudio,
     CycleSubtitle,
+    /// Plays audio track `id` (mpv's `aid`, an id of `Event::Vod`'s tracks);
+    /// none: no sound track. A track choice, as `a`'s is: the load of another
+    /// stream puts it back to auto (`tracks::TrackChoice`), so it goes after
+    /// the load it is for.
+    SetAudio(Option<i64>),
+    /// Shows subtitle track `id` (mpv's `sid`); none: no subtitles. A track
+    /// choice, as `SetAudio` is.
+    SetSubtitles(Option<i64>),
+    /// Mutes or unmutes (mpv's `mute`).
+    SetMute(bool),
     SetWindowSize(u32, u32),
     Quit,
+}
+
+/// A load of the thuisbioscoop. `Debug` for the tests only: its URL holds the
+/// account.
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, PartialEq)]
+pub struct VodLoad {
+    /// What plays, as it is.
+    pub url: String,
+    /// Where it starts, in seconds; 0 from the start.
+    pub start: f64,
+    /// A separate sound track: a trailer's audio, as yt-dlp gives it.
+    pub audio_file: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +82,70 @@ pub enum Event {
         index: usize,
         label: String,
     },
+    Vod(VodEvent),
+}
+
+/// What the player reports of a `Cmd::LoadVod` while it plays
+/// (`Event::Vod`), and of nothing else.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VodEvent {
+    /// Where it plays, in seconds: when the whole second changes, so once a
+    /// second at most while it plays, and at once after a seek.
+    Position(f64),
+    /// How long it lasts, in seconds, when the whole second changes: a stream
+    /// that tells its length as it is read (a TS) tells it once a second.
+    Duration(f64),
+    /// Its audio and subtitle tracks, as mpv lists them.
+    Tracks(Vec<Track>),
+}
+
+/// An audio or subtitle track of what plays (mpv's `track-list`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Track {
+    /// What `Cmd::SetAudio` and `Cmd::SetSubtitles` take.
+    pub id: i64,
+    pub kind: TrackKind,
+    /// Its language as the file names it ("nld", "eng"); empty when none.
+    pub lang: String,
+    /// Its title as the file names it; empty when none.
+    pub title: String,
+    /// It plays or shows now.
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackKind {
+    Audio,
+    Subtitle,
+}
+
+/// The `reply_userdata` the properties of a VOD load are observed with:
+/// `time-pos`, `duration` and `track-list`, all unobserved at once by it. 1 is
+/// `paused-for-cache`'s.
+pub const OBSERVE_VOD: u64 = 2;
+
+/// Lets a position through when its whole second differs from the last one's.
+#[derive(Debug, Default)]
+pub struct SecondGate {
+    last: Option<i64>,
+}
+
+impl SecondGate {
+    /// Whether `pos` (seconds) is news.
+    pub fn pass(&mut self, pos: f64) -> bool {
+        if !pos.is_finite() {
+            return false;
+        }
+        let second = pos.floor() as i64;
+        let news = self.last != Some(second);
+        self.last = Some(second);
+        news
+    }
+
+    /// A new file: its first position is news.
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
 }
 
 pub struct PlayerHandle {
@@ -103,11 +194,23 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
 
             info!("mpv player thread started");
             let mut choice = tracks::TrackChoice::new();
+            // A VOD load is playing: its properties are observed and reported.
+            let mut vod = false;
+            // Its file has started (`MPV_EVENT_START_FILE`): what the properties
+            // say is its own from then on, not the file before it's.
+            let mut vod_started = false;
+            let (mut seconds, mut lengths) = (SecondGate::default(), SecondGate::default());
 
             loop {
                 loop {
                     match cmd_rx.try_recv() {
-                        Ok(load @ (Cmd::LoadUrl(_) | Cmd::LoadWithHeaders(_))) => {
+                        Ok(
+                            load @ (Cmd::LoadUrl(_) | Cmd::LoadWithHeaders(_) | Cmd::LoadVod(_)),
+                        ) => {
+                            follow_vod(&mpv, &mut vod, matches!(load, Cmd::LoadVod(_)));
+                            vod_started = false;
+                            seconds.reset();
+                            lengths.reset();
                             if let Some((args, line)) = loadfile_command(&load) {
                                 if choice.load(&args[1]) {
                                     reset_tracks(&mpv);
@@ -125,7 +228,19 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                         }
                         Ok(Cmd::Stop) => {
                             info!("stop");
+                            follow_vod(&mpv, &mut vod, false);
+                            vod_started = false;
                             let _ = mpv.command(&["stop"]);
+                        }
+                        Ok(Cmd::SetAudio(id)) => {
+                            set_track(&mut choice, "aid", id, |n, v| mpv.set_property(n, v));
+                        }
+                        Ok(Cmd::SetSubtitles(id)) => {
+                            set_track(&mut choice, "sid", id, |n, v| mpv.set_property(n, v));
+                        }
+                        Ok(Cmd::SetMute(on)) => {
+                            debug!("mute {}", on);
+                            let _ = mpv.set_property("mute", if on { "yes" } else { "no" });
                         }
                         Ok(Cmd::SeekRelative(s)) => {
                             let _ = mpv.command(&["seek", &s.to_string(), "relative"]);
@@ -166,6 +281,12 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                             }
                         }
                     }
+                    mpv_sys::MPV_EVENT_START_FILE => {
+                        // What the VOD properties say from here on is this load's.
+                        vod_started = true;
+                        seconds.reset();
+                        lengths.reset();
+                    }
                     mpv_sys::MPV_EVENT_FILE_LOADED => {
                         info!("mpv: file-loaded");
                         let _ = evt_tx.send(Event::FileLoaded);
@@ -175,6 +296,7 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                         let _ = evt_tx.send(Event::PlaybackStarted);
                     }
                     mpv_sys::MPV_EVENT_END_FILE => {
+                        vod_started = false;
                         let reason = unsafe { events::end_file_reason(evt) };
                         warn!("mpv: end-file (reason={})", reason);
                         let _ = evt_tx.send(Event::EndOfFile { reason });
@@ -190,6 +312,25 @@ pub fn spawn(initial_w: u32, initial_h: u32) -> anyhow::Result<PlayerHandle> {
                     }
                     mpv_sys::MPV_EVENT_AUDIO_RECONFIG => {
                         info!("mpv: audio-reconfig");
+                    }
+                    mpv_sys::MPV_EVENT_PROPERTY_CHANGE
+                        if unsafe { (*evt).reply_userdata } == OBSERVE_VOD =>
+                    {
+                        // A late change of a load that is no VOD load any more,
+                        // or of the file before this one, says nothing.
+                        let report = match vod && vod_started {
+                            true => unsafe { events::vod_report(evt) },
+                            false => None,
+                        };
+                        let news = match &report {
+                            Some(VodEvent::Position(pos)) => seconds.pass(*pos),
+                            Some(VodEvent::Duration(length)) => lengths.pass(*length),
+                            Some(_) => true,
+                            None => false,
+                        };
+                        if let (true, Some(report)) = (news, report) {
+                            let _ = evt_tx.send(Event::Vod(report));
+                        }
                     }
                     mpv_sys::MPV_EVENT_PROPERTY_CHANGE => {
                         if let Some((n, v)) = unsafe { events::property_change(evt) } {
@@ -274,12 +415,68 @@ fn reset_tracks(mpv: &Mpv) {
     }
 }
 
+/// `Cmd::SetAudio` and `Cmd::SetSubtitles`: `aid` or `sid` (`name`) set
+/// through `set` to track `id`, or to `no` for none. A track choice, as `a`'s
+/// and `s`'s are: mpv keeps it for every later file, so the load of another
+/// stream puts it back to auto (`TrackChoice`), and the app sends it after the
+/// load it is for. A value mpv does not take chooses nothing.
+fn set_track(
+    choice: &mut tracks::TrackChoice,
+    name: &str,
+    id: Option<i64>,
+    set: impl FnOnce(&str, &str) -> Result<(), MpvError>,
+) {
+    let value = id.map_or_else(|| "no".to_owned(), |id| id.to_string());
+    debug!("{} {}", name, value);
+    if set(name, &value).is_ok() {
+        choice.chosen();
+    }
+}
+
+/// Starts or stops observing a VOD load's properties when what loads is or is
+/// no VOD load: live TV reports nothing of them, so it costs nothing.
+fn follow_vod(mpv: &Mpv, vod: &mut bool, now_vod: bool) {
+    if now_vod == *vod {
+        return;
+    }
+    *vod = now_vod;
+    if now_vod {
+        for (name, format) in [
+            ("time-pos", mpv_sys::MPV_FORMAT_DOUBLE),
+            ("duration", mpv_sys::MPV_FORMAT_DOUBLE),
+            ("track-list", mpv_sys::MPV_FORMAT_STRING),
+        ] {
+            if let Err(e) = mpv.observe_property(name, format, OBSERVE_VOD) {
+                warn!("observe {} failed: {}", name, e);
+            }
+        }
+    } else if let Err(e) = mpv.unobserve_property(OBSERVE_VOD) {
+        warn!("unobserve failed: {}", e);
+    }
+}
+
 /// What the player thread runs for a load, and the line it logs (`None` for a
 /// command that is no load). A plain load hands mpv its URL as it is, as 0.6.1
 /// did; only a load with headers has them split off (`loadfile_args`). The line
 /// names the headers a load sends, never their values, and its address goes
-/// through `redact`.
+/// through `redact`. A VOD load's line names its host and options only: a
+/// trailer's address holds tokens `redact` does not know.
 pub fn loadfile_command(cmd: &Cmd) -> Option<(Vec<String>, String)> {
+    if let Cmd::LoadVod(load) = cmd {
+        let mut said = Vec::new();
+        if load.start.is_finite() && load.start > 0.0 {
+            said.push(format!("start {} s", load.start));
+        }
+        if load.audio_file.is_some() {
+            said.push("audio file".to_owned());
+        }
+        let host = crate::redact::url_host(&load.url);
+        let line = match said.is_empty() {
+            true => format!("loadfile vod from {host}"),
+            false => format!("loadfile vod from {host} ({})", said.join(", ")),
+        };
+        return Some((vod_loadfile_args(load), line));
+    }
     let (args, sent) = match cmd {
         Cmd::LoadUrl(url) => (vec!["loadfile".to_owned(), url.clone()], Vec::new()),
         Cmd::LoadWithHeaders(url) => {
@@ -329,6 +526,25 @@ pub fn loadfile_args(url: &str) -> Vec<String> {
         ));
     }
     let mut args = vec!["loadfile".to_owned(), target.to_owned()];
+    if !options.is_empty() {
+        args.extend(["replace".to_owned(), "-1".to_owned(), options.join(",")]);
+    }
+    args
+}
+
+/// The `loadfile` command of a VOD load: its URL as it is, byte for byte, and
+/// `start` and `audio-file` as options of that one file (mpv puts them back
+/// after it). A load from the start without a sound track is a plain loadfile,
+/// as a film from `f` is.
+pub fn vod_loadfile_args(load: &VodLoad) -> Vec<String> {
+    let mut options = Vec::new();
+    if load.start.is_finite() && load.start > 0.0 {
+        options.push(format!("start={}", load.start));
+    }
+    if let Some(audio) = &load.audio_file {
+        options.push(format!("audio-file={}", option_value(audio)));
+    }
+    let mut args = vec!["loadfile".to_owned(), load.url.clone()];
     if !options.is_empty() {
         args.extend(["replace".to_owned(), "-1".to_owned(), options.join(",")]);
     }
@@ -598,5 +814,38 @@ mod tests {
             super::loadfile_args(&url)[4],
             "http-header-fields=%32%Referer: http://zürich.example/"
         );
+    }
+
+    #[test]
+    fn a_track_the_app_sets_goes_back_to_auto_when_another_stream_loads() {
+        // An `aid` or `sid` set at runtime outlives the file: a subtitle track
+        // set on a film would follow the user to a channel. `SetAudio` and
+        // `SetSubtitles` are choices as `a`'s and `s`'s are (`TrackChoice`).
+        let film = "http://h:80/movie/u/p/5001.mkv";
+        let channel = "http://127.0.0.1:5555/live/7.ts";
+        for (name, id, value) in [
+            ("aid", Some(2), "2"),
+            ("aid", None, "no"),
+            ("sid", Some(3), "3"),
+            ("sid", None, "no"),
+        ] {
+            let mut choice = super::tracks::TrackChoice::new();
+            assert!(!choice.load(film));
+            let mut set = Vec::new();
+            super::set_track(&mut choice, name, id, |n, v| {
+                set.push(format!("{n}={v}"));
+                Ok(())
+            });
+            assert_eq!(set, [format!("{name}={value}")]);
+            assert!(!choice.load(film), "the same film again keeps {name}");
+            assert!(choice.load(channel), "another stream: {name} back to auto");
+        }
+        // A track mpv does not take is no choice.
+        let mut choice = super::tracks::TrackChoice::new();
+        assert!(!choice.load(film));
+        super::set_track(&mut choice, "sid", Some(3), |_, _| {
+            Err(super::MpvError::NullHandle)
+        });
+        assert!(!choice.load(channel));
     }
 }

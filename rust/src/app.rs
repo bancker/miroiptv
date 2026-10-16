@@ -1726,6 +1726,8 @@ impl TvApp {
                         }
                     }
                 }
+                // What a load of the thuisbioscoop reports: none loads yet.
+                Event::Vod(_) => {}
                 Event::PropertyChanged { name, value } => {
                     if name == "paused-for-cache" {
                         let on = value == "yes";

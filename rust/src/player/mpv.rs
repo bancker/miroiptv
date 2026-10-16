@@ -135,6 +135,11 @@ impl Mpv {
         check(unsafe { sys::mpv_observe_property(self.handle, userdata, n.as_ptr(), format) })
     }
 
+    /// Stops observing every property observed with `userdata`.
+    pub fn unobserve_property(&self, userdata: u64) -> Result<(), MpvError> {
+        check(unsafe { sys::mpv_unobserve_property(self.handle, userdata) })
+    }
+
     pub fn wait_event(&self, timeout_s: f64) -> *mut sys::mpv_event {
         unsafe { sys::mpv_wait_event(self.handle, timeout_s) }
     }

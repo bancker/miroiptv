@@ -109,6 +109,7 @@ extern "C" {
         name: *const c_char,
         format: c_int,
     ) -> c_int;
+    pub fn mpv_unobserve_property(ctx: *mut mpv_handle, registered_reply_userdata: u64) -> c_int;
     pub fn mpv_command(ctx: *mut mpv_handle, args: *mut *const c_char) -> c_int;
     pub fn mpv_command_async(
         ctx: *mut mpv_handle,

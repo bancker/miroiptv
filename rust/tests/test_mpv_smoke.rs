@@ -204,3 +204,133 @@ fn mpv_marks_a_selected_track_and_one_it_leaves_off_in_its_log() {
     assert!(audio(&lines, '\u{25CB}'), "{lines:#?}");
     assert!(!audio(&lines, '\u{25CF}'), "{lines:#?}");
 }
+
+#[test]
+#[ignore]
+fn a_vod_load_reports_its_length_position_and_tracks_and_live_tv_reports_none() {
+    use bongo_player::player::{spawn, Cmd, Event, TrackKind, VodEvent, VodLoad};
+    use std::time::{Duration, Instant};
+    let player = spawn(320, 240).expect("player");
+    // No sound on the developer's speakers.
+    player.cmd_tx.send(Cmd::SetMute(true)).unwrap();
+    let vod = VodLoad {
+        url: "av://lavfi:testsrc2=size=320x240:rate=25:duration=8".into(),
+        start: 1.0,
+        audio_file: Some("av://lavfi:sine=frequency=440:duration=8".into()),
+    };
+    player.cmd_tx.send(Cmd::LoadVod(vod)).unwrap();
+    let mut events = player.evt_rx.lock();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut length, mut first, mut audio) = (None, None, false);
+    while Instant::now() < deadline && !(length.is_some() && first.is_some() && audio) {
+        match events.try_recv() {
+            Ok(Event::Vod(VodEvent::Duration(d))) => length = Some(d),
+            Ok(Event::Vod(VodEvent::Position(p))) => {
+                first.get_or_insert(p);
+            }
+            Ok(Event::Vod(VodEvent::Tracks(tracks))) => {
+                audio |= tracks.iter().any(|t| t.kind == TrackKind::Audio);
+            }
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    // A lavfi source has no length up front: mpv tells it as it reads it.
+    assert!(length.is_some_and(|d| d > 0.0), "{length:?}");
+    assert!(
+        first.is_some_and(|p| p >= 0.9),
+        "start=1 is kept: {first:?}"
+    );
+    assert!(
+        audio,
+        "the audio file is a track of mpv's track-list, read as JSON"
+    );
+    // `Cmd::SetAudio(None)` sets aid=no: the track list says no audio plays.
+    // (`SetSubtitles` gets no check: lavfi has no subtitle track.)
+    while events.try_recv().is_ok() {}
+    player.cmd_tx.send(Cmd::SetAudio(None)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut silent = false;
+    while Instant::now() < deadline && !silent {
+        match events.try_recv() {
+            Ok(Event::Vod(VodEvent::Tracks(tracks))) => {
+                let audio: Vec<_> = tracks
+                    .iter()
+                    .filter(|t| t.kind == TrackKind::Audio)
+                    .collect();
+                silent = !audio.is_empty() && audio.iter().all(|t| !t.selected);
+            }
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    assert!(silent, "Cmd::SetAudio(None) sets aid=no");
+    // A VOD load after another reports its own position, never the first
+    // file's. It goes right after a position of the first, so no other comes
+    // in before the player takes it.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(Event::Vod(VodEvent::Position(_))) => break,
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    while events.try_recv().is_ok() {}
+    let second = VodLoad {
+        url: "av://lavfi:testsrc2=size=320x240:rate=25:duration=8".into(),
+        start: 0.0,
+        audio_file: None,
+    };
+    player.cmd_tx.send(Cmd::LoadVod(second)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut first = None;
+    while Instant::now() < deadline && first.is_none() {
+        match events.try_recv() {
+            Ok(Event::Vod(VodEvent::Position(p))) => first = Some(p),
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    assert!(
+        first.is_some_and(|p| p < 1.0),
+        "the second load's own position: {first:?}"
+    );
+    // `Cmd::SetAudio` is a track choice, as `a`'s is (`TrackChoice`): the
+    // second load, the same film again, kept aid=no, and the load of another
+    // film puts it back to auto, so its sound track plays.
+    while events.try_recv().is_ok() {}
+    let other = VodLoad {
+        url: "av://lavfi:testsrc2=size=320x180:rate=25:duration=8".into(),
+        start: 0.0,
+        audio_file: Some("av://lavfi:sine=frequency=330:duration=8".into()),
+    };
+    player.cmd_tx.send(Cmd::LoadVod(other)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut plays = false;
+    while Instant::now() < deadline && !plays {
+        match events.try_recv() {
+            Ok(Event::Vod(VodEvent::Tracks(tracks))) => {
+                plays = tracks
+                    .iter()
+                    .any(|t| t.kind == TrackKind::Audio && t.selected);
+            }
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    assert!(plays, "another film's sound track plays: aid is auto again");
+    // Live TV reports none of it.
+    let live = "av://lavfi:smptebars=size=320x240:rate=25:duration=3";
+    player.cmd_tx.send(Cmd::LoadUrl(live.into())).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    while events.try_recv().is_ok() {}
+    let quiet = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < quiet {
+        if let Ok(Event::Vod(report)) = events.try_recv() {
+            panic!("live TV reported {report:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    player.cmd_tx.send(Cmd::Quit).unwrap();
+}

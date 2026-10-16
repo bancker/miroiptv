@@ -1,5 +1,5 @@
 use super::mpv_sys as sys;
-use super::Event;
+use super::{Event, Track, TrackKind, VodEvent};
 use std::ffi::CStr;
 
 /// Map a raw mpv event to our higher-level Event enum.
@@ -98,6 +98,65 @@ pub unsafe fn property_change(evt: *mut sys::mpv_event) -> Option<(String, Strin
         String::new()
     };
     Some((name, val))
+}
+
+/// What a property change of a VOD load says (see `player::OBSERVE_VOD`):
+/// `time-pos` and `duration` as doubles, `track-list` as mpv's JSON. None for
+/// another property, and for one that has no value now (nothing plays).
+///
+/// # Safety
+/// Same constraints as [`from_mpv`]. Callers should only pass events whose
+/// `event_id == MPV_EVENT_PROPERTY_CHANGE`.
+pub unsafe fn vod_report(evt: *mut sys::mpv_event) -> Option<VodEvent> {
+    let data = (*evt).data as *mut sys::mpv_event_property;
+    if data.is_null() || (*data).data.is_null() {
+        return None;
+    }
+    let name = CStr::from_ptr((*data).name).to_str().ok()?;
+    match ((*data).format, name) {
+        (sys::MPV_FORMAT_DOUBLE, "time-pos") => {
+            Some(VodEvent::Position(*((*data).data as *const f64)))
+        }
+        (sys::MPV_FORMAT_DOUBLE, "duration") => {
+            Some(VodEvent::Duration(*((*data).data as *const f64)))
+        }
+        (sys::MPV_FORMAT_STRING, "track-list") => {
+            let p = *((*data).data as *const *const std::os::raw::c_char);
+            if p.is_null() {
+                return None;
+            }
+            Some(VodEvent::Tracks(parse_tracks(
+                &CStr::from_ptr(p).to_string_lossy(),
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// The audio and subtitle tracks of mpv's `track-list`, read as a string: a
+/// JSON list of objects with `id`, `type`, `lang`, `title` and `selected`.
+/// Video tracks, and anything that is no such object, are left out.
+pub fn parse_tracks(json: &str) -> Vec<Track> {
+    let Ok(serde_json::Value::Array(list)) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|t| {
+            let kind = match t.get("type")?.as_str()? {
+                "audio" => TrackKind::Audio,
+                "sub" => TrackKind::Subtitle,
+                _ => return None,
+            };
+            let text = |key: &str| t.get(key).and_then(|v| v.as_str()).unwrap_or("").to_owned();
+            Some(Track {
+                id: t.get("id")?.as_i64()?,
+                kind,
+                lang: text("lang"),
+                title: text("title"),
+                selected: t.get("selected").and_then(|v| v.as_bool()).unwrap_or(false),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
