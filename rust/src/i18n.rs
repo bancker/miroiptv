@@ -180,7 +180,6 @@ texts! {
     PressF5 => ["druk F5 om opnieuw te proberen", "press F5 to retry", "F5 drücken für einen neuen Versuch"],
     EpgTitle => ["Gids", "Guide", "Programm"],
     // Sources: an M3U list
-    NoGuideForSource => ["voor deze bron is er nog geen gids", "this source has no guide yet", "für diese Quelle gibt es noch kein Programm"],
     ListNotUpdated => ["zenderlijst niet bijgewerkt", "channel list not updated", "Senderliste nicht aktualisiert"],
     NotAChannelList => ["dit is geen zenderlijst", "this is not a channel list", "das ist keine Senderliste"],
     FetchingList => ["zenderlijst ophalen...", "fetching the channel list...", "Senderliste wird abgerufen..."],
@@ -229,7 +228,7 @@ texts! {
     HelpFullscreen => ["volledig scherm", "fullscreen", "Vollbild"],
     HelpRetryPortal => ["opnieuw ophalen", "fetch again", "erneut abrufen"],
     HelpDebug => ["debug-info", "debug info", "Debug-Info"],
-    HelpOpenGuide => ["gids openen", "open guide", "Programm öffnen"],
+    HelpOpenGuide => ["gids openen (M3U: zenderlijst)", "open guide (M3U: channel list)", "Programm öffnen (M3U: Senderliste)"],
     HelpBorderless => ["randloos + altijd bovenop  (aan/uit)", "borderless + always on top  (toggle)", "randlos + immer im Vordergrund  (an/aus)"],
     KeyRightDrag => ["rechtermuisknop + slepen", "right button + drag", "rechte Maustaste + ziehen"],
     HelpRightDrag => ["venster verplaatsen (alleen randloos)", "move the window (borderless only)", "Fenster verschieben (nur randlos)"],

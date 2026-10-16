@@ -4,6 +4,8 @@ use crate::args::{
 use crate::bad_streams::{BadStreams, Failure};
 use crate::catalog::GuideChannel;
 use crate::catalog::{fallback_variant, quality_label, quality_rank, CatalogNotice, CatalogStatus, CatalogStore, ZapFrom, ZapRing};
+use crate::channel_list::GroupKey;
+use crate::channel_list_ui::{ChannelListView, ListAction, ListData};
 use crate::epg::{Epg, EpgEntry};
 use crate::favorites::{Entry as FavoriteEntry, Favorites};
 use crate::guide::fetch::EpgFetcher;
@@ -36,6 +38,7 @@ use crate::window_drag::{self, Mouse, RightDrag};
 use crate::zap::ZapPacer;
 use egui::{Color32, ColorImage, Key, TextureHandle, TextureOptions};
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -611,6 +614,17 @@ pub struct TvApp {
     guide_open: bool,
     /// The guide's state: it opens as it was left.
     guide_view: GuideView,
+    /// The channel list of an M3U source (`g`), while it is open (spec
+    /// 2026-10-15 §3). Closed, it is `None` and costs nothing.
+    channel_list: Option<ChannelListView>,
+    /// The group the list had open when it closed last, this session: it opens
+    /// there again.
+    channel_list_group: Option<GroupKey>,
+    /// What the open list's groups were made for: the catalog's generation and
+    /// revision, the marks' revision, the favorites' revision.
+    channel_list_for: Option<(u64, u64, u64, u64)>,
+    /// Counts every change of the favorites, for the list's Favorites group.
+    favorites_revision: u64,
     /// The guide's columns, the catalog's channels with catch-up, as the
     /// catalog and the lock stood at `guide_channels_for` (catalog generation,
     /// the catalog's revision, unlocked).
@@ -898,6 +912,10 @@ impl TvApp {
             search_sel: 0,
             guide_open: false,
             guide_view: GuideView::new(today),
+            channel_list: None,
+            channel_list_group: None,
+            channel_list_for: None,
+            favorites_revision: 0,
             guide_channels: Vec::new(),
             guide_channels_for: None,
             guide_channels_revision: 0,
@@ -1049,6 +1067,7 @@ impl TvApp {
         self.show_epg_grid = false;
         self.guide_open = false;
         self.news_picker = None;
+        self.close_channel_list();
     }
 
     fn open_settings(&mut self) {
@@ -2137,7 +2156,10 @@ impl TvApp {
         self.current_name = Some(name.to_owned());
         self.current_stream_id = Some(sid);
         self.current_epg = None;
-        self.set_toast(format!("[TV] {}", name));
+        // While the channel list is open its play mark shows what plays (spec §3.5).
+        if self.channel_list.is_none() {
+            self.set_toast(format!("[TV] {}", name));
+        }
         self.kick_epg_fetch(sid);
     }
 
@@ -2657,6 +2679,7 @@ impl TvApp {
         let name = self.current_name.clone().unwrap_or_default();
         let was = self.favorites.contains(sid);
         self.favorites.toggle(sid, &name);
+        self.favorites_revision += 1;
         let _ = self.favorites.save(&self.storage.favorites_path());
         if was {
             self.set_toast(self.tr(T::FavoriteRemoved, &[&name]));
@@ -2969,6 +2992,9 @@ impl TvApp {
         self.bad_streams = None;
         self.bad_streams_for = None;
         self.stream_checks.reset();
+        // Another source's groups mean nothing here.
+        self.close_channel_list();
+        self.channel_list_group = None;
         // Whatever waited for the old portal's catalog, or was told by it, means
         // nothing to the new one: a 0.5 resume would play the old portal's URL
         // through it, an old stream id would be another channel, a catch-up
@@ -2992,6 +3018,7 @@ impl TvApp {
     fn use_data_of(&mut self, id: SourceId) {
         self.storage.set_source(id);
         self.favorites = Favorites::load(&self.storage.favorites_path()).unwrap_or_default();
+        self.favorites_revision += 1;
         self.presets = Presets::load(&self.storage.presets_path()).unwrap_or_default();
         self.stop_playback();
         // A catch-up pick of the other source's waits no longer: it stopped.
@@ -3900,6 +3927,7 @@ impl TvApp {
         }
         if let Some(id) = remove_id {
             self.favorites.remove(id);
+            self.favorites_revision += 1;
             let _ = self.favorites.save(&self.storage.favorites_path());
         }
     }
@@ -4232,9 +4260,9 @@ impl TvApp {
     /// `g`: the guide opens as it was left (in Nu & straks: on now). From now on
     /// its EPG is fetched in the background.
     fn open_guide(&mut self) {
-        // Round 1 reads no XMLTV guide: an M3U source has none yet.
+        // An M3U source has no guide yet: `g` opens its channel list.
         if self.catalog.kind() == SourceKind::M3u {
-            self.set_toast(self.t(T::NoGuideForSource));
+            self.open_channel_list();
             return;
         }
         if !self.catalog.is_loaded() {
@@ -4262,6 +4290,149 @@ impl TvApp {
         if self.guide_open {
             self.guide_open = false;
             tracing::info!("guide: closed");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Channel list (`g` on an M3U source): channel_list_ui.rs draws it and
+    // hands back what the user did.
+    // ------------------------------------------------------------------
+
+    /// What the open list's groups depend on. Read before the groups, so a
+    /// change that lands in between is noticed next frame.
+    fn channel_list_key(&self) -> (u64, u64, u64, u64) {
+        (
+            self.catalog_generation,
+            self.catalog.revision(),
+            self.catalog.defect_revision(),
+            self.favorites_revision,
+        )
+    }
+
+    /// The source's favorites, for the list's Favorites group.
+    fn favorite_ids(&self) -> HashSet<i64> {
+        self.favorites.iter().map(|e| e.stream_id).collect()
+    }
+
+    /// `g` on an M3U source (spec §3.1, §3.3): the channel list, in the group
+    /// open last this session, on the channel that plays. Opening starts
+    /// nothing. While the catalog loads, the guide's word for that.
+    fn open_channel_list(&mut self) {
+        if !self.catalog.is_loaded() {
+            self.set_toast(self.t(T::GuideCatalogLoading));
+            return;
+        }
+        let key = self.channel_list_key();
+        let Some(groups) = self.catalog.channel_groups(&self.favorite_ids()) else {
+            return;
+        };
+        tracing::info!(
+            "channel list: opened ({} channels, {} groups)",
+            groups.channel_count(),
+            groups.group_count()
+        );
+        // Its rows take clicks: the two never show at once.
+        self.show_favs = false;
+        let last = self.channel_list_group.as_ref();
+        let view = ChannelListView::new(groups, last, self.current_stream_id);
+        self.channel_list = Some(view);
+        self.channel_list_for = Some(key);
+    }
+
+    /// Closes the list. Only which group it had open stays.
+    fn close_channel_list(&mut self) {
+        if let Some(view) = self.channel_list.take() {
+            self.channel_list_group = view.group_key().cloned();
+            self.channel_list_for = None;
+            tracing::info!("channel list: closed");
+        }
+    }
+
+    /// The open list's groups made anew when the catalog (a fresh copy of the
+    /// list, F5), the marks or the favorites changed; the selection keeps its
+    /// place. Four comparisons per frame otherwise.
+    fn refresh_channel_list(&mut self) {
+        if self.channel_list.is_none() {
+            return;
+        }
+        if self.catalog.kind() != SourceKind::M3u {
+            self.close_channel_list();
+            return;
+        }
+        let key = self.channel_list_key();
+        if self.channel_list_for == Some(key) {
+            return;
+        }
+        let Some(groups) = self.catalog.channel_groups(&self.favorite_ids()) else {
+            self.close_channel_list();
+            return;
+        };
+        if let Some(view) = self.channel_list.as_mut() {
+            view.replace_groups(groups);
+        }
+        self.channel_list_for = Some(key);
+    }
+
+    /// The open list over the picture, and what the user did in it. Nothing at
+    /// all while it is closed.
+    fn paint_channel_list(&mut self, ctx: &egui::Context) {
+        if self.channel_list.is_none() {
+            return;
+        }
+        self.refresh_channel_list();
+        let marks = self.catalog.defect_marks();
+        let data = ListData {
+            lang: self.lang,
+            playing: self.current_stream_id,
+            marks: &marks,
+            now_unix: chrono::Utc::now().timestamp(),
+        };
+        let Some(view) = self.channel_list.as_mut() else {
+            return;
+        };
+        let actions = view.show(ctx, &data);
+        for action in actions {
+            // An action that closed the list ends what this frame did in it.
+            if self.channel_list.is_none() {
+                break;
+            }
+            self.apply_list_action(action);
+        }
+    }
+
+    /// What the list's keys and clicks mean (spec §3.4).
+    fn apply_list_action(&mut self, action: ListAction) {
+        match action {
+            ListAction::Preview {
+                stream_id,
+                name,
+                repeat,
+            } => {
+                // The zap tempo: a lone press starts at once; quick presses and a
+                // held key only move the selection, and the channel the user stops
+                // on starts. Not the one that plays: it would only start over.
+                let (target, now) = ((stream_id, name, None), Instant::now());
+                if let Some((sid, name, idx)) = self.zap_pacer.press(now, target, repeat) {
+                    if !self.plays(sid) {
+                        self.zap_to(sid, &name, idx);
+                    }
+                }
+            }
+            ListAction::Play { stream_id, name } => {
+                // Enter or a double click: closed, and the channel plays now,
+                // also when it still waited for the tempo.
+                self.close_channel_list();
+                self.zap_pacer.cancel();
+                if !self.plays(stream_id) {
+                    self.zap_to(stream_id, &name, None);
+                }
+            }
+            // The selection left the channel that waited: nothing starts.
+            ListAction::GroupChanged => self.zap_pacer.cancel(),
+            ListAction::Close => {
+                self.zap_pacer.cancel();
+                self.close_channel_list();
+            }
         }
     }
 
@@ -4750,11 +4921,12 @@ impl TvApp {
         // hotkeys); the setup prompt owns the keyboard. The wait screen of a
         // catch-up pick takes Esc and g only. The search that `f` opened over
         // the guide has the keyboard: `handle_keys` then does its Esc, and
-        // nothing else.
+        // nothing else. The channel list reads its own keys in
+        // paint_channel_list, as the guide does.
         if self.settings_ui.is_none() && !setup_prompt {
             if self.pending_catchup.is_some() {
                 self.handle_wait_keys(ctx);
-            } else if !self.guide_open || self.show_search {
+            } else if self.channel_list.is_none() && (!self.guide_open || self.show_search) {
                 self.handle_keys(ctx);
             }
         }
@@ -4803,6 +4975,7 @@ impl TvApp {
             self.paint_epg_strip(ctx);
             self.paint_epg_grid(ctx);
             self.paint_debug_hud(ctx);
+            self.paint_channel_list(ctx);
         }
         // Toast remains visible above everything (covers play-action feedback
         // when the user picks a programme from the guide).
@@ -9564,22 +9737,6 @@ https://c.example/twee-nieuws.m3u8\n";
     }
 
     #[tokio::test]
-    async fn g_on_an_m3u_source_says_there_is_no_guide_yet() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut h = m3u_app(dir.path(), TEST_LIST);
-        h.frame_with(vec![key_press(Key::G), egui::Event::Text("g".into())]);
-        h.frame(&[]);
-        assert!(!h.app.guide_open);
-        assert!(
-            h.painted
-                .iter()
-                .any(|t| t == "this source has no guide yet"),
-            "{:?}",
-            h.painted
-        );
-    }
-
-    #[tokio::test]
     async fn unlocking_changes_nothing_on_an_m3u_source() {
         let dir = tempfile::tempdir().unwrap();
         let mut h = m3u_app(dir.path(), TEST_LIST);
@@ -11394,6 +11551,414 @@ https://c.example/twee-nieuws.m3u8\n";
             one.bad_streams_path().exists(),
             "the source in use keeps its own"
         );
+    }
+
+    // ---- the channel list ----
+
+    /// Four channels in two groups, out of A-Z order in the file: D, B, C, A.
+    const LISTED: &str = "#EXTM3U\n\
+#EXTINF:-1 group-title=\"Nieuws\",Kanaal D\nhttps://d.example/d.m3u8\n\
+#EXTINF:-1 group-title=\"Sport\",Kanaal B\nhttps://b.example/b.m3u8\n\
+#EXTINF:-1 group-title=\"Nieuws;Sport\",Kanaal C\nhttps://c.example/c.m3u8\n\
+#EXTINF:-1,Kanaal A\nhttps://a.example/a.m3u8\n";
+
+    /// `g` as a keyboard makes it, and the frame after it drawn: egui keeps
+    /// the list's new area invisible in its first frame.
+    fn open_list(h: &mut Harness) {
+        h.frame_with(vec![key_press(Key::G), egui::Event::Text("g".into())]);
+        h.frame(&[]);
+    }
+
+    fn list(h: &Harness) -> &ChannelListView {
+        h.app
+            .channel_list
+            .as_ref()
+            .expect("the channel list is open")
+    }
+
+    /// The name of the channel the list's selection is on.
+    fn selected(h: &Harness) -> Option<String> {
+        let view = list(h);
+        view.cursor().channel(view.groups()).map(|c| c.name.clone())
+    }
+
+    /// The middle of the `k`th channel row on screen, in the tests' window.
+    fn list_row(k: usize) -> egui::Pos2 {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let layout = crate::channel_list_ui::Layout::of(screen);
+        crate::channel_list_ui::Layout::row(layout.rows, k).center()
+    }
+
+    #[tokio::test]
+    async fn g_on_an_m3u_source_opens_the_channel_list_on_the_channel_that_plays() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        h.sent();
+        let log = LogCapture::start();
+        open_list(&mut h);
+        assert_eq!(list(&h).group_key(), Some(&GroupKey::All));
+        assert_eq!(selected(&h).as_deref(), Some("Kanaal C"));
+        assert!(loads(h.sent()).is_empty(), "opening starts nothing");
+        assert!(!h.app.guide_open);
+        for text in [
+            "Channel list",
+            "All channels",
+            "Nieuws",
+            "Sport",
+            "No group",
+            "Kanaal A",
+            "Kanaal D",
+        ] {
+            assert!(
+                h.painted.iter().any(|t| t == text),
+                "{text}: {:?}",
+                h.painted
+            );
+        }
+        let text = log.text();
+        assert!(
+            text.contains("channel list: opened (4 channels, 4 groups)"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn g_on_an_xtream_portal_is_still_the_guide() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), guide_catalog(), PortalState::Configured, None);
+        h.press(&[Key::G]);
+        assert!(h.app.guide_open);
+        assert!(h.app.channel_list.is_none());
+    }
+
+    #[tokio::test]
+    async fn g_while_the_list_loads_says_so_and_opens_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (portal, _) = M3uPortal::from_text(LISTED).unwrap();
+        let store = Arc::new(CatalogStore::new(Arc::new(portal)));
+        let mut h = Harness::start_with(
+            dir.path(),
+            store,
+            PortalState::Configured,
+            None,
+            None,
+            Sources::default(),
+            None,
+        );
+        open_list(&mut h);
+        assert!(h.app.channel_list.is_none());
+        let said = "catalog still loading - press g again in a moment";
+        assert!(h.painted.iter().any(|t| t == said), "{:?}", h.painted);
+    }
+
+    #[tokio::test]
+    async fn down_starts_the_next_channel_at_once_and_a_held_key_only_where_it_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        open_list(&mut h);
+        h.sent();
+        // Nothing plays: the list opens on Kanaal A. One press: B at once.
+        h.frame(&[Key::ArrowDown]);
+        assert_eq!(loads(h.sent()), [ring_url('b')]);
+        // Held (the harness never lets a key go): the repeats only move on.
+        h.frame(&[Key::ArrowDown]);
+        h.frame(&[Key::ArrowDown]);
+        assert!(loads(h.sent()).is_empty());
+        assert_eq!(selected(&h).as_deref(), Some("Kanaal D"));
+        std::thread::sleep(Duration::from_millis(350));
+        h.frame(&[]);
+        assert_eq!(loads(h.sent()), [ring_url('d')], "where it stopped");
+        assert!(h.app.channel_list.is_some(), "behind the list");
+    }
+
+    #[tokio::test]
+    async fn left_and_right_change_the_group_and_start_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        open_list(&mut h);
+        h.sent();
+        let named = |name: &str| GroupKey::Named(name.into());
+        h.press(&[Key::ArrowRight]);
+        assert_eq!(list(&h).group_key(), Some(&named("Nieuws")));
+        assert_eq!(selected(&h).as_deref(), Some("Kanaal C"), "C is in Nieuws");
+        h.press(&[Key::ArrowRight]);
+        assert_eq!(list(&h).group_key(), Some(&named("Sport")));
+        assert_eq!(selected(&h).as_deref(), Some("Kanaal C"));
+        h.press(&[Key::ArrowRight]);
+        assert_eq!(list(&h).group_key(), Some(&GroupKey::NoGroup));
+        assert_eq!(selected(&h).as_deref(), Some("Kanaal A"), "C is not in it");
+        h.press(&[Key::ArrowRight]);
+        assert_eq!(
+            list(&h).group_key(),
+            Some(&GroupKey::NoGroup),
+            "the last group"
+        );
+        h.press(&[Key::ArrowLeft]);
+        assert_eq!(list(&h).group_key(), Some(&named("Sport")));
+        assert!(loads(h.sent()).is_empty(), "nothing started");
+    }
+
+    #[tokio::test]
+    async fn enter_closes_the_list_and_plays_the_channel_now_even_while_it_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        open_list(&mut h);
+        h.sent();
+        h.frame(&[Key::ArrowDown]); // B, at once
+        h.frame(&[Key::ArrowDown]); // C, waiting for the tempo
+        h.press(&[Key::Enter]);
+        assert!(h.app.channel_list.is_none(), "closed");
+        assert_eq!(loads(h.sent()), [ring_url('b'), ring_url('c')]);
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal C"));
+        std::thread::sleep(Duration::from_millis(350));
+        h.frame(&[]);
+        assert!(loads(h.sent()).is_empty(), "the waiting start is gone");
+    }
+
+    #[tokio::test]
+    async fn enter_on_the_channel_that_plays_only_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        open_list(&mut h);
+        h.sent();
+        h.press(&[Key::Enter]);
+        assert!(h.app.channel_list.is_none());
+        assert!(loads(h.sent()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_channel_that_failed_tries_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        start_fails(&mut h);
+        open_list(&mut h);
+        h.sent();
+        assert_eq!(selected(&h).as_deref(), Some("Kanaal C"));
+        h.press(&[Key::Enter]);
+        assert!(h.app.channel_list.is_none());
+        assert_eq!(loads(h.sent()), [ring_url('c')], "tried again");
+    }
+
+    #[tokio::test]
+    async fn esc_and_g_close_the_list_keep_what_plays_and_drop_a_waiting_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.app.zap_pacer = ZapPacer::new(Duration::from_millis(300));
+        open_list(&mut h);
+        h.sent();
+        h.frame(&[Key::ArrowDown]); // B, at once
+        h.frame(&[Key::ArrowDown]); // C, waiting
+        h.press(&[Key::Escape]);
+        assert!(h.app.channel_list.is_none());
+        std::thread::sleep(Duration::from_millis(350));
+        h.frame(&[]);
+        assert_eq!(loads(h.sent()), [ring_url('b')], "C never started");
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal B"));
+        open_list(&mut h);
+        assert!(h.app.channel_list.is_some());
+        h.frame_with(vec![key_press(Key::G), egui::Event::Text("g".into())]);
+        assert!(h.app.channel_list.is_none(), "g closes it too");
+    }
+
+    #[tokio::test]
+    async fn while_the_list_is_open_no_zap_toast_shows_but_a_stream_error_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        // Kanaal A's zap toast makes the toast's area before the list opens.
+        h.app.zap_by_id(m3u_sid("Kanaal A"));
+        open_list(&mut h);
+        h.press(&[Key::ArrowDown]);
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal B"));
+        assert!(
+            !h.painted.iter().any(|t| t == "[TV] Kanaal B"),
+            "the list's play mark shows what plays: {:?}",
+            h.painted
+        );
+        start_fails(&mut h);
+        let named = "stream error on Kanaal B - zap up or down to retry";
+        assert!(h.painted.iter().any(|t| t == named), "{:?}", h.painted);
+    }
+
+    #[tokio::test]
+    async fn after_the_list_up_and_down_zap_on_in_the_files_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        open_list(&mut h);
+        h.press(&[Key::End]); // Kanaal D, the last A-Z
+        h.press(&[Key::Escape]);
+        assert_eq!(h.app.current_name.as_deref(), Some("Kanaal D"));
+        h.sent();
+        h.press(&[Key::ArrowDown]);
+        assert_eq!(
+            loads(h.sent()),
+            [ring_url('b')],
+            "after D in the file comes B"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_list_opens_in_the_group_it_had_open_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        open_list(&mut h);
+        h.press(&[Key::ArrowRight, Key::ArrowRight]); // Nieuws, Sport
+        h.press(&[Key::Escape]);
+        open_list(&mut h);
+        assert_eq!(list(&h).group_key(), Some(&GroupKey::Named("Sport".into())));
+        assert_eq!(
+            selected(&h).as_deref(),
+            Some("Kanaal B"),
+            "nothing plays: the first"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_click_on_a_channel_starts_it_and_the_list_stays_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        open_list(&mut h);
+        h.sent();
+        click_at(&mut h, list_row(2)); // Kanaal C
+        assert_eq!(loads(h.sent()), [ring_url('c')]);
+        assert!(h.app.channel_list.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_double_click_on_a_channel_plays_it_and_closes_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        open_list(&mut h);
+        h.sent();
+        click_at(&mut h, list_row(3)); // Kanaal D
+        click_at(&mut h, list_row(3));
+        assert!(h.app.channel_list.is_none(), "closed");
+        assert_eq!(
+            loads(h.sent()),
+            [ring_url('d')],
+            "started by the first click, once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_marked_while_the_list_is_open_moves_to_broken_channels() {
+        // B's address answers 404, half a second late: the mark lands while the
+        // list is open.
+        let server = list_server(404, "", Duration::from_millis(500)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let text = LISTED.replace(
+            "https://b.example/b.m3u8",
+            &format!("{}/b.m3u8", server.uri()),
+        );
+        let mut h = m3u_app(dir.path(), &text);
+        h.app.zap_pacer = ZapPacer::new(Duration::ZERO);
+        open_list(&mut h);
+        h.press(&[Key::ArrowDown]); // B starts
+        start_fails(&mut h); // and dies before its first picture
+        h.press(&[Key::ArrowDown]); // C starts
+        picture_comes(&mut h); // and plays: B's address is checked
+
+        // The list does not wait for the check.
+        h.press(&[Key::ArrowRight, Key::ArrowLeft]);
+        assert_eq!(selected(&h).as_deref(), Some("Kanaal C"));
+        assert!(
+            list(&h).groups().find(&GroupKey::Defect).is_none(),
+            "not marked before the answer"
+        );
+        checks_answered(&mut h).await;
+        h.frame(&[]);
+        let view = list(&h);
+        assert_eq!(view.group_key(), Some(&GroupKey::All));
+        assert_eq!(
+            selected(&h).as_deref(),
+            Some("Kanaal C"),
+            "the selection stays"
+        );
+        assert_eq!(view.groups().rows(0), 3, "B left All channels");
+        let broken = view
+            .groups()
+            .find(&GroupKey::Defect)
+            .expect("Broken channels");
+        let first = view.groups().channel(broken, 0).map(|c| c.name.as_str());
+        assert_eq!(first, Some("Kanaal B"));
+        assert!(
+            h.painted.iter().any(|t| t == "Broken channels"),
+            "{:?}",
+            h.painted
+        );
+    }
+
+    #[tokio::test]
+    async fn the_list_keeps_its_place_when_a_fresh_copy_of_the_list_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lijst.m3u");
+        std::fs::write(&file, LISTED).unwrap();
+        let portal = M3uPortal::new(1, &file.display().to_string(), dir.path().join("m3u-1.m3u"));
+        let store = Arc::new(CatalogStore::new(Arc::new(portal)));
+        store.spawn_fetch();
+        wait_until("the list", || store.is_loaded()).await;
+        let mut h = Harness::start_with(
+            dir.path(),
+            store.clone(),
+            PortalState::Configured,
+            None,
+            None,
+            Sources::default(),
+            None,
+        );
+        h.app.zap_by_id(m3u_sid("Kanaal C"));
+        open_list(&mut h);
+        assert_eq!(list(&h).cursor().row, 2);
+        // The fresh copy puts a channel before all the others, A-Z.
+        let fresh = format!(
+            "#EXTM3U\n#EXTINF:-1,Kanaal 0\nhttps://z.example/0.m3u8\n{}",
+            &LISTED["#EXTM3U\n".len()..]
+        );
+        std::fs::write(&file, fresh).unwrap();
+        store.spawn_fetch();
+        wait_until("the fresh copy", || store.revision() == 2).await;
+        h.frame(&[]);
+        assert_eq!(
+            selected(&h).as_deref(),
+            Some("Kanaal C"),
+            "the same channel"
+        );
+        assert_eq!(list(&h).cursor().row, 3);
+        assert_eq!(list(&h).groups().rows(0), 5);
+    }
+
+    #[tokio::test]
+    async fn while_the_list_is_open_other_hotkeys_do_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        open_list(&mut h);
+        h.frame_with(f_pressed());
+        h.frame_holding(egui::Modifiers::SHIFT, shift_f_pressed());
+        h.frame_with(vec![key_press(Key::O), egui::Event::Text("o".into())]);
+        h.frame_with(vec![egui::Event::Text("?".into())]);
+        h.frame_with(vec![egui::Event::Text("*".into())]);
+        h.frame(&[Key::N, Key::D, Key::E]);
+        h.frame(&[]);
+        assert!(h.app.channel_list.is_some(), "the list stays open");
+        assert!(!h.app.show_search && !h.app.show_favs && !h.app.show_help);
+        assert!(h.app.settings_ui.is_none());
+        assert!(!h.app.show_debug && !h.app.show_epg_strip && !h.app.news_fetching);
+        assert_eq!(h.app.favorites.iter().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn opening_the_settings_closes_the_channel_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = m3u_app(dir.path(), LISTED);
+        open_list(&mut h);
+        h.app.open_settings();
+        assert!(h.app.channel_list.is_none());
     }
 
     // ---- the picture of the channel before ----
