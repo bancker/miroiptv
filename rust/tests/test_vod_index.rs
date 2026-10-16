@@ -705,9 +705,9 @@ fn the_genre_names_are_read_once_each_and_not_once_per_title() {
     );
 }
 
-/// What Task 4's A-Z rank adds to `heap_bytes` a title: 0 until the rank is
-/// there, then 4 (a `u32` a title). The tests that count the heap exactly add it.
-const RANK: usize = 0;
+/// What the A-Z rank adds to `heap_bytes` a title: 4 bytes, a `u32`. The tests
+/// that count the heap exactly add it.
+const RANK: usize = 4;
 
 #[test]
 fn every_flag_is_a_bit_of_its_own_and_learning_a_trailer_sets_that_bit_only() {

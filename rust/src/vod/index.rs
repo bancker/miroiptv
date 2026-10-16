@@ -13,7 +13,7 @@ use super::genres::{category_labels, genres_in, parse_name, Genre, Labels, Langu
 use super::versions::merge;
 use super::{fit_id, fold_into, Kind, TitleId};
 use crate::portal::{Categories, Movie, Series};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU8, Ordering};
 
 const FLAG_FILM: u8 = 1;
@@ -212,6 +212,9 @@ pub struct TitleIndex {
     versions: Vec<VersionRec>,
     exts: Vec<Box<str>>,
     categories: Vec<CategoryRec>,
+    /// Each title's place in the A-Z order of the search names: the sort
+    /// "Titel (A–Z)", and the tie-break of the others.
+    rank: Vec<u32>,
     skipped: usize,
 }
 
@@ -419,6 +422,7 @@ impl TitleIndex {
             versions: Vec::with_capacity(pool.len()),
             exts: Vec::new(),
             categories,
+            rank: Vec::new(),
             skipped: given - n,
         };
         let mut key = String::new();
@@ -465,6 +469,15 @@ impl TitleIndex {
                 rating: e.rating,
                 flags: AtomicU8::new(flags),
             });
+        }
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_by(|&a, &b| {
+            let (a, b) = (a as usize, b as usize);
+            index.keys.get(a).cmp(index.keys.get(b)).then(a.cmp(&b))
+        });
+        index.rank = vec![0; n];
+        for (rank, pos) in order.into_iter().enumerate() {
+            index.rank[pos as usize] = rank as u32;
         }
         index.names.shrink();
         index.keys.shrink();
@@ -634,12 +647,14 @@ impl TitleIndex {
     }
 
     /// The bytes the index holds, the covers aside (spec §4.2's 5 MB): the
-    /// records, the names and search names, the versions and the categories.
+    /// records, the names and search names, the versions, the A-Z order and
+    /// the categories.
     pub fn heap_bytes(&self) -> usize {
         self.records.capacity() * std::mem::size_of::<Record>()
             + self.names.heap_bytes()
             + self.keys.heap_bytes()
             + self.versions.capacity() * std::mem::size_of::<VersionRec>()
+            + self.rank.capacity() * 4
             + self.exts.iter().map(|e| e.len() + 16).sum::<usize>()
             + self
                 .categories
@@ -662,5 +677,354 @@ pub(crate) fn category_rec(c: &CategoryIn<'_>) -> CategoryRec {
         name: c.name.into(),
         genres: genres_in(c.name),
         language: category_labels(c.name).language(),
+    }
+}
+
+// ---- the search page's queries (spec 2026-10-15 §3.3) ----
+
+/// How results are ordered: "Sorteer".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sort {
+    /// A title that starts with the query before one that holds it, then ★.
+    #[default]
+    Relevance,
+    /// ★ high to low; a title without one last; the newest first on a tie.
+    Rating,
+    /// The portal's add day, newest first.
+    Newest,
+    /// A to Z by the folded title.
+    Title,
+}
+
+/// The year filter's values, as bits of `Query::years`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Years {
+    /// 2020 and later.
+    Since2020,
+    The2010s,
+    The2000s,
+    /// A known year before 2000.
+    Before2000,
+}
+
+impl Years {
+    pub const ALL: [Years; 4] = [
+        Years::Since2020,
+        Years::The2010s,
+        Years::The2000s,
+        Years::Before2000,
+    ];
+
+    pub fn bit(self) -> u8 {
+        1 << self as u8
+    }
+
+    /// The bucket of `year`; none for an unknown year.
+    pub fn of(year: u16) -> Option<Years> {
+        match year {
+            0 => None,
+            2020.. => Some(Years::Since2020),
+            2010..=2019 => Some(Years::The2010s),
+            2000..=2009 => Some(Years::The2000s),
+            _ => Some(Years::Before2000),
+        }
+    }
+}
+
+/// The rating filter's values, as bits of `Query::stars`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stars {
+    /// ★ 8 and higher.
+    EightUp,
+    /// ★ 7 and higher.
+    SevenUp,
+}
+
+impl Stars {
+    pub const ALL: [Stars; 2] = [Stars::EightUp, Stars::SevenUp];
+
+    pub fn bit(self) -> u8 {
+        1 << self as u8
+    }
+
+    /// The lowest rating it lets through, in tenths.
+    pub fn floor(self) -> u8 {
+        match self {
+            Stars::EightUp => 80,
+            Stars::SevenUp => 70,
+        }
+    }
+}
+
+/// The language filter's values, as bits of `Query::spoken`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spoken {
+    Dutch,
+    English,
+    /// Neither Dutch nor English as far as the names tell, unknown included.
+    Other,
+}
+
+impl Spoken {
+    pub const ALL: [Spoken; 3] = [Spoken::Dutch, Spoken::English, Spoken::Other];
+
+    pub fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// What the search page asks: its text and its filters. Within a group the
+/// chosen values add up (Komedie or Drama); the groups narrow each other.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Query {
+    /// Every word must be in the title. The text is folded as the names are
+    /// (`vod::fold`): case, accents and apostrophes do not count, any other
+    /// mark between words is one gap, and a text without a letter or a digit
+    /// filters nothing.
+    pub text: String,
+    /// "Soort": a series or a film; none for "Alles".
+    pub kind: Option<Kind>,
+    /// "Genre": a mask of `Genre::bit`s; 0 when none is chosen.
+    pub genres: u32,
+    /// "Jaar": a mask of `Years::bit`s.
+    pub years: u8,
+    /// "Waardering": a mask of `Stars::bit`s.
+    pub stars: u8,
+    /// "Taal": a mask of `Spoken::bit`s.
+    pub spoken: u8,
+    pub sort: Sort,
+}
+
+/// How many titles each filter value gives, with the text and the other
+/// groups' filters: what choosing it would show.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// "Soort": everything, the series, the films.
+    pub all: usize,
+    pub series: usize,
+    pub films: usize,
+    /// Per genre, in `Genre::ALL`'s order.
+    pub genres: [usize; Genre::ALL.len()],
+    /// Per `Years::ALL`.
+    pub years: [usize; 4],
+    /// Per `Stars::ALL`.
+    pub stars: [usize; 2],
+    /// Per `Spoken::ALL`.
+    pub spoken: [usize; 3],
+}
+
+/// A query's titles, in its order, and the counts beside them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Results {
+    /// Positions in the index.
+    pub titles: Vec<u32>,
+    pub counts: Counts,
+}
+
+/// Which of the five filter groups a title passes, as bits.
+const KIND: u8 = 1;
+const GENRE: u8 = 1 << 1;
+const YEAR: u8 = 1 << 2;
+const STARS: u8 = 1 << 3;
+const SPOKEN: u8 = 1 << 4;
+const EVERY: u8 = KIND | GENRE | YEAR | STARS | SPOKEN;
+
+impl TitleIndex {
+    /// The titles that answer `query`, sorted as it asks, with the counts of
+    /// every filter value. Adult titles are left out unless `unlocked`.
+    pub fn search(&self, query: &Query, unlocked: bool) -> Results {
+        let folded = super::fold(&query.text);
+        let words: Vec<&str> = folded.split(' ').filter(|w| !w.is_empty()).collect();
+        let mut counts = Counts::default();
+        let mut hits: Vec<(u64, u32)> = Vec::new();
+        for (pos, r) in self.records.iter().enumerate() {
+            let flags = r.flags.load(Ordering::Relaxed);
+            if flags & FLAG_ADULT != 0 && !unlocked {
+                continue;
+            }
+            let key = self.keys.get(pos);
+            if !words.iter().all(|w| key.contains(w)) {
+                continue;
+            }
+            let film = flags & FLAG_FILM != 0;
+            let genres = r.genres.load(Ordering::Relaxed);
+            let year = Years::of(r.year.load(Ordering::Relaxed));
+            let (dutch, english) = (flags & FLAG_DUTCH != 0, flags & FLAG_ENGLISH != 0);
+            let spoken = if dutch || english {
+                (u8::from(dutch) * Spoken::Dutch.bit())
+                    | (u8::from(english) * Spoken::English.bit())
+            } else {
+                Spoken::Other.bit()
+            };
+            let stars = Stars::ALL
+                .iter()
+                .filter(|s| r.rating >= s.floor())
+                .fold(0, |m, s| m | s.bit());
+            let passes = [
+                (KIND, query.kind.is_none_or(|k| (k == Kind::Film) == film)),
+                (GENRE, query.genres == 0 || genres & query.genres != 0),
+                (
+                    YEAR,
+                    query.years == 0 || year.is_some_and(|y| query.years & y.bit() != 0),
+                ),
+                (STARS, query.stars == 0 || stars & query.stars != 0),
+                (SPOKEN, query.spoken == 0 || spoken & query.spoken != 0),
+            ]
+            .iter()
+            .filter(|(_, ok)| *ok)
+            .fold(0, |m, (bit, _)| m | bit);
+            let but = |group: u8| passes | group == EVERY;
+            if but(KIND) {
+                counts.all += 1;
+                if film {
+                    counts.films += 1;
+                } else {
+                    counts.series += 1;
+                }
+            }
+            if but(GENRE) {
+                // Only the bits of the genres there are: a bit past them would
+                // index past the counts, and the release build aborts on that.
+                let mut g = genres & GENRE_BITS;
+                while g != 0 {
+                    counts.genres[g.trailing_zeros() as usize] += 1;
+                    g &= g - 1;
+                }
+            }
+            if let (true, Some(y)) = (but(YEAR), year) {
+                counts.years[y as usize] += 1;
+            }
+            if but(STARS) {
+                for (i, s) in Stars::ALL.iter().enumerate() {
+                    counts.stars[i] += usize::from(stars & s.bit() != 0);
+                }
+            }
+            if but(SPOKEN) {
+                for (i, s) in Spoken::ALL.iter().enumerate() {
+                    counts.spoken[i] += usize::from(spoken & s.bit() != 0);
+                }
+            }
+            if passes == EVERY {
+                let starts = key.starts_with(folded.as_str());
+                hits.push((self.sort_key(pos, query.sort, starts), pos as u32));
+            }
+        }
+        hits.sort_unstable_by_key(|&(key, _)| key);
+        Results {
+            titles: hits.into_iter().map(|(_, pos)| pos).collect(),
+            counts,
+        }
+    }
+
+    /// The order of title `pos` under `sort`, as one number, smallest first;
+    /// the A-Z rank breaks every tie. `starts`: its title starts with the query.
+    fn sort_key(&self, pos: usize, sort: Sort, starts: bool) -> u64 {
+        let r = &self.records[pos];
+        let unrated = u64::from(u8::MAX - r.rating);
+        let older = u64::from(u16::MAX - r.added);
+        let rank = u64::from(self.rank[pos]);
+        match sort {
+            Sort::Relevance => (u64::from(!starts) << 63) | (unrated << 32) | rank,
+            Sort::Rating => (unrated << 48) | (older << 32) | rank,
+            Sort::Newest => (older << 48) | (unrated << 32) | rank,
+            Sort::Title => rank,
+        }
+    }
+
+    /// Up to `limit` titles like title `pos` ("Meer zoals dit", "Omdat je X
+    /// leuk vond"): those that share a genre with it or sit in its category,
+    /// best rated first (the newest on a tie), without it, without what was
+    /// `watched` or `disliked`, and without adult titles unless `unlocked`.
+    pub fn more_like(
+        &self,
+        pos: usize,
+        limit: usize,
+        unlocked: bool,
+        watched: &HashSet<TitleId>,
+        disliked: &HashSet<TitleId>,
+    ) -> Vec<u32> {
+        let Some(this) = self.title(pos) else {
+            return Vec::new();
+        };
+        let category = self.records[pos].category;
+        let mut like: Vec<(u64, u32)> = Vec::new();
+        for (other, r) in self.records.iter().enumerate() {
+            let flags = r.flags.load(Ordering::Relaxed);
+            let shares = r.genres.load(Ordering::Relaxed) & this.genres != 0
+                || (category != 0 && r.category == category);
+            if other == pos || !shares || (flags & FLAG_ADULT != 0 && !unlocked) {
+                continue;
+            }
+            let kind = if flags & FLAG_FILM != 0 {
+                Kind::Film
+            } else {
+                Kind::Series
+            };
+            let id = TitleId {
+                kind,
+                id: i64::from(r.id),
+            };
+            if watched.contains(&id) || disliked.contains(&id) {
+                continue;
+            }
+            like.push((self.sort_key(other, Sort::Rating, false), other as u32));
+        }
+        if like.len() > limit {
+            if limit == 0 {
+                return Vec::new();
+            }
+            like.select_nth_unstable_by_key(limit - 1, |&(key, _)| key);
+            like.truncate(limit);
+        }
+        like.sort_unstable_by_key(|&(key, _)| key);
+        like.into_iter().map(|(_, pos)| pos).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record holds the 24 genre bits and no more: the lists' build reads them
+    /// from the 24 genres, `learn` masks what it is told. The counts are indexed
+    /// by the bit all the same and do not rely on that alone, for the release
+    /// build aborts on an index past them (what a cache file says is checked
+    /// where it is read, and this is the last line).
+    #[test]
+    fn a_stray_genre_bit_in_a_record_is_counted_nowhere_and_panics_nowhere() {
+        let entry = |id: u32, genres: u32| Entry {
+            kind: Kind::Series,
+            id,
+            name: "x",
+            key: None,
+            cover: "",
+            year: 0,
+            rating: 0,
+            added: 0,
+            category: 0,
+            genres,
+            dutch: false,
+            english: false,
+            adult: false,
+            trailer: false,
+            versions: 0..0,
+        };
+        let index = TitleIndex::assemble(
+            vec![
+                entry(1, u32::MAX),
+                entry(2, 1 << Genre::ALL.len()),
+                entry(3, Genre::Drama.bit() | 1 << 31),
+            ],
+            &[],
+            Vec::new(),
+        );
+        let counts = index.search(&Query::default(), false).counts;
+        // Title 1 holds every bit, the 24 genres once each; title 2 only a stray
+        // bit; title 3 its drama and a stray bit.
+        let drama = Genre::ALL.iter().position(|g| *g == Genre::Drama).unwrap();
+        for (i, count) in counts.genres.iter().enumerate() {
+            assert_eq!(*count, if i == drama { 2 } else { 1 }, "genre {i}");
+        }
+        assert_eq!(counts.all, 3);
     }
 }
