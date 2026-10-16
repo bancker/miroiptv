@@ -704,3 +704,838 @@ fn the_genre_names_are_read_once_each_and_not_once_per_title() {
         "{building_distinct} allocations for {N} different genre fields, {building} for three"
     );
 }
+
+/// What Task 4's A-Z rank adds to `heap_bytes` a title: 0 until the rank is
+/// there, then 4 (a `u32` a title). The tests that count the heap exactly add it.
+const RANK: usize = 0;
+
+#[test]
+fn every_flag_is_a_bit_of_its_own_and_learning_a_trailer_sets_that_bit_only() {
+    // One title with each flag alone or in a pair, so that two flags sharing a
+    // bit, or a learn that replaces the flags instead of adding one, show on some
+    // title.
+    let movies = [
+        Movie {
+            is_adult: true,
+            ..film(1, "Adult (2001) NL")
+        },
+        film(2, "Plain (2002)"),
+        film(3, "English (2003) EN"),
+    ];
+    let shows = [Series {
+        is_adult: true,
+        ..series(1, "Late EN")
+    }];
+    let index = TitleIndex::build(&movies, &shows, &Categories::default(), MAX_YEAR);
+    let flags = |id: TitleId| {
+        let t = index.title(index.find(id).unwrap()).unwrap();
+        (t.adult, t.dutch, t.english, t.trailer, t.id.kind)
+    };
+    assert_eq!(flags(film_id(1)), (true, true, false, false, Kind::Film));
+    assert_eq!(flags(film_id(2)), (false, false, false, false, Kind::Film));
+    assert_eq!(flags(film_id(3)), (false, false, true, false, Kind::Film));
+    assert_eq!(
+        flags(series_id(1)),
+        (true, false, true, false, Kind::Series)
+    );
+    for id in [film_id(1), film_id(3), series_id(1)] {
+        let pos = index.find(id).unwrap();
+        let before = flags(id);
+        index.learn(
+            pos,
+            Learned {
+                trailer: true,
+                ..Learned::default()
+            },
+        );
+        let (adult, dutch, english, trailer, kind) = flags(id);
+        assert_eq!(
+            (adult, dutch, english, kind),
+            (before.0, before.1, before.2, before.4),
+            "learning a trailer changes no other flag"
+        );
+        assert!(trailer);
+        assert_eq!(index.find(id), Some(pos), "and the title is still found");
+    }
+}
+
+#[test]
+fn a_version_without_a_container_has_none_beside_one_that_has() {
+    let movies = [
+        Movie {
+            container_extension: None,
+            ..film(1, "Heat (1995) 4K")
+        },
+        Movie {
+            container_extension: Some(" mkv ".into()),
+            ..film(2, "Heat (1995) 1080p")
+        },
+        Movie {
+            container_extension: Some("".into()),
+            ..film(3, "Heat (1995) 720p")
+        },
+        Movie {
+            container_extension: Some("mkv".into()),
+            ..film(4, "Heat (1995) SD")
+        },
+    ];
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    let heat = index.title(index.find(film_id(1)).unwrap()).unwrap();
+    let exts: Vec<(i64, &str)> = heat.versions.iter().map(|v| (v.stream_id, v.ext)).collect();
+    assert_eq!(
+        exts,
+        [(1, ""), (2, "mkv"), (3, ""), (4, "mkv")],
+        "none is none, a padded one is trimmed, and mkv is one container"
+    );
+}
+
+#[test]
+fn a_portal_may_name_more_containers_than_the_index_has_codes_for() {
+    // 600 films over 300 different containers: the first 255 are kept, in record
+    // order; a later one that is not among them has none, and one that is still
+    // has its own, however late it comes.
+    let movies: Vec<Movie> = (1..=600)
+        .map(|i| Movie {
+            container_extension: Some(format!("x{}", (i - 1) % 300 + 1)),
+            ..film(i, &format!("Film x{i}"))
+        })
+        .collect();
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    assert_eq!(index.len(), 600);
+    for i in 1..=600i64 {
+        let n = (i - 1) % 300 + 1;
+        let t = index.title(index.find(film_id(i)).unwrap()).unwrap();
+        let want = if n <= 255 {
+            format!("x{n}")
+        } else {
+            String::new()
+        };
+        assert_eq!(t.versions.get(0).unwrap().ext, want, "film {i}");
+    }
+}
+
+#[test]
+fn a_category_is_found_by_its_kind_and_id_and_the_first_of_an_id_counts() {
+    let cats = Categories {
+        vod: vec![
+            category(0, "NL | Komedie"),
+            category(5, "EN | Action"),
+            category(5, "NL | Drama"),
+            category(9, "Kids"),
+        ],
+        series: vec![category(5, "Series | Drama"), category(7, "Nieuw")],
+    };
+    let movies = [
+        // 0 is the portal's "none" (and its unreadable id), though a category has it.
+        Movie {
+            category_id: 0,
+            ..film(1, "Zero (2001)")
+        },
+        // The first category of an id counts.
+        Movie {
+            category_id: 5,
+            ..film(2, "Five (2001)")
+        },
+        // 7 is a series category only.
+        Movie {
+            category_id: 7,
+            ..film(3, "Seven (2001)")
+        },
+        Movie {
+            category_id: -5,
+            ..film(4, "Minus (2001)")
+        },
+    ];
+    let shows = [
+        Series {
+            category_id: 5,
+            ..series(1, "A")
+        },
+        // 9 is a film category only.
+        Series {
+            category_id: 9,
+            ..series(2, "B")
+        },
+        Series {
+            category_id: 0,
+            ..series(3, "C")
+        },
+    ];
+    let index = TitleIndex::build(&movies, &shows, &cats, MAX_YEAR);
+    let of = |id: TitleId| {
+        let t = index.title(index.find(id).unwrap()).unwrap();
+        (
+            t.category.map(|c| (c.kind, c.id, c.name)),
+            t.genres,
+            t.dutch,
+            t.english,
+        )
+    };
+    assert_eq!(of(film_id(1)), (None, 0, false, false), "id 0 names none");
+    assert_eq!(
+        of(film_id(2)),
+        (
+            Some((Kind::Film, 5, "EN | Action")),
+            Genre::Action.bit(),
+            false,
+            true
+        ),
+        "the first of two categories of one id"
+    );
+    assert_eq!(of(film_id(3)), (None, 0, false, false), "a series category");
+    assert_eq!(of(film_id(4)), (None, 0, false, false));
+    assert_eq!(
+        of(series_id(1)),
+        (
+            Some((Kind::Series, 5, "Series | Drama")),
+            Genre::Drama.bit(),
+            false,
+            false
+        ),
+        "the series own id space"
+    );
+    assert_eq!(of(series_id(2)), (None, 0, false, false), "a film category");
+    assert_eq!(of(series_id(3)), (None, 0, false, false));
+}
+
+#[test]
+fn the_categories_are_listed_films_first_in_the_portals_order() {
+    let index = TitleIndex::build(&[], &[], &categories(), MAX_YEAR);
+    let listed: Vec<(Kind, i64, &str)> =
+        index.categories().map(|c| (c.kind, c.id, c.name)).collect();
+    assert_eq!(
+        listed,
+        [
+            (Kind::Film, 12, "NL | Komedie"),
+            (Kind::Film, 13, "EN | Action & Adventure"),
+            (Kind::Film, 14, "Nieuw"),
+            (Kind::Series, 12, "Series | Drama"),
+            (Kind::Series, 7, "Kids"),
+        ]
+    );
+}
+
+#[test]
+fn a_cover_and_a_rating_come_from_the_first_version_that_has_one() {
+    let movies = [
+        // The default has a cover and no rating; the next has both.
+        Movie {
+            stream_icon: Some("https://x/4k.jpg".into()),
+            rating: 0,
+            ..film(1, "Dune (2021) 4K")
+        },
+        Movie {
+            stream_icon: Some("https://x/hd.jpg".into()),
+            rating: 77,
+            ..film(2, "Dune (2021) 1080p")
+        },
+        Movie {
+            stream_icon: Some("  ".into()),
+            rating: 55,
+            ..film(3, "Dune (2021) 720p")
+        },
+        // The default has a rating and no cover; the next has a padded one.
+        Movie {
+            rating: 91,
+            ..film(10, "Heat (1995) 4K")
+        },
+        Movie {
+            stream_icon: Some(" https://x/heat.jpg ".into()),
+            rating: 60,
+            ..film(11, "Heat (1995) 1080p")
+        },
+        // A blank cover is none.
+        Movie {
+            stream_icon: Some("   ".into()),
+            ..film(20, "Blank (2000)")
+        },
+    ];
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    let of = |id: i64| {
+        let t = index.title(index.find(film_id(id)).unwrap()).unwrap();
+        (t.cover, t.rating)
+    };
+    assert_eq!(of(1), (Some("https://x/4k.jpg"), 77));
+    assert_eq!(of(10), (Some("https://x/heat.jpg"), 91));
+    assert_eq!(of(20), (None, 0));
+}
+
+#[test]
+fn a_title_is_as_new_as_its_earliest_known_version() {
+    let movies = [
+        // 5 days old, 20 days old, and unknown (last): the earliest known day.
+        Movie {
+            added: OCT_15 - 5 * DAY,
+            ..film(1, "Tron (1982) 4K")
+        },
+        Movie {
+            added: OCT_15 - 20 * DAY,
+            ..film(2, "Tron (1982) 1080p")
+        },
+        Movie {
+            added: 0,
+            ..film(3, "Tron (1982) 720p")
+        },
+        // An unknown default: the next version has the day.
+        Movie {
+            added: 0,
+            ..film(4, "Zed (1990) 4K")
+        },
+        Movie {
+            added: OCT_15 - 7 * DAY,
+            ..film(5, "Zed (1990) 1080p")
+        },
+    ];
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    let day = |id: i64| {
+        index
+            .title(index.find(film_id(id)).unwrap())
+            .unwrap()
+            .added_day
+    };
+    assert_eq!(day(1), 20_741 - 20);
+    assert_eq!(day(4), 20_741 - 7);
+}
+
+#[test]
+fn a_day_before_1970_or_after_the_last_a_u16_holds_is_clamped() {
+    let movies = [
+        Movie {
+            added: -3 * DAY,
+            ..film(1, "Before (2001)")
+        },
+        Movie {
+            added: OCT_15,
+            ..film(2, "Today (2001)")
+        },
+        Movie {
+            added: i64::MAX,
+            ..film(3, "Forever (2001)")
+        },
+        // Milliseconds where seconds are meant: the last day, not a wrapped one.
+        Movie {
+            added: OCT_15 * 1_000,
+            ..film(4, "Millis (2001)")
+        },
+    ];
+    let shows = [
+        Series {
+            last_modified: -DAY,
+            ..series(1, "Old")
+        },
+        Series {
+            last_modified: i64::MAX,
+            ..series(2, "Never")
+        },
+    ];
+    let index = TitleIndex::build(&movies, &shows, &Categories::default(), MAX_YEAR);
+    let day = |id: TitleId| index.title(index.find(id).unwrap()).unwrap().added_day;
+    assert_eq!(day(film_id(1)), 0);
+    assert_eq!(day(film_id(2)), 20_741);
+    assert_eq!(day(film_id(3)), u16::MAX);
+    assert_eq!(day(film_id(4)), u16::MAX);
+    assert_eq!(day(series_id(1)), 0);
+    assert_eq!(day(series_id(2)), u16::MAX);
+}
+
+#[test]
+fn a_series_year_is_its_release_date_before_its_name_and_releasedate_before_release_date() {
+    let shows = [
+        Series {
+            release_date: Some("2006-02-02".into()),
+            ..series(1, "Show (2005)")
+        },
+        Series {
+            release_date: Some("n/a".into()),
+            ..series(2, "Show Two (2005)")
+        },
+        Series {
+            release_date_camel: Some("2010".into()),
+            release_date: Some("2011".into()),
+            ..series(3, "Show Three")
+        },
+    ];
+    let index = TitleIndex::build(&[], &shows, &Categories::default(), MAX_YEAR);
+    let years: Vec<u16> = (0..3).map(|p| index.title(p).unwrap().year).collect();
+    assert_eq!(years, [2006, 2005, 2010]);
+}
+
+#[test]
+fn a_series_cover_is_trimmed_and_a_blank_one_is_none() {
+    let shows = [
+        Series {
+            cover: Some("  https://x/s.jpg ".into()),
+            ..series(1, "A")
+        },
+        Series {
+            cover: Some("   ".into()),
+            ..series(2, "B")
+        },
+        series(3, "C"),
+    ];
+    let index = TitleIndex::build(&[], &shows, &Categories::default(), MAX_YEAR);
+    let covers: Vec<Option<&str>> = (0..3).map(|p| index.title(p).unwrap().cover).collect();
+    assert_eq!(covers, [Some("https://x/s.jpg"), None, None]);
+}
+
+#[test]
+fn find_answers_for_the_kind_and_the_id_it_was_asked() {
+    // Film 2 and 9 only: series 2 is no film 2, and film 5 is between two.
+    let movies = [film(2, "Two (2001)"), film(9, "Nine (2001)")];
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    assert_eq!(index.find(series_id(2)), None, "film 2 is no series 2");
+    assert_eq!(index.find(film_id(5)), None, "film 5 is not film 9");
+    assert_eq!(index.find(film_id(10)), None);
+    assert!(index.find(film_id(2)).is_some() && index.find(film_id(9)).is_some());
+    // And the other way round: series 3 only.
+    let shows = [series(3, "Three")];
+    let index = TitleIndex::build(&[], &shows, &Categories::default(), MAX_YEAR);
+    assert_eq!(index.find(film_id(3)), None, "series 3 is no film 3");
+    assert_eq!(index.find(series_id(2)), None);
+    assert_eq!(index.find(series_id(4)), None);
+    assert_eq!(index.find(series_id(3)), Some(0));
+}
+
+#[test]
+fn a_record_is_20_bytes_and_a_text_end_4_and_the_heap_is_counted_exactly() {
+    // 1,000 series named "a": per title the record (20), the name and where it
+    // ends (1 + 4), the search name and where it ends (1 + 4); the cover table
+    // holds the ends only (4).
+    let shows: Vec<Series> = (1..=1_000).map(|i| series(i, "a")).collect();
+    let index = TitleIndex::build(&[], &shows, &Categories::default(), MAX_YEAR);
+    assert_eq!(index.len(), 1_000);
+    assert_eq!(index.heap_bytes(), 1_000 * (20 + 5 + 5 + RANK));
+    assert_eq!(index.cover_bytes(), 1_000 * 4);
+}
+
+#[test]
+fn the_heap_counts_the_versions_the_containers_and_the_categories() {
+    // 1,000 films of one version and one container each: 20 + 8 a title, and
+    // the name and the search name with 4 bytes for where each ends. The names
+    // x1 to x1000 are 18 + 270 + 3,600 + 5 = 3,893 bytes.
+    let movies: Vec<Movie> = (1..=1_000).map(|i| film(i, &format!("x{i}"))).collect();
+    let bare = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    assert_eq!(bare.len(), 1_000);
+    let counted = 1_000 * (20 + 8 + RANK) + 2 * (3_893 + 4 * 1_000);
+    let heap = bare.heap_bytes();
+    assert!(
+        heap >= counted + 3,
+        "{heap} bytes: the container is counted"
+    );
+    assert!(heap <= counted + 64, "{heap} bytes: nothing else is");
+    // Five categories: each a record of its own, and its name byte for byte.
+    let heap_with = |len: usize| {
+        let cats = Categories {
+            vod: (1..=5).map(|i| category(i, &"c".repeat(len))).collect(),
+            series: Vec::new(),
+        };
+        TitleIndex::build(&movies, &[], &cats, MAX_YEAR).heap_bytes()
+    };
+    let (short, long) = (heap_with(1), heap_with(101));
+    assert_eq!(long - short, 5 * 100, "a name is counted byte for byte");
+    assert!(short >= heap + 5 * (1 + 16), "each category is a record");
+    assert!(short <= heap + 5 * (1 + 64));
+}
+
+#[test]
+fn the_versions_of_a_dropped_duplicate_leave_no_slack_behind() {
+    // Two films of one id and two names are two titles of one id: the first
+    // stays. The build had room for both versions; the index keeps one.
+    let movies = [
+        Movie {
+            container_extension: None,
+            ..film(5, "A (2001)")
+        },
+        Movie {
+            container_extension: None,
+            ..film(5, "B (2002)")
+        },
+    ];
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    assert_eq!(index.len(), 1);
+    assert_eq!(index.title(0).unwrap().name, "A");
+    assert_eq!(index.stats().versions, 1);
+    // The record (20), the version (8), the name and the search name (5 + 5).
+    assert_eq!(index.heap_bytes(), 20 + 8 + 5 + 5 + RANK);
+}
+
+#[test]
+fn of_many_titles_with_one_id_the_first_in_the_lists_stays() {
+    // 400 series over 50 ids, in an order the sort has to move: for each id the
+    // first series of that id stays, whatever the sort does with the others.
+    let shows: Vec<Series> = (0..400)
+        .map(|i| series((i * 37) % 50 + 1, &format!("Copy {i}")))
+        .collect();
+    let index = TitleIndex::build(&[], &shows, &Categories::default(), MAX_YEAR);
+    assert_eq!(index.len(), 50);
+    for id in 1..=50i64 {
+        let first = (0..400i64).find(|i| (i * 37) % 50 + 1 == id).unwrap();
+        let t = index.title(index.find(series_id(id)).unwrap()).unwrap();
+        assert_eq!(t.name, format!("Copy {first}"), "series {id}");
+    }
+}
+
+#[test]
+fn two_film_titles_whose_default_has_one_id_keep_the_first() {
+    let movies = [
+        film(5, "Alpha (2001)"),
+        film(6, "Gamma (2003)"),
+        film(5, "Beta (2002)"),
+    ];
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    assert_eq!(index.len(), 2);
+    let five = index.find(film_id(5)).unwrap();
+    assert_eq!(index.title(five).unwrap().name, "Alpha");
+    assert_eq!(index.title_of_version(5), Some(five));
+}
+
+#[test]
+fn the_dashes_and_bars_of_every_spelling_make_one_title() {
+    // Ruling 12 as the review of Tasks 2a and 2b changed it, through the index:
+    // a hyphen, an en dash, an em dash, the box-drawing bars and the fullwidth
+    // bar in front, labels after a bar at the end.
+    let movies = [
+        film(1, "Frozen II (2019)"),
+        film(2, "NL - Frozen II (2019) 1080p"),
+        film(3, "NL \u{2013} Frozen II (2019) 720p"),
+        film(4, "NL \u{2014} Frozen II (2019) 4K"),
+        film(5, "NL \u{2503} Frozen II (2019) HD"),
+        film(6, "NL \u{2502} Frozen II (2019) SD"),
+        film(7, "Frozen II (2019) 4K \u{ff5c} EN"),
+    ];
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    assert_eq!(index.len(), 1, "seven spellings, one title");
+    let frozen = index.title(0).unwrap();
+    assert_eq!((frozen.name, frozen.year), ("Frozen II", 2019));
+    let ids: Vec<i64> = frozen.versions.iter().map(|v| v.stream_id).collect();
+    assert_eq!(ids, [4, 7, 2, 3, 5, 1, 6], "by quality, then by id");
+    assert!(frozen.dutch && frozen.english);
+}
+
+#[test]
+fn merge_and_the_index_agree_on_which_ids_fit() {
+    // Versions of ids 2^32, 0 and -5 do not fit, 2^32 - 1, 1 and 2 do. merge
+    // puts the unfit ones last whatever their quality; the index then finds a
+    // default that fits and leaves the three out. Both ask `fit_id`: its line
+    // stays at 1 and at u32::MAX, and merge and the index cannot disagree.
+    let movies = [
+        film(4_294_967_296, "Edge (2001) 4K"),
+        film(0, "Edge (2001) 4K HDR"),
+        film(-5, "Edge (2001) 2160p"),
+        film(4_294_967_295, "Edge (2001) 1080p"),
+        film(1, "Edge (2001) 720p"),
+        film(2, "Edge (2001) SD"),
+    ];
+    let order: Vec<i64> = merge(&movies, MAX_YEAR)[0]
+        .versions
+        .iter()
+        .map(|v| movies[v.index as usize].stream_id)
+        .collect();
+    assert_eq!(&order[..3], [4_294_967_295, 1, 2]);
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    assert_eq!(index.len(), 1);
+    let edge = index
+        .title(index.find(film_id(4_294_967_295)).unwrap())
+        .unwrap();
+    let ids: Vec<i64> = edge.versions.iter().map(|v| v.stream_id).collect();
+    assert_eq!(ids, [4_294_967_295, 1, 2]);
+    assert_eq!(index.stats().skipped, 3);
+}
+
+#[test]
+fn a_stream_listed_under_two_names_is_a_version_of_a_title_that_lists_it() {
+    // Alpha holds the streams 5 and 6, Beta the stream 6 (a portal that lists
+    // one stream twice): the answer is one of the two, never none.
+    let movies = [
+        film(5, "Alpha (2001) 4K"),
+        film(6, "Alpha (2001) 1080p"),
+        film(6, "Beta (2002)"),
+    ];
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    assert_eq!(index.len(), 2);
+    let found = index.title_of_version(6).unwrap();
+    let lists = |pos: usize| {
+        let t = index.title(pos).unwrap();
+        t.versions.iter().any(|v| v.stream_id == 6)
+    };
+    assert!(lists(found));
+}
+
+#[test]
+fn a_huge_name_and_a_huge_cover_are_kept_whole() {
+    let big = "Z".repeat(200_000);
+    let cover = format!("https://x/{big}.jpg");
+    let movies = [Movie {
+        stream_icon: Some(cover.clone()),
+        ..film(1, &format!("{big} (2001)"))
+    }];
+    let shows = [Series {
+        cover: Some(big.clone()),
+        ..series(1, &big)
+    }];
+    let index = TitleIndex::build(&movies, &shows, &Categories::default(), MAX_YEAR);
+    assert_eq!(index.len(), 2);
+    let s = index.title(0).unwrap();
+    assert_eq!(
+        (s.name.len(), s.cover.map(str::len)),
+        (200_000, Some(200_000))
+    );
+    let f = index.title(1).unwrap();
+    assert_eq!((f.name.len(), f.year), (200_000, 2001));
+    assert_eq!(f.cover, Some(cover.as_str()));
+    assert!(index.heap_bytes() >= 4 * 200_000);
+    assert!(index.cover_bytes() >= 200_000 + cover.len());
+}
+
+#[test]
+fn learning_races_readers_and_every_read_is_a_whole_value() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    // The index is shared between threads (it is an Arc in the catalog).
+    fn shared<T: Send + Sync>() {}
+    shared::<TitleIndex>();
+    let movies: Vec<Movie> = (1..=500).map(|i| film(i, &format!("Film x{i}"))).collect();
+    let index = Arc::new(TitleIndex::build(
+        &movies,
+        &[],
+        &Categories::default(),
+        MAX_YEAR,
+    ));
+    let (stop, passes) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let (index, stop, passes) = (index.clone(), stop.clone(), passes.clone());
+            std::thread::spawn(move || {
+                let mut first = true;
+                while first || !stop.load(Ordering::Relaxed) {
+                    for pos in 0..index.len() {
+                        let t = index.title(pos).unwrap();
+                        // Never half of a value: a year is 0 or the learned one.
+                        assert!(t.year == 0 || t.year == 1994, "year {}", t.year);
+                        assert!(t.genres == 0 || t.genres == 0x1234, "genres {}", t.genres);
+                        assert_eq!(index.find(t.id), Some(pos));
+                    }
+                    let _ = index.stats();
+                    if first {
+                        first = false;
+                        passes.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })
+        })
+        .collect();
+    // Learn only once both readers are in their loops.
+    let t0 = Instant::now();
+    while passes.load(Ordering::SeqCst) < 2 && t0.elapsed() < Duration::from_secs(20) {
+        std::thread::yield_now();
+    }
+    for round in 0..200 {
+        for pos in 0..index.len() {
+            index.learn(
+                pos,
+                Learned {
+                    year: 1994,
+                    genres: 0x1234,
+                    trailer: round % 2 == 0,
+                },
+            );
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    assert_eq!(passes.load(Ordering::SeqCst), 2, "both readers ran");
+    for pos in 0..index.len() {
+        let t = index.title(pos).unwrap();
+        assert_eq!((t.year, t.genres, t.trailer), (1994, 0x1234, true));
+    }
+}
+
+#[test]
+fn a_portal_with_more_categories_than_a_u16_holds_names_the_first_65534() {
+    // A place in the categories is a u16 plus one: the 65,534 first categories
+    // can be named, the others are listed but name no title.
+    let cats = Categories {
+        vod: (1..=70_000).map(|i| category(i, "")).collect(),
+        series: Vec::new(),
+    };
+    let movies: Vec<Movie> = [1, 65_534, 65_535, 65_536, 70_000]
+        .iter()
+        .map(|&c| Movie {
+            category_id: c,
+            ..film(c, &format!("Film x{c}"))
+        })
+        .collect();
+    let index = TitleIndex::build(&movies, &[], &cats, MAX_YEAR);
+    assert_eq!(index.categories().count(), 70_000);
+    let named = |id: i64| {
+        let t = index.title(index.find(film_id(id)).unwrap()).unwrap();
+        t.category.map(|c| c.id)
+    };
+    assert_eq!(named(1), Some(1));
+    assert_eq!(named(65_534), Some(65_534));
+    assert_eq!(named(65_535), None);
+    assert_eq!(named(65_536), None);
+    assert_eq!(named(70_000), None);
+}
+
+#[test]
+fn the_stats_tell_dutch_from_english_and_count_the_smallest_values() {
+    // Two Dutch series and one English, so that the two counts cannot swap; a
+    // rating of one tenth and the first genre alone are still given.
+    let first = Genre::ALL[0];
+    let shows = [
+        Series {
+            genre: Some(first.aliases()[0].to_string()),
+            rating: 1,
+            ..series(1, "A NL")
+        },
+        series(2, "B NL"),
+        series(3, "C EN"),
+    ];
+    let index = TitleIndex::build(&[], &shows, &Categories::default(), MAX_YEAR);
+    let s = index.stats();
+    assert_eq!((s.dutch, s.english), (2, 1));
+    assert_eq!((s.with_rating, s.with_genre), (1, 1));
+    assert_eq!(index.title(0).unwrap().genres, first.bit());
+}
+
+#[test]
+fn a_title_is_adult_when_a_version_that_is_not_the_default_is() {
+    let movies = [
+        film(1, "Late (2020) 4K"),
+        Movie {
+            is_adult: true,
+            ..film(2, "Late (2020) 1080p")
+        },
+    ];
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    let late = index.title(index.find(film_id(1)).unwrap()).unwrap();
+    assert!(
+        late.adult,
+        "the 1080p copy is adult, the 4K one is the default"
+    );
+}
+
+#[test]
+fn a_series_in_an_english_category_is_english() {
+    let cats = Categories {
+        vod: Vec::new(),
+        series: vec![category(1, "EN | Series"), category(2, "UK Drama")],
+    };
+    let shows = [
+        Series {
+            category_id: 1,
+            ..series(1, "A")
+        },
+        Series {
+            category_id: 2,
+            ..series(2, "B")
+        },
+    ];
+    let index = TitleIndex::build(&[], &shows, &cats, MAX_YEAR);
+    for pos in 0..2 {
+        let t = index.title(pos).unwrap();
+        assert_eq!((t.dutch, t.english), (false, true), "{}", t.name);
+    }
+}
+
+#[test]
+fn learning_no_trailer_sets_none_and_learning_nothing_changes_nothing() {
+    let movies = [film(1, "Known (2001)"), film(2, "Open")];
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    let (known, open) = (
+        index.find(film_id(1)).unwrap(),
+        index.find(film_id(2)).unwrap(),
+    );
+    index.learn(open, Learned::default());
+    index.learn(
+        known,
+        Learned {
+            year: 1994,
+            genres: Genre::Horror.bit(),
+            trailer: false,
+        },
+    );
+    let t = index.title(open).unwrap();
+    assert_eq!((t.year, t.genres, t.trailer), (0, 0, false));
+    let t = index.title(known).unwrap();
+    assert_eq!(
+        (t.year, t.genres, t.trailer),
+        (2001, Genre::Horror.bit(), false)
+    );
+}
+
+#[test]
+fn a_search_name_shorter_than_its_name_leaves_no_slack() {
+    // The apostrophe is in the name and not in the search name "oceans", for a
+    // series and for a film: each has its record (20), its name and where it ends
+    // (7 + 4) and its search name and where it ends (6 + 4); the film also has its
+    // one version (8).
+    let movies = [Movie {
+        container_extension: None,
+        ..film(1, "Ocean's (2001)")
+    }];
+    let shows = [series(1, "Ocean's")];
+    let index = TitleIndex::build(&movies, &shows, &Categories::default(), MAX_YEAR);
+    assert_eq!(index.title(0).unwrap().name, "Ocean's");
+    assert_eq!(index.title(1).unwrap().name, "Ocean's");
+    assert_eq!(index.heap_bytes(), 2 * (20 + (7 + 4) + (6 + 4 + RANK)) + 8);
+}
+
+#[test]
+fn a_title_left_out_because_an_earlier_one_has_its_id_is_counted() {
+    let shows = [series(7, "First"), series(7, "Second"), series(8, "Third")];
+    let index = TitleIndex::build(&[], &shows, &Categories::default(), MAX_YEAR);
+    assert_eq!(index.len(), 2);
+    assert_eq!(index.stats().skipped, 1);
+    let movies = [film(5, "Alpha (2001)"), film(5, "Beta (2002)")];
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    assert_eq!(index.len(), 1);
+    assert_eq!(index.stats().skipped, 1);
+}
+
+#[test]
+fn what_details_learn_is_only_ever_a_genre_there_is() {
+    let all = (1u32 << Genre::ALL.len()) - 1;
+    let movies = [film(1, "A (2001)"), film(2, "B (2002)")];
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    index.learn(
+        0,
+        Learned {
+            genres: u32::MAX,
+            ..Learned::default()
+        },
+    );
+    assert_eq!(index.title(0).unwrap().genres, all);
+    // A mask of bits past the genres names none.
+    index.learn(
+        1,
+        Learned {
+            genres: 1 << 30,
+            ..Learned::default()
+        },
+    );
+    assert_eq!(index.title(1).unwrap().genres, 0);
+}
+
+#[test]
+fn a_stream_that_is_a_titles_default_belongs_to_that_title() {
+    // Stream 6 is the second version of Alpha and the only one of Beta, whose
+    // id it is (a portal that lists one stream under two names).
+    let movies = [
+        film(5, "Alpha (2001) 4K"),
+        film(6, "Alpha (2001) 1080p"),
+        film(6, "Beta (2002)"),
+    ];
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), MAX_YEAR);
+    let beta = index.find(film_id(6)).unwrap();
+    assert_eq!(index.title(beta).unwrap().name, "Beta");
+    assert_eq!(index.title_of_version(6), Some(beta));
+    assert_eq!(index.title_of_version(5), index.find(film_id(5)));
+}

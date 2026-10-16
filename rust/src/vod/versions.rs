@@ -5,8 +5,8 @@
 //! quality is the default version, as `catalog::quality_rank` picks a
 //! channel's variant; a film page offers the others. Series are not merged.
 
-use super::fold_into;
 use super::genres::{parse_name, Labels};
+use super::{fit_id, fold_into};
 use crate::portal::Movie;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -78,7 +78,7 @@ pub fn merge(movies: &[Movie], max_year: u16) -> Vec<FilmTitle<'_>> {
             title.versions.sort_by_key(|v| {
                 let id = movies[v.index as usize].stream_id;
                 (
-                    !(1..=i64::from(u32::MAX)).contains(&id),
+                    fit_id(id).is_none(),
                     std::cmp::Reverse(v.labels.rank()),
                     !v.labels.has(Labels::HDR),
                     id,

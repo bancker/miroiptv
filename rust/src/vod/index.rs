@@ -9,9 +9,9 @@
 //! unreadable one is 0) and far below 4·10⁹; a title, a version or a series
 //! whose id is not 1 to `u32::MAX` is left out and counted.
 
-use super::genres::{category_labels, genres_in, parse_name, Labels, Language};
+use super::genres::{category_labels, genres_in, parse_name, Genre, Labels, Language};
 use super::versions::merge;
-use super::{fold_into, Kind, TitleId};
+use super::{fit_id, fold_into, Kind, TitleId};
 use crate::portal::{Categories, Movie, Series};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU8, Ordering};
@@ -196,7 +196,10 @@ pub struct Stats {
     pub with_genre: usize,
     pub dutch: usize,
     pub english: usize,
-    /// Left out: an id that is not 1 to `u32::MAX`.
+    /// Left out: a title (a film's default version, a series) or a version whose
+    /// id is not 1 to `u32::MAX`, and a title whose id an earlier title of the
+    /// same kind already has. A film whose default does not fit counts once, for
+    /// the whole title.
     pub skipped: usize,
 }
 
@@ -249,13 +252,8 @@ fn day_of(secs: i64) -> u16 {
     (secs.max(0) / 86_400).min(u16::MAX as i64) as u16
 }
 
-/// An id as the index keeps it: 1 to `u32::MAX`. Xtream ids are positive and
-/// the portal's unreadable id is 0, so 0 fits no more than a negative id does
-/// (`u32::try_from` alone takes it). One rule for a title, a version and a
-/// series, and for asking after one.
-pub(crate) fn fit_id(id: i64) -> Option<u32> {
-    u32::try_from(id).ok().filter(|&id| id != 0)
-}
+/// The bits of the genres there are: what `learn` lets in.
+const GENRE_BITS: u32 = (1 << Genre::ALL.len()) - 1;
 
 impl TitleIndex {
     /// The titles of these lists. `max_year` is the latest year a name may
@@ -391,18 +389,23 @@ impl TitleIndex {
             });
         }
         let mut index = Self::assemble(entries, &pool, cat_recs);
-        index.skipped = skipped;
+        index.skipped += skipped;
         index
     }
 
     /// The index of `entries`, whose versions are ranges of `pool` and whose
     /// `category` is a position plus one in `categories`. Two titles of one
-    /// kind and id keep the first.
+    /// kind and id keep the first; the others, a title whose id does not fit and
+    /// a version whose stream id does not fit are left out and counted (the
+    /// lists' build has left out its own already: this is the fence for what a
+    /// cache file says).
     pub(crate) fn assemble(
         mut entries: Vec<Entry<'_>>,
         pool: &[VersionIn<'_>],
         categories: Vec<CategoryRec>,
     ) -> Self {
+        let given = entries.len();
+        entries.retain(|e| e.id != 0);
         entries.sort_by_key(|e| (e.kind, e.id));
         entries.dedup_by_key(|e| (e.kind, e.id));
         let n = entries.len();
@@ -416,7 +419,7 @@ impl TitleIndex {
             versions: Vec::with_capacity(pool.len()),
             exts: Vec::new(),
             categories,
-            skipped: 0,
+            skipped: given - n,
         };
         let mut key = String::new();
         for e in entries {
@@ -431,6 +434,10 @@ impl TitleIndex {
             }
             index.covers.push(e.cover);
             for &(sid, labels, ext) in &pool[e.versions.start as usize..e.versions.end as usize] {
+                if sid == 0 {
+                    index.skipped += 1;
+                    continue;
+                }
                 let ext = index.ext_code(ext);
                 index.versions.push(VersionRec {
                     stream_id: sid,
@@ -556,6 +563,15 @@ impl TitleIndex {
     /// title it is (a scan of the versions; no map is kept for it).
     pub fn title_of_version(&self, stream_id: i64) -> Option<usize> {
         let sid = fit_id(stream_id)?;
+        // The title whose default it is, if there is one: a stream a portal lists
+        // under two names is that title's, as `find` has it.
+        let id = TitleId {
+            kind: Kind::Film,
+            id: i64::from(sid),
+        };
+        if let Some(pos) = self.find(id) {
+            return Some(pos);
+        }
         let at = self.versions.iter().position(|v| v.stream_id == sid)? as u32;
         Some(self.records.partition_point(|r| r.versions_end <= at))
     }
@@ -581,10 +597,13 @@ impl TitleIndex {
                 .year
                 .compare_exchange(0, learned.year, Ordering::Relaxed, Ordering::Relaxed);
         }
-        if learned.genres != 0 {
-            let _ =
-                r.genres
-                    .compare_exchange(0, learned.genres, Ordering::Relaxed, Ordering::Relaxed);
+        // Only the bits of the genres there are: a bit past them would index the
+        // counts of a query.
+        let genres = learned.genres & GENRE_BITS;
+        if genres != 0 {
+            let _ = r
+                .genres
+                .compare_exchange(0, genres, Ordering::Relaxed, Ordering::Relaxed);
         }
         if learned.trailer {
             r.flags.fetch_or(FLAG_TRAILER, Ordering::Relaxed);

@@ -20,6 +20,16 @@ pub struct TitleId {
     pub id: i64,
 }
 
+/// A film's, a version's or a series' id as the index keeps it: 1 to `u32::MAX`.
+/// Xtream ids are positive and the portal's unreadable id is 0, so 0 fits no
+/// more than a negative id does (`u32::try_from` alone takes it). One rule for
+/// a title, a version and a series, for the order of a film's versions
+/// (`versions::merge` puts an id that does not fit last) and for asking after
+/// one; what reads an id from a file applies it too.
+pub(crate) fn fit_id(id: i64) -> Option<u32> {
+    u32::try_from(id).ok().filter(|&id| id != 0)
+}
+
 /// `text` as the search compares it: lower case, accents off ("Pokémon" is
 /// "pokemon", "ß" is "ss"), an apostrophe dropped ("Ocean's" is "oceans",
 /// "Don’t" is "dont"), every run of other characters one space, no space at
