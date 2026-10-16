@@ -834,7 +834,11 @@ impl TitleIndex {
     /// every filter value. Adult titles are left out unless `unlocked`.
     pub fn search(&self, query: &Query, unlocked: bool) -> Results {
         let folded = super::fold(&query.text);
-        let words: Vec<&str> = folded.split(' ').filter(|w| !w.is_empty()).collect();
+        let mut words: Vec<&str> = folded.split(' ').filter(|w| !w.is_empty()).collect();
+        // A word said twice is looked for once: a text that says one common word
+        // 100,000 times would cost 100,000 searches in every title.
+        words.sort_unstable();
+        words.dedup();
         let mut counts = Counts::default();
         let mut hits: Vec<(u64, u32)> = Vec::new();
         for (pos, r) in self.records.iter().enumerate() {

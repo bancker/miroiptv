@@ -1312,3 +1312,206 @@ fn more_like_agrees_with_a_plain_reading_of_the_rule() {
     }
     assert!(some > 100, "{some} answers had a title in them");
 }
+
+#[test]
+fn relevance_asks_that_the_title_starts_with_the_whole_query_not_with_its_first_word() {
+    let idx = index(
+        &[],
+        &[
+            show(1, "Dark Knight Rises", "Action", 2012, 70),
+            // starts with "dark", holds both words, rated better than the first
+            show(2, "Dark City Knight", "Action", 1998, 90),
+            // holds the query, rated best, does not start with it
+            show(3, "The Dark Knight", "Action", 2008, 95),
+        ],
+    );
+    let want = ["Dark Knight Rises", "The Dark Knight", "Dark City Knight"];
+    assert_eq!(names(&idx, &text("dark knight")), want);
+    // The same with the gap spelled another way, and with a half-typed last word.
+    assert_eq!(names(&idx, &text("dark | knight")), want);
+    assert_eq!(names(&idx, &text("dark kni")), want);
+}
+
+#[test]
+fn a_title_in_any_of_the_chosen_languages_is_found() {
+    // Dutch or English: a Dutch title, an English one, but not one that says neither.
+    let movies = [
+        film(1, "NL | Alfa (2001)", 0, 50),
+        film(2, "EN | Bravo (2002)", 0, 50),
+        film(3, "Charlie (2003)", 0, 50),
+    ];
+    let idx = index(&movies, &[]);
+    let either = Query {
+        spoken: Spoken::Dutch.bit() | Spoken::English.bit(),
+        sort: Sort::Title,
+        ..Query::default()
+    };
+    assert_eq!(names(&idx, &either), ["Alfa", "Bravo"]);
+    assert_eq!(idx.search(&either, false).counts.spoken, [1, 1, 1]);
+}
+
+#[test]
+fn a_title_with_several_genres_is_counted_under_each_of_them() {
+    let idx = index(
+        &[],
+        &[
+            show(1, "Triple", "Comedy, Drama, Crime", 2001, 50),
+            show(2, "Single", "Drama", 2001, 50),
+        ],
+    );
+    let counts = idx.search(&Query::default(), false).counts;
+    let at = |g: Genre| counts.genres[Genre::ALL.iter().position(|x| *x == g).unwrap()];
+    assert_eq!(
+        (at(Genre::Comedy), at(Genre::Drama), at(Genre::Crime)),
+        (1, 2, 1)
+    );
+    assert_eq!(counts.genres.iter().sum::<usize>(), 4);
+}
+
+#[test]
+fn newest_ties_go_to_the_better_rated_and_rating_ties_to_the_newer_day_an_unknown_day_last() {
+    let shows = [
+        Series {
+            last_modified: DAY_20000,
+            ..show(1, "Aaa", "Drama", 2001, 40)
+        },
+        Series {
+            last_modified: DAY_20000,
+            ..show(2, "Bbb", "Drama", 2001, 90)
+        },
+        Series {
+            last_modified: DAY_20000 + DAY,
+            ..show(3, "Ccc", "Drama", 2001, 0)
+        },
+        show(4, "Ddd", "Drama", 2001, 80),
+        show(5, "Eee", "Drama", 2001, 20),
+    ];
+    let idx = index(&[], &shows);
+    let sorted = |sort| {
+        names(
+            &idx,
+            &Query {
+                sort,
+                ..Query::default()
+            },
+        )
+    };
+    // Newest first; the same day: the better ★ first; no day at all: last, again by ★.
+    assert_eq!(sorted(Sort::Newest), ["Ccc", "Bbb", "Aaa", "Ddd", "Eee"]);
+    // Rated first, an unrated one last.
+    assert_eq!(sorted(Sort::Rating), ["Bbb", "Ddd", "Aaa", "Eee", "Ccc"]);
+    // The same ★: the newer day first, an unknown day last.
+    let same = [
+        show(1, "Unknown", "Drama", 2001, 70),
+        Series {
+            last_modified: DAY_20000 + DAY,
+            ..show(2, "Newer", "Drama", 2001, 70)
+        },
+        Series {
+            last_modified: DAY_20000,
+            ..show(3, "Older", "Drama", 2001, 70)
+        },
+    ];
+    let idx = index(&[], &same);
+    let rated = Query {
+        sort: Sort::Rating,
+        ..Query::default()
+    };
+    assert_eq!(names(&idx, &rated), ["Newer", "Older", "Unknown"]);
+}
+
+#[test]
+fn more_like_breaks_a_tie_of_stars_by_the_newer_day_whatever_the_names_say() {
+    let shows = [
+        show(1, "Seed", "Comedy", 2020, 50),
+        Series {
+            last_modified: DAY_20000 + DAY,
+            ..show(2, "Zulu newer", "Comedy", 2020, 80)
+        },
+        Series {
+            last_modified: DAY_20000,
+            ..show(3, "Alfa older", "Comedy", 2020, 80)
+        },
+        show(4, "Mike unknown day", "Comedy", 2020, 80),
+    ];
+    let idx = index(&[], &shows);
+    let seed = idx.find(title_id(Kind::Series, 1)).unwrap();
+    let none = HashSet::new();
+    // The same ★: the newer day first, against the A to Z of the names; no day last.
+    assert_eq!(
+        like_names(&idx, seed, 9, &none, &none),
+        ["Zulu newer", "Alfa older", "Mike unknown day"]
+    );
+}
+
+#[test]
+fn a_position_past_the_end_is_like_nothing_though_the_last_title_has_likes() {
+    let shows = [
+        show(1, "First", "Comedy", 2020, 50),
+        show(2, "Last", "Comedy", 2020, 60),
+    ];
+    let idx = index(&[], &shows);
+    let none = HashSet::new();
+    assert_eq!(idx.more_like(0, 9, true, &none, &none).len(), 1);
+    assert_eq!(idx.more_like(1, 9, true, &none, &none).len(), 1);
+    assert!(idx.more_like(idx.len(), 9, true, &none, &none).is_empty());
+    assert!(idx.more_like(usize::MAX, 9, true, &none, &none).is_empty());
+}
+
+#[test]
+fn the_counts_arrays_are_as_long_as_the_value_lists() {
+    let counts = Counts::default();
+    assert_eq!(counts.genres.len(), Genre::ALL.len());
+    assert_eq!(counts.years.len(), Years::ALL.len());
+    assert_eq!(counts.stars.len(), Stars::ALL.len());
+    assert_eq!(counts.spoken.len(), Spoken::ALL.len());
+}
+
+#[test]
+fn the_sorts_hold_for_more_titles_than_a_u16_counts() {
+    // The key of a sort packs the A-Z rank beside the star and the day; a rank
+    // that needs 17 bits must not leak into them. Half the titles are a day newer.
+    let shows: Vec<Series> = (0..70_000i64)
+        .map(|i| Series {
+            last_modified: DAY_20000 + (i % 2) * DAY,
+            ..show(1 + i, &format!("T{i:05}"), "Drama", 2001, 50)
+        })
+        .collect();
+    let idx = index(&[], &shows);
+    assert_eq!(idx.len(), 70_000);
+    let sorted = |sort| {
+        idx.search(
+            &Query {
+                sort,
+                ..Query::default()
+            },
+            false,
+        )
+        .titles
+    };
+    let a_to_z: Vec<u32> = (0..70_000).collect();
+    let newest_then_a_to_z: Vec<u32> = (1..70_000)
+        .step_by(2)
+        .chain((0..70_000).step_by(2))
+        .collect();
+    assert_eq!(sorted(Sort::Title), a_to_z);
+    assert_eq!(sorted(Sort::Relevance), a_to_z);
+    assert_eq!(sorted(Sort::Rating), newest_then_a_to_z);
+    assert_eq!(sorted(Sort::Newest), newest_then_a_to_z);
+}
+
+#[test]
+fn a_query_that_says_one_word_over_and_over_costs_that_word_once() {
+    // 3,000 titles that hold an "e" and a query of 100,000 of them: 300 million
+    // substring searches unless the words are told apart first.
+    let shows: Vec<Series> = (0..3_000i64)
+        .map(|i| show(1 + i, &format!("Eee {i}"), "Drama", 2001, 50))
+        .collect();
+    let idx = index(&[], &shows);
+    let started = std::time::Instant::now();
+    let found = idx.search(&text(&"e ".repeat(100_000)), false);
+    let took = started.elapsed();
+    assert_eq!(found.titles.len(), 3_000);
+    assert_eq!(found.counts, idx.search(&text("e"), false).counts);
+    assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+}
