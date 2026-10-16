@@ -196,11 +196,20 @@ fn image(v: &Value, keys: &[&str]) -> String {
 }
 
 /// The year a date starts with ("1999-03-30", "1999"); 0 when it starts with
-/// none from 1900 to 2100.
+/// none from 1900 to 2100. It allocates nothing: the catalog reads one per
+/// series at every load.
 pub fn year_of(date: &str) -> u16 {
-    let digits: String = date.trim().chars().take(4).collect();
-    match digits.parse::<u16>() {
-        Ok(y) if (1900..=2100).contains(&y) && digits.len() == 4 => y,
+    match date.trim().as_bytes() {
+        [a, b, c, d, ..] if [a, b, c, d].iter().all(|x| x.is_ascii_digit()) => {
+            let y = [a, b, c, d]
+                .iter()
+                .fold(0u16, |y, x| y * 10 + u16::from(**x - b'0'));
+            if (1900..=2100).contains(&y) {
+                y
+            } else {
+                0
+            }
+        }
         _ => 0,
     }
 }

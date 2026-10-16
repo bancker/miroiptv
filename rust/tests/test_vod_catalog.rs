@@ -395,11 +395,33 @@ async fn a_stalled_category_list_holds_up_neither_the_catalog_nor_zapping() {
 
 #[tokio::test]
 async fn the_titles_come_after_the_categories() {
-    let (_server, portal) = mock_portal(FILMS, Some(KOMEDIE), Duration::from_millis(600)).await;
+    // The category lists come only when the test lets them: the titles wait
+    // for them however long the three lists took, with no margin of time.
+    let (release, gate) = oneshot::channel();
+    let komedie = Categories {
+        vod: vec![Category {
+            category_id: 12,
+            category_name: "NL | Komedie".into(),
+        }],
+        series: Vec::new(),
+    };
+    let portal = Arc::new(Gate::new(
+        Lists::Films(
+            || {
+                vec![Movie {
+                    category_id: 12,
+                    ..film(5, "Lachen (2020)", false)
+                }]
+            },
+            Vec::new,
+        ),
+        Cats::After(Mutex::new(Some(gate)), komedie),
+    ));
     let store = Arc::new(CatalogStore::new(portal));
     store.spawn_fetch();
     loaded(&store).await;
     assert!(store.titles().is_none(), "the categories are not in yet");
+    release.send(()).unwrap();
     titled(&store).await;
     let lachen = store.titles().unwrap().title(0).unwrap().genres;
     assert_eq!(lachen, Genre::Comedy.bit(), "built with them");
@@ -721,4 +743,491 @@ async fn the_titles_of_a_catalog_replaced_while_they_wait_are_not_put() {
         1,
         "the first catalog's were not put"
     );
+}
+
+// ---- The Task 5 review's tests: each kills a mutant the twelve and five above
+// let live (task-5-review.md). They reuse this file's helpers. ----
+
+use bongo_player::catalog::Titles;
+use bongo_player::vod::index::Learned;
+use std::collections::HashSet;
+use tokio::sync::Notify;
+
+/// A portal of the review's own: its lists in memory, its category lists as
+/// the test says, and a note of when the category lists were asked.
+struct Gate {
+    lists: Lists,
+    categories: Cats,
+    asked: Notify,
+}
+
+/// How [`Gate`]'s three lists answer.
+enum Lists {
+    /// One film, `Lachen`, at once.
+    Film,
+    /// `Lachen`, but only once the category lists were asked; 2 s later a
+    /// refusal.
+    AfterTheCategories,
+    /// These films, at once.
+    Films(fn() -> Vec<Movie>, fn() -> Vec<Series>),
+    /// Refused.
+    Refused,
+    /// The same list as the one that shows.
+    Unchanged,
+}
+
+/// How [`Gate`]'s category lists answer.
+enum Cats {
+    /// These, at once.
+    Now(Categories),
+    /// Never: the request hangs until it is stopped.
+    Never,
+    /// These, once the test lets them come.
+    After(Mutex<Option<oneshot::Receiver<()>>>, Categories),
+}
+
+impl Gate {
+    fn new(lists: Lists, categories: Cats) -> Self {
+        Self {
+            lists,
+            categories,
+            asked: Notify::new(),
+        }
+    }
+}
+
+fn lachen() -> Catalog {
+    Catalog {
+        movies: vec![film(5, "Lachen (2020)", false)],
+        ..Catalog::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl Portal for Gate {
+    async fn fetch_catalog(&self) -> Result<Catalog, PortalError> {
+        match &self.lists {
+            Lists::Film => Ok(lachen()),
+            Lists::AfterTheCategories => {
+                match tokio::time::timeout(Duration::from_secs(2), self.asked.notified()).await {
+                    Ok(()) => Ok(lachen()),
+                    Err(_) => Err(PortalError::Status(504)),
+                }
+            }
+            Lists::Films(movies, series) => Ok(Catalog {
+                movies: movies(),
+                series: series(),
+                ..Catalog::default()
+            }),
+            Lists::Refused => Err(PortalError::Status(503)),
+            Lists::Unchanged => Err(PortalError::Unchanged),
+        }
+    }
+    async fn fetch_categories(&self) -> Result<Categories, PortalError> {
+        self.asked.notify_one();
+        match &self.categories {
+            Cats::Now(categories) => Ok(categories.clone()),
+            Cats::Never => std::future::pending().await,
+            Cats::After(gate, categories) => {
+                let gate = gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    let _ = gate.await;
+                }
+                Ok(categories.clone())
+            }
+        }
+    }
+    async fn fetch_epg(&self, _: i64) -> Result<Epg, PortalError> {
+        Ok(Epg::new(Vec::new()))
+    }
+    async fn fetch_day_epg(&self, _: i64) -> Result<Epg, PortalError> {
+        Ok(Epg::new(Vec::new()))
+    }
+    async fn fetch_series_episodes(&self, _: i64) -> Result<Vec<Episode>, PortalError> {
+        Ok(Vec::new())
+    }
+    fn live_stream_url(&self, _: i64) -> String {
+        String::new()
+    }
+    fn live_stream_id(&self, _: &str) -> Option<i64> {
+        None
+    }
+    fn movie_stream_url(&self, _: i64, _: &str) -> String {
+        String::new()
+    }
+    fn series_stream_url(&self, _: &str, _: &str) -> String {
+        String::new()
+    }
+    fn catchup_url(&self, _: i64, _: chrono::DateTime<chrono::Utc>, _: u32) -> String {
+        String::new()
+    }
+}
+
+/// Waits (2 s at most) until only the test and the store hold `portal`: every
+/// task of a fetch holds it until it ends, the category lists' own included.
+async fn only_the_store_holds(portal: &Arc<Gate>) {
+    for _ in 0..400 {
+        if Arc::strong_count(portal) == 2 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!(
+        "a task of the fetch still runs: {} holders",
+        Arc::strong_count(portal)
+    );
+}
+
+#[tokio::test]
+async fn the_category_lists_are_asked_beside_the_three_lists() {
+    // Ruling 1': beside them, not after them. This portal's lists come only
+    // once its category lists were asked.
+    let portal = Arc::new(Gate::new(
+        Lists::AfterTheCategories,
+        Cats::Now(Categories::default()),
+    ));
+    let store = Arc::new(CatalogStore::new(portal));
+    store.spawn_fetch();
+    titled(&store).await;
+    assert_eq!(store.status(), CatalogStatus::Loaded);
+    assert_eq!(store.titles().unwrap().title(0).unwrap().name, "Lachen");
+}
+
+#[tokio::test]
+async fn a_fetch_that_brings_no_catalog_stops_its_category_lists() {
+    // A refused list and an unchanged one: no titles wait for the categories,
+    // and their request stops.
+    for (lists, status) in [(Lists::Refused, "Failed"), (Lists::Unchanged, "Loaded")] {
+        let portal = Arc::new(Gate::new(lists, Cats::Never));
+        let store = Arc::new(CatalogStore::new(portal.clone()));
+        store.spawn_fetch();
+        for _ in 0..400 {
+            let now = format!("{:?}", store.status());
+            if now.starts_with("Failed") || now == "Loaded" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(format!("{:?}", store.status()).starts_with(status));
+        only_the_store_holds(&portal).await;
+        assert!(store.titles().is_none());
+    }
+}
+
+#[tokio::test]
+async fn at_the_bound_the_request_for_the_categories_stops() {
+    let portal = Arc::new(Gate::new(Lists::Film, Cats::Never));
+    let store = Arc::new(
+        CatalogStore::new(portal.clone()).with_categories_wait(Duration::from_millis(100)),
+    );
+    store.spawn_fetch();
+    titled(&store).await;
+    only_the_store_holds(&portal).await;
+    assert_eq!(store.titles().unwrap().title(0).unwrap().genres, 0);
+}
+
+#[test]
+fn the_bound_is_logged_as_the_wait_that_ran_out() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let text = logged(|| {
+        runtime.block_on(async {
+            let portal = Arc::new(Gate::new(Lists::Film, Cats::Never));
+            let store = Arc::new(
+                CatalogStore::new(portal).with_categories_wait(Duration::from_millis(200)),
+            );
+            store.spawn_fetch();
+            titled(&store).await;
+        })
+    });
+    assert!(
+        text.contains("catalog: no categories (none within 200ms) - the titles go without"),
+        "{text}"
+    );
+}
+
+/// Three dramas: Dark, the adult Hot, and Ozark.
+fn dramas() -> Catalog {
+    let drama = |id: i64, name: &str, adult: bool| Series {
+        series_id: id,
+        name: name.into(),
+        genre: Some("Drama".into()),
+        is_adult: adult,
+        ..Series::default()
+    };
+    Catalog {
+        series: vec![
+            drama(1, "Dark", false),
+            drama(2, "Hot", true),
+            drama(3, "Ozark", false),
+        ],
+        ..Catalog::default()
+    }
+}
+
+/// The series ids `titles` holds like series `id`, in their order.
+fn like(titles: &Titles, unlocked: &Titles, id: i64) -> Vec<i64> {
+    let none = HashSet::new();
+    let pos = unlocked
+        .find(TitleId {
+            kind: Kind::Series,
+            id,
+        })
+        .unwrap();
+    titles
+        .more_like(pos, 10, &none, &none)
+        .into_iter()
+        .map(|p| unlocked.title(p as usize).unwrap().id.id)
+        .collect()
+}
+
+#[test]
+fn a_locked_handle_knows_nothing_like_an_adult_title_and_no_adult_title_like_another() {
+    let store = CatalogStore::from_catalog(idle_portal(), dramas());
+    let locked = store.titles().unwrap();
+    store.set_adult_unlocked(true);
+    let unlocked = store.titles().unwrap();
+    assert_eq!(like(&locked, &unlocked, 1), [3], "not the adult Hot");
+    assert_eq!(
+        like(&locked, &unlocked, 2),
+        Vec::<i64>::new(),
+        "none like Hot"
+    );
+    assert_eq!(like(&unlocked, &unlocked, 1), [2, 3]);
+    assert_eq!(like(&unlocked, &unlocked, 2), [1, 3]);
+}
+
+#[test]
+fn what_a_handle_learns_reaches_the_index_every_handle_shares() {
+    let store = CatalogStore::from_catalog(idle_portal(), library());
+    let titles = store.titles().unwrap();
+    let id = TitleId {
+        kind: Kind::Film,
+        id: 1,
+    };
+    let pos = titles.find(id).unwrap();
+    assert_eq!(titles.title(pos).unwrap().genres, 0);
+    titles.learn(
+        pos,
+        Learned {
+            year: 2001,
+            genres: Genre::Action.bit(),
+            trailer: true,
+        },
+    );
+    let again = store.titles().unwrap();
+    let matrix = again.title(again.find(id).unwrap()).unwrap();
+    assert_eq!(
+        (matrix.year, matrix.genres, matrix.trailer),
+        (1999, Genre::Action.bit(), true),
+        "the name's year stays; genres and the trailer are learned"
+    );
+}
+
+#[test]
+fn a_name_may_give_the_year_after_this_one_and_no_later() {
+    use chrono::Datelike;
+    let year = chrono::Utc::now().year() as u16;
+    let catalog = Catalog {
+        movies: vec![
+            film(1, &format!("Nieuw ({})", year + 1), false),
+            film(2, &format!("Later ({})", year + 2), false),
+        ],
+        ..Catalog::default()
+    };
+    let store = CatalogStore::from_catalog(idle_portal(), catalog);
+    let titles = store.titles().unwrap();
+    let title = |id| {
+        let t = titles
+            .title(
+                titles
+                    .find(TitleId {
+                        kind: Kind::Film,
+                        id,
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+        (t.name.to_owned(), t.year)
+    };
+    assert_eq!(title(1), ("Nieuw".to_owned(), year + 1));
+    assert_eq!(title(2), (format!("Later ({})", year + 2), 0));
+}
+
+#[test]
+fn a_catalog_without_titles_logs_no_vod_line() {
+    // Ruling 30: once per build that has titles. An M3U list has none.
+    let (portal, catalog) =
+        M3uPortal::from_text("#EXTM3U\n#EXTINF:-1,Een\nhttp://a.example/1\n").unwrap();
+    let text = logged(|| {
+        CatalogStore::from_catalog(Arc::new(portal), catalog);
+    });
+    assert!(!text.contains("vod: "), "{text}");
+}
+
+/// 400 films with long covers and 30 series: an index and a cover table of
+/// sizes apart.
+fn sized_films() -> Vec<Movie> {
+    (0..400)
+        .map(|i| Movie {
+            stream_icon: Some(format!("https://c.example/{}/{i:04}.jpg", "x".repeat(280))),
+            category_id: 1,
+            ..film(i + 1, &format!("Film {i} (2001)"), false)
+        })
+        .collect()
+}
+
+fn sized_series() -> Vec<Series> {
+    (0..30)
+        .map(|i| Series {
+            series_id: i + 1,
+            name: format!("Serie {i}"),
+            category_id: 1 + i % 3,
+            ..Series::default()
+        })
+        .collect()
+}
+
+#[test]
+fn the_fetch_logs_both_category_lists_and_the_sizes_it_built() {
+    // The fetch builds on the blocking pool: its threads log into the sink too.
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let sink = Sink::default();
+    let writer = sink.clone();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let category = |id: i64, name: &str| Category {
+        category_id: id,
+        category_name: name.into(),
+    };
+    let categories = Categories {
+        vod: vec![category(1, "NL | Komedie")],
+        series: vec![
+            category(1, "Drama"),
+            category(2, "Actie"),
+            category(3, "Kids"),
+        ],
+    };
+    let on_start = dispatch.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .on_thread_start(move || std::mem::forget(tracing::dispatcher::set_default(&on_start)))
+        .build()
+        .unwrap();
+    let cats = categories.clone();
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async move {
+            let portal = Arc::new(Gate::new(
+                Lists::Films(sized_films, sized_series),
+                Cats::Now(cats),
+            ));
+            let store = Arc::new(CatalogStore::new(portal));
+            store.spawn_fetch();
+            titled(&store).await;
+        })
+    });
+    let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.contains("vod: "))
+        .unwrap_or_else(|| panic!("{text}"));
+    use chrono::Datelike;
+    let next = chrono::Utc::now().year() as u16 + 1;
+    let index = TitleIndex::build(&sized_films(), &sized_series(), &categories, next);
+    let (kb, covers) = (index.heap_bytes() / 1024, index.cover_bytes() / 1024);
+    assert!(kb > 0 && covers > kb, "sizes apart: {kb} KB, {covers} KB");
+    assert!(
+        line.contains(
+            "vod: 430 titles (30 series, 400 films in 400 versions, at most 1 in one film, 0 left out), 4 categories - cover 93 %, "
+        ),
+        "{line}"
+    );
+    assert!(
+        line.contains(&format!(" - index {kb} KB, covers {covers} KB, built in ")),
+        "{line}"
+    );
+}
+
+#[test]
+fn a_catalog_replaced_while_its_categories_wait_builds_no_titles() {
+    // F5 while the first fetch's category lists are held (the Task 5 review,
+    // m8): the second catalog's titles are built and put, and once the first
+    // fetch's categories come its titles are built not at all, so the log has
+    // one `vod:` line. `Cats::After` takes its gate once: the second fetch's
+    // category lists come at once.
+    fn films() -> Vec<Movie> {
+        static FETCHES: AtomicUsize = AtomicUsize::new(0);
+        match FETCHES.fetch_add(1, Ordering::SeqCst) {
+            0 => vec![film(5, "Lachen (2020)", false)],
+            _ => vec![film(6, "Later (2021)", false)],
+        }
+    }
+    // The builds run on the blocking pool: its threads log into the sink too.
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let sink = Sink::default();
+    let writer = sink.clone();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let on_start = dispatch.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .on_thread_start(move || std::mem::forget(tracing::dispatcher::set_default(&on_start)))
+        .build()
+        .unwrap();
+    let (release, gate) = oneshot::channel();
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async move {
+            let portal = Arc::new(Gate::new(
+                Lists::Films(films, Vec::new),
+                Cats::After(Mutex::new(Some(gate)), Categories::default()),
+            ));
+            let store = Arc::new(CatalogStore::new(portal.clone()));
+            store.spawn_fetch();
+            loaded(&store).await;
+            store.spawn_fetch();
+            loaded(&store).await;
+            titled(&store).await;
+            let name =
+                |store: &CatalogStore| store.titles().unwrap().title(0).unwrap().name.to_owned();
+            assert_eq!(name(&store), "Later", "the second catalog's titles");
+            release.send(()).unwrap();
+            only_the_store_holds(&portal).await;
+            assert_eq!(name(&store), "Later");
+            assert_eq!(store.titles_revision(), 1);
+        })
+    });
+    let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(text.matches("vod: ").count(), 1, "{text}");
 }

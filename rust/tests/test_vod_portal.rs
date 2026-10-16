@@ -5,7 +5,7 @@
 
 use bongo_player::args::XtreamCreds;
 use bongo_player::portal::m3u::M3uPortal;
-use bongo_player::portal::vod_info::{parse_series_info, parse_vod_info};
+use bongo_player::portal::vod_info::{parse_series_info, parse_vod_info, year_of};
 use bongo_player::portal::VodDetails;
 use bongo_player::portal::{xtream::XtreamPortal, Category, Movie, Portal, PortalError, Series};
 use serde_json::json;
@@ -808,5 +808,45 @@ async fn the_errors_of_the_new_calls_name_no_address_when_the_answer_is_no_json(
     for err in &errors {
         assert!(matches!(err, PortalError::Http(_)), "{err}");
         assert_names_no_address(err, &host_port);
+    }
+}
+
+#[test]
+fn a_dates_year_is_its_first_four_digits_from_1900_to_2100_and_nothing_else() {
+    // `year_of` reads a release date without a String of its own (the Task 5
+    // review, m7). This table is what the reading that collected four chars
+    // into a String and parsed them answered, input by input.
+    for (date, year) in [
+        ("2019-05-01", 2019),
+        (" 2019", 2019),
+        ("2019", 2019),
+        ("2019 ", 2019),
+        ("1900", 1900),
+        ("1899", 0),
+        ("2100", 2100),
+        ("2101", 0),
+        ("201", 0),
+        ("19", 0),
+        ("", 0),
+        ("   ", 0),
+        ("+201", 0),
+        ("+2019", 0),
+        ("-201", 0),
+        ("2019abc", 2019),
+        ("2017-12-01T00:00:00Z", 2017),
+        ("30-03-1999", 0),
+        ("\u{ff12}\u{ff10}\u{ff11}\u{ff19}", 0), // full-width digits
+        ("20\u{ff11}9", 0),                      // one full-width digit
+        ("\u{e9}2019", 0),                       // é
+        ("\u{a0}2019", 2019),                    // a no-break space is white space
+        ("\u{200b}2019", 0),                     // a zero-width space is not
+        ("\t2019\n", 2019),
+        ("0000", 0),
+        ("9999", 0),
+        ("\u{661}\u{669}\u{669}\u{669}", 0), // Arabic-Indic digits
+        ("2O19", 0),                         // a letter O
+        ("12345", 0),
+    ] {
+        assert_eq!(year_of(date), year, "{date:?}");
     }
 }

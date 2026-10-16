@@ -955,14 +955,17 @@ pub struct CatalogStore {
 }
 
 /// Puts a catalog in its slot and counts it. The count moves after the catalog
-/// is in, so whoever sees the new count finds the new catalog. The count it put
-/// the catalog at: its titles are put for that one ([`put_titles`]).
+/// is in, so whoever sees the new count finds the new catalog, and before the
+/// slot's write lock is let go: two fetches that put at once cannot leave one's
+/// catalog in the slot under the other's count. The count it put the catalog
+/// at: its titles are put for that one ([`put_titles`]).
 fn put_catalog(
     slot: &RwLock<Option<StoredCatalog>>,
     revision: &AtomicU64,
     stored: StoredCatalog,
 ) -> u64 {
-    *slot.write() = Some(stored);
+    let mut held = slot.write();
+    *held = Some(stored);
     revision.fetch_add(1, Ordering::Release) + 1
 }
 
@@ -1065,7 +1068,10 @@ impl CatalogStore {
     /// How many times this store's titles were put: 0 until the first
     /// catalog's are built, then one more with every build. Whatever is worked
     /// out from the titles compares this per frame, an atomic load, as the
-    /// guide does [`CatalogStore::revision`].
+    /// guide does [`CatalogStore::revision`]. Read it before the titles: titles
+    /// that land in between are then noticed next time, not missed. It does not
+    /// move when the lock changes, so whatever is worked out from the titles
+    /// also compares [`CatalogStore::adult_unlocked`].
     pub fn titles_revision(&self) -> u64 {
         self.titles_revision.load(Ordering::Acquire)
     }
@@ -1203,6 +1209,10 @@ impl CatalogStore {
                     // blocking pool: off the screen and off the async workers,
                     // where the relay runs.
                     let categories = categories_after(categories, categories_wait).await;
+                    // A newer catalog is in: these would never be put, so none is built or logged.
+                    if revision.load(Ordering::Acquire) != of {
+                        return;
+                    }
                     let build = move || input.build(&categories);
                     match tokio::task::spawn_blocking(build).await {
                         Ok(built) => {
@@ -1588,5 +1598,83 @@ mod news_tests {
             [None, None]
         );
         assert!(store.resolve_news(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod titles_tests {
+    //! What only the crate sees of the titles' input (Rulings 22 and 53) and
+    //! the bound of Ruling 1'.
+    use super::*;
+    use crate::args::XtreamCreds;
+    use crate::portal::xtream::XtreamPortal;
+
+    /// A portal that is never asked anything.
+    fn idle_portal() -> Arc<dyn Portal> {
+        Arc::new(XtreamPortal::new(XtreamCreds {
+            username: "u".into(),
+            password: "p".into(),
+            host: "h".into(),
+            port: 80,
+        }))
+    }
+
+    #[test]
+    fn the_stored_lists_give_up_what_only_the_index_reads_and_share_the_rest() {
+        let (stored, input) = StoredCatalog::new(PortalCatalog {
+            movies: vec![Movie {
+                stream_id: 1,
+                name: "Een (2001)".into(),
+                stream_icon: Some("https://c.example/een.jpg".into()),
+                ..Movie::default()
+            }],
+            series: vec![Series {
+                series_id: 9,
+                name: "Dark".into(),
+                cover: Some("https://c.example/dark.jpg".into()),
+                genre: Some("Drama".into()),
+                release_date: Some("2017-12-01".into()),
+                release_date_camel: Some("2017-12-01".into()),
+                ..Series::default()
+            }],
+            ..PortalCatalog::default()
+        });
+        // Ruling 22: no address held twice once the index has it.
+        assert!(stored.movies.iter().all(|m| m.stream_icon.is_none()));
+        assert!(stored
+            .series
+            .iter()
+            .all(|s| s.cover.is_none() && s.genre.is_none() && s.released().is_none()));
+        // Ruling 53: the build reads the stored lists themselves, no copy.
+        assert!(Arc::ptr_eq(&stored.catalog, &input.lists));
+        let titles = input.build(&Categories::default());
+        let dark = titles
+            .title(
+                titles
+                    .find(TitleId {
+                        kind: crate::vod::Kind::Series,
+                        id: 9,
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            (dark.cover, dark.year, dark.genres),
+            (
+                Some("https://c.example/dark.jpg"),
+                2017,
+                crate::vod::genres::Genre::Drama.bit()
+            )
+        );
+        // What the build was handed goes with it: the store keeps one list.
+        assert_eq!(Arc::strong_count(&stored.catalog), 1);
+    }
+
+    #[test]
+    fn the_titles_wait_15_s_for_the_categories_unless_told_otherwise() {
+        let store = CatalogStore::new(idle_portal());
+        assert_eq!(store.categories_wait, Duration::from_secs(15));
+        let store = store.with_categories_wait(Duration::from_millis(5));
+        assert_eq!(store.categories_wait, Duration::from_millis(5));
     }
 }
