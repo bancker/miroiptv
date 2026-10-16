@@ -54,7 +54,7 @@ async fn a_url_source_downloads_saves_and_plays_its_list() {
     // The list was asked for as the portal is: with the app's User-Agent.
     let asked = &server.received_requests().await.unwrap()[0];
     let agent = asked.headers.get("user-agent").unwrap().to_str().unwrap();
-    assert!(agent.starts_with("BongoPlayer/"), "{agent}");
+    assert!(agent.starts_with("BongoIPTVPlayer/"), "{agent}");
 }
 
 #[tokio::test]

@@ -69,7 +69,7 @@ mod win_console {
 }
 
 /// Initialize tracing: stderr + rolling daily file under
-/// %APPDATA%\BongoPlayer\config\log\. Returns the log directory path so callers
+/// %APPDATA%\BongoIPTVPlayer\config\log\. Returns the log directory path so callers
 /// can show it in the UI / panic hook.
 fn init_logging(storage: &Storage) -> std::path::PathBuf {
     let log_dir = storage.config_dir().join("log");
@@ -150,7 +150,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Windowed binary: no console by default. --console opens one with live
-    // logs (the file log under %APPDATA%\BongoPlayer\config\log\ is always
+    // logs (the file log under %APPDATA%\BongoIPTVPlayer\config\log\ is always
     // written).
     #[cfg(windows)]
     if cli.console {
@@ -158,18 +158,26 @@ fn main() -> anyhow::Result<()> {
     }
 
     let storage = Storage::standard()?;
-    // First start after the tvplayer -> Bongo Player rename: carry over the old
-    // data and ini. Must run before ensure_config_dir (an existing config dir
-    // means "already migrated"); results are logged once logging is up.
-    // Under the test override the old tvplayer data must not be copied in.
+    // First start after a rename (tvplayer, then Bongo Player): carry over the
+    // newest earlier name's data and ini. Must run before ensure_config_dir (an
+    // existing config dir means "already migrated"); results are logged once
+    // logging is up. Under the test override no earlier data may be copied in.
     let isolated = std::env::var_os("BONGO_CONFIG_DIR").is_some();
-    let migrated_config = legacy::legacy_config_dir()
-        .filter(|_| !isolated)
-        .map(|old| legacy::migrate_config_dir(&old, storage.config_dir()));
-    let migrated_ini = if isolated {
-        Ok(false)
+    let (migrated_config, migrated_ini) = if isolated {
+        (None, None)
     } else {
-        legacy::migrate_file(&legacy::legacy_ini_path(), &ini_path())
+        let dirs: Vec<(&str, std::path::PathBuf)> = legacy::LEGACY_APP_IDS
+            .iter()
+            .filter_map(|id| legacy::legacy_config_dir(id).map(|dir| (*id, dir)))
+            .collect();
+        let inis: Vec<(&str, std::path::PathBuf)> = legacy::LEGACY_APP_IDS
+            .iter()
+            .map(|id| (*id, legacy::legacy_ini_path(id)))
+            .collect();
+        (
+            legacy::migrate_config_from(&dirs, storage.config_dir()),
+            legacy::migrate_ini_from(&inis, &ini_path()),
+        )
     };
     storage.ensure_config_dir()?;
     let log_dir = init_logging(&storage);
@@ -179,23 +187,23 @@ fn main() -> anyhow::Result<()> {
     tracing::info!("config dir: {}", storage.config_dir().display());
     tracing::info!("log dir:    {}", log_dir.display());
     match migrated_config {
-        Some(Ok(n)) if n > 0 => tracing::info!("migrated {} files from the tvplayer config dir", n),
-        Some(Err(e)) => tracing::warn!("could not migrate the tvplayer config dir: {}", e),
+        Some((id, Ok(n))) if n > 0 => tracing::info!("migrated {n} files from the {id} config dir"),
+        Some((id, Err(e))) => tracing::warn!("could not migrate the {id} config dir: {e}"),
         _ => {}
     }
     match migrated_ini {
-        Ok(true) => tracing::info!("renamed tvplayer.ini to {}", ini_path().display()),
-        Ok(false) => {}
-        Err(e) => tracing::warn!("could not rename tvplayer.ini: {}", e),
+        Some((id, Ok(true))) => tracing::info!("renamed {id}.ini to {}", ini_path().display()),
+        Some((id, Err(e))) => tracing::warn!("could not rename {id}.ini: {e}"),
+        _ => {}
     }
 
     let rt = Runtime::new()?;
     let _rt_guard = rt.enter();
 
     // The portal of --xtream with real values wins (see args::resolve_creds),
-    // then the source in use in BongoPlayer.ini. Placeholder, missing or
+    // then the source in use in BongoIPTVPlayer.ini. Placeholder, missing or
     // unreadable credentials never stop the app: it shows the setup prompt,
-    // which writes BongoPlayer.ini.
+    // which writes BongoIPTVPlayer.ini.
     let sources = Sources::load(&ini_path());
     let mut storage = storage;
     let (opened, creds_from_cli) =

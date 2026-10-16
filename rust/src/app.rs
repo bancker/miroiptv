@@ -347,7 +347,7 @@ fn paint_help_row(ui: &mut egui::Ui, row: &HelpRow) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortalState {
     /// A source runs: the portal of `--xtream` (non-placeholder values), or
-    /// the source in use in `BongoPlayer.ini`: an M3U list, or Xtream
+    /// the source in use in `BongoIPTVPlayer.ini`: an M3U list, or Xtream
     /// credentials that are no placeholder.
     Configured,
     /// Nothing to run: neither `--xtream` nor a source in the ini gives
@@ -586,7 +586,7 @@ pub struct TvApp {
     /// They came from `--xtream`, which beats the ini on every start: the
     /// settings say that what is saved there only counts without it.
     creds_from_command_line: bool,
-    /// The saved sources (`BongoPlayer.ini`), and the one in use unless the
+    /// The saved sources (`BongoIPTVPlayer.ini`), and the one in use unless the
     /// portal of `--xtream` runs. Kept in step with the ini by every save,
     /// switch and delete (`write_sources`).
     sources: Sources,
@@ -776,7 +776,7 @@ pub struct TvApp {
     /// True once a held digit fired its save, so its release won't also recall.
     digit_long_fired: [bool; 10],
 
-    // ---- first-run portal setup prompt (writes BongoPlayer.ini) ----
+    // ---- first-run portal setup prompt (writes BongoIPTVPlayer.ini) ----
     cfg_host: String,
     cfg_user: String,
     cfg_pass: String,
@@ -1045,7 +1045,7 @@ impl TvApp {
             app.load_url(url, false);
         } else if app.portal_state == PortalState::Configured {
             // Only resume when a portal is actually configured. Without creds
-            // (e.g. BongoPlayer.ini deleted) drop to the setup prompt instead of
+            // (e.g. BongoIPTVPlayer.ini deleted) drop to the setup prompt instead of
             // silently replaying the last URL (whose credentials are baked in).
             if let Some(lw) = LastWatched::load(&app.storage.last_watched_path()) {
                 if app.choosing_language.is_some() {
@@ -2889,7 +2889,7 @@ impl TvApp {
 
     /// First-run portal setup: shown when no credentials are configured.
     /// Collects host/user/pass, tests them, and once they log in writes
-    /// BongoPlayer.ini and connects live.
+    /// BongoIPTVPlayer.ini and connects live.
     fn paint_portal_prompt(&mut self, ctx: &egui::Context) {
         let mut submit: Option<String> = None;
         let mut open_sources = false;
@@ -10601,7 +10601,7 @@ https://c.example/twee-nieuws.m3u8\n";
             [
                 "portal: xtream <user>@srv.example.net:8080",
                 "portal: placeholder credentials - showing the setup prompt",
-                "portal: no credentials (--xtream or BongoPlayer.ini) - showing the setup prompt",
+                "portal: no credentials (--xtream or BongoIPTVPlayer.ini) - showing the setup prompt",
                 "portal: unreadable credentials (missing '@' separator in creds) - showing the setup prompt",
             ],
             "{text}"

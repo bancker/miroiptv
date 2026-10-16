@@ -198,7 +198,7 @@ pub enum ConnState {
     Done(ConnCheck),
     /// The fields cannot make credentials (e.g. a bad port).
     BadInput(T),
-    /// The login worked but BongoPlayer.ini could not be written, so nothing was
+    /// The login worked but BongoIPTVPlayer.ini could not be written, so nothing was
     /// saved: where it should have gone and why not (the OS's words).
     WriteFailed {
         path: String,

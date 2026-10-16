@@ -5,8 +5,8 @@ use thiserror::Error;
 #[derive(Parser)]
 #[cfg_attr(test, derive(Debug))]
 #[command(
-    name = "BongoPlayer",
-    display_name = "Bongo Player",
+    name = "BongoIPTVPlayer",
+    display_name = "Bongo IPTV Player",
     version,
     about = "Lightweight IPTV player"
 )]
@@ -23,7 +23,7 @@ pub struct Cli {
     pub selftest: bool,
 
     /// Show a live debug console window (off by default). Logs always also go
-    /// to the file under %APPDATA%\BongoPlayer\config\log\.
+    /// to the file under %APPDATA%\BongoIPTVPlayer\config\log\.
     #[arg(long)]
     pub console: bool,
 }
@@ -48,12 +48,12 @@ pub enum CredsError {
     BadPort,
 }
 
-/// Path to `BongoPlayer.ini` next to the executable (falls back to CWD if the
+/// Path to `BongoIPTVPlayer.ini` next to the executable (falls back to CWD if the
 /// exe path can't be resolved). This is the app's "root folder" config file.
 ///
 /// `BONGO_INI` points it elsewhere. So does `BONGO_CONFIG_DIR` (the test
 /// override, see `Storage::standard`) when `BONGO_INI` is not set: the ini is
-/// then `BongoPlayer.ini` in that folder, never the file next to the exe, which
+/// then `BongoIPTVPlayer.ini` in that folder, never the file next to the exe, which
 /// may hold the developer's real portal and which a Save in the settings
 /// overwrites.
 pub fn ini_path() -> std::path::PathBuf {
@@ -171,7 +171,7 @@ pub fn is_placeholder_creds(creds: &XtreamCreds) -> bool {
 pub enum CredsOrigin {
     /// `--xtream`, which wins over the ini on every start.
     CommandLine,
-    /// `BongoPlayer.ini`.
+    /// `BongoIPTVPlayer.ini`.
     Ini,
 }
 

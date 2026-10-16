@@ -1,5 +1,5 @@
 <#
-Runs Bongo Player against the mock portal in an isolated config folder, sends
+Runs Bongo IPTV Player against the mock portal in an isolated config folder, sends
 keys to its window and checks its log. Example:
 
   .\run-scenario.ps1 -Resume 10 -Keys 'UP' -Expect 'zap: -> TEST 09'
@@ -23,16 +23,16 @@ focus, so the result would depend on the keyboard's state (see held-keys.ps1).
 -Settings replaces settings.json; without it a folder that has none gets
 {"language":"nl"}, so the first-start language screen stays away unless
 -FirstStart asks for it. -ConfigDir reuses a folder across runs (restarts); its
-old BongoPlayer.log.* and panic-*.log are removed first, so a run is judged on
+old Bongo*Player.log.* and panic-*.log are removed first, so a run is judged on
 its own log lines only.
 
 -NoPortal leaves out the --xtream arguments. A fresh isolated config folder has
-no BongoPlayer.ini either, so the app starts on the first-run setup prompt
+no BongoPlayer.ini either (the file BONGO_INI names), so the app starts on the first-run setup prompt
 ("portal: no credentials" in its log), e.g.
   .\run-scenario.ps1 -NoPortal -Keys 'TEXT:onno' -Expect 'portal: no credentials'
 #>
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\BongoPlayer.exe'),
+    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\BongoIPTVPlayer.exe'),
     [int]$Port = 18080,
     [int]$Resume = 0,
     [string]$ResumeUrl = '',
@@ -109,7 +109,8 @@ if ($lastUrl) {
 # A reused -ConfigDir still holds the previous run's log (the app appends to one
 # file per day) and panic files: clear them, so a run is judged on its own lines.
 $logDir = Join-Path $ConfigDir 'log'
-foreach ($old in 'BongoPlayer.log.*', 'panic-*.log') {
+# Bongo*Player: the renamed app's log and 0.6.1's (the startup A/B's baseline).
+foreach ($old in 'Bongo*Player.log.*', 'panic-*.log') {
     Get-ChildItem $logDir -Filter $old -ErrorAction SilentlyContinue | Remove-Item -Force
 }
 $mock = $null; $app = $null
@@ -121,6 +122,7 @@ try {
     $mock = Start-Process py -ArgumentList '-3', (Join-Path $PSScriptRoot 'mock_portal.py'), $Port, $segs, $reqLog, $MockMode -PassThru -WindowStyle Hidden
     Start-Sleep -Milliseconds 800
     $env:BONGO_CONFIG_DIR = $ConfigDir
+    # One file name for every exe the harness runs, 0.6.1's for the A/B included: BONGO_INI decides.
     $env:BONGO_INI = Join-Path $ConfigDir 'BongoPlayer.ini'
     if ($MpvVerbose) { $env:MPV_LOG_LEVEL = 'v' }
     $appArgs = @()
@@ -186,7 +188,7 @@ try {
     $env:BONGO_CONFIG_DIR = $null; $env:BONGO_INI = $null; $env:MPV_LOG_LEVEL = $null
     foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
 }
-$log = Get-ChildItem (Join-Path $ConfigDir 'log') -Filter 'BongoPlayer.log.*' -ErrorAction SilentlyContinue |
+$log = Get-ChildItem (Join-Path $ConfigDir 'log') -Filter 'Bongo*Player.log.*' -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1
 # The log is UTF-8 without a BOM: say so, or "nächste" arrives as "nÃ¤chste".
 $lines = if ($log) { Get-Content $log.FullName -Encoding UTF8 } else { @() }
@@ -198,7 +200,7 @@ $lines | Where-Object { $_ -match 'zap: |source: |m3u: |mpv: file-loaded|guide: 
 if (Test-Path $reqLog) { Get-Content $reqLog | Where-Object { $_ -match '/live/' } | ForEach-Object { '  ' + $_ } }
 $fail = 0
 # A pass has to mean the app ran: with no log at all every -Forbid would pass.
-if (-not $log) { "FAIL  no log: the app wrote no BongoPlayer.log.* in $logDir"; $fail++ }
+if (-not $log) { "FAIL  no log: the app wrote no Bongo*Player.log.* in $logDir"; $fail++ }
 elseif (-not ($lines -match ' starting')) { "FAIL  no ' starting' line in the log: the app did not start"; $fail++ }
 foreach ($problem in $problems) { "FAIL  $problem"; $fail++ }
 if ($exitedEarly) {

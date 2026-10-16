@@ -1,32 +1,32 @@
-# Extract latest Bongo Player zip, run --selftest, do a brief test-pattern render check.
+# Extract latest Bongo IPTV Player zip, run --selftest, do a brief test-pattern render check.
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $distDir = Join-Path $root 'dist'
 
-$latestZip = Get-ChildItem (Join-Path $distDir 'BongoPlayer-v*.zip') -ErrorAction SilentlyContinue |
+$latestZip = Get-ChildItem (Join-Path $distDir 'BongoIPTVPlayer-v*.zip') -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1
-if (-not $latestZip) { throw "no Bongo Player zip in $distDir - run build-zip.ps1 first" }
+if (-not $latestZip) { throw "no Bongo IPTV Player zip in $distDir - run build-zip.ps1 first" }
 
-$verifyDir = Join-Path $env:TEMP "BongoPlayer-verify-$(Get-Random)"
+$verifyDir = Join-Path $env:TEMP "BongoIPTVPlayer-verify-$(Get-Random)"
 New-Item -ItemType Directory -Path $verifyDir -Force | Out-Null
 
 try {
     Write-Host "== extracting $($latestZip.Name) =="
     Expand-Archive -Path $latestZip.FullName -DestinationPath $verifyDir -Force
 
-    $exe = Join-Path $verifyDir 'BongoPlayer.exe'
+    $exe = Join-Path $verifyDir 'BongoIPTVPlayer.exe'
     $dll = Join-Path $verifyDir 'libmpv-2.dll'
 
-    if (-not (Test-Path $exe)) { throw "BongoPlayer.exe missing from zip" }
+    if (-not (Test-Path $exe)) { throw "BongoIPTVPlayer.exe missing from zip" }
     if (-not (Test-Path $dll)) { throw "libmpv-2.dll missing from zip" }
 
     $exeKb = [math]::Round((Get-Item $exe).Length / 1KB, 1)
     $dllMb = [math]::Round((Get-Item $dll).Length / 1MB, 1)
-    Write-Host "  BongoPlayer.exe   $exeKb KB"
+    Write-Host "  BongoIPTVPlayer.exe   $exeKb KB"
     Write-Host "  libmpv-2.dll      $dllMb MB"
 
-    Write-Host "== smoke: BongoPlayer --selftest =="
+    Write-Host "== smoke: BongoIPTVPlayer --selftest =="
     $out = & $exe --selftest 2>&1
     $rc = $LASTEXITCODE
     if ($rc -ne 0) { throw "selftest exit code ${rc}; output:`n$out" }
@@ -35,10 +35,10 @@ try {
     }
     Write-Host "  OK: $out"
 
-    Write-Host "== smoke: BongoPlayer --version =="
+    Write-Host "== smoke: BongoIPTVPlayer --version =="
     $verOut = & $exe --version 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "BongoPlayer --version failed:`n$verOut" }
-    if ($verOut -notmatch 'Bongo Player') {
+    if ($LASTEXITCODE -ne 0) { throw "BongoIPTVPlayer --version failed:`n$verOut" }
+    if ($verOut -notmatch 'Bongo IPTV Player') {
         throw "version output unexpected:`n$verOut"
     }
     Write-Host "  OK: $verOut"

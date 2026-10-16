@@ -1,6 +1,6 @@
 # End-to-end tests
 
-Runs the real Bongo Player against a mock Xtream portal, in a throw-away
+Runs the real Bongo IPTV Player against a mock Xtream portal, in a throw-away
 config folder (`BONGO_CONFIG_DIR`, `BONGO_INI`), so your own settings, PIN and
 credentials are never touched.
 
@@ -58,7 +58,8 @@ scenarios that type into a field, the setup prompt's login above all (an extra
 character is a `BadLogin` or an unreachable host), so run such a scenario once
 more before looking for a bug in the app.
 
-Before committing: `bash check-staged.sh`. It reads the `BongoPlayer.ini` next to
+Before committing: `bash check-staged.sh`. It reads the `BongoIPTVPlayer.ini` (or, until the renamed app has moved it, the
+`BongoPlayer.ini`) next to
 the release exe and fails if the staged diff holds a secret from it: the user and
 password of every Xtream source and, of every M3U address, the `user:pass@` part
 and the values of `username`, `user`, `password`, `pass` and `token`. Values under

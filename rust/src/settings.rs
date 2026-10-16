@@ -1,5 +1,5 @@
-//! User preferences in %APPDATA%\BongoPlayer\config\settings.json. Portal
-//! credentials stay in BongoPlayer.ini next to the exe (see args.rs).
+//! User preferences in %APPDATA%\BongoIPTVPlayer\config\settings.json. Portal
+//! credentials stay in BongoIPTVPlayer.ini next to the exe (see args.rs).
 
 use crate::i18n::Lang;
 use crate::news::{default_rules, default_rules_static, NewsRule};

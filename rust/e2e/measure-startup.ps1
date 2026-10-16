@@ -1,4 +1,4 @@
-# Time from the app's first log line ("Bongo Player ... starting") to the first
+# Time from the app's first log line ("Bongo IPTV Player ... starting") to the first
 # picture ("playback restart complete") when resuming a live channel against the
 # mock portal with portal-like latency. The clock starts at that log line, not at
 # process creation: loading the exe and its DLLs before it is not counted.
@@ -23,7 +23,7 @@
 # starts about 0.4 s ahead for that reason alone: report both numbers as they
 # come, and read the -M3u comparison with that in mind.
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\BongoPlayer.exe'),
+    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\BongoIPTVPlayer.exe'),
     [int]$Runs = 10,
     [string]$Baseline = '',
     [switch]$M3u
@@ -50,7 +50,7 @@ function Measure-Run([string]$ExePath, [bool]$AsM3u) {
         $out = & (Join-Path $PSScriptRoot 'run-scenario.ps1') @common -Resume 3 -MockEnv @{ MOCK_LATENCY = '1' }
     }
     $dir = (($out | Select-String '^config folder: (.+)$').Matches[0].Groups[1].Value).Trim()
-    $log = Get-ChildItem (Join-Path $dir 'log') -Filter 'BongoPlayer.log.*' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $log = Get-ChildItem (Join-Path $dir 'log') -Filter 'Bongo*Player.log.*' -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $log) { return }
     $lines = Get-Content $log.FullName
     $start = Secs (($lines | Select-String ' starting' | Select-Object -First 1).Line)

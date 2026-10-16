@@ -83,7 +83,7 @@ fn a_redirected_config_folder_without_an_ini_variable_keeps_the_ini_in_that_fold
     ]);
     let ini = bongo_player::args::ini_path();
     drop(env);
-    assert_eq!(ini, dir.path().join("BongoPlayer.ini"));
+    assert_eq!(ini, dir.path().join("BongoIPTVPlayer.ini"));
 }
 
 #[test]
@@ -106,7 +106,7 @@ fn the_ini_variable_wins_and_with_neither_the_ini_is_next_to_the_exe() {
         .parent()
         .unwrap()
         .to_path_buf();
-    assert_eq!(default, exe_folder.join("BongoPlayer.ini"));
+    assert_eq!(default, exe_folder.join("BongoIPTVPlayer.ini"));
 }
 
 #[test]

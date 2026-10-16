@@ -9,7 +9,7 @@ pub struct Storage {
 }
 
 impl Storage {
-    /// Standard location: %APPDATA%\BongoPlayer\config\ on Windows. The
+    /// Standard location: %APPDATA%\BongoIPTVPlayer\config\ on Windows. The
     /// `BONGO_CONFIG_DIR` environment variable points it elsewhere: the
     /// end-to-end tests use that so they never touch the user's own files.
     pub fn standard() -> anyhow::Result<Self> {

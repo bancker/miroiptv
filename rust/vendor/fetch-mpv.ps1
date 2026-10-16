@@ -21,7 +21,7 @@ if ((Test-Path $dll) -and (Test-Path $header)) {
 Write-Host "Querying GitHub for latest mpv-dev release..."
 $apiUrl = 'https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases'
 
-$headers = @{ 'User-Agent' = 'BongoPlayer-fetch-mpv'; 'Accept' = 'application/vnd.github+json' }
+$headers = @{ 'User-Agent' = 'BongoIPTVPlayer-fetch-mpv'; 'Accept' = 'application/vnd.github+json' }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $releases = Invoke-RestMethod -Uri $apiUrl -Headers $headers -ErrorAction Stop
 

@@ -1,9 +1,9 @@
-// Bongo Player: lightweight IPTV player on libmpv + egui
+// Bongo IPTV Player: lightweight IPTV player on libmpv + egui
 
 /// Product name as users see it: window title, --version, help overlay.
-pub const APP_NAME: &str = "Bongo Player";
+pub const APP_NAME: &str = "Bongo IPTV Player";
 /// Technical name: exe, ini, data folder, log file and User-Agent.
-pub const APP_ID: &str = "BongoPlayer";
+pub const APP_ID: &str = "BongoIPTVPlayer";
 /// This crate's tracing target (its crate name), for the default log filter.
 pub const LOG_TARGET: &str = module_path!();
 

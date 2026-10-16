@@ -1,10 +1,10 @@
-# Bongo Player manual validation checklist
+# Bongo IPTV Player manual validation checklist
 
 Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream portal.
 
 ## Setup
-- [ ] Extract `rust\dist\BongoPlayer-v*.zip` to a fresh folder
-- [ ] Double-click `run.bat`: the first start asks for the language and then for the portal (server, user, password); `BongoPlayer.ini` appears next to the exe
+- [ ] Extract `rust\dist\BongoIPTVPlayer-v*.zip` to a fresh folder
+- [ ] Double-click `run.bat`: the first start asks for the language and then for the portal (server, user, password); `BongoIPTVPlayer.ini` appears next to the exe
 
 ## Smoke
 - [ ] Window opens within 3 seconds
@@ -36,7 +36,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] First start (no `settings.json`): a language screen in three languages, the Windows language preselected; Enter picks it and the last channel then plays
 - [ ] `o` opens the settings; Up/Down choose a section, Enter opens it, Esc goes back; Esc or `o` in the list closes
 - [ ] Switch the language: every text changes at once (help, toasts, guide, settings)
-- [ ] Bronnen: Test with a wrong password → "Gebruiker of wachtwoord onjuist"; Save with the right one → "Verbonden: N zenders", or just "Verbonden" when the channel list is slow to arrive; `BongoPlayer.ini` then holds the line `portal=<user>:<password>@<server>:<port>`
+- [ ] Bronnen: Test with a wrong password → "Gebruiker of wachtwoord onjuist"; Save with the right one → "Verbonden: N zenders", or just "Verbonden" when the channel list is slow to arrive; `BongoIPTVPlayer.ini` then holds the line `portal=<user>:<password>@<server>:<port>`
 - [ ] Bronnen: a pasted server such as `http://host:8080/` (with a line break after it) connects like `host:8080`; a busy portal (HTTP 503 or 509) reads "Server niet bereikbaar", not "Geen geldige portal"
 - [ ] Started with `--xtream user:pass@host:port`: Settings → Bronnen shows a note under the fields that the portal comes from the command line and that what is saved there only counts without that option; after a Save the note is gone
 - [ ] Controls: reverse zapping → arrow up and wheel up go to the next channel; the help shows it
@@ -49,13 +49,13 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] A channel of the list with an `#EXTVLCOPT` User-Agent plays; a dead one says "streamfout op <naam>" and the app stays on it; `g` opens the channel list (see Zenderlijst)
 - [ ] Zap from a playing channel to a dead one: the picture goes black under the error toast, not the picture of the channel before it frozen under the new name; a channel that played and then dies keeps its own last frame
 - [ ] Back to the portal with Actief maken: the portal's favorites, presets and last channel are back; the guide works
-- [ ] An M3U address with a password (`https://user:pass@…`): nothing of it in the log (`%APPDATA%\BongoPlayer\config\log\`), only `source: m3u <id> (<host>)`
+- [ ] An M3U address with a password (`https://user:pass@…`): nothing of it in the log (`%APPDATA%\BongoIPTVPlayer\config\log\`), only `source: m3u <id> (<host>)`
 - [ ] A `http://…/get.php?username=…&password=…` link typed as an M3U address, then Opslaan: the question offers an Xtream source; "Als Xtream-bron" fills Server, User and Password. The same link with `https://` stays an M3U list, with no question
 - [ ] A list in a file (`C:\…\lijst.m3u`) loads; remove the file and start again: the empty state says "zenderlijst ophalen mislukt" with its path
 - [ ] A video file (over 128 MB, or any with a NUL byte in its first KB) saved as an M3U address: "dit is geen zenderlijst", at once; the next start is as quick as ever
 - [ ] Verwijderen is disabled for the source in use; for another source it is one button that needs a second press (the first turns it into "Echt verwijderen (met favorieten)?") and takes that source's favorites, presets, last channel and saved list along
 - [ ] First start without any source: the setup prompt's last line is a link to Bronnen with a new M3U list ready; typing there types, it fires no hotkey. With a 0.6.1 `favorites.json` in the config folder, a list saved there is source 2 (`source=2;m3u;…` in the ini) and shows none of those favorites
-- [ ] Downgrade check: with a portal and an M3U list saved, BongoPlayer 0.6.1 still starts on the portal
+- [ ] Downgrade check: with a portal and an M3U list saved, `BongoIPTVPlayer.ini` copied as `BongoPlayer.ini` next to BongoPlayer 0.6.1: it still starts on the portal
 
 ## Zenderlijst (M3U, g)
 - [ ] On an M3U source `g` opens the channel list on the left and the picture of what plays on the right, whole and in proportion, as high as the list; it keeps playing, and Esc gives it the whole window again: groups on the left (Alle zenders, Favorieten when the source has favorites in the list, the list's groups A–Z, Zonder groep when a channel has none, Defecte zenders when channels are marked), each with its count; the group's channels A–Z on the right ("Sport 2" before "Sport 10"); "Één" sorts among the E's, not after Z; a ▶ on the channel that plays; long names end in "…"; the keys at the bottom, in two rows at most, broken between two keys
@@ -66,7 +66,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] While the list is open no "[TV] …" toast shows, but "streamfout op …" does; f, o, ?, n and * do nothing
 - [ ] After closing, Up/Down zap on from the channel that plays, in the M3U file's order
 - [ ] On an Xtream portal `g` is still the guide (see Guide (g))
-- [ ] A dead channel, then within 2 minutes one that plays from another server: after the check of its address (up to 5 s) the dead one shows in "Defecte zenders" with how long ago it failed, zapping skips it, `f` shows it with "defect", and Shift+F does too when it is a favorite; the log says `m3u: <naam> (stream_id <id>) failed before its first picture` and `… marked defect (http 404)` (or another status of 400 or more except the busy 429, 503 and 509, which mark nothing; or `connect failed`, `timeout`), never an address; `bad_streams-<id>.json` (or `bad_streams.json` for a list that is source 1) in `%APPDATA%\BongoPlayer\config\` holds its id and time, no name and no address
+- [ ] A dead channel, then within 2 minutes one that plays from another server: after the check of its address (up to 5 s) the dead one shows in "Defecte zenders" with how long ago it failed, zapping skips it, `f` shows it with "defect", and Shift+F does too when it is a favorite; the log says `m3u: <naam> (stream_id <id>) failed before its first picture` and `… marked defect (http 404)` (or another status of 400 or more except the busy 429, 503 and 509, which mark nothing; or `connect failed`, `timeout`), never an address; `bad_streams-<id>.json` (or `bad_streams.json` for a list that is source 1) in `%APPDATA%\BongoIPTVPlayer\config\` holds its id and time, no name and no address
 - [ ] A dead channel, then within 2 minutes one that plays from the same server (a paid list: one account for every channel): the dead one is not marked and its server is not asked; the log says `… not checked (the server of what plays), not marked`
 - [ ] A dead channel whose server answers the check busy (429, 503 or 509), then within 2 minutes one that plays from another server: the dead one is not marked; the log says `… not checked (busy, http 503), not marked` (with its own status)
 - [ ] Pull the network cable, zap through a few channels (they fail), wait more than 2 minutes, plug it back and zap: nothing is marked
@@ -90,7 +90,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] Saving another portal (Settings → Bronnen) while adult content plays stops playback
 - [ ] In the PIN dialogs Enter moves to the next field and Esc cancels the open dialog first
 - [ ] After 3 wrong PINs and Forgot PIN the 30 s wait is gone (a new PIN can be chosen at once)
-- [ ] A bare adult stream URL on the command line (`BongoPlayer.exe <url>`) → the next plain start does not resume it
+- [ ] A bare adult stream URL on the command line (`BongoIPTVPlayer.exe <url>`) → the next plain start does not resume it
 
 ## News rules
 - [ ] Settings → News lists the 7 default rules, each with "gevonden: …" or "niet gevonden"
@@ -124,7 +124,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] `/` (or a click) puts the keyboard in the filter box; n, p and g typed there switch nothing; a channel name or a programme title filters; Esc leaves the box, Esc again clears the filter; a filter without matches says "niets gevonden"
 - [ ] `f` in the guide opens the search over it (Shift+F does nothing there); Esc returns to the guide as it was; a film or channel pick plays and closes the guide; a series pick shows the toast and leaves the guide open
 - [ ] Enter on now plays live; on a past programme the wait screen shows, then the programme from its start; Esc on the wait screen goes back to the guide; a programme still to come says when it starts; one too old is dimmed and says "niet terug te kijken"
-- [ ] Close the app with the guide loaded: the next start opens the guide complete at once (`%APPDATA%\BongoPlayer\config\cache\epg-<host>_<port>.json`)
+- [ ] Close the app with the guide loaded: the next start opens the guide complete at once (`%APPDATA%\BongoIPTVPlayer\config\cache\epg-<host>_<port>.json`)
 - [ ] Locked: no adult columns; unlocked: they show; lock, then `g`: they are gone
 - [ ] After F5 (catalog reload) the guide shows the new channel list without a restart
 
@@ -164,10 +164,10 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] CPU stays < 10% (Task Manager check)
 - [ ] Memory steady (no growth over 100 MB after 30 min)
 
-## Upgrade from tvplayer
-- [ ] With old data in `%APPDATA%\tvplayer\config` and no `%APPDATA%\BongoPlayer`: first start → Shift+F shows the old favorites, resume/presets work
-- [ ] `tvplayer.ini` next to `BongoPlayer.exe` → renamed to `BongoPlayer.ini`, portal connects without the setup prompt
-- [ ] Log (`%APPDATA%\BongoPlayer\config\log\BongoPlayer.log.*`) says "migrated N files from the tvplayer config dir"
+## Upgrade from Bongo Player or tvplayer
+- [ ] With Bongo Player's data in `%APPDATA%\BongoPlayer\config` and no `%APPDATA%\BongoIPTVPlayer`: first start → Shift+F shows the old favorites, resume and presets work, an M3U list shows at once (its saved copy came along); the log (`%APPDATA%\BongoIPTVPlayer\config\log\BongoIPTVPlayer.log.*`) says "migrated N files from the BongoPlayer config dir"; `%APPDATA%\BongoPlayer` is still there
+- [ ] `BongoPlayer.ini` next to `BongoIPTVPlayer.exe` → moved to `BongoIPTVPlayer.ini` (the log: "renamed BongoPlayer.ini to …"), every source is there, no setup prompt
+- [ ] With only tvplayer's data (`%APPDATA%\tvplayer\config`, `tvplayer.ini`): the same, and the log says "migrated N files from the tvplayer config dir"
 
 ## Crash safety
 - [ ] Bad Xtream cred (`--xtream nope:bad@127.0.0.1:1`) → boots to black window with error toasts, NOT a crash

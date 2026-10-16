@@ -79,9 +79,9 @@ async fn fetch_epg_returns_parsed_entries() {
 }
 
 #[tokio::test]
-async fn portal_requests_identify_as_bongo_player() {
+async fn portal_requests_identify_as_bongo_iptv_player() {
     let server = MockServer::start().await;
-    let ua = format!("BongoPlayer/{}", env!("CARGO_PKG_VERSION"));
+    let ua = format!("BongoIPTVPlayer/{}", env!("CARGO_PKG_VERSION"));
     Mock::given(method("GET"))
         .and(path("/player_api.php"))
         .and(wiremock::matchers::header("user-agent", ua.as_str()))

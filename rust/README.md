@@ -1,4 +1,4 @@
-# Bongo Player
+# Bongo IPTV Player
 
 The Rust rewrite of [miroiptv](../c/) (formerly `tvplayer`): a clean
 rebuild of the same IPTV player on libmpv + egui/eframe (wgpu) + tokio.
@@ -16,14 +16,14 @@ Run from this folder (`rust/`):
 ```powershell
 .\vendor\fetch-mpv.ps1           # one-time: vendor libmpv-2.dll + headers
 cargo test                       # unit + integration tests
-cargo build --release            # -> target\release\BongoPlayer.exe
-.\target\release\BongoPlayer.exe --selftest
+cargo build --release            # -> target\release\BongoIPTVPlayer.exe
+.\target\release\BongoIPTVPlayer.exe --selftest
 ```
 
 ## Portable zip
 
 ```powershell
-.\build-zip.ps1                  # -> dist\BongoPlayer-vX.Y.Z.zip
+.\build-zip.ps1                  # -> dist\BongoIPTVPlayer-vX.Y.Z.zip
 .\verify.ps1                     # smoke-test the zip
 ```
 
@@ -33,7 +33,7 @@ extraction.
 
 ## Where the app keeps its data
 
-- Sources: `BongoPlayer.ini` next to the exe holds every source, Xtream portals
+- Sources: `BongoIPTVPlayer.ini` next to the exe holds every source, Xtream portals
   and M3U lists (a URL or a file), and which one is in use. The first-start
   prompt writes the first portal; Settings (`o`, Bronnen) adds, changes,
   deletes and switches sources. The 0.6.1 line `portal=…` stays, so an older
@@ -54,11 +54,13 @@ extraction.
   address finds it dead too, and that check never asks the server of the
   channel that plays: on a paid list one account serves every channel, and its
   portal allows one session.
-- Preferences: `settings.json` in `%APPDATA%\BongoPlayer\config\`. It holds the
+- Preferences: `settings.json` in `%APPDATA%\BongoIPTVPlayer\config\`. It holds the
   language, reversed zapping, the adult-content PIN (a salted hash, never the
   PIN) and the news rules; a file that is missing or broken gives the defaults.
-- Favorites, resume points, presets and logs: `%APPDATA%\BongoPlayer\config\`.
+- Favorites, resume points, presets and logs: `%APPDATA%\BongoIPTVPlayer\config\`.
 
-On the first start after the rename, data from the old `tvplayer`
-locations (`%APPDATA%\tvplayer\config\`, `tvplayer.ini`) is carried over
-automatically; the old config folder stays as a backup.
+On the first start after a rename, the data of the newest earlier name is
+carried over automatically: Bongo Player's (`%APPDATA%\BongoPlayer\config\`, with
+its saved lists, and `BongoPlayer.ini`), else tvplayer's (`%APPDATA%\tvplayer\config\`,
+`tvplayer.ini`). The old config folder stays as a backup; the ini is moved, so
+there is one.

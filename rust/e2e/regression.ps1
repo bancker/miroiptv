@@ -126,7 +126,7 @@ function Scn([string]$Id, [hashtable]$P, [scriptblock]$Check = $null, [scriptblo
             # keep the app's own log of a failed attempt: a re-run in the same folder clears it
             $m = [regex]::Match($r.Out, 'config folder: (.+?)\s*(\r?\n|$)')
             if ($m.Success) {
-                $log = Get-ChildItem (Join-Path $m.Groups[1].Value 'log') -Filter 'BongoPlayer.log.*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                $log = Get-ChildItem (Join-Path $m.Groups[1].Value 'log') -Filter 'Bongo*Player.log.*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
                 if ($log) { Copy-Item $log.FullName (Join-Path $Results "$Id.attempt$attempts.applog.txt") -Force }
             }
             # and what the mock portal saw (its request log is rewritten by the next run)
@@ -283,7 +283,7 @@ function Group-N {
     Scn 'N-H1' @{ MockEnv = $A; Settings = $S; Resume = 2; Keys = 'o;DOWN;DOWN;DOWN;ENTER;ENTER;TEXT:0000;ENTER;SLEEP:400;TEXT:1234;ENTER;SLEEP:500;ESC;ESC'; Expect = 'adult: wrong PIN', 'adult: unlocked' }
     Scn 'N-H2' @{ MockEnv = $A; Settings = $S; Resume = 2; Keys = 'o;DOWN;DOWN;DOWN;ENTER;ENTER;TEXT:12;ENTER;SLEEP:300;TEXT:1234;ENTER;SLEEP:500;ESC;ESC'; Expect = 'adult: unlocked'; Forbid = 'adult: wrong PIN' }
     # J: the log says the portal comes from --xtream (the Portal settings show their note then); not so for the ini.
-    Scn 'N-J1' @{ Resume = 3; Expect = 'portal: from --xtream, which beats BongoPlayer.ini on every start' }
+    Scn 'N-J1' @{ Resume = 3; Expect = 'portal: from --xtream, which beats BongoIPTVPlayer.ini on every start' }
     $dJ = Fresh 'ini-portal'; New-Item -ItemType Directory $dJ | Out-Null
     [IO.File]::WriteAllText((Join-Path $dJ 'BongoPlayer.ini'), "portal=tester:secret@127.0.0.1:18080`n")
     Scn 'N-J2' @{ NoPortal = $true; ConfigDir = $dJ; Seconds = 8; Expect = 'portal: xtream <user>@127.0.0.1:18080'; Forbid = 'portal: from --xtream' }

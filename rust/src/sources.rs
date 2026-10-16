@@ -1,5 +1,5 @@
 //! The sources the app can play from, Xtream portals and M3U lists, as
-//! `BongoPlayer.ini` keeps them, and which one is in use.
+//! `BongoIPTVPlayer.ini` keeps them, and which one is in use.
 //!
 //! The ini of 0.6.1 holds one line, `portal=user:pass@host:port`. It stays, as
 //! the first Xtream source's address, so a downgrade still starts on the

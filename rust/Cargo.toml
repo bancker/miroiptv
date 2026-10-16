@@ -9,9 +9,9 @@ license = "MIT"
 name = "bongo_player"
 path = "src/lib.rs"
 
-# Bin name = exe name: BongoPlayer.exe.
+# Bin name = exe name: BongoIPTVPlayer.exe.
 [[bin]]
-name = "BongoPlayer"
+name = "BongoIPTVPlayer"
 path = "src/main.rs"
 
 [dependencies]

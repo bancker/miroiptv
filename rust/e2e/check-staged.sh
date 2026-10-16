@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Fails when the staged diff holds a credential from BongoPlayer.ini next to the
+# Fails when the staged diff holds a credential from the ini next to the
 # release exe: the user and password of every Xtream portal in it, and of every
 # M3U address the user, password and token in it. A public M3U address is no
 # secret. Prints counts only, never a value. Run before a commit.
-# BONGO_CHECK_INI points it at another ini (test-check-staged.sh does).
-INI="${BONGO_CHECK_INI:-$(dirname "$0")/../target/release/BongoPlayer.ini}"
+# The ini is BongoIPTVPlayer.ini, or BongoPlayer.ini until the renamed app has
+# started there once and moved it. BONGO_CHECK_INI points it at another ini
+# (test-check-staged.sh does).
+REL="$(dirname "$0")/../target/release"
+INI="${BONGO_CHECK_INI:-$REL/BongoIPTVPlayer.ini}"
+[ -n "$BONGO_CHECK_INI" ] || [ -f "$INI" ] || INI="$REL/BongoPlayer.ini"
 [ -f "$INI" ] || { echo "no $INI - nothing to check against"; exit 0; }
 users=(); passes=(); tokens=()
 # trim <variable>: the variable without the spaces around its value (the app

@@ -1,4 +1,4 @@
-"""Mock Xtream portal for Bongo Player end-to-end tests.
+"""Mock Xtream portal for Bongo IPTV Player end-to-end tests.
 
     py -3 mock_portal.py PORT SEGDIR LOGFILE [MODE]
 

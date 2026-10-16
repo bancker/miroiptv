@@ -136,7 +136,7 @@ texts! {
     DefaultPortalName => ["Portaal", "Portal", "Portal"],
     DefaultListName => ["M3U-lijst", "M3U list", "M3U-Liste"],
     PortalSetupTitle => ["Portal instellen", "Set up your portal", "Portal einrichten"],
-    PortalSetupIntro => ["Vul je Xtream-gegevens in. Ze worden opgeslagen in BongoPlayer.ini naast de app.", "Enter your Xtream details. They are saved in BongoPlayer.ini next to the app.", "Gib deine Xtream-Daten ein. Sie werden in BongoPlayer.ini neben der App gespeichert."],
+    PortalSetupIntro => ["Vul je Xtream-gegevens in. Ze worden opgeslagen in BongoIPTVPlayer.ini naast de app.", "Enter your Xtream details. They are saved in BongoIPTVPlayer.ini next to the app.", "Gib deine Xtream-Daten ein. Sie werden in BongoIPTVPlayer.ini neben der App gespeichert."],
     ServerLabel => ["Server (host:poort)", "Server (host:port)", "Server (Host:Port)"],
     UserLabel => ["Gebruiker", "Username", "Benutzer"],
     UserHint => ["naam", "name", "Name"],
