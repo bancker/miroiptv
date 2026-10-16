@@ -49,6 +49,12 @@ Environment:
                      /m3uplay/ request that carries a Referer header answers 400: a
                      referrer that leaked from an earlier load. (M3U DOOD and
                      /m3uplay/none/... are not playable: they answer 404 first.)
+                     M3U DOOD's address is under localhost, every other one under
+                     127.0.0.1: the check before a defect mark never asks the server of
+                     the stream that plays, and localhost is another server by its host
+                     that still reaches this mock. The mock listens on 127.0.0.1 only;
+                     Windows resolves localhost to ::1 and then 127.0.0.1, and the ::1
+                     attempt is refused, so mpv and the check go on to 127.0.0.1.
   MOCK_M3U_BIG=N     /m3u/big.m3u: N channels "GROOT nnnnn" in iptv-org's form (logos, groups,
                      an x-tvg-url); the first 18 play like M3U 01..18 (the startup measurement)
 """
@@ -210,7 +216,8 @@ def m3u_list():
                   f"http://127.0.0.1:{PORT}/m3uplay/{k}.m3u8"]
     lines += ['#EXTINF:-1 group-title="Test",M3U UA', f"#EXTVLCOPT:http-user-agent={M3U_UA}",
               f"http://127.0.0.1:{PORT}/m3uplay/ua.m3u8"]
-    lines += ['#EXTINF:-1 group-title="Test",M3U DOOD', f"http://127.0.0.1:{PORT}/m3uplay/dead.m3u8"]
+    # Under localhost, every other channel under 127.0.0.1: see MOCK_M3U above.
+    lines += ['#EXTINF:-1 group-title="Test",M3U DOOD', f"http://localhost:{PORT}/m3uplay/dead.m3u8"]
     # Last, so that no earlier channel moves.
     lines += ['#EXTINF:-1 group-title="Test",M3U REF', f"#EXTVLCOPT:http-referrer={M3U_REF}",
               f"http://127.0.0.1:{PORT}/m3uplay/ref.m3u8"]

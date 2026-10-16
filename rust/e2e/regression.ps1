@@ -17,7 +17,7 @@ Groups
   N  new scenarios for the fixes (A, C, D, F, G, H, J, L, M)
   X  the other extras of the Task 12-17 reports that run through run-scenario.ps1 alone
   G  the guide of 0.6.0 part 2 (MOCK_GUIDE)
-  M  M3U sources (MOCK_M3U)
+  M  M3U sources and the channel list (MOCK_M3U)
 
 Everything goes through rust\e2e\run-scenario.ps1 (mock portal, isolated config folder). No mouse, no
 SendInput: keys are posted to the app's window by the harness. The script refuses to start while a key
@@ -325,6 +325,10 @@ function Group-G {
     # Ten columns, EPG fetched, logos: PNG ready, the GIF of channel 9 (second page) is none.
     Scn 'G-open' @{ MockEnv = $G; ConfigDir = (Fresh 'g-open'); Resume = 3; Seconds = 22; Keys = 'g;SLEEP:2500;PGDN;SLEEP:2000'; Expect = 'guide: opened \(10 channels\)', 'epg: day table for sid=801', 'logo: 127\.0\.0\.1:18080 ready', 'logo: 127\.0\.0\.1:18080 is no PNG' }
     Scn 'G-live' @{ MockEnv = $G; Resume = 3; Seconds = 22; Keys = 'g;SLEEP:3000;ENTER'; Expect = 'guide: \[LIVE\] NL \| GIDS 1 \|', 'guide: closed' }
+    # E8: g opens the guide on the column of the channel that plays (GIDS 5 resumed), so ENTER plays GIDS 5, not GIDS 1.
+    Scn 'G-centre' @{ MockEnv = $G; Resume = 705; Seconds = 22; Keys = 'g;SLEEP:3000;ENTER'; Expect = 'guide: \[LIVE\] NL \| GIDS 5 \|'; Forbid = 'guide: \[LIVE\] NL \| GIDS [1-46-9] \|', 'toast: .* heeft geen gids' }
+    # E8: a channel without a guide column: the guide opens where it was, with a toast that names the channel.
+    Scn 'G-noguide' @{ MockEnv = $G; Resume = 3; Seconds = 14; Keys = 'g;SLEEP:2500'; Expect = 'toast: TEST 03 heeft geen gids', 'guide: opened' }
     # G-catchup and G-wait-esc step UP from the programme on now: run them after 01:00 (as GUIDE-catchup), when
     # that programme is not the first of today's guide day.
     Scn 'G-catchup' @{ MockEnv = $G; Resume = 3; Seconds = 26; Keys = 'g;SLEEP:3000;UP;ENTER'; Expect = 'guide: \[CATCHUP\] NL \| GIDS 1 \|', 'catch-up: waiting for the first frame', 'relay: catch-up playlist in', 'catch-up: first frame' }
@@ -352,13 +356,14 @@ function Group-G {
 
 # ---- M: M3U sources ----------------------------------------------------------------------------
 # Each scenario starts with -NoPortal and an ini in its own config folder that names the sources; the mock's list
-# (MOCK_M3U) has 21 channels. M-zap, M-add, M-switch and M-getphp change what is in their folder, so each has a -Before:
-# every attempt, the second one too, makes the folder anew with its first ini. M-restart has none: it goes on from the
-# folder that M-zap's last attempt left. M-add, M-switch and M-getphp press the keys that settings_ui's and app's
-# keyboard tests press (the Bronnen pane's Tab order, pinned there). The SLEEPs after M-add's Save and after a Use are
-# margin, the tests need none. M-getphp's first SLEEP:300, after the Save that opens the question, is needed: its test
-# has a quiet frame there (a_get_php_link_by_keyboard_becomes_an_xtream_source_to_save). An Xtream Save gets a long
-# SLEEP, because its answer comes whenever the mock's login is over and a Tab in that frame is lost.
+# (MOCK_M3U) has 21 channels. M-zap, M-add, M-switch, M-getphp, M-list and M-defect change what is in their
+# folder, so each has a -Before: every attempt, the second one too, makes the folder anew with its first ini.
+# M-restart has none: it goes on from the folder that M-zap's last attempt left. M-add, M-switch and M-getphp
+# press the keys that settings_ui's and app's keyboard tests press (the Bronnen pane's Tab order, pinned there).
+# The SLEEPs after M-add's Save and after a Use are margin, the tests need none. M-getphp's first SLEEP:300, after
+# the Save that opens the question, is needed: its test has a quiet frame there
+# (a_get_php_link_by_keyboard_becomes_an_xtream_source_to_save). An Xtream Save gets a long SLEEP, because its
+# answer comes whenever the mock's login is over and a Tab in that frame is lost.
 function Group-M {
     'M: M3U sources (MOCK_M3U)'
     $M = @{ MOCK_M3U = '1' }
@@ -391,8 +396,19 @@ function Group-M {
     Scn 'M-ref' @{ MockEnv = $M; NoPortal = $true; ConfigDir = (IniDir 'm-ref' $onlyList); Seconds = 20; Keys = 'SLEEP:1500;f;SLEEP:400;TEXT:m3u ref;SLEEP:800;ENTER;SLEEP:3000;f;SLEEP:400;TEXT:m3u 01;SLEEP:800;ENTER;SLEEP:3000'; Expect = 'loadfile http://127\.0\.0\.1:18080/m3uplay/ref\.m3u8 \(referrer\)', 'zap: -> M3U 01', 'loadfile http://127\.0\.0\.1:18080/m3uplay/1\.m3u8'; Forbid = 'end-file \(reason=error\)', 'loadfile http://127\.0\.0\.1:18080/m3uplay/1\.m3u8 \(' }
     # A dead channel: the error names it, and the app stays on it.
     Scn 'M-dead' @{ MockEnv = $M; NoPortal = $true; ConfigDir = (IniDir 'm-dead' $onlyList); Seconds = 16; Keys = 'SLEEP:1500;f;SLEEP:400;TEXT:m3u dood;SLEEP:800;ENTER;SLEEP:4000'; Expect = 'zap: -> M3U DOOD', 'toast: streamfout op M3U DOOD'; Forbid = 'zap: -> M3U [01]' }
-    # No guide for an M3U source.
-    Scn 'M-guide' @{ MockEnv = $M; NoPortal = $true; ConfigDir = (IniDir 'm-guide' $onlyList); Seconds = 10; Keys = 'SLEEP:1500;g'; Expect = 'toast: voor deze bron is er nog geen gids'; Forbid = 'guide: opened' }
+    # A dead channel, then one that plays: the dead one is confirmed, the check finds its address 404 too, and it is
+    # marked (bad_streams.json holds its id and time); zapping skips it. In the mock's file order M3U DOOD lies
+    # between M3U UA and M3U REF, so DOWN from UA lands on REF. DOOD is under localhost and UA under 127.0.0.1: two
+    # servers, so the check asks DOOD's address (it never asks the server of what plays).
+    $dd = IniDir 'm-defect' $onlyList
+    Scn 'M-defect' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $dd; Seconds = 26; Keys = 'SLEEP:1500;f;SLEEP:400;TEXT:m3u dood;SLEEP:800;ENTER;SLEEP:4000;f;SLEEP:400;TEXT:m3u ua;SLEEP:800;ENTER;SLEEP:4000;DOWN;SLEEP:3000'; Expect = 'm3u: M3U DOOD \(stream_id \d+\) failed before its first picture', 'm3u: M3U DOOD \(stream_id \d+\) marked defect \(http 404\)', 'zap: -> M3U REF \(stream_id=\d+, idx=Some\(19\), prev=Some\("M3U UA"\)\)'; Forbid = 'zap: -> M3U DOOD \(stream_id=\d+, idx=[^,]*, prev=Some\("M3U UA"\)\)' } {
+        (Get-Content -Raw (Join-Path $dd 'bad_streams.json')) -match '^\{"version":1,"marks":\{"\d+":\d+\}\}$'
+    } -Before { $null = IniDir 'm-defect' $onlyList }
+    # g on an M3U source: the channel list, A-Z (M3U 01 first). DOWN starts M3U 02 at once, with no zap toast while
+    # the list is open; ENTER closes it, and M3U 02 plays on. Its last channel would be resumed on a re-run, so its
+    # -Before makes the folder anew.
+    $dl = IniDir 'm-list' $onlyList
+    Scn 'M-list' @{ MockEnv = $M; NoPortal = $true; ConfigDir = $dl; Seconds = 14; Keys = 'SLEEP:1500;g;SLEEP:800;DOWN;SLEEP:2500;ENTER;SLEEP:1500'; Expect = 'channel list: opened \(21 channels, 2 groups\)', 'zap: -> M3U 02', 'loadfile http://127\.0\.0\.1:18080/m3uplay/2\.m3u8', 'channel list: closed'; Forbid = 'toast: \[TV\] M3U 02', 'guide: opened', 'zap: -> M3U (0[13-9]|1\d|UA|DOOD|REF)' } -Before { $null = IniDir 'm-list' $onlyList }
     # Added in the settings next to the saved portal, then put in use: the keys of settings_ui's
     # an_m3u_list_is_added_by_keyboard and app's an_m3u_list_is_added_and_used_by_keyboard_alone.
     $da = IniDir 'm-add' $portal

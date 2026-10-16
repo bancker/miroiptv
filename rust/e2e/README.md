@@ -22,7 +22,8 @@ end, as the real portal sends it; channel 2 sends no `has_archive`.
 `MOCK_M3U=1` adds an M3U list of 21 channels at `/m3u/list.m3u`. Its channels
 "M3U 01".."M3U 18" play `/m3uplay/k.m3u8`, a live playlist on the test segments.
 "M3U UA" plays only with the User-Agent `BongoTest/1.0`, which the list's
-`#EXTVLCOPT` names. "M3U DOOD" answers 404. "M3U REF", the last, plays only with
+`#EXTVLCOPT` names. "M3U DOOD" answers 404; its address is under `localhost`, every
+other one under `127.0.0.1` (see `M-defect`). "M3U REF", the last, plays only with
 the Referer `http://ref.test/`, which its `#EXTVLCOPT` names; any other playable
 `/m3uplay/` request that carries a `Referer` answers 400, a referrer that leaked
 from an earlier load (scenario `M-ref`); "M3U DOOD" and `/m3uplay/none/...` answer
@@ -68,15 +69,22 @@ and the values of `username`, `user`, `password`, `pass` and `token`. Values und
 
 `regression.ps1` runs the keyboard-only scenarios of 0.6.0 through `run-scenario.ps1`: groups `R`,
 `B`, `C`, `N` and `X` are part 1's, group `G` is the guide of part 2 (against `MOCK_GUIDE=1`), group
-`M` the M3U sources (against `MOCK_M3U=1`). The default `-Group` is `R,B,C,N`, so `X`, `G` and `M`
-have to be named: `-Group R,B,C,N,X,G,M` is everything. A full run opens the app's window about 110
-times (once per scenario, more for re-runs), so start it when nobody minds windows coming and going.
-`M-restart` goes on in the config folder `M-zap` left (the saved list, the last channel): run the two
-together. `M-zap`, `M-add`, `M-switch` and `M-getphp` change what is in their folder, so each has a
-`-Before` (`Scn`'s optional fourth argument) that runs before every attempt, the second one too, and
-makes the folder anew with its first ini: a re-run starts where the first attempt did. `M-restart`
-has none; it starts from what `M-zap`'s last attempt left. `M-add` and `M-getphp` type a lot (35 and
-62 characters that matter), so one doubled character fails them now and then: run a failed one once
+`M` the M3U sources (against `MOCK_M3U=1`). `G-centre` resumes GIDS 5 and checks that `g` opens the
+guide on its column; `G-noguide` resumes TEST 03, which has no column, and checks the toast that
+names it. The default `-Group` is `R,B,C,N`, so `X`, `G` and `M` have to be named:
+`-Group R,B,C,N,X,G,M` is everything. A full run opens the app's window about 110 times (once per
+scenario, more for re-runs), so start it when nobody minds windows coming and going. `M-restart`
+goes on in the config folder `M-zap` left (the saved list, the last channel): run the two together.
+`M-list` opens the channel list with `g` and starts M3U 02 from it. `M-defect` makes M3U DOOD fail,
+plays M3U UA (which confirms DOOD; DOOD is under `localhost` and UA under `127.0.0.1`, two servers,
+so the check before the mark asks DOOD's address, finds `/m3uplay/dead.m3u8` 404 and marks it) and
+zaps down past DOOD to M3U REF; its check reads `bad_streams.json` in its folder, and its `-Before`
+makes the folder anew for a re-run, as the marks change it. `M-zap`, `M-add`, `M-switch`,
+`M-getphp`, `M-list` and `M-defect` change what is in their folder, so each has a `-Before` (`Scn`'s
+optional fourth argument) that runs before every attempt, the second one too, and makes the folder
+anew with its first ini: a re-run starts where the first attempt did. `M-restart` has none; it
+starts from what `M-zap`'s last attempt left. `M-add` and `M-getphp` type a lot (35 and 62
+characters that matter), so one doubled character fails them now and then: run a failed one once
 more by hand before suspecting the app.
 
 `-Group` picks groups, `-Only` scenario ids (wildcards), `-DryRun` prints the commands, `-Summary`
