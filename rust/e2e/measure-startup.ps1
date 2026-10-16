@@ -22,11 +22,19 @@
 # /edge/ before its first frame; its own playlist, /m3uplay/, costs 0.05 s. So it
 # starts about 0.4 s ahead for that reason alone: report both numbers as they
 # come, and read the -M3u comparison with that in mind.
+#
+# -VodBig serves both exes a film and series catalog of Pandora's size
+# (MOCK_VOD_BIG: 47,188 films, 10,589 series and their categories), so the new
+# exe builds its title index at every start, as on the real portal. Its config
+# folder is kept between its runs, as -M3u keeps it (and emptied before the
+# first), so from the second run on it also reads its index cache after the
+# first frame and writes it anew; the baseline's is fresh every run.
 param(
     [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\BongoIPTVPlayer.exe'),
     [int]$Runs = 10,
     [string]$Baseline = '',
-    [switch]$M3u
+    [switch]$M3u,
+    [switch]$VodBig
 )
 . (Join-Path $PSScriptRoot 'held-keys.ps1')
 Assert-KeysUp
@@ -37,7 +45,8 @@ function Secs($line) {
     if ($line -match 'T(\d\d):(\d\d):(\d\d\.\d+)Z') { [int]$Matches[1] * 3600 + [int]$Matches[2] * 60 + [double]$Matches[3] }
 }
 # One run of the exe; the seconds from "starting" to the first picture, or nothing.
-function Measure-Run([string]$ExePath, [bool]$AsM3u) {
+# $Keep: in the -VodBig folder that is kept between runs.
+function Measure-Run([string]$ExePath, [bool]$AsM3u, [bool]$Keep) {
     $common = @{ Exe = $ExePath; Seconds = 8; MpvVerbose = $true; Settings = '{"language":"nl"}' }
     if ($AsM3u) {
         $dir = Join-Path $env:TEMP 'bongo-measure-m3u'
@@ -47,7 +56,11 @@ function Measure-Run([string]$ExePath, [bool]$AsM3u) {
             -ResumeUrl 'http://127.0.0.1:18080/m3uplay/3.m3u8' `
             -MockEnv @{ MOCK_LATENCY = '1'; MOCK_M3U = '1'; MOCK_M3U_BIG = '11000' }
     } else {
-        $out = & (Join-Path $PSScriptRoot 'run-scenario.ps1') @common -Resume 3 -MockEnv @{ MOCK_LATENCY = '1' }
+        $mockEnv = @{ MOCK_LATENCY = '1' }
+        if ($VodBig) { $mockEnv.MOCK_VOD_BIG = '1' }
+        $kept = @{}
+        if ($Keep) { $kept.ConfigDir = $vodDir }
+        $out = & (Join-Path $PSScriptRoot 'run-scenario.ps1') @common @kept -Resume 3 -MockEnv $mockEnv
     }
     $dir = (($out | Select-String '^config folder: (.+)$').Matches[0].Groups[1].Value).Trim()
     $log = Get-ChildItem (Join-Path $dir 'log') -Filter 'Bongo*Player.log.*' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -65,18 +78,21 @@ function Summary([string]$label, $times) {
     '{0}median: {1} s (min {2}, max {3}) over {4} runs' -f $label, (Num $median), (Num $s[0]), (Num $s[$n - 1]), $n
 }
 
-$targets = @(@{ Label = ''; Exe = $Exe; M3u = [bool]$M3u; Times = @() })
+if ($M3u -and $VodBig) { throw '-M3u and -VodBig measure the new exe on different sources: run them apart' }
+$vodDir = Join-Path $env:TEMP 'bongo-measure-vod'
+if ($VodBig) { Remove-Item -Recurse -Force $vodDir -ErrorAction SilentlyContinue }
+$targets = @(@{ Label = ''; Exe = $Exe; M3u = [bool]$M3u; Keep = [bool]$VodBig; Times = @() })
 if ($Baseline) {
     if (-not (Test-Path $Baseline)) { throw "baseline exe not found: $Baseline" }
-    $targets = @(@{ Label = 'baseline'; Exe = $Baseline; M3u = $false; Times = @() },
-                 @{ Label = 'new'; Exe = $Exe; M3u = [bool]$M3u; Times = @() })
+    $targets = @(@{ Label = 'baseline'; Exe = $Baseline; M3u = $false; Keep = $false; Times = @() },
+                 @{ Label = 'new'; Exe = $Exe; M3u = [bool]$M3u; Keep = [bool]$VodBig; Times = @() })
 }
 $n = 0
 for ($i = 1; $i -le $Runs; $i++) {
     foreach ($t in $targets) {
         $n++
         $name = if ($t.Label) { "run $n ($($t.Label))" } else { "run $n" }
-        $secs = Measure-Run $t.Exe $t.M3u
+        $secs = Measure-Run $t.Exe $t.M3u $t.Keep
         if ($null -ne $secs) { $t.Times += $secs; '{0}: {1} s' -f $name, (Num $secs) }
         else { '{0}: no picture' -f $name }
     }

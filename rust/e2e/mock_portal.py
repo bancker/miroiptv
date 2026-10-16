@@ -57,6 +57,12 @@ Environment:
                      attempt is refused, so mpv and the check go on to 127.0.0.1.
   MOCK_M3U_BIG=N     /m3u/big.m3u: N channels "GROOT nnnnn" in iptv-org's form (logos, groups,
                      an x-tvg-url); the first 18 play like M3U 01..18 (the startup measurement)
+  MOCK_VOD_BIG=1     a film and series catalog of Pandora's size, as the portal sends it (every
+                     value a string): 47,188 films (one in ten another version of the one before),
+                     10,589 series, 200 film and 100 series categories. Made once (about half a
+                     second) and kept in the temp folder (bongo-mock-vod-big-1), so a mock that
+                     starts reads them before it answers. It takes the place of MOCK_ADULT's and
+                     MOCK_XXX's films (measure-startup.ps1 -VodBig)
 """
 import base64
 import datetime
@@ -65,6 +71,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -123,6 +130,95 @@ def vod_streams():
         films += [{"stream_id": 9003, "name": "xXx: State of the Union", "container_extension": "mp4",
                    "is_adult": "0"}]
     return films
+
+
+WORDS = ["the", "last", "night", "of", "dark", "matrix", "love", "story", "dead", "city", "secret",
+         "man", "woman", "king", "lost", "house", "blood", "river", "star", "war", "pokémon", "zomer",
+         "liefde", "nacht"]
+VOD_BIG_ACTIONS = ["get_vod_streams", "get_series", "get_vod_categories", "get_series_categories"]
+
+
+def mix(i):
+    """A number from i, the same on every run (as tests/test_vod_timing.rs has it)."""
+    m64 = (1 << 64) - 1
+    x = (i * 0x9E3779B97F4A7C15) & m64
+    x ^= x >> 29
+    return ((x * 0xBF58476D1CE4E5B9) & m64) >> 32
+
+
+def big_title(i):
+    t = " ".join(WORDS[mix(i * 7 + k) % len(WORDS)] for k in range(2 + mix(i) % 3))
+    return f"{t[:1].upper()}{t[1:]} {i % 997}"
+
+
+def big_cover(m):
+    # A cover for nine titles in ten; m comes from mix.
+    return f"https://image.tmdb.org/t/p/w600_and_h900_bestv2/{m:027x}.jpg" if m % 10 else ""
+
+
+def make_vod_big():
+    """MOCK_VOD_BIG's lists as JSON bytes, by action."""
+    films_n = 47188
+    prefixes = ["", "NL | ", "EN | ", "4K | "]
+    labels = ["", " 1080p", " 4K", " NL SUBS", " [NL]", " HD"]
+    films = []
+    for i in range(films_n):
+        base = i - 1 if i % 10 == 9 else i
+        m, mb = mix(i), mix(base)
+        r = m % 101
+        name = f"{prefixes[mb % 4]}{big_title(base)} ({1950 + mb % 77}){labels[mix(i + 3) % 6]}"
+        films.append({"num": i + 1, "name": name, "stream_type": "movie", "stream_id": str(100000 + i),
+                      "stream_icon": big_cover(m), "rating": f"{r / 10:.1f}", "rating_5based": r / 20,
+                      "added": str(1700000000 + m % 90000000), "is_adult": "1" if i % 97 == 0 else "0",
+                      "category_id": str(1 + m % 200), "container_extension": ("mkv", "mp4")[i % 2],
+                      "custom_sid": "", "direct_source": ""})
+    genres = ["Drama", "Comedy", "Crime, Drama", "Sci-Fi & Fantasy", "Kids", "Reality", ""]
+    series = []
+    for i in range(10589):
+        m = mix(i)
+        r = mix(i + 11) % 101
+        c = big_cover(mix(films_n + i))
+        series.append({"num": i + 1, "name": big_title(films_n + i), "series_id": 1 + i, "cover": c,
+                       "plot": "A family's secrets come out when a child goes missing in a small town.",
+                       "cast": "An Actor, Another Actor, A Third Actor", "director": "A Director",
+                       "genre": genres[m % 7], "releaseDate": f"{1990 + m % 36}-05-01",
+                       "last_modified": str(1700000000 + m % 90000000), "rating": f"{r / 10:.1f}",
+                       "rating_5based": r / 20, "backdrop_path": [c] if c else [], "youtube_trailer": "",
+                       "episode_run_time": "45", "category_id": str(1 + m % 100),
+                       "is_adult": "1" if i % 89 == 0 else "0"})
+    names = ["NL | Komedie", "EN | Action", "NL | Kids", "4K Films", "Nieuw", "EN | Drama", "Horror",
+             "Documentaire"]
+
+    def categories(n):
+        return [{"category_id": str(1 + i), "category_name": f"{names[i % 8]} {i}", "parent_id": 0}
+                for i in range(n)]
+
+    lists = [films, series, categories(200), categories(100)]
+    return {a: json.dumps(l, separators=(",", ":")).encode() for a, l in zip(VOD_BIG_ACTIONS, lists)}
+
+
+def vod_big():
+    """MOCK_VOD_BIG's lists, read from the temp folder; made and kept there the first
+    time, so no later start of the mock pays for them."""
+    folder = os.path.join(tempfile.gettempdir(), "bongo-mock-vod-big-1")
+    try:
+        lists = {}
+        for a in VOD_BIG_ACTIONS:
+            with open(os.path.join(folder, a + ".json"), "rb") as f:
+                lists[a] = f.read()
+        return lists
+    except OSError:
+        pass
+    lists = make_vod_big()
+    os.makedirs(folder, exist_ok=True)
+    for a, body in lists.items():
+        with open(os.path.join(folder, a + ".json.tmp"), "wb") as f:
+            f.write(body)
+        os.replace(os.path.join(folder, a + ".json.tmp"), os.path.join(folder, a + ".json"))
+    return lists
+
+
+VOD_BIG = vod_big() if ENV("MOCK_VOD_BIG") == "1" else {}
 
 
 def news_epg():
@@ -273,6 +369,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return self.reply(int(ENV("MOCK_LOGIN_STATUS")), b"busy")
                 ok = q.get("username") == "tester" and q.get("password") == "secret"
                 return self.json({"user_info": {"auth": 1 if ok else 0, "status": "Active"}, "server_info": {}})
+            if action in VOD_BIG:
+                return self.reply(200, VOD_BIG[action], "application/json")
             if action == "get_live_streams":
                 return self.json(live_streams())
             if action == "get_vod_streams":

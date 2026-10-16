@@ -28,7 +28,13 @@ the Referer `http://ref.test/`, which its `#EXTVLCOPT` names; any other playable
 `/m3uplay/` request that carries a `Referer` answers 400, a referrer that leaked
 from an earlier load (scenario `M-ref`); "M3U DOOD" and `/m3uplay/none/...` answer
 404 first. `MOCK_M3U_BIG=N` serves `/m3u/big.m3u`
-with N channels, for `measure-startup.ps1 -M3u`. An M3U scenario starts with
+with N channels, for `measure-startup.ps1 -M3u`. `MOCK_VOD_BIG=1` serves a film
+and series catalog of Pandora's size (47,188 films, 10,589 series, 200 and 100
+categories, every value a string as the portal sends it), for
+`measure-startup.ps1 -VodBig`: both exes load it at every start, and the new
+one keeps its config folder, so from the second run on it reads its index cache
+too. The mock makes the lists once and keeps them in the temp folder
+(`bongo-mock-vod-big-1`). An M3U scenario starts with
 `-NoPortal` and an ini in its config folder that names the list as a source.
 
 `run-scenario.ps1` and `measure-startup.ps1` refuse to start while Tab, Shift,
