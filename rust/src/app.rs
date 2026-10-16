@@ -3954,7 +3954,16 @@ impl TvApp {
 
                         let key = (self.search_query.clone(), self.catalog.is_loaded());
                         if self.search_hits_for.as_ref() != Some(&key) {
+                            let t0 = Instant::now();
                             self.search_hits = self.catalog.search(&self.search_query);
+                            // The baseline of the thuisbioscoop's search (spec
+                            // 2026-10-15 §5): what a keystroke costs, and
+                            // nothing of what was typed.
+                            tracing::info!(
+                                "search: {} results in {:.1} ms",
+                                self.search_hits.len(),
+                                t0.elapsed().as_secs_f64() * 1000.0
+                            );
                             self.search_hits_for = Some(key);
                             self.search_sel = 0;
                         }
@@ -6477,6 +6486,46 @@ https://c.example/twee-nieuws.m3u8\n";
             }],
         };
         Arc::new(CatalogStore::from_catalog(idle_portal(), catalog))
+    }
+
+    #[tokio::test]
+    async fn the_search_of_f_logs_what_each_keystroke_cost_and_nothing_that_was_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        let log = LogCapture::start();
+        h.frame_with(f_pressed());
+        h.type_text("zeb");
+        let text = log.text();
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("search: ")).collect();
+        assert_eq!(lines.len(), 4, "one for the empty box, one a key: {text}");
+        assert!(lines[3].contains("search: 2 results in "), "{}", lines[3]);
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.ends_with(" ms") && !l.contains("zeb")),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_search_line_comes_once_per_change_of_the_query_and_counts_what_that_query_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::start(dir.path(), library_catalog(), PortalState::Configured, None);
+        let log = LogCapture::start();
+        h.frame_with(f_pressed());
+        h.type_text("zebra f");
+        // Frames in which the query stays as it is search nothing and log nothing.
+        h.frame(&[]);
+        h.frame(&[]);
+        let text = log.text();
+        let counts: Vec<&str> = text
+            .lines()
+            .filter_map(|l| Some(l.split_once("search: ")?.1.split_once(" results in ")?.0))
+            .collect();
+        // The empty box finds nothing, "z" to "zebra " (with its space) the film
+        // and the series, "zebra f" the film alone.
+        assert_eq!(counts, ["0", "2", "2", "2", "2", "2", "2", "1"], "{text}");
+        assert!(!text.contains("zebra"), "{text}");
     }
 
     /// The press of `f` as a keyboard makes it: the key and its letter, together.
