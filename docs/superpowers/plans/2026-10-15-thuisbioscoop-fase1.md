@@ -4,7 +4,7 @@
 
 **Goal:** The data layer of the thuisbioscoop, with nothing new on screen but one log line per keystroke in `f`: the film and series lists' extra fields and the portal's categories; a compact title index (genres, labels, merged versions; search, filters with counts, four sorts, "meer zoals dit") built off the screen, handed out only behind the catalog's adult lock and kept between starts in a cache file; the watching store; the details and cover stores; the player's VOD load and its reports; and release timing tests with `f` as the baseline.
 
-**Architecture:** A new `rust/src/vod/` holds the data and draws nothing. `genres.rs` and `versions.rs` read names (genres, labels, years) and merge a film's versions; `index.rs` keeps every title in a 20-byte record, with its name, search name and cover in shared text tables, and answers a query with its counts in one pass; `cache.rs` writes it to a file per portal. The catalog's fetch task asks the two category lists beside the three lists and puts the catalog as soon as they are in, as before; then it builds the index on the blocking pool and puts it beside the catalog, so the channels wait for none of it. The index leaves the store only as `Titles`, which apply the lock. `watching.rs`, `details.rs` and `covers.rs` are stores that phase 2 wires to pages; here they are built and tested on their own. The portal gains the categories and the details through trait methods with defaults (an M3U list answers with nothing), and the player a VOD load whose reports run only while one plays.
+**Architecture:** A new `rust/src/vod/` holds the data and draws nothing. `genres.rs` and `versions.rs` read names (genres, labels, years) and merge a film's versions; `index.rs` keeps every title in a 20-byte record, with its name, search name and cover in shared text tables, and answers a query with its counts in one pass; `cache.rs` writes it to a file per portal. The catalog's fetch task asks the two category lists beside the three lists and puts the catalog as soon as the three lists are in, as before; the titles wait for the categories (15 s at most), then the index is built on the blocking pool from the stored lists, copying none of them, and put beside the catalog: the channels wait for none of it. The index leaves the store only as `Titles`, which apply the lock. `watching.rs`, `details.rs` and `covers.rs` are stores that phase 2 wires to pages; here they are built and tested on their own. The portal gains the categories and the details through trait methods with defaults (an M3U list answers with nothing), and the player a VOD load whose reports run only while one plays.
 
 **Tech Stack:** Rust 2021, egui/eframe 0.27.2, tokio (the blocking pool), reqwest 0.12 (rustls), serde + serde_json, image 0.24 (png; jpeg added here), ring (SHA-256), parking_lot, chrono, libmpv (client API 2.5); tempfile and wiremock (tests).
 
@@ -12,7 +12,7 @@
 
 **Where:** the main checkout `C:\Dropbox\Sources\tv`, branch `feat/thuisbioscoop`, which the controller rebases on the finished zenderlijst and on the rename (`APP_ID` "BongoIPTVPlayer") and checks out there before Task 1. The plan was written at c81d7b0: main with the M3U sources, plus Tasks 1–4 of the zenderlijst (`bad_streams.rs`, the zap ring, `stream_check.rs`); the zenderlijst's Tasks 5–10 and the rename come in between. So this plan touches `app.rs` in a few small places only (the `f` log line, reading the index cache after the first frame, the cache path of a new catalog, one arm of the player's events, two test literals) and names functions, never line numbers. When a function reads differently from what a step shows around a change, keep the step's meaning, make the change there, and say so in your report.
 
-Every step's code below was built and run, task by task in this order, on a copy of c81d7b0, once as first written and again with the pre-flight rulings: each task's tests passed, the rustfmt hunk counts held, and clippy showed only the two old warnings.
+Every step's code below was built and run, task by task in this order, on a copy of c81d7b0, once as first written, again with the pre-flight rulings and once more with their follow-up rulings: each task's tests passed, the rustfmt hunk counts held, and clippy showed only the two old warnings.
 
 ## Global Constraints
 
@@ -34,7 +34,7 @@ Every step's code below was built and run, task by task in this order, on a copy
   - Covers log hosts only (`guide::logos::host_of`), a VOD load's line its host only (`redact::url_host`), the details store titles by id. The errors of the new API calls name no address (`XtreamPortal::api_json`), so a failed category list is logged without one.
   - `Cmd`, `XtreamCreds` and `XtreamPortal` derive `Debug` in the crate's own tests only: the integration tests (`rust/tests/`) never format one with `{:?}`, nor compare one with `assert_eq!`.
 - **The catalog is the only adult filter.** The index keeps adult titles with a flag and leaves the store only as `Titles`, whose every answer leaves them out while locked: "Er komt nergens anders een filter."
-- **Nothing visible yet.** No store is wired to a screen in this phase. What the running app does new: the `f` log line, the two category lists asked beside the three lists, the catalog's `vod:` log line, the index built after the catalog is put and written to its file, that file read after the first frame, and the covers folder (empty until phase 2) pruned in the background at a start.
+- **Nothing visible yet.** No store is wired to a screen in this phase. What the running app does new: the `f` log line, the two category lists asked beside the three lists, the catalog's `vod:` log line, the index built after the catalog is put and its categories are in (15 s at most) and written to its file, that file read after the first frame, and the covers folder (empty until phase 2) pruned in the background at a start.
 - **Release profile** is `panic = "abort"`: nothing may rely on catching a panic, and nothing from outside (a name, an answer, a file) may cause one; the tests feed odd ones. A value read from a file that serves as an index or a bound is masked or validated where it is read (Ruling 51), with a test for each kind.
 - **No window, no real network.** Every test talks to wiremock or a `TcpListener` on 127.0.0.1, never to a real portal, YouTube or TMDB. The mpv smoke tests (ignored) run libmpv without a window. This phase has no e2e scenario; the one window run is the controller's startup A/B at the end, with the user's consent. No real mouse or keyboard injection (no SetCursorPos, mouse_event, keybd_event, SendInput): the user works on this machine.
 - **The real ini:** never open, print, copy or modify any `BongoPlayer.ini` or `BongoIPTVPlayer.ini`; never read or copy anything under a `rust\target` folder (copying the single exe, `BongoIPTVPlayer.exe` or 0.6.1's `BongoPlayer.exe`, is fine). `rust/e2e/check-staged.sh` reads the real ini next to the release exe itself and prints only counts.
@@ -77,7 +77,7 @@ The spec is the authority. These settle what it leaves open, one line each: what
 
 **The portal (§4.1)**
 
-1'. **The categories come through a trait method, not in `Catalog`, and the channels wait for nothing:** `Portal::fetch_categories` (a default that answers none). The catalog's fetch task asks the three lists and the two category lists together (`tokio::join!` of `fetch_catalog` and `fetch_categories`: one list and one category list in flight at a time). As soon as the lists are in, it puts the catalog as before phase 1: zapping, the zap ring, `f` and the guide work from that moment. Then it builds the title index on tokio's blocking pool (`spawn_blocking`, no new thread) and puts it in the store through `put_titles`, which counts it in `titles_revision` (titles of a catalog that was replaced meanwhile are not put: the newer one's own come after it). The adult lock applies to the titles through the store, as to the lists. F5 does the same. `Catalog` keeps its three fields, so its many struct literals in `app.rs` and the tests stay as they are; a refused or broken category list gives the titles no categories (one warn line, which names no address: `api_json` drops the URL from its errors), since the titles are worth more than their genres.
+1'. **The categories come through a trait method, not in `Catalog`, and the channels wait for nothing:** `Portal::fetch_categories` (a default that answers none). The catalog's fetch task asks the two category lists beside the three lists, in a task of their own (one list and one category list in flight at a time), and puts the catalog as soon as the three lists are in, as before phase 1: zapping, the zap ring, `f` and the guide work from that moment and never wait for the categories. Then it awaits the categories, 15 s at most (`CATEGORIES_WAIT`): a refused or broken category list, or none by then, gives the titles none, with one warn line that names no address (`api_json` drops the URL from its errors), and a request still open stops; the titles are worth more than their genres. Only then does it build the title index on tokio's blocking pool (`spawn_blocking`, no new thread) and put it in the store through `put_titles`, which counts it in `titles_revision` (titles of a catalog that was replaced meanwhile are not put: the newer one's own come after it). The adult lock applies to the titles through the store, as to the lists. F5 does the same. `Catalog` keeps its three fields, so its many struct literals in `app.rs` and the tests stay as they are.
 2. **`Movie` and `Series` gain the fields and derive `Default`;** the two literals that name every field (`app.rs`'s test `library_catalog`, `tests/test_catalog_adult.rs`'s helpers) take `..Default::default()`. A new field always breaks such a literal, and that is the smallest touch.
 3. **Read tolerantly:** a rating ("7.3", 7.3, "7,3") becomes tenths in a `u8`; empty, null, a word, 0 and anything outside 0–10 mean none (spec: "een lege waarde of 0 betekent geen waardering"). Ids, times and category ids come as a number or a numeric string; anything else is 0, never a failed list.
 4. **`releaseDate` and `release_date` are two fields,** read by `Series::released`: a serde alias fails the whole list on an entry that has both (a duplicate field), as `start` and `start_timestamp` once emptied the EPG.
@@ -107,7 +107,7 @@ The spec is the authority. These settle what it leaves open, one line each: what
 **The index (§4.2, §3.3)**
 
 21. **A record is 20 bytes:** id `u32`, genres `u32`, versions end `u32`, year `u16`, add day `u16`, category `u16` (a place plus one), rating `u8`, flags `u8` (film, adult, trailer, Dutch, English). Name, search name and cover live in three text tables (one `String` and its ends each); a version is 8 bytes (`u32` stream id, `u16` labels, `u8` container code); the A-Z rank is a `u32` per title. Xtream ids are positive and below 4·10⁹: a title whose id does not fit is left out and counted (`Stats::skipped`). Measured on Pandora's size (53,057 titles): 4.16 MB.
-22. **The covers are no part of the 5 MB:** §4.2's record holds "geen tekst behalve een verwijzing naar de naam", and §4.4 takes the covers "uit de lijsten". They sit beside the records in their own text table (`cover_bytes`, 4.02 MB for Pandora), which the lists give up before they are stored (`StoredCatalog::new` hands them to the build in its `TitleInput`), so no address is held twice once the index has it. The log line prints both sizes; the timing test prints them and the list records', and the user gets all three numbers (spec §5) with the remedies: a prefix table for the cover addresses, narrower stored lists. Phase 1 builds neither: the numbers decide it in phase 2.
+22. **The covers are no part of the 5 MB:** §4.2's record holds "geen tekst behalve een verwijzing naar de naam", and §4.4 takes the covers "uit de lijsten". They sit beside the records in their own text table (`cover_bytes`, 4.02 MB for Pandora), which the lists give up before they are stored (`vod::index::Extras`, which `StoredCatalog::new` hands to the build in its `TitleInput`), so no address is held twice once the index has it. The log line prints both sizes; the timing test prints them and the list records', and the user gets all three numbers (spec §5) with the remedies: a prefix table for the cover addresses, narrower stored lists. Phase 1 builds neither: the numbers decide it in phase 2.
 23. **Lookups:** records in (kind, id) order, so `find` is a binary search; `title_of_version` scans the versions (no map: it is asked once per playback, not per frame).
 24. **`learn`:** what a title's details tell the shared index in place (atomics): a year where its name gave none (the name's year made the title's key), genres where none were named, and that it has a trailer. Nothing calls it before phase 2. What `learn` adds lives in that index only: the cache is written from a fresh index before anything is learned, and the next load builds anew. Phase 2 decides whether the filters keep it (carry it into a new index by `TitleId`, or learn again from the details files).
 25. **Filters:** values of one group add up (Komedie or Drama), the groups narrow each other; a value's count leaves its own group out, so it says what choosing it gives. "Eerder" is a known year before 2000; an unknown year is in no bucket. ★ 8 and ★ 7 overlap. A query without letters or digits filters nothing.
@@ -116,7 +116,7 @@ The spec is the authority. These settle what it leaves open, one line each: what
 
 **The catalog (§4.2, §11)**
 
-28. **The "laaddraad" is the catalog's fetch task;** the build runs there on the blocking pool once the catalog is put (`spawn_blocking` around `TitleInput::build`: the lists put together again, a passing copy of their records and names, then the index; the timing test times both), so the ~80 ms never hold a tokio worker, where the relay runs, nor the screen, nor the channels. `from_catalog` (tests, tools) builds in place. The lists' parse stays where it was (the fetch's worker); its extra fields are timed by the timing test.
+28. **The "laaddraad" is the catalog's fetch task;** the build runs there on the blocking pool once the catalog is put and its categories are in (`spawn_blocking` around `TitleInput::build`), so the ~80 ms never hold a tokio worker, where the relay runs, nor the screen, nor the channels. It reads the stored lists and copies none of them (Ruling 53). `from_catalog` (tests, tools) builds in place. The lists' parse stays where it was (the fetch's worker); its extra fields are timed by the timing test.
 29. **`Titles` is the index and the lock state when asked:** a handle taken while locked stays locked; one taken unlocked shows adult titles until asked again (§6: "De rijen en de resultaten worden opnieuw berekend").
 30. **The data quality line**, once per build that has titles: `vod: <n> titles (<s> series, <f> films in <v> versions, <k> left out), <c> categories - cover <a> %, rating <b> %, year <c> %, genre <d> %, Dutch <e> %, English <g> % - index <x> KB, covers <y> KB, built in <t> ms`. The language shares show whether a portal's "NL |" means Dutch speech or a Dutch section.
 
@@ -162,6 +162,7 @@ The spec is the authority. These settle what it leaves open, one line each: what
 
 51. **What a file says is checked where it is read:** a value that serves as an index or a bound is masked or validated, each kind with its test. The index cache: genre bits past the 24 are dropped (they index the counts), a category's place past the file's categories names none, labels with stray bits name nothing new, and containers past the 255 codes have none. A details file's `fetched_at` from the far past or future only makes it stale or fresh. The release build aborts on a panic, and one odd file would take every start with it.
 52. **One atomic writer in `vod/`:** `write_atomic_with` (a temporary file beside the file, renamed over it) writes the index cache, the watching file and the details files. Across modules the zenderlijst's Ruling 31 stands: `cache::portal_key` and `covers::file_stem` stay as they are, beside `guide::cache`'s and `guide::logos`' own.
+53. **The title build copies no list:** the store shares its films and series through one `Arc` (`StoredCatalog.catalog`; its live channels stay apart in `live`), and the build reads them through a clone of it with what they gave up beside them (`TitleIndex::build_with`, `vod::index::Extras`). Beside the lists only the handles of what moved out are new, an `Option<String>` a film and 56 bytes a series (a series' release dates go, their year stays): ~1.7 MB for Pandora, from the catalog's put until its titles are built; the strings themselves move. The timing test prints the build's peak on the heap, what it keeps (the index) and what passes (its own working lists).
 
 ## Review Focus
 
@@ -170,7 +171,7 @@ The six inputs the spec implies but its test list does not name, most likely to 
 1. **Odd names from the portal** (a no-break space before the year, an unclosed bracket, a name that is one label or only a year, an en dash or emoji at the end, a combining accent): `parse_name` never panics, since the release build aborts on a panic and one bad name would take every start with it, and it always keeps a title. → Task 2b, `odd_names_never_panic_and_keep_a_title`.
 2. **Nulls and wrong types in a details answer** (`"info": null`, `"seasons": null`, `"episodes": {"1": null}`, an episode without an id, a rating that is an object, a video that is a string): fields stay empty, the answer is no error, and an episode that cannot play is left out. → Task 1, `nulls_and_odd_types_in_a_details_answer_leave_fields_empty`.
 3. **A series entry with both `releaseDate` and `release_date`:** the whole series list still loads, and the date that has text wins. → Task 1, `the_series_list_carries_cover_rating_release_date_genre_category_and_change_time` (its third series).
-4. **The category lists refused or busy beside the three lists** (the portal answers 503 or 509 while the lists come): the catalog loads and its titles go without genres, instead of the thuisbioscoop losing everything. → Task 5, `a_refused_category_list_leaves_the_titles_without_genres`.
+4. **The category lists refused, busy or stalled beside the three lists** (the portal answers 503 or 509 while the lists come, or answers nothing): the catalog loads at once and its titles go without genres, 15 s later at most, instead of the thuisbioscoop losing everything or the channels waiting. → Task 5, `a_refused_category_list_leaves_the_titles_without_genres`, `a_stalled_category_list_holds_up_neither_the_catalog_nor_zapping` and `at_the_bound_the_titles_are_built_without_the_categories`.
 5. **A query of punctuation or spaces only** (" ", "!!!", " - ", "★", what a user types before a word): it filters nothing and shows what an empty query shows, never no results. → Task 4, `a_query_without_letters_or_digits_is_no_text_filter`.
 6. **A cache file that holds what no index writes** (genre bits past the 24, a category's place past its categories, labels with every bit set, more containers than codes): it is read without a panic and names nothing it does not have (Ruling 51). → Task 6a, `a_file_with_stray_genre_bits_counts_the_24_and_nothing_else` and the two tests after it.
 
@@ -186,12 +187,12 @@ Not a finding: the version labels ("4K HDR", "NL SUBS") are built outside `i18n.
 | `rust/src/vod/mod.rs` (new) | `Kind`, `TitleId`, `fold`, `write_atomic_with` |
 | `rust/src/vod/genres.rs` (new) | the 24 genres, aliases, labels, language markers, `parse_name`, `category_labels` |
 | `rust/src/vod/versions.rs` (new) | films merged into titles with versions |
-| `rust/src/vod/index.rs` (new) | `TitleIndex`: records, text tables, lookups, `learn`, stats; search, filters, counts, sorts, `more_like` |
+| `rust/src/vod/index.rs` (new) | `TitleIndex`: records, text tables, lookups, `learn`, stats; search, filters, counts, sorts, `more_like`; `Extras` and `build_with`, the catalog's build |
 | `rust/src/vod/cache.rs` (new) | the index cache file |
 | `rust/src/vod/watching.rs` (new) | `Watching`: progress, Mijn lijst, thumbs, the file |
 | `rust/src/vod/details.rs` (new) | `DetailStore` |
 | `rust/src/vod/covers.rs` (new) | `CoverStore`, `TextureLru`, `decode`, `prune`, `placeholder_tint` |
-| `rust/src/catalog.rs` | the categories beside the lists; the catalog put as soon as they are in; the index built after it, logged and put beside it; `Titles`; the cache's path, read and write |
+| `rust/src/catalog.rs` | the catalog put as soon as the three lists are in; the categories asked beside them and awaited 15 s at most; then the index built from the stored lists, logged and put beside it; `Titles`; the cache's path, read and write |
 | `rust/src/player/` | `Cmd::LoadVod`, `SetAudio`, `SetSubtitles`, `SetMute`; `Event::Vod`; observing the VOD properties |
 | `rust/src/app.rs` | the `f` log line; the cache read after the first frame; the cache path of a new catalog; the `Event::Vod` arm; two test literals |
 | `rust/src/main.rs` | the cache path of the first catalog; the covers folder pruned at a start |
@@ -4939,16 +4940,26 @@ Run from `C:\Dropbox\Sources\tv`: `git add rust/src/vod/index.rs rust/tests/test
 
 ### Task 5: The catalog: the titles built after the catalog, off the screen, behind the lock
 
-The catalog's fetch task asks the portal's two category lists beside its three lists (`tokio::join!`) and puts the catalog as soon as they are in, as before phase 1: zapping, the zap ring, `f` and the guide wait for nothing new (Ruling 1'). Then it builds the title index on the blocking pool (Ruling 28) and puts it in the store beside the catalog (`put_titles`, counted in `titles_revision`); F5 does the same. What only the index reads leaves the lists before they are stored and goes to the build (`TitleInput`, Ruling 22). One log line tells what the lists gave (Ruling 30, spec §11). The index leaves the store only as `Titles`, the index and the lock state when asked, whose every answer leaves adult titles out while locked (spec §4.2: "Er komt nergens anders een filter").
+The catalog's fetch task asks the portal's two category lists beside its three lists, in a task of their own, and puts the catalog as soon as the three lists are in, as before phase 1: zapping, the zap ring, `f` and the guide never wait for the categories (Ruling 1'). The titles wait for them, 15 s at most (then they go without), are then built on the blocking pool (Ruling 28) and are put in the store beside the catalog (`put_titles`, counted in `titles_revision`); F5 does the same. What only the index reads moves out of the lists before they are stored (`vod::index::Extras`, Ruling 22); the build reads the stored lists with that beside them and copies none of them (`TitleIndex::build_with`, Ruling 53). One log line tells what the lists gave (Ruling 30, spec §11). The index leaves the store only as `Titles`, the index and the lock state when asked, whose every answer leaves adult titles out while locked (spec §4.2: "Er komt nergens anders een filter").
 
 **Files:**
-- Modify: `rust/src/catalog.rs`
-- Test: `rust/tests/test_vod_catalog.rs` (new), `rust/src/catalog.rs` (`mod zap_tests`: one test reads the new `StoredCatalog::new`)
+- Modify: `rust/src/catalog.rs`, `rust/src/vod/index.rs` (`Extras`, `build_with`)
+- Test: `rust/tests/test_vod_catalog.rs` (new; 12 tests), `rust/src/catalog.rs` (`mod zap_tests`: one test reads the new `StoredCatalog::new`)
 
 **Interfaces:**
-- Consumes: Task 1's `Categories` and `Portal::fetch_categories` (whose errors name no address); Tasks 3–4's `TitleIndex::{build, title, find, title_of_version, more_like, learn, categories, stats, heap_bytes, cover_bytes, search}`, `Query`, `Results`, `Title`, `CategoryInfo`, `Learned`; `TitleId`.
+- Consumes: Task 1's `Categories` and `Portal::fetch_categories` (whose errors name no address); Tasks 3–4's `TitleIndex::{build, title, find, title_of_version, more_like, learn, categories, stats, heap_bytes, cover_bytes, search}` (Task 3's body of `build` becomes `build_with`'s), `Query`, `Results`, `Title`, `CategoryInfo`, `Learned`; `TitleId`.
 - Produces:
   ```rust
+  // vod/index.rs
+  #[derive(Default)]
+  pub struct Extras;   // what the lists give up: a film's cover; a series' cover, genre field and release year
+  impl Extras {
+      pub fn take(movies: &mut [Movie], series: &mut [Series]) -> Extras;   // moves them out, copies nothing
+  }
+  impl TitleIndex {
+      pub fn build_with(movies: &[Movie], series: &[Series], extras: &Extras, categories: &Categories,
+          max_year: u16) -> Self;   // `build` is this with `Extras::default()`: every record keeps its own
+  }
   // catalog.rs
   #[derive(Clone)]
   pub struct Titles;   // the index and the lock state when asked
@@ -4964,15 +4975,19 @@ The catalog's fetch task asks the portal's two category lists beside its three l
   impl CatalogStore {
       pub fn titles(&self) -> Option<Titles>;      // none until the titles of a catalog are put
       pub fn titles_revision(&self) -> u64;        // one more with every put of titles
+      pub fn with_categories_wait(self, wait: Duration) -> Self;   // 15 s; a test waits less
   }
-  // private: StoredCatalog.catalog: Arc<PortalCatalog>; StoredCatalog::new(PortalCatalog) -> (StoredCatalog, TitleInput);
-  //          struct TitleInput { lists, film_covers, series_extras }, TitleInput::build(self, &Categories) -> TitleIndex;
-  //          struct SeriesExtras; CatalogStore.{titles: Arc<RwLock<Option<Arc<TitleIndex>>>>, titles_revision};
+  // private: StoredCatalog.catalog: Arc<PortalCatalog> (its films and series, shared with the build);
+  //          StoredCatalog::new(PortalCatalog) -> (StoredCatalog, TitleInput);
+  //          struct TitleInput { lists: Arc<PortalCatalog>, extras: Extras }, TitleInput::build(self, &Categories) -> TitleIndex;
+  //          CatalogStore.{titles: Arc<RwLock<Option<Arc<TitleIndex>>>>, titles_revision, categories_wait};
+  //          const CATEGORIES_WAIT: Duration (15 s);
+  //          async fn categories_after(JoinHandle<Result<Categories, PortalError>>, Duration) -> Categories;
   //          fn put_catalog(..) -> u64 (the count it put the catalog at);
   //          fn put_titles(slot, titles_revision, revision, of: u64, Arc<TitleIndex>);
   //          fn latest_year() -> u16; fn log_titles(&TitleIndex, &Categories, Duration)
   ```
-  Log lines: info Ruling 30's `vod: <n> titles (…) …`; warn `catalog: no categories (<e>) - the titles go without` (`<e>` names no address), `vod: titles not built (<e>)`.
+  Log lines: info Ruling 30's `vod: <n> titles (…) …`; warn `catalog: no categories (<e>) - the titles go without` (`<e>` names no address; `none within 15s` at the bound), `vod: titles not built (<e>)`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4980,8 +4995,9 @@ Create `rust/tests/test_vod_catalog.rs`:
 
 ```rust
 //! The title index behind the catalog (catalog.rs, spec 2026-10-15 §4.2): the
-//! portal's categories come beside the three lists, the catalog is put as soon
-//! as they are in, and its titles are built after it, off the screen. They leave
+//! portal's categories are asked beside the three lists, the catalog is put as
+//! soon as those are in, and its titles are built after it, once the categories
+//! are in (15 s at most), off the screen and from the stored lists. They leave
 //! the store only as `Titles`, which apply the adult lock. The channels wait for
 //! none of it, and `f` is untouched.
 
@@ -5088,6 +5104,41 @@ fn there_are_no_titles_before_a_catalog_and_none_on_an_m3u_list() {
 }
 
 #[test]
+fn what_the_stored_lists_give_up_reaches_the_titles() {
+    let catalog = Catalog {
+        movies: vec![Movie {
+            stream_icon: Some("https://c.example/een.jpg".into()),
+            ..film(1, "Een (2001)", false)
+        }],
+        series: vec![Series {
+            series_id: 9,
+            name: "Dark".into(),
+            cover: Some("https://c.example/dark.jpg".into()),
+            genre: Some("Drama".into()),
+            release_date: Some("2017-12-01".into()),
+            ..Series::default()
+        }],
+        ..Catalog::default()
+    };
+    let store = CatalogStore::from_catalog(idle_portal(), catalog);
+    let titles = store.titles().unwrap();
+    let title = |kind, id| {
+        titles
+            .title(titles.find(TitleId { kind, id }).unwrap())
+            .unwrap()
+    };
+    assert_eq!(
+        title(Kind::Film, 1).cover,
+        Some("https://c.example/een.jpg")
+    );
+    let dark = title(Kind::Series, 9);
+    assert_eq!(
+        (dark.cover, dark.genres, dark.year),
+        (Some("https://c.example/dark.jpg"), Genre::Drama.bit(), 2017)
+    );
+}
+
+#[test]
 fn f_still_finds_a_film_by_its_full_name() {
     let store = CatalogStore::from_catalog(idle_portal(), library());
     let found: Vec<String> = store.search("matrix").into_iter().map(|i| i.name).collect();
@@ -5100,9 +5151,14 @@ fn f_still_finds_a_film_by_its_full_name() {
 /// Two live channels, to zap through.
 const LIVE: &str = r#"[{"stream_id":1,"name":"NL | Een"},{"stream_id":2,"name":"NL | Twee"}]"#;
 
-/// A portal on a mock with these films, two live channels, no series, and
-/// these two category lists (`None`: refused with 503).
-async fn portal_with(films: &str, vod_categories: Option<&str>) -> (MockServer, Arc<CatalogStore>) {
+/// A portal on a mock with these films, two live channels and no series; its
+/// film categories are `vod_categories` (`None`: refused with 503), answered
+/// after `delay`.
+async fn mock_portal(
+    films: &str,
+    vod_categories: Option<&str>,
+    delay: Duration,
+) -> (MockServer, Arc<dyn Portal>) {
     let server = MockServer::start().await;
     let answer = |action: &str, body: &str| {
         Mock::given(method("GET"))
@@ -5114,15 +5170,14 @@ async fn portal_with(films: &str, vod_categories: Option<&str>) -> (MockServer, 
     answer("get_vod_streams", films).mount(&server).await;
     answer("get_series", "[]").mount(&server).await;
     answer("get_series_categories", "[]").mount(&server).await;
-    match vod_categories {
-        Some(body) => answer("get_vod_categories", body).mount(&server).await,
-        None => {
-            Mock::given(query_param("action", "get_vod_categories"))
-                .respond_with(ResponseTemplate::new(503))
-                .mount(&server)
-                .await
-        }
-    }
+    let categories = match vod_categories {
+        Some(body) => ResponseTemplate::new(200).set_body_string(body.to_owned()),
+        None => ResponseTemplate::new(503),
+    };
+    Mock::given(query_param("action", "get_vod_categories"))
+        .respond_with(categories.set_delay(delay))
+        .mount(&server)
+        .await;
     let uri = url::Url::parse(&server.uri()).unwrap();
     let portal = XtreamPortal::new(XtreamCreds {
         username: "u".into(),
@@ -5130,7 +5185,13 @@ async fn portal_with(films: &str, vod_categories: Option<&str>) -> (MockServer, 
         host: uri.host_str().unwrap().into(),
         port: uri.port().unwrap(),
     });
-    (server, Arc::new(CatalogStore::new(Arc::new(portal))))
+    (server, Arc::new(portal))
+}
+
+/// A store on [`mock_portal`], whose categories answer at once.
+async fn portal_with(films: &str, vod_categories: Option<&str>) -> (MockServer, Arc<CatalogStore>) {
+    let (server, portal) = mock_portal(films, vod_categories, Duration::ZERO).await;
+    (server, Arc::new(CatalogStore::new(portal)))
 }
 
 /// Waits (2 s at most) until the store's catalog is in.
@@ -5158,13 +5219,12 @@ async fn titled(store: &CatalogStore) {
 
 const FILMS: &str = r#"[{"stream_id":5,"name":"Lachen (2020)","category_id":"12"}]"#;
 
+/// The film list's one category.
+const KOMEDIE: &str = r#"[{"category_id":"12","category_name":"NL | Komedie"}]"#;
+
 #[tokio::test]
 async fn the_fetch_gives_the_titles_the_genres_of_their_categories() {
-    let (_server, store) = portal_with(
-        FILMS,
-        Some(r#"[{"category_id":"12","category_name":"NL | Komedie"}]"#),
-    )
-    .await;
+    let (_server, store) = portal_with(FILMS, Some(KOMEDIE)).await;
     store.spawn_fetch();
     titled(&store).await;
     let titles = store.titles().unwrap();
@@ -5184,6 +5244,45 @@ async fn a_refused_category_list_leaves_the_titles_without_genres() {
     let titles = store.titles().unwrap();
     assert_eq!(titles.title(0).unwrap().genres, 0);
     assert_eq!(titles.categories().count(), 0);
+}
+
+#[tokio::test]
+async fn a_stalled_category_list_holds_up_neither_the_catalog_nor_zapping() {
+    let (_server, portal) = mock_portal(FILMS, Some(KOMEDIE), Duration::from_secs(30)).await;
+    let store = Arc::new(CatalogStore::new(portal));
+    store.spawn_fetch();
+    loaded(&store).await;
+    assert!(store.is_loaded());
+    assert_eq!(store.zap_channels().len(), 2, "zapping works");
+    assert_eq!(store.search("lachen").len(), 1, "f works");
+    assert!(
+        store.titles().is_none(),
+        "the titles wait for the categories"
+    );
+}
+
+#[tokio::test]
+async fn the_titles_come_after_the_categories() {
+    let (_server, portal) = mock_portal(FILMS, Some(KOMEDIE), Duration::from_millis(600)).await;
+    let store = Arc::new(CatalogStore::new(portal));
+    store.spawn_fetch();
+    loaded(&store).await;
+    assert!(store.titles().is_none(), "the categories are not in yet");
+    titled(&store).await;
+    let lachen = store.titles().unwrap().title(0).unwrap().genres;
+    assert_eq!(lachen, Genre::Comedy.bit(), "built with them");
+}
+
+#[tokio::test]
+async fn at_the_bound_the_titles_are_built_without_the_categories() {
+    let (_server, portal) = mock_portal(FILMS, Some(KOMEDIE), Duration::from_secs(30)).await;
+    let wait = Duration::from_millis(200);
+    let store = Arc::new(CatalogStore::new(portal).with_categories_wait(wait));
+    store.spawn_fetch();
+    titled(&store).await;
+    let titles = store.titles().unwrap();
+    assert_eq!(titles.title(0).unwrap().genres, 0, "no genres");
+    assert_eq!(titles.categories().count(), 0, "no categories");
 }
 
 #[test]
@@ -5306,9 +5405,178 @@ fn a_category_list_that_fails_is_logged_without_its_address() {
 - [ ] **Step 2: Run them to see them fail**
 
 Run: `ct --test test_vod_catalog`
-Expected: compile errors: `CatalogStore` has no method `titles` or `titles_revision`.
+Expected: compile errors: `CatalogStore` has no method `titles`, `titles_revision` or `with_categories_wait`.
 
-- [ ] **Step 3: The stored catalog and what its titles are built from**
+- [ ] **Step 3: What the lists give up, and the stored catalog**
+
+In `rust/src/vod/index.rs`, after `fn day_of`, add what a catalog's lists give up for the index (`Extras`); `TitleIndex::build` keeps its signature and calls the new `build_with`, which takes over its body. Replace
+
+```rust
+impl TitleIndex {
+    /// The titles of these lists. `max_year` is the latest year a name may
+    /// give: the year after this one.
+    pub fn build(
+        movies: &[Movie],
+        series: &[Series],
+        categories: &Categories,
+        max_year: u16,
+    ) -> Self {
+        let cats: Vec<CategoryIn<'_>> = categories
+```
+
+with
+
+```rust
+/// What a catalog's lists give up for its title index (Ruling 22): a film's
+/// cover, and a series' cover, genre field and release year, moved out of
+/// their records ([`Extras::take`]). The catalog keeps the lists without them
+/// and builds its titles from both ([`TitleIndex::build_with`]): no list is
+/// copied for the build, and no address is held twice once the index has it.
+#[derive(Default)]
+pub struct Extras {
+    /// The films' covers, in the films' order.
+    film_covers: Vec<Option<String>>,
+    /// The series' own, in the series' order.
+    series: Vec<SeriesExtras>,
+}
+
+/// A series' share of [`Extras`].
+struct SeriesExtras {
+    cover: Option<String>,
+    genre: Option<String>,
+    /// The year of its release date; 0 for none.
+    released: u16,
+}
+
+impl Extras {
+    /// Moves them out of the records of these lists: the strings move, and
+    /// none is copied. A series' release dates go; their year stays.
+    pub fn take(movies: &mut [Movie], series: &mut [Series]) -> Self {
+        let film_covers = movies.iter_mut().map(|m| m.stream_icon.take()).collect();
+        let series = series
+            .iter_mut()
+            .map(|s| {
+                let released = s.released().map_or(0, crate::portal::vod_info::year_of);
+                s.release_date = None;
+                s.release_date_camel = None;
+                SeriesExtras {
+                    cover: s.cover.take(),
+                    genre: s.genre.take(),
+                    released,
+                }
+            })
+            .collect();
+        Self {
+            film_covers,
+            series,
+        }
+    }
+}
+
+impl TitleIndex {
+    /// The titles of these lists. `max_year` is the latest year a name may
+    /// give: the year after this one.
+    pub fn build(
+        movies: &[Movie],
+        series: &[Series],
+        categories: &Categories,
+        max_year: u16,
+    ) -> Self {
+        Self::build_with(movies, series, &Extras::default(), categories, max_year)
+    }
+
+    /// [`TitleIndex::build`] for lists whose records gave up what `extras`
+    /// holds: the catalog's build, which reads its stored lists and copies
+    /// none of them. A record that `extras` does not cover keeps its own.
+    pub fn build_with(
+        movies: &[Movie],
+        series: &[Series],
+        extras: &Extras,
+        categories: &Categories,
+        max_year: u16,
+    ) -> Self {
+        let cats: Vec<CategoryIn<'_>> = categories
+```
+
+In `rust/src/vod/index.rs`, in `TitleIndex::build_with`, in the loop over a film title's versions: its cover, from the extras when the list gave it up. Replace
+
+```rust
+                if entry.cover.is_empty() {
+                    entry.cover = m.stream_icon.as_deref().map_or("", str::trim);
+                }
+```
+
+with
+
+```rust
+                if entry.cover.is_empty() {
+                    let cover = match extras.film_covers.get(v.index as usize) {
+                        Some(given_up) => given_up.as_deref(),
+                        None => m.stream_icon.as_deref(),
+                    };
+                    entry.cover = cover.map_or("", str::trim);
+                }
+```
+
+In `rust/src/vod/index.rs`, in `TitleIndex::build_with`, the loop over the series: each with its share of the extras. Replace
+
+```rust
+        for s in series {
+            let Ok(id) = u32::try_from(s.series_id) else {
+```
+
+with
+
+```rust
+        for (n, s) in series.iter().enumerate() {
+            let given_up = extras.series.get(n);
+            let Ok(id) = u32::try_from(s.series_id) else {
+```
+
+In `rust/src/vod/index.rs`, in the same loop, its genre field. Replace
+
+```rust
+            let field = s.genre.as_deref().unwrap_or("");
+```
+
+with
+
+```rust
+            let field = given_up
+                .map_or(s.genre.as_deref(), |x| x.genre.as_deref())
+                .unwrap_or("");
+```
+
+In `rust/src/vod/index.rs`, in the same loop, its release year. Replace
+
+```rust
+            let released = s.released().map_or(0, crate::portal::vod_info::year_of);
+            let spoken = [
+```
+
+with
+
+```rust
+            let released = match given_up {
+                Some(x) => x.released,
+                None => s.released().map_or(0, crate::portal::vod_info::year_of),
+            };
+            let spoken = [
+```
+
+In `rust/src/vod/index.rs`, in the same loop, its cover. Replace
+
+```rust
+                cover: s.cover.as_deref().map_or("", str::trim),
+```
+
+with
+
+```rust
+                cover: given_up
+                    .map_or(s.cover.as_deref(), |x| x.cover.as_deref())
+                    .map_or("", str::trim),
+```
 
 In `rust/src/catalog.rs`, the imports. Replace
 
@@ -5327,9 +5595,25 @@ use crate::portal::{
 };
 use crate::search::{rank, ItemKind, SearchItem};
 use crate::sources::SourceKind;
-use crate::vod::index::{CategoryInfo, Learned, Query, Results, Title, TitleIndex};
+use crate::vod::index::{CategoryInfo, Extras, Learned, Query, Results, Title, TitleIndex};
 use crate::vod::TitleId;
 use parking_lot::{Mutex, RwLock};
+```
+
+In `rust/src/catalog.rs`, the imports, `Duration` beside `Instant`. Replace
+
+```rust
+use std::sync::Arc;
+use std::time::Instant;
+use tracing::{info, warn};
+```
+
+with
+
+```rust
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
 ```
 
 In `rust/src/catalog.rs`, in `struct StoredCatalog`, the lists are shared with the build of their titles. Replace
@@ -5378,19 +5662,13 @@ with
 
 ```rust
         let live = Arc::new(std::mem::take(&mut catalog.live));
-        // The covers, a series' genres and release dates are the index's alone
-        // (Ruling 22): the stored lists do not keep them.
-        let film_covers = catalog
-            .movies
-            .iter_mut()
-            .map(|m| m.stream_icon.take())
-            .collect();
-        let series_extras = catalog.series.iter_mut().map(SeriesExtras::take).collect();
+        // The covers, a series' genre and release date are the index's alone
+        // (Ruling 22): they move out of the stored lists, to its build.
+        let extras = Extras::take(&mut catalog.movies, &mut catalog.series);
         let catalog = Arc::new(catalog);
         let titles = TitleInput {
             lists: catalog.clone(),
-            film_covers,
-            series_extras,
+            extras,
         };
         let stored = Self {
             catalog,
@@ -5429,68 +5707,29 @@ impl std::ops::Deref for StoredCatalog {
 add:
 
 ```rust
-/// What a series' record in the title index takes that its stored entry gives
-/// up (`StoredCatalog::new`).
-struct SeriesExtras {
-    cover: Option<String>,
-    genre: Option<String>,
-    release_date: Option<String>,
-    release_date_camel: Option<String>,
-}
-
-impl SeriesExtras {
-    fn take(s: &mut Series) -> Self {
-        Self {
-            cover: s.cover.take(),
-            genre: s.genre.take(),
-            release_date: s.release_date.take(),
-            release_date_camel: s.release_date_camel.take(),
-        }
-    }
-}
-
 /// What the titles of a stored catalog are built from ([`TitleInput::build`]):
-/// its lists, shared with it, and what only the index reads, which the lists
-/// gave up before they were stored, so that no address is held twice once the
-/// index has it (Ruling 22).
+/// its lists, shared with it through their `Arc`, and what only the index
+/// reads, which the lists gave up before they were stored, so that no address
+/// is held twice once the index has it (Ruling 22).
 struct TitleInput {
     lists: Arc<PortalCatalog>,
-    film_covers: Vec<Option<String>>,
-    series_extras: Vec<SeriesExtras>,
+    extras: Extras,
 }
 
 impl TitleInput {
     /// The title index of these lists, with the portal's `categories`, and its
-    /// `vod:` line: on the blocking pool in the fetch, after the catalog is put
-    /// (up to ~150 ms for a big portal); in place in `from_catalog`. The lists
-    /// are put together again for it, a copy of their records and names,
-    /// which goes once it is built.
+    /// `vod:` line: on the blocking pool in the fetch, once the catalog is put
+    /// and its categories are in (up to ~150 ms for a big portal); in place in
+    /// `from_catalog`. It reads the stored lists and copies none of them.
     fn build(self, categories: &Categories) -> TitleIndex {
         let t0 = Instant::now();
-        let movies: Vec<Movie> = self
-            .lists
-            .movies
-            .iter()
-            .zip(self.film_covers)
-            .map(|(m, stream_icon)| Movie {
-                stream_icon,
-                ..m.clone()
-            })
-            .collect();
-        let series: Vec<Series> = self
-            .lists
-            .series
-            .iter()
-            .zip(self.series_extras)
-            .map(|(s, x)| Series {
-                cover: x.cover,
-                genre: x.genre,
-                release_date: x.release_date,
-                release_date_camel: x.release_date_camel,
-                ..s.clone()
-            })
-            .collect();
-        let titles = TitleIndex::build(&movies, &series, categories, latest_year());
+        let titles = TitleIndex::build_with(
+            &self.lists.movies,
+            &self.lists.series,
+            &self.extras,
+            categories,
+            latest_year(),
+        );
         if !titles.is_empty() {
             log_titles(&titles, categories, t0.elapsed());
         }
@@ -5604,7 +5843,7 @@ with
         let (stored, _) = StoredCatalog::new(PortalCatalog {
 ```
 
-- [ ] **Step 4: The store: the catalog at once, then its titles**
+- [ ] **Step 4: The store: the catalog at once, then its titles once the categories are in**
 
 In `rust/src/catalog.rs`, in `pub struct CatalogStore`, after `defect_revision`, the titles and their count. Replace
 
@@ -5623,6 +5862,9 @@ with
     titles: Arc<RwLock<Option<Arc<TitleIndex>>>>,
     /// How many times `titles` was put (see [`CatalogStore::titles_revision`]).
     titles_revision: Arc<AtomicU64>,
+    /// How long the titles wait for the category lists once the catalog is in
+    /// ([`CatalogStore::with_categories_wait`]).
+    categories_wait: Duration,
 }
 ```
 
@@ -5669,9 +5911,35 @@ fn put_titles(
     *held = Some(titles);
     titles_revision.fetch_add(1, Ordering::Release);
 }
+
+/// How long the titles wait for the portal's category lists once the catalog
+/// is in: then they are built without them (spec 2026-10-15 §5: the channels
+/// wait for none of it, and the titles not for long).
+const CATEGORIES_WAIT: Duration = Duration::from_secs(15);
+
+/// The category lists the fetch asked beside the three lists, once its catalog
+/// is in: what they brought; none when they fail or have not come within
+/// `wait`, and then their request stops. The warn line names no address
+/// (`api_json`).
+async fn categories_after(
+    mut asked: tokio::task::JoinHandle<Result<Categories, PortalError>>,
+    wait: Duration,
+) -> Categories {
+    let why = match tokio::time::timeout(wait, &mut asked).await {
+        Ok(Ok(Ok(categories))) => return categories,
+        Ok(Ok(Err(e))) => e.to_string(),
+        Ok(Err(e)) => e.to_string(),
+        Err(_) => {
+            asked.abort();
+            format!("none within {wait:?}")
+        }
+    };
+    warn!("catalog: no categories ({why}) - the titles go without");
+    Categories::default()
+}
 ```
 
-In `rust/src/catalog.rs`, in `CatalogStore::new`, start the new fields. Replace
+In `rust/src/catalog.rs`, in `CatalogStore::new`, start the new fields, and after `new` add `with_categories_wait`. Replace
 
 ```rust
             defect_revision: AtomicU64::new(0),
@@ -5685,7 +5953,15 @@ with
             defect_revision: AtomicU64::new(0),
             titles: Arc::new(RwLock::new(None)),
             titles_revision: Arc::new(AtomicU64::new(0)),
+            categories_wait: CATEGORIES_WAIT,
         }
+    }
+
+    /// How long this store's titles wait for the portal's category lists once
+    /// its catalog is in: 15 s, a test less. Then they are built without them.
+    pub fn with_categories_wait(mut self, wait: Duration) -> Self {
+        self.categories_wait = wait;
+        self
     }
 ```
 
@@ -5743,6 +6019,7 @@ In `rust/src/catalog.rs`, in `CatalogStore::spawn_fetch`, with the other clones:
 ```rust
         let titles = self.titles.clone();
         let titles_revision = self.titles_revision.clone();
+        let categories_wait = self.categories_wait;
 ```
 
 In `rust/src/catalog.rs`, in `CatalogStore::spawn_fetch`, the saved M3U list. Replace
@@ -5762,30 +6039,24 @@ with
                     put_catalog(&inner, &revision, stored);
 ```
 
-In `rust/src/catalog.rs`, in `CatalogStore::spawn_fetch`, the lists and the two category lists together. Replace
+In `rust/src/catalog.rs`, in `CatalogStore::spawn_fetch`, the two category lists asked beside the three lists. Before
 
 ```rust
             match portal.fetch_catalog().await {
                 Ok(c) => {
 ```
 
-with
+add:
 
 ```rust
-            // The two category lists come beside the three lists (spec
-            // 2026-10-15 §4.1, §5): the catalog waits for no round trip of
-            // theirs. Without them the titles go without genres.
-            let (fetched, categories) =
-                tokio::join!(portal.fetch_catalog(), portal.fetch_categories());
-            let categories = categories.unwrap_or_else(|e| {
-                warn!("catalog: no categories ({e}) - the titles go without");
-                Categories::default()
-            });
-            match fetched {
-                Ok(c) => {
+            // The two category lists are asked beside the three lists (spec
+            // 2026-10-15 §4.1, §5), in a task of their own: only the titles
+            // wait for them.
+            let asker = portal.clone();
+            let categories = tokio::spawn(async move { asker.fetch_categories().await });
 ```
 
-In `rust/src/catalog.rs`, in `CatalogStore::spawn_fetch`, in the `Ok(c)` arm, after the archive dump: the catalog at once, then its titles on the blocking pool. Replace
+In `rust/src/catalog.rs`, in `CatalogStore::spawn_fetch`, in the `Ok(c)` arm, after the archive dump: the catalog at once, then its titles once the categories are in. Replace
 
 ```rust
                     // Worked out before the lock is taken: readers never wait for it.
@@ -5802,10 +6073,12 @@ with
                     let (stored, input) = StoredCatalog::new(c);
                     let of = put_catalog(&inner, &revision, stored);
                     *status.write() = CatalogStatus::Loaded;
-                    // The channels, zapping, `f` and the guide work from here on.
-                    // Then the titles: up to ~150 ms for a big portal, on the
-                    // blocking pool, off the screen and off the async workers,
+                    // The channels, zapping, `f` and the guide work from here on,
+                    // whatever the categories do. The titles wait for them (15 s
+                    // at most), then take up to ~150 ms for a big portal on the
+                    // blocking pool: off the screen and off the async workers,
                     // where the relay runs.
+                    let categories = categories_after(categories, categories_wait).await;
                     let build = move || input.build(&categories);
                     match tokio::task::spawn_blocking(build).await {
                         Ok(built) => {
@@ -5814,6 +6087,27 @@ with
                         Err(e) => warn!("vod: titles not built ({e})"),
                     }
                 }
+```
+
+In `rust/src/catalog.rs`, in `CatalogStore::spawn_fetch`, the two arms without a new catalog: nothing waits for the categories. Replace
+
+```rust
+                // The same list as the one that shows: it stays as it is.
+                Err(PortalError::Unchanged) => *status.write() = CatalogStatus::Loaded,
+                Err(e) => {
+```
+
+with
+
+```rust
+                // The same list as the one that shows: it stays as it is, and
+                // no titles wait for the categories.
+                Err(PortalError::Unchanged) => {
+                    categories.abort();
+                    *status.write() = CatalogStatus::Loaded;
+                }
+                Err(e) => {
+                    categories.abort();
 ```
 
 In `rust/src/catalog.rs`, after `CatalogStore::search`, add `titles`. After
@@ -5841,16 +6135,16 @@ add:
     }
 ```
 
-At the point where the catalog is put, the zenderlijst's later tasks may have added fields to `StoredCatalog` or work to `StoredCatalog::new` (the channel list's groups): keep them, and keep the order of this step: the catalog first, its titles after it.
+At the point where the catalog is put, the zenderlijst's later tasks may have added fields to `StoredCatalog` or work to `StoredCatalog::new` (the channel list's groups): keep them, and keep the order of this step: the catalog first, then the categories, then its titles.
 
 - [ ] **Step 5: Run the tests to see them pass**
 
 Run: `ct --test test_vod_catalog --test test_catalog_adult --test test_catalog_m3u --test test_zap_ring`, then `ct --lib catalog::`
-Expected: all pass (8 in `test_vod_catalog`). `the_channels_wait_for_nothing_while_the_titles_are_built` holds the runtime's one blocking thread: the catalog loads, zaps and searches while the titles wait for it, and they come once it is free.
+Expected: all pass (12 in `test_vod_catalog`). `the_channels_wait_for_nothing_while_the_titles_are_built` holds the runtime's one blocking thread: the catalog loads, zaps and searches while the titles wait for it, and they come once it is free. Three tests answer the film categories late: after 30 s, where the catalog loads, zaps and searches at once while the titles wait; after 600 ms, where the titles come after them, with their genres; and after 30 s with a bound of 200 ms, where the titles come without them. `what_the_stored_lists_give_up_reaches_the_titles` checks that a cover, a series' genre and its year reach the titles from the extras.
 
 - [ ] **Step 6: Format, lint, full suite**
 
-- Run `fmt tests/test_vod_catalog.rs`. Expected: no output.
+- Run `fmt src/vod/mod.rs tests/test_vod_catalog.rs`. Expected: no output.
 - Run `hunks src/catalog.rs`. Expected: the count Task 1 Step 1 recorded (`3` at c81d7b0).
 - Run `cc`. Expected: only the 2 old warnings.
 - Run `ct`. Expected: everything passes: the baseline plus this task's tests.
@@ -5859,12 +6153,12 @@ Expected: all pass (8 in `test_vod_catalog`). `the_channels_wait_for_nothing_whi
 
 Message file (in the scratchpad):
 ```
-feat(rust): the catalog asks the category lists beside the lists, puts the catalog at once, then builds the title index on the blocking pool, logs what the lists gave, and hands it out only behind the lock
+feat(rust): the catalog asks the category lists beside the lists and puts the catalog at once; its titles wait for the categories (15 s at most), are built on the blocking pool from the stored lists, copying none, log what the lists gave, and are handed out only behind the lock
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01WsPJfuisYwZ6smLPWrbS2D
 ```
-Run from `C:\Dropbox\Sources\tv`: `git add rust/src/catalog.rs rust/tests/test_vod_catalog.rs && bash rust/e2e/check-staged.sh && git commit -q -F <msgfile> -- rust/src/catalog.rs rust/tests/test_vod_catalog.rs`
+Run from `C:\Dropbox\Sources\tv`: `git add rust/src/catalog.rs rust/src/vod/index.rs rust/tests/test_vod_catalog.rs && bash rust/e2e/check-staged.sh && git commit -q -F <msgfile> -- rust/src/catalog.rs rust/src/vod/index.rs rust/tests/test_vod_catalog.rs`
 
 ---
 
@@ -6525,7 +6819,7 @@ The catalog keeps its titles in the file (spec §4.6, Rulings 32 and 33): writte
 - Test: `rust/tests/test_vod_cache.rs` (5 more), `rust/src/app.rs` (`mod tests`), `rust/src/catalog.rs` (`mod zap_tests`)
 
 **Interfaces:**
-- Consumes: Task 5's `Titles`, `CatalogStore.titles`, `titles_revision`, `put_titles`, `spawn_fetch`'s `Ok(built)` arm; Task 6a's `cache::{path_for, save, load}`; `crate::args::XtreamCreds`; the tests' `Harness`, `loaded_catalog`, `idle_portal`, `wait_until`.
+- Consumes: Task 5's `Titles`, `CatalogStore.{titles, titles_revision, categories_wait}`, `with_categories_wait`, `put_titles`, `spawn_fetch`'s `Ok(built)` arm; Task 6a's `cache::{path_for, save, load}`; `crate::args::XtreamCreds`; the tests' `Harness`, `loaded_catalog`, `idle_portal`, `wait_until`.
 - Produces:
   ```rust
   // catalog.rs
@@ -6937,6 +7231,9 @@ In `rust/src/catalog.rs`, in `pub struct CatalogStore`, the titles may be the fi
     titles: Arc<RwLock<Option<Arc<TitleIndex>>>>,
     /// How many times `titles` was put (see [`CatalogStore::titles_revision`]).
     titles_revision: Arc<AtomicU64>,
+    /// How long the titles wait for the category lists once the catalog is in
+    /// ([`CatalogStore::with_categories_wait`]).
+    categories_wait: Duration,
 }
 ```
 
@@ -6950,6 +7247,9 @@ with
     titles: Arc<RwLock<Option<StoredTitles>>>,
     /// How many times `titles` was put (see [`CatalogStore::titles_revision`]).
     titles_revision: Arc<AtomicU64>,
+    /// How long the titles wait for the category lists once the catalog is in
+    /// ([`CatalogStore::with_categories_wait`]).
+    categories_wait: Duration,
     /// Where this portal's titles are kept between starts (`vod::cache`);
     /// none for an M3U list, and in tests that do not ask for one.
     vod_cache: Option<PathBuf>,
@@ -7005,26 +7305,39 @@ fn put_titles(
 }
 ```
 
-In `rust/src/catalog.rs`, in `CatalogStore::new`, start the new fields, and after `new` add `with_vod_cache` and `read_vod_cache`. Replace
+In `rust/src/catalog.rs`, in `CatalogStore::new`, start the new fields. Replace
 
 ```rust
-            titles: Arc::new(RwLock::new(None)),
-            titles_revision: Arc::new(AtomicU64::new(0)),
+            categories_wait: CATEGORIES_WAIT,
         }
     }
-
 ```
 
 with
 
 ```rust
-            titles: Arc::new(RwLock::new(None)),
-            titles_revision: Arc::new(AtomicU64::new(0)),
+            categories_wait: CATEGORIES_WAIT,
             vod_cache: None,
             vod_cache_asked: AtomicBool::new(false),
             vod_cache_writing: Arc::new(Mutex::new(())),
         }
     }
+```
+
+In `rust/src/catalog.rs`, after `CatalogStore::with_categories_wait`, add `with_vod_cache` and `read_vod_cache`. After
+
+```rust
+    /// How long this store's titles wait for the portal's category lists once
+    /// its catalog is in: 15 s, a test less. Then they are built without them.
+    pub fn with_categories_wait(mut self, wait: Duration) -> Self {
+        self.categories_wait = wait;
+        self
+    }
+```
+
+add:
+
+```rust
 
     /// This store keeps its titles in the file at `path` (`vod::cache`): it
     /// writes it after every build of its titles and reads it once, when asked
@@ -7079,7 +7392,6 @@ with
             }
         });
     }
-
 ```
 
 In `rust/src/catalog.rs`, in `CatalogStore::spawn_fetch`, with the other clones. After
@@ -10858,15 +11170,15 @@ Run from `C:\Dropbox\Sources\tv`: `git add rust/src/player/mod.rs rust/src/playe
 
 ### Task 11: The baseline: `f`'s line and the timing test
 
-Spec §5's yardstick. `f` logs one line per search it runs, what it cost and how many results, never what was typed: the only change to `f` (Ruling 48). An ignored test, run in release, makes a catalog of Pandora's size, times the index's build and the copy of the lists the catalog's build starts with, prints the index's size beside the covers' and the list records' (Ruling 22), times the parse of the film and series lists as Pandora sends them (Ruling 28), and per keystroke times the index's search with filters and counts beside `f`'s search on the same catalog (Ruling 49). It asserts no speed: the numbers go to the user.
+Spec §5's yardstick. `f` logs one line per search it runs, what it cost and how many results, never what was typed: the only change to `f` (Ruling 48). An ignored test, run in release, makes a catalog of Pandora's size, times the index's build as the catalog makes it, from the lists it keeps and what they gave up beside them (Ruling 53), prints what the build holds on the heap while it runs and what it keeps, the index's size beside the covers' and the list records' (Ruling 22), times the parse of the film and series lists as Pandora sends them (Ruling 28), and per keystroke times the index's search with filters and counts beside `f`'s search on the same catalog (Ruling 49). It asserts no speed: the numbers go to the user.
 
 **Files:**
 - Modify: `rust/src/app.rs` (`TvApp::paint_search`; a test)
 - Test: `rust/src/app.rs` (`mod tests`), `rust/tests/test_vod_timing.rs` (new, ignored)
 
 **Interfaces:**
-- Consumes: `CatalogStore::{from_catalog, search}`, `TitleIndex::{build, search, stats, heap_bytes, cover_bytes, len}`, `Query`, `Sort`, `Years`, `Genre`; the tests' `Harness`, `library_catalog`, `f_pressed`, `LogCapture`.
-- Produces: the log line (info) `search: <n> results in <ms> ms`; the test `a_catalog_of_pandoras_size_timed` printing `index build: …`, `lists put together for the build: …`, `index size: …`, `list records: …`, `film list parse: …`, one line per keystroke and `worst keystroke: …`.
+- Consumes: `CatalogStore::{from_catalog, search}`, `TitleIndex::{build_with, search, stats, heap_bytes, cover_bytes, len}` and `Extras::take` (Task 5), `Query`, `Sort`, `Years`, `Genre`; the tests' `Harness`, `library_catalog`, `f_pressed`, `LogCapture`.
+- Produces: the log line (info) `search: <n> results in <ms> ms`; the test `a_catalog_of_pandoras_size_timed` printing `index build: …`, `index build memory: …`, `what the lists give up for it: …`, `index size: …`, `list records: …`, `film list parse: …`, one line per keystroke and `worst keystroke: …`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -10945,13 +11257,15 @@ Create `rust/tests/test_vod_timing.rs`:
 ```rust
 //! The thuisbioscoop's timing test (spec 2026-10-15 §5, "Een tijdtest in
 //! release"): a made-up catalog of Pandora's size, 47,188 films and 10,589
-//! series beside 13,000 live channels. It times the title index's build and
-//! the copy of the lists the catalog's build starts with, prints the index's
-//! size, the covers' and the list records', times the parse of the film and
-//! series lists as Pandora sends them, and per keystroke the index's search
-//! with filters and counts next to the search of `f` on the same catalog. It
-//! asserts no speed (a busy machine would fail it): the numbers go to the
-//! user. `test_f_timing.rs` times `f` alone, before phase 1 and after.
+//! series beside 13,000 live channels. It times the title index's build as the
+//! catalog makes it, from the lists it keeps and what they gave up beside them
+//! (`Extras`), prints what the build holds on the heap while it runs and what
+//! it keeps, the index's size, the covers' and the list records', times the
+//! parse of the film and series lists as Pandora sends them, and per keystroke
+//! the index's search with filters and counts next to the search of `f` on the
+//! same catalog. It asserts no speed (a busy machine would fail it): the
+//! numbers go to the user. `test_f_timing.rs` times `f` alone, before phase 1
+//! and after.
 //!
 //! `cargo test --release --test test_vod_timing -- --ignored --nocapture`
 
@@ -10960,11 +11274,65 @@ use bongo_player::catalog::CatalogStore;
 use bongo_player::portal::xtream::XtreamPortal;
 use bongo_player::portal::{Catalog, Categories, Category, LiveChannel, Movie, Portal, Series};
 use bongo_player::vod::genres::Genre;
-use bongo_player::vod::index::{Query, Sort, TitleIndex, Years};
+use bongo_player::vod::index::{Extras, Query, Sort, TitleIndex, Years};
 use bongo_player::vod::Kind;
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// This test's heap, counted while `COUNTING`: what the build of the index
+/// holds while it runs, and what it keeps.
+struct Counted;
+
+static COUNTING: AtomicBool = AtomicBool::new(false);
+static HELD: AtomicIsize = AtomicIsize::new(0);
+static PEAK: AtomicIsize = AtomicIsize::new(0);
+
+fn count(bytes: isize) {
+    if COUNTING.load(Relaxed) {
+        let held = HELD.fetch_add(bytes, Relaxed) + bytes;
+        PEAK.fetch_max(held, Relaxed);
+    }
+}
+
+unsafe impl GlobalAlloc for Counted {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc(layout);
+        if !p.is_null() {
+            count(layout.size() as isize);
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
+        System.dealloc(p, layout);
+        count(-(layout.size() as isize));
+    }
+
+    unsafe fn realloc(&self, p: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        let moved = System.realloc(p, layout, size);
+        if !moved.is_null() {
+            count(size as isize - layout.size() as isize);
+        }
+        moved
+    }
+}
+
+#[global_allocator]
+static HEAP: Counted = Counted;
+
+/// What `work` made, the most it held on the heap beyond what was there before
+/// it ran, and what it left there, in bytes.
+fn heap_of<T>(work: impl FnOnce() -> T) -> (T, isize, isize) {
+    HELD.store(0, Relaxed);
+    PEAK.store(0, Relaxed);
+    COUNTING.store(true, Relaxed);
+    let made = work();
+    COUNTING.store(false, Relaxed);
+    (made, PEAK.load(Relaxed), HELD.load(Relaxed))
+}
 
 const FILMS: usize = 47_188;
 const SERIES: usize = 10_589;
@@ -11172,15 +11540,23 @@ fn time(n: usize, mut work: impl FnMut()) -> (f64, f64, f64, f64) {
 #[ignore]
 fn a_catalog_of_pandoras_size_timed() {
     let (movies, series, categories) = (films(), shows(), categories());
-    let (first, best, mean, worst) = time(5, || {
-        black_box(TitleIndex::build(
-            black_box(&movies),
-            black_box(&series),
+    // The lists as the catalog keeps them, and what they give up for the index
+    // beside them, as `catalog::StoredCatalog::new` takes it out.
+    let (mut kept_movies, mut kept_series) = (movies.clone(), series.clone());
+    let (extras, _, given_up) = heap_of(|| Extras::take(&mut kept_movies, &mut kept_series));
+    let build = || {
+        TitleIndex::build_with(
+            black_box(&kept_movies),
+            black_box(&kept_series),
+            &extras,
             &categories,
             MAX_YEAR,
-        ));
+        )
+    };
+    let (first, best, mean, worst) = time(5, || {
+        black_box(build());
     });
-    let index = TitleIndex::build(&movies, &series, &categories, MAX_YEAR);
+    let (index, peak, kept) = heap_of(build);
     let s = index.stats();
     println!(
         "index build: {} titles ({} series, {} films from {} versions): first {first:.1} ms, best {best:.1} ms, mean {mean:.1} ms, worst {worst:.1} ms",
@@ -11189,13 +11565,16 @@ fn a_catalog_of_pandoras_size_timed() {
         s.films,
         s.versions
     );
-    // The catalog's build first puts its lists together again, a copy of
-    // every record and name (`catalog::TitleInput`), and the covers move in:
-    // this copy of the whole lists costs at least as much.
-    let (_, copy_ms, _, _) = time(5, || {
-        black_box((movies.clone(), series.clone()));
-    });
-    println!("lists put together for the build: {copy_ms:.1} ms at most, beside the build");
+    println!(
+        "index build memory: {:.2} MB at its peak, {:.2} MB kept (the index), {:.2} MB passing (its own working lists); no list copied",
+        peak as f64 / 1e6,
+        kept as f64 / 1e6,
+        (peak - kept) as f64 / 1e6
+    );
+    println!(
+        "what the lists give up for it: {:.2} MB of handles (the strings move), held from the catalog's put until its titles are built",
+        given_up as f64 / 1e6
+    );
     println!(
         "index size: {:.2} MB (budget 5 MB), covers beside it {:.2} MB",
         index.heap_bytes() as f64 / 1e6,
@@ -11676,8 +12055,8 @@ The guide's merge (`guide_channels_of`) returns at once for a list with no catch
 with
 
 ```markdown
-The guide's merge (`guide_channels_of`) returns at once for a list with no catch-up channel, which an M3U list never has. The fetch task asks the two category lists beside the three lists (`tokio::join!`) and puts the catalog as soon as they are in, so zapping, `f` and the guide wait for nothing new; what only the title index reads (covers, a series' genres and release dates) leaves the lists there (`StoredCatalog::new` hands it on as a `TitleInput`). Then it builds the thuisbioscoop's title index on the blocking pool (~80 ms for Pandora's 58,000 titles), logs one `vod:` line on what the lists gave (covers, ratings, years, genres, languages), and puts it beside the catalog (`put_titles`, counted in `titles_revision`; titles of a catalog that was replaced meanwhile are not put). The index leaves the store only as `Titles` (`CatalogStore::titles`), which apply the adult lock. The store writes the index to its cache file after every build and reads that file once, when the app asks after its first frame (`with_vod_cache`, `read_vod_cache`); the file's titles are put only while the store has none, and the catalog's own take their place.
-- **`vod/`** — the thuisbioscoop's data, drawing nothing (spec 2026-10-15; phase 1 wires none of it to a screen). `genres.rs`: the 24 genres with their aliases, the labels and language markers (they count only where labels stand: a prefix, a group in brackets, the end, and a category's leading words), the year of a name (`parse_name` allocates nothing: it reads ~58,000 names per catalog). `versions.rs`: films merged by folded title and year, the highest quality the default. `index.rs` (`TitleIndex`): 20-byte records in (kind, id) order, the names, search names and covers in text tables; search with filters, counts per value and four sorts in one pass, `more_like`, and `learn` for what details add. `cache.rs`: the index as `config\cache\vod-<host>_<port>.json`, written as it is serialized; no adult title, no cover address with an account or a query, and what a file says is checked as it is read (genre bits, a category's place). `mod.rs`'s `write_atomic_with` writes the cache, watching and details files through a temporary file. `watching.rs`: per source `watching.json` / `watching-<id>.json` (progress, Mijn lijst, thumbs; the 60 s and 90 % rules; writes 5 s apart and at a stop; an unreadable file kept as `.bad`). `details.rs` (`DetailStore`: 2 at a time, the newest first, a file per title without an image address that has a query, 24 h for series and 30 days for films). `covers.rs` (`CoverStore`: 6 downloads and 6 file reads at once, dropped when off screen, decoded on the blocking pool into fixed sizes, a 96 MB texture LRU generic over `CoverTexture`/`Uploader` so it is tested without a GPU, `prune` to 500 MB at every start (`main`), `placeholder_tint`).
+The guide's merge (`guide_channels_of`) returns at once for a list with no catch-up channel, which an M3U list never has. The fetch task asks the two category lists beside the three lists, in a task of their own, and puts the catalog as soon as the three lists are in, so zapping, `f` and the guide never wait for the categories; what only the title index reads (covers, a series' genre and release year) moves out of the lists there (`vod::index::Extras`, handed on in a `TitleInput`). The titles wait for the categories, 15 s at most (`CATEGORIES_WAIT`; then they go without, with a warn line), and are then built on the blocking pool from the stored lists, which the build reads and copies none of (`TitleIndex::build_with`; ~80 ms for Pandora's 58,000 titles). One `vod:` line says what the lists gave (covers, ratings, years, genres, languages), and the index is put beside the catalog (`put_titles`, counted in `titles_revision`; titles of a catalog that was replaced meanwhile are not put). The index leaves the store only as `Titles` (`CatalogStore::titles`), which apply the adult lock. The store writes the index to its cache file after every build and reads that file once, when the app asks after its first frame (`with_vod_cache`, `read_vod_cache`); the file's titles are put only while the store has none, and the catalog's own take their place.
+- **`vod/`** — the thuisbioscoop's data, drawing nothing (spec 2026-10-15; phase 1 wires none of it to a screen). `genres.rs`: the 24 genres with their aliases, the labels and language markers (they count only where labels stand: a prefix, a group in brackets, the end, and a category's leading words), the year of a name (`parse_name` allocates nothing: it reads ~58,000 names per catalog). `versions.rs`: films merged by folded title and year, the highest quality the default. `index.rs` (`TitleIndex`): 20-byte records in (kind, id) order, the names, search names and covers in text tables; search with filters, counts per value and four sorts in one pass, `more_like`, `learn` for what details add, and `build_with`, which builds it from a catalog's stored lists with what they gave up (`Extras`), copying none of them. `cache.rs`: the index as `config\cache\vod-<host>_<port>.json`, written as it is serialized; no adult title, no cover address with an account or a query, and what a file says is checked as it is read (genre bits, a category's place). `mod.rs`'s `write_atomic_with` writes the cache, watching and details files through a temporary file. `watching.rs`: per source `watching.json` / `watching-<id>.json` (progress, Mijn lijst, thumbs; the 60 s and 90 % rules; writes 5 s apart and at a stop; an unreadable file kept as `.bad`). `details.rs` (`DetailStore`: 2 at a time, the newest first, a file per title without an image address that has a query, 24 h for series and 30 days for films). `covers.rs` (`CoverStore`: 6 downloads and 6 file reads at once, dropped when off screen, decoded on the blocking pool into fixed sizes, a 96 MB texture LRU generic over `CoverTexture`/`Uploader` so it is tested without a GPU, `prune` to 500 MB at every start (`main`), `placeholder_tint`).
 ```
 
 In `CLAUDE.md`, the `search.rs` bullet. Replace
@@ -11763,7 +12142,7 @@ with
 
 - [ ] **Step 4: Full verification**
 
-- Run `ct`. Expected: all pass. Report the total and how many are new since Task 1's baseline (119 new tests: 14 + 11 + 6 + 12 + 10 + 8 + 14 + 14 + 11 + 11 + 5 in the new files, 2 in `app.rs` and 1 in `catalog.rs`; and 3 new ignored ones, the smoke test and the two timing tests).
+- Run `ct`. Expected: all pass. Report the total and how many are new since Task 1's baseline (123 new tests: 14 + 11 + 6 + 12 + 10 + 12 + 14 + 14 + 11 + 11 + 5 in the new files, 2 in `app.rs` and 1 in `catalog.rs`; and 3 new ignored ones, the smoke test and the two timing tests).
 - Run `cc`. Expected: the 2 old warnings only.
 - Run `fmt src/vod/mod.rs src/storage.rs src/i18n.rs src/main.rs src/portal/types.rs src/player/events.rs src/player/mpv.rs src/player/mpv_sys.rs tests/test_vod_portal.rs tests/test_vod_genres.rs tests/test_vod_versions.rs tests/test_vod_index.rs tests/test_vod_search.rs tests/test_vod_catalog.rs tests/test_vod_cache.rs tests/test_vod_watching.rs tests/test_vod_details.rs tests/test_vod_covers.rs tests/test_player_vod.rs tests/test_vod_timing.rs tests/test_f_timing.rs tests/test_storage.rs tests/test_catalog_adult.rs tests/test_mpv_smoke.rs`. Expected: no output.
 - The hunk counts, file by file as in Task 1's Step 1. Expected: the lines Task 1 Step 1 recorded.
@@ -11773,11 +12152,11 @@ with
 
 Run: `cd /c/Dropbox/Sources/tv/rust && CARGO_TARGET_DIR='C:\Users\brnck\AppData\Local\Temp\claude\C--Dropbox-Sources-tv\7bade0af-c82f-473e-9f05-1727a9a2ac83\scratchpad\tgt-thb' cargo test -j 4 --release --test test_vod_timing -- --ignored --nocapture`
 
-Expected: it passes and prints `index build: <n> titles (…): first … ms, best … ms, mean … ms, worst … ms`, `lists put together for the build: … ms at most, beside the build`, `index size: <x> MB (budget 5 MB), covers beside it <y> MB`, `list records: Movie … B x 47188, Series … B x 10589 = … MB`, `film list parse: … ms, series list parse: … ms (on the fetch's worker, as before)`, a table of keystrokes (`index: text`, `index: + filters`, `f today`) and `worst keystroke: index … ms (budget 16 ms, and no slower than f), f … ms`. When this plan was written, on the user's PC: build 74–83 ms, index 4.16 MB (covers 4.02 MB beside it), a keystroke 1.3–2.6 ms for the index and 9–16 ms for `f`.
+Expected: it passes and prints `index build: <n> titles (…): first … ms, best … ms, mean … ms, worst … ms`, `index build memory: … MB at its peak, … MB kept (the index), … MB passing (its own working lists); no list copied`, `what the lists give up for it: … MB of handles (the strings move), held from the catalog's put until its titles are built`, `index size: <x> MB (budget 5 MB), covers beside it <y> MB`, `list records: Movie … B x 47188, Series … B x 10589 = … MB`, `film list parse: … ms, series list parse: … ms (on the fetch's worker, as before)`, a table of keystrokes (`index: text`, `index: + filters`, `f today`) and `worst keystroke: index … ms (budget 16 ms, and no slower than f), f … ms`. When this plan was written, on the user's PC: build 74–83 ms (67–85 ms with the follow-up rulings), index 4.16 MB (covers 4.02 MB beside it), the build at its peak 15.3 MB on the heap, of which 8.2 MB kept and 7.1 MB passing, the lists' handles 1.6 MB, a keystroke 1.3–2.7 ms for the index and 8–16 ms for `f`.
 
 Then `f` against the base: `cd /c/Dropbox/Sources/tv/rust && CARGO_TARGET_DIR='C:\Users\brnck\AppData\Local\Temp\claude\C--Dropbox-Sources-tv\7bade0af-c82f-473e-9f05-1727a9a2ac83\scratchpad\tgt-thb' cargo test -j 4 --release --test test_f_timing -- --ignored --nocapture`. Expected: its worst keystroke within ±10 % of what Task 1 Step 0 printed.
 
-Write all of it in your report: what phase 1 adds to memory is the index, the covers and the list records together (the remedies, should the user count them: a prefix table for the cover addresses, narrower stored lists; Ruling 22), the build with the lists' copy before it is what the laaddraad spends, and the lists' parse stands beside it. Over a budget (150 ms for the build and the copy, 5 MB, 16 ms or slower than `f` for a keystroke), or `f` more than 10 % slower than at the base: report it and change nothing; the controller takes the numbers to the user first (spec §5).
+Write all of it in your report: what phase 1 adds to memory is the index, the covers and the list records together (the remedies, should the user count them: a prefix table for the cover addresses, narrower stored lists; Ruling 22); beside them pass the build's own working lists while it runs and the handles of what the lists gave up until the titles are built. The build is what the laaddraad spends, and the lists' parse stands beside it. Over a budget (150 ms for the build, 5 MB, 16 ms or slower than `f` for a keystroke), or `f` more than 10 % slower than at the base: report it and change nothing; the controller takes the numbers to the user first (spec §5).
 
 - [ ] **Step 6: The release build**
 
