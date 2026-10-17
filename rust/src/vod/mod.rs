@@ -1,6 +1,7 @@
 //! The thuisbioscoop's data (spec 2026-10-15 §7): titles, genres, versions,
 //! details, covers and what was watched. It draws nothing.
 
+pub mod cache;
 pub mod genres;
 pub mod index;
 pub mod versions;
@@ -23,9 +24,11 @@ pub struct TitleId {
 /// A film's, a version's or a series' id as the index keeps it: 1 to `u32::MAX`.
 /// Xtream ids are positive and the portal's unreadable id is 0, so 0 fits no
 /// more than a negative id does (`u32::try_from` alone takes it). One rule for
-/// a title, a version and a series, for the order of a film's versions
-/// (`versions::merge` puts an id that does not fit last) and for asking after
-/// one; what reads an id from a file applies it too.
+/// a title, a version and a series of the lists, for the order of a film's
+/// versions (`versions::merge` puts an id that does not fit last) and for
+/// asking after one. A file's ids are `u32` by the file's own type and do not
+/// come through here: the fence for them is `TitleIndex::assemble`'s, which
+/// leaves out a title whose id is 0 and a version whose stream id is 0.
 pub(crate) fn fit_id(id: i64) -> Option<u32> {
     u32::try_from(id).ok().filter(|&id| id != 0)
 }
@@ -128,4 +131,83 @@ fn plain(c: char) -> Option<&'static str> {
 /// Unicode's combining diacritical marks (U+0300 to U+036F).
 fn is_combining(c: char) -> bool {
     ('\u{0300}'..='\u{036f}').contains(&c)
+}
+
+/// Writes a file of the thuisbioscoop through a temporary one beside it
+/// (`<name>.json.tmp`) that is renamed over it, so a write that fails leaves
+/// the old file whole and no temporary file behind (spec 2026-10-15 §6).
+/// `write` fills the temporary file, buffered.
+pub(crate) fn write_atomic_with(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let written = std::fs::File::create(&tmp)
+        .and_then(|file| {
+            let mut out = std::io::BufWriter::new(file);
+            write(&mut out)?;
+            out.flush()
+        })
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_atomic_with;
+    use std::io::Write as _;
+
+    /// The new text is written beside the old file, which stays whole until
+    /// the rename: a crash or a full disk halfway never leaves half a file.
+    #[test]
+    fn a_file_is_written_beside_the_old_one_and_renamed_over_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // The folder is made when it is missing.
+        let path = dir.path().join("cache").join("vod.json");
+        let tmp = path.with_extension("json.tmp");
+        write_atomic_with(&path, |out| out.write_all(b"old")).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert!(!tmp.exists());
+        let mut seen = None;
+        write_atomic_with(&path, |out| {
+            out.write_all(b"the new one, a good deal longer")?;
+            out.flush()?;
+            seen = Some((std::fs::read(&path)?, std::fs::read(&tmp)?));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            Some((b"old".to_vec(), b"the new one, a good deal longer".to_vec())),
+            "while it is written: the old file whole, the new text beside it"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"the new one, a good deal longer"
+        );
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn a_write_that_fails_halfway_keeps_the_old_file_whole_and_leaves_no_temporary_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vod.json");
+        let tmp = path.with_extension("json.tmp");
+        write_atomic_with(&path, |out| out.write_all(b"old")).unwrap();
+        let failed = write_atomic_with(&path, |out| {
+            out.write_all(b"half of the new one")?;
+            out.flush()?;
+            Err(std::io::Error::other("disk full"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert!(!tmp.exists());
+    }
 }

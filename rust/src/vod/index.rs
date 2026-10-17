@@ -202,7 +202,8 @@ pub struct Stats {
     /// Left out: a title (a film's default version, a series) or a version whose
     /// id is not 1 to `u32::MAX`, and a title whose id an earlier title of the
     /// same kind already has. A film whose default does not fit counts once, for
-    /// the whole title.
+    /// the whole title, and so does a film from a cache file that no version is
+    /// left for.
     pub skipped: usize,
 }
 
@@ -471,18 +472,29 @@ impl TitleIndex {
     }
 
     /// The index of `entries`, whose versions are ranges of `pool` and whose
-    /// `category` is a position plus one in `categories`. Two titles of one
-    /// kind and id keep the first; the others, a title whose id does not fit and
-    /// a version whose stream id does not fit are left out and counted (the
-    /// lists' build has left out its own already: this is the fence for what a
-    /// cache file says).
+    /// `category` is a position plus one in `categories`. Left out and counted:
+    /// a title whose id is 0; a film with no version that can play (none handed
+    /// over, or every stream id 0), once, for the whole title; of two titles of
+    /// one kind and id that stay, the later; and a version whose stream id is
+    /// 0. A series has no versions and stays. The lists' build has left out its
+    /// own already, and hands over no film without a version that fits: this is
+    /// the fence for what a cache file says.
     pub(crate) fn assemble(
         mut entries: Vec<Entry<'_>>,
         pool: &[VersionIn<'_>],
         categories: Vec<CategoryRec>,
     ) -> Self {
         let given = entries.len();
-        entries.retain(|e| e.id != 0);
+        // A film that no version is left for cannot play. It goes out here,
+        // before the order is taken, so `given - n` counts it once and a later
+        // title of its id is not mistaken for a copy of it.
+        entries.retain(|e| {
+            e.id != 0
+                && (e.kind == Kind::Series
+                    || pool[e.versions.start as usize..e.versions.end as usize]
+                        .iter()
+                        .any(|v| v.0 != 0))
+        });
         entries.sort_by_key(|e| (e.kind, e.id));
         entries.dedup_by_key(|e| (e.kind, e.id));
         let n = entries.len();
@@ -741,6 +753,12 @@ impl TitleIndex {
     /// The bytes of the cover addresses.
     pub fn cover_bytes(&self) -> usize {
         self.covers.heap_bytes()
+    }
+
+    /// Title `pos`'s category as its record keeps it: a place in the
+    /// categories plus one, 0 for none (the cache writes it so).
+    pub(crate) fn category_code(&self, pos: usize) -> u16 {
+        self.records[pos].category
     }
 }
 
