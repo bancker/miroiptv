@@ -148,7 +148,8 @@ pub(crate) fn write_atomic_with(
     let tmp = path.with_extension("json.tmp");
     let written = std::fs::File::create(&tmp)
         .and_then(|file| {
-            let mut out = std::io::BufWriter::new(file);
+            // 64 KiB: serde writes in small pieces, and the cache is 9 MB.
+            let mut out = std::io::BufWriter::with_capacity(64 * 1024, file);
             write(&mut out)?;
             out.flush()
         })
@@ -209,5 +210,39 @@ mod tests {
         assert!(failed.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"old");
         assert!(!tmp.exists());
+    }
+
+    /// Kills a5 (the temporary file is made with `create_new`): what a crash
+    /// leaves behind is written over by the next write, not a reason to fail.
+    #[test]
+    fn a_temporary_file_left_by_a_crash_does_not_stop_the_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vod.json");
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(
+            &tmp,
+            b"half of a write that never ended, longer than the new text",
+        )
+        .unwrap();
+        write_atomic_with(&path, |out| out.write_all(b"new")).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert!(!tmp.exists());
+    }
+
+    /// 6b reads the file on the blocking pool while a build may be writing it.
+    /// std opens a file with all three share flags, so a reader that holds the
+    /// old file open does not stop the rename, and keeps reading the old file.
+    #[test]
+    fn a_reader_that_holds_the_file_open_does_not_stop_the_write() {
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vod.json");
+        write_atomic_with(&path, |out| out.write_all(b"old old old")).unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        write_atomic_with(&path, |out| out.write_all(b"new")).unwrap();
+        let mut seen = String::new();
+        reader.read_to_string(&mut seen).unwrap();
+        assert_eq!(seen, "old old old");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 }

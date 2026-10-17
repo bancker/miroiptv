@@ -18,6 +18,13 @@ use std::path::{Path, PathBuf};
 
 const VERSION: u32 = 1;
 
+/// Every save of a file goes through the same temporary file
+/// (`write_atomic_with`), so two at once would write into each other: the
+/// stores of two sources of one portal (an edited account, two accounts of one
+/// provider) share the file. Held by `save` alone, which runs on the blocking
+/// pool: a writer of another file never waits for it.
+static SAVING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// The file as it is read.
 #[derive(Deserialize)]
 struct CacheFile {
@@ -150,8 +157,10 @@ pub fn path_for(cache_dir: &Path, creds: Option<&XtreamCreds>) -> Option<PathBuf
 /// they are serialized, through a temporary file renamed over it
 /// (`write_atomic_with`), so a write that fails leaves the old file whole.
 /// Adult titles stay out, and so does a cover address that holds an account
-/// or a query. How many titles went in and the file's size.
+/// or a query. How many titles went in and the file's size. One save runs at a
+/// time in the process (`SAVING`).
 pub fn save(path: &Path, index: &TitleIndex, saved_at: i64) -> std::io::Result<(usize, u64)> {
+    let _one_at_a_time = SAVING.lock();
     let file = CacheFileRef {
         version: VERSION,
         saved_at,
@@ -182,6 +191,9 @@ pub fn load(path: &Path) -> Result<Option<(TitleIndex, i64)>, String> {
         Err(e) => return Err(e.to_string()),
     };
     let file: CacheFile = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    // The text is parsed into strings of its own: give the bytes back before
+    // the index is assembled (their 9 MB are not in the peak then).
+    drop(bytes);
     if file.version != VERSION {
         return Err(format!("version {}", file.version));
     }

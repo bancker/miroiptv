@@ -476,9 +476,10 @@ impl TitleIndex {
     /// a title whose id is 0; a film with no version that can play (none handed
     /// over, or every stream id 0), once, for the whole title; of two titles of
     /// one kind and id that stay, the later; and a version whose stream id is
-    /// 0. A series has no versions and stays. The lists' build has left out its
-    /// own already, and hands over no film without a version that fits: this is
-    /// the fence for what a cache file says.
+    /// 0. A series stays and has no versions: those a file hands over for one
+    /// are not read, and not counted. The lists' build has left out its own
+    /// already, and hands over no film without a version that fits: this is the
+    /// fence for what a cache file says.
     pub(crate) fn assemble(
         mut entries: Vec<Entry<'_>>,
         pool: &[VersionIn<'_>],
@@ -523,7 +524,12 @@ impl TitleIndex {
                 }
             }
             index.covers.push(e.cover);
-            for &(sid, labels, ext) in &pool[e.versions.start as usize..e.versions.end as usize] {
+            // Only a film has versions (`title_of_version` answers films).
+            let versions = match e.kind {
+                Kind::Film => e.versions.start as usize..e.versions.end as usize,
+                Kind::Series => 0..0,
+            };
+            for &(sid, labels, ext) in &pool[versions] {
                 if sid == 0 {
                     index.skipped += 1;
                     continue;

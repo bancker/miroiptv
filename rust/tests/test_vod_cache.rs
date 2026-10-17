@@ -521,3 +521,403 @@ fn what_the_build_writes_is_read_back_whole_odd_ids_in_the_lists_included() {
     );
     assert_eq!(back.title_of_version(0), None);
 }
+
+/// Kills w11 (the writer writes a series' category as a film's) and r6 (the
+/// reader reads every category as a film's): nothing committed has a category
+/// of a series, so the `film` flag of a category is read back by no test.
+#[test]
+fn a_series_category_and_a_film_category_of_one_id_stay_two_categories_in_the_file() {
+    // The file's [film, id, name]: films' categories and series' ones are two
+    // id spaces, and id 5 names one of each.
+    let movies = [Movie {
+        stream_id: 1,
+        name: "Funny (2001)".into(),
+        category_id: 5,
+        ..Movie::default()
+    }];
+    let shows = [Series {
+        series_id: 9,
+        name: "Dark".into(),
+        category_id: 5,
+        ..Series::default()
+    }];
+    let categories = Categories {
+        vod: vec![Category {
+            category_id: 5,
+            category_name: "NL | Komedie".into(),
+        }],
+        series: vec![Category {
+            category_id: 5,
+            category_name: "Drama".into(),
+        }],
+    };
+    let index = TitleIndex::build(&movies, &shows, &categories, 2027);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vod.json");
+    save(&path, &index, SAVED_AT).unwrap();
+    let (back, _) = load(&path).unwrap().unwrap();
+    let category_of = |id: TitleId| {
+        let t = back.title(back.find(id).unwrap()).unwrap();
+        t.category.map(|c| (c.kind, c.id, c.name))
+    };
+    assert_eq!(category_of(film(1)), Some((Kind::Film, 5, "NL | Komedie")));
+    assert_eq!(category_of(series(9)), Some((Kind::Series, 5, "Drama")));
+    let listed: Vec<_> = back.categories().map(|c| (c.kind, c.id)).collect();
+    assert_eq!(listed, [(Kind::Film, 5), (Kind::Series, 5)]);
+}
+
+/// Kills r5 (the reader drops the trailer flag) and, with the next test, w8 (the
+/// writer does) and any swap of the three flags: no committed test has a trailer.
+#[test]
+fn the_flags_of_a_title_are_read_in_the_order_they_are_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vod.json");
+    std::fs::write(
+        &path,
+        br#"{"version":1,"saved_at":0,"categories":[],"titles":[
+            [true,1,"A","",0,0,0,0,0,true,false,false,[[1,0,""]]],
+            [true,2,"B","",0,0,0,0,0,false,true,false,[[2,0,""]]],
+            [true,3,"C","",0,0,0,0,0,false,false,true,[[3,0,""]]]]}"#,
+    )
+    .unwrap();
+    let (index, _) = load(&path).unwrap().unwrap();
+    let flags = |id: i64| {
+        let t = index.title(index.find(film(id)).unwrap()).unwrap();
+        (t.dutch, t.english, t.trailer)
+    };
+    assert_eq!(flags(1), (true, false, false));
+    assert_eq!(flags(2), (false, true, false));
+    assert_eq!(flags(3), (false, false, true));
+}
+
+/// Kills w8 (the writer writes `false` for the trailer).
+#[test]
+fn what_the_details_taught_a_title_is_written_with_it() {
+    use bongo_player::vod::index::Learned;
+    let index = library();
+    let secret = index.find(film(4)).unwrap();
+    index.learn(
+        secret,
+        Learned {
+            year: 0,
+            genres: Genre::Horror.bit(),
+            trailer: true,
+        },
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vod.json");
+    save(&path, &index, SAVED_AT).unwrap();
+    let (back, _) = load(&path).unwrap().unwrap();
+    let title = |id: i64| back.title(back.find(film(id)).unwrap()).unwrap();
+    assert_eq!(
+        (title(4).trailer, title(4).genres),
+        (true, Genre::Horror.bit())
+    );
+    assert!(!title(1).trailer, "only the title that learned it");
+}
+
+/// Kills r1 (a rating past 100 is kept as it is): `Title::rating` is "in tenths,
+/// 0 to 100".
+#[test]
+fn a_rating_past_100_reads_as_100() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vod.json");
+    std::fs::write(
+        &path,
+        br#"{"version":1,"saved_at":0,"categories":[],"titles":[
+            [true,1,"A","",0,99,0,0,0,false,false,false,[[1,0,""]]],
+            [true,2,"B","",0,100,0,0,0,false,false,false,[[2,0,""]]],
+            [true,3,"C","",0,101,0,0,0,false,false,false,[[3,0,""]]],
+            [true,4,"D","",0,255,0,0,0,false,false,false,[[4,0,""]]]]}"#,
+    )
+    .unwrap();
+    let (index, _) = load(&path).unwrap().unwrap();
+    let rating = |id: i64| index.title(index.find(film(id)).unwrap()).unwrap().rating;
+    assert_eq!(
+        (rating(1), rating(2), rating(3), rating(4)),
+        (99, 100, 100, 100)
+    );
+}
+
+/// Kills r2 (the place one past the list is kept). The committed test names place
+/// 7 in a list of one, which a bound one too high lets pass.
+#[test]
+fn a_category_place_one_past_the_list_names_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vod.json");
+    // Two categories: places 1 and 2 are theirs, 3 is one past them.
+    std::fs::write(
+        &path,
+        br#"{"version":1,"saved_at":0,"categories":[[true,12,"A"],[true,13,"B"]],"titles":[
+            [true,1,"One","",0,0,0,2,0,false,false,false,[[1,0,""]]],
+            [true,2,"Two","",0,0,0,3,0,false,false,false,[[2,0,""]]],
+            [true,3,"Three","",0,0,0,3,0,false,false,false,[[3,0,""]]]]}"#,
+    )
+    .unwrap();
+    let (index, _) = load(&path).unwrap().unwrap();
+    let category = |id: i64| {
+        let t = index.title(index.find(film(id)).unwrap()).unwrap();
+        t.category.map(|c| c.id)
+    };
+    assert_eq!(
+        (category(1), category(2), category(3)),
+        (Some(13), None, None)
+    );
+    let none = HashSet::new();
+    let two = index.find(film(2)).unwrap();
+    assert!(
+        index.more_like(two, 6, false, &none, &none).is_empty(),
+        "no category to share"
+    );
+}
+
+/// Kills p1 (a dash becomes `_`) and p2 (a letter that is no ASCII letter stays):
+/// the rule is the EPG cache's, and the committed test has neither.
+#[test]
+fn portal_key_keeps_dots_and_dashes_and_turns_the_rest_into_underscores() {
+    assert_eq!(portal_key("my-host.example", 8080), "my-host.example_8080");
+    assert_eq!(portal_key("b\u{fc}cher.example", 443), "b_cher.example_443");
+    assert_eq!(portal_key("a b@c", 1), "a_b_c_1");
+}
+
+/// Kills i7 (the film check after the dedup): the report's "a later title of the
+/// same kind and id is no longer taken for a copy of a film that was left out" is
+/// pinned by no committed test.
+#[test]
+fn a_dead_film_does_not_shadow_a_live_one_of_its_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vod.json");
+    std::fs::write(
+        &path,
+        br#"{"version":1,"saved_at":0,"categories":[],"titles":[
+            [true,7,"Dead","",0,0,0,0,0,false,false,false,[[0,0,""]]],
+            [true,7,"Alive","",0,0,0,0,0,false,false,false,[[7,0,"mkv"]]]]}"#,
+    )
+    .unwrap();
+    let (index, _) = load(&path).unwrap().unwrap();
+    assert_eq!(index.len(), 1);
+    let alive = index.title(index.find(film(7)).unwrap()).unwrap();
+    assert_eq!(alive.name, "Alive");
+    assert_eq!(index.stats().skipped, 1, "the dead one, once");
+}
+
+/// Kills r13 (an unreadable file answers "no cache"): a folder where the file
+/// should be is an error the caller logs, not a missing file.
+#[test]
+fn a_file_that_cannot_be_read_is_an_error_and_not_no_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(load(dir.path()).is_err());
+}
+
+/// Kills r12 (only a higher version is refused).
+#[test]
+fn a_file_of_a_version_before_this_one_is_refused_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vod.json");
+    std::fs::write(
+        &path,
+        br#"{"version":0,"saved_at":0,"categories":[],"titles":[]}"#,
+    )
+    .unwrap();
+    let Err(e) = load(&path) else {
+        panic!("version 0 was read");
+    };
+    assert!(e.contains('0'), "{e}");
+}
+
+/// One assertion for every field the reader or the writer drops or changes: what
+/// a file holds, written again, is the same file.
+#[test]
+fn a_file_read_and_written_again_is_the_same_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, again) = (dir.path().join("first.json"), dir.path().join("again.json"));
+    save(&first, &library(), SAVED_AT).unwrap();
+    let (back, saved_at) = load(&first).unwrap().unwrap();
+    save(&again, &back, saved_at).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&first).unwrap(),
+        std::fs::read_to_string(&again).unwrap()
+    );
+}
+
+/// The cover filter is `redact`'s: every form of an account it knows stays out,
+/// whatever the file's reader would do with it. (Forms it has never known, such
+/// as `//user:pass@host/x.jpg` or a `#` fragment, are no address a portal's
+/// cover takes; see the review.)
+#[test]
+fn a_cover_that_holds_an_account_is_left_out_in_every_form_redact_knows() {
+    let stays = [
+        "https://image.tmdb.org/t/p/w600_and_h900_bestv2/abcdef0123456789.jpg",
+        "http://203.0.113.5:8080/images/m.jpg",
+        "https://cdn.example/posters/12/34/56.jpg",
+    ];
+    let goes = [
+        "http://u:p@h/x.jpg",
+        "http://user@h/x.jpg",
+        "http://h:80/movie/u/p/4.jpg",
+        "http://h:80/series/u/p/4.jpg",
+        "http://h:80/live/u/p/4.jpg",
+        "http://h:80/timeshift/u/p/4.jpg",
+        "http://h/u/p/4.jpg",
+        "http://h/u/p/4",
+        "http://h/x.jpg?username=u&password=p",
+        "http://h/x.jpg?token=abc",
+        "http://h/x.jpg?",
+    ];
+    let movies: Vec<Movie> = stays
+        .iter()
+        .chain(goes.iter())
+        .enumerate()
+        .map(|(i, cover)| Movie {
+            stream_id: i as i64 + 1,
+            name: format!("Film {i} (2001)"),
+            stream_icon: Some((*cover).to_string()),
+            ..Movie::default()
+        })
+        .collect();
+    let index = TitleIndex::build(&movies, &[], &Categories::default(), 2027);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vod.json");
+    save(&path, &index, SAVED_AT).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    for cover in goes {
+        assert!(!text.contains(cover), "{cover} was written");
+    }
+    let (back, _) = load(&path).unwrap().unwrap();
+    for (i, cover) in stays.iter().chain(goes.iter()).enumerate() {
+        let t = back.title(back.find(film(i as i64 + 1)).unwrap()).unwrap();
+        assert_eq!(t.cover, (i < stays.len()).then_some(*cover), "{cover}");
+    }
+}
+
+/// A file cut anywhere is refused, and one with a damaged byte is refused or read:
+/// the release build aborts on a panic, and a half file is what a crash leaves.
+/// Every fifth cut and every eleventh byte, two ways each (a file costs 4 ms in a
+/// debug build; the review ran every cut and every bit of this file, and 290,000
+/// more, and met no panic).
+#[test]
+fn a_damaged_file_is_refused_or_read_and_never_a_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let valid = dir.path().join("valid.json");
+    save(&valid, &library(), SAVED_AT).unwrap();
+    let bytes = std::fs::read(&valid).unwrap();
+    let path = dir.path().join("damaged.json");
+    for cut in (0..bytes.len()).step_by(5) {
+        std::fs::write(&path, &bytes[..cut]).unwrap();
+        assert!(load(&path).is_err(), "a file cut at byte {cut} was read");
+    }
+    for at in (0..bytes.len()).step_by(11) {
+        for flip in [0x01u8, 0x20] {
+            let mut damaged = bytes.clone();
+            damaged[at] ^= flip;
+            std::fs::write(&path, &damaged).unwrap();
+            let _ = load(&path);
+        }
+    }
+}
+
+/// RED on e74cd62 (the implementer's concern 1): a series that carries versions
+/// in a file keeps them, `title_of_version` answers its position, and the
+/// versions count in `Stats`. GREEN with `assemble` giving a series none.
+#[test]
+fn a_series_that_carries_versions_in_a_file_has_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vod.json");
+    std::fs::write(
+        &path,
+        br#"{"version":1,"saved_at":0,"categories":[],"titles":[
+            [false,9,"A series","",0,0,0,0,0,false,false,false,[[77,0,"mkv"],[78,0,""]]],
+            [true,5,"A film","",0,0,0,0,0,false,false,false,[[5,0,"mp4"],[79,0,""]]]]}"#,
+    )
+    .unwrap();
+    let (index, _) = load(&path).unwrap().unwrap();
+    let dark = index.title(index.find(series(9)).unwrap()).unwrap();
+    assert!(dark.versions.is_empty(), "a series has no versions");
+    assert_eq!(
+        index.title_of_version(77),
+        None,
+        "no film plays as stream 77"
+    );
+    assert_eq!(index.title_of_version(79), index.find(film(5)));
+    let s = index.stats();
+    assert_eq!((s.series, s.films, s.versions, s.skipped), (1, 1, 2, 0));
+}
+
+/// RED on e74cd62: two stores of one portal write one file, and their saves share
+/// its temporary file. Measured on e74cd62 (release): 13 to 24 of 100 saves fail
+/// with "The system cannot find the file specified", readers meet files that are
+/// halfway, and the file at the end can be a valid mix of both. GREEN with one
+/// save at a time in the process.
+#[test]
+fn two_saves_of_one_file_at_once_leave_it_whole() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let films = |n: i64, tag: &str| -> Arc<TitleIndex> {
+        let movies: Vec<Movie> = (1..=n)
+            .map(|i| Movie {
+                stream_id: i,
+                name: format!("{tag} film {i} (2001)"),
+                container_extension: Some("mkv".into()),
+                stream_icon: Some(format!("https://img.example/{tag}/{i}.jpg")),
+                ..Movie::default()
+            })
+            .collect();
+        Arc::new(TitleIndex::build(
+            &movies,
+            &[],
+            &Categories::default(),
+            2027,
+        ))
+    };
+    let (small, big) = (films(400, "small"), films(1200, "big"));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache").join("vod-h_80.json");
+    save(&path, &small, 1).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let path = path.clone();
+            let index = if w % 2 == 0 {
+                small.clone()
+            } else {
+                big.clone()
+            };
+            std::thread::spawn(move || {
+                (0..20)
+                    .filter_map(|_| save(&path, &index, 2).err())
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let reader = {
+        let (path, done) = (path.clone(), done.clone());
+        std::thread::spawn(move || {
+            let mut halfway = Vec::new();
+            while !done.load(Ordering::Relaxed) {
+                if let Err(e) = load(&path) {
+                    halfway.push(e);
+                }
+            }
+            halfway
+        })
+    };
+    let failed: Vec<String> = writers
+        .into_iter()
+        .flat_map(|w| w.join().unwrap())
+        .collect();
+    done.store(true, Ordering::Relaxed);
+    let halfway = reader.join().unwrap();
+    assert!(
+        failed.is_empty(),
+        "{} saves failed: {failed:?}",
+        failed.len()
+    );
+    assert!(halfway.is_empty(), "reads of a file halfway: {halfway:?}");
+    let (back, _) = load(&path).unwrap().unwrap();
+    assert!(
+        back.len() == small.len() || back.len() == big.len(),
+        "a mix of both: {} titles",
+        back.len()
+    );
+}
