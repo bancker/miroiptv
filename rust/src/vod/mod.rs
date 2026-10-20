@@ -2,6 +2,7 @@
 //! details, covers and what was watched. It draws nothing.
 
 pub mod cache;
+pub mod covers;
 pub mod details;
 pub mod genres;
 pub mod index;

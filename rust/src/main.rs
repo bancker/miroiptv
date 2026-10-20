@@ -200,6 +200,10 @@ fn main() -> anyhow::Result<()> {
     let rt = Runtime::new()?;
     let _rt_guard = rt.enter();
 
+    // The thuisbioscoop's covers folder keeps to its 500 MB (spec 2026-10-15
+    // §4.4): the oldest files go, in the background.
+    bongo_player::vod::covers::prune_in_background(storage.cache_dir().join("covers"));
+
     // The portal of --xtream with real values wins (see args::resolve_creds),
     // then the source in use in BongoIPTVPlayer.ini. Placeholder, missing or
     // unreadable credentials never stop the app: it shows the setup prompt,

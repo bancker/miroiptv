@@ -18,9 +18,10 @@ path = "src/main.rs"
 eframe = { version = "0.27", default-features = false, features = ["wgpu", "default_fonts"] }
 egui = "0.27"
 egui_extras = "0.27"
-# PNG logos in the guide. eframe pulls in this very version with these very
-# features already, so nothing new is compiled in.
-image = { version = "0.24", default-features = false, features = ["png"] }
+# PNG logos in the guide; PNG and JPEG covers in the thuisbioscoop. eframe
+# pulls in this very version with PNG already; JPEG adds its decoder
+# (jpeg-decoder), no crate of our own.
+image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "net", "io-util"] }
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
