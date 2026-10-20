@@ -32,6 +32,15 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] After the arrows, keep typing → the letters land at the end of the query
 - [ ] Esc dismisses search
 
+## Thuisbioscoop, phase 1 (the log only)
+- [ ] Start on the Xtream portal and wait for the catalog: the log says `vod: <n> titles (… series, … films in … versions, … left out), … categories - cover … %, rating … %, year … %, genre … %, Dutch … %, English … % - index … KB, covers … KB, built in … ms`. Note the line for the user: the shares say how good the portal's data is, and the build stays within 150 ms
+- [ ] The catalog comes first and the titles after it: zapping, the guide and `f` work as soon as `catalog: loaded in …` is logged, before the `vod:` line
+- [ ] Then `vod: cache written (<n> titles, … KB)`, and `%APPDATA%\BongoIPTVPlayer\config\cache\vod-<host>_<port>.json` exists; it holds no user name, no password and no adult title
+- [ ] Quit and start again: soon after the window shows, `vod: cache read (<n> titles, written at …) in … ms`
+- [ ] `f`, type a few letters: one line per keystroke, `search: <n> results in <ms> ms`, never the letters typed; the search finds and plays as before
+- [ ] On an M3U source: no `vod: <n> titles` line and no cache file
+- [ ] Zapping, the guide and a film from `f` play as before
+
 ## Settings (o) and language
 - [ ] First start (no `settings.json`): a language screen in three languages, the Windows language preselected; Enter picks it and the last channel then plays
 - [ ] `o` opens the settings; Up/Down choose a section, Enter opens it, Esc goes back; Esc or `o` in the list closes

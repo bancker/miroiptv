@@ -42,6 +42,10 @@ extraction.
   addresses can hold passwords: they stay in the ini, never in a log.
 - Saved M3U lists: `cache\m3u-<id>.m3u` in the config folder, shown at once on
   the next start while the fresh list downloads.
+- The films and series of an Xtream portal, for the coming thuisbioscoop:
+  `cache\vod-<host>_<port>.json` in the config folder, written after every
+  catalog load and read at the next start. It holds titles, covers and
+  ratings, never an adult title, a user name or a password.
 - Favorites, presets and the last channel are kept per source: source 1 in
   `favorites.json`, `presets.json`, `last_watched.json`, another source in
   `favorites-<id>.json` and so on. Source 1's files are 0.6.1's portal's, so
