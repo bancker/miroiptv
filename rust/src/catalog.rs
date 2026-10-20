@@ -10,6 +10,7 @@ use crate::vod::index::{CategoryInfo, Extras, Learned, Query, Results, Title, Ti
 use crate::vod::TitleId;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -308,10 +309,16 @@ fn log_titles(titles: &TitleIndex, categories: &Categories, took: std::time::Dur
 /// 2026-10-15 §4.2). Every answer leaves the adult titles out while locked:
 /// this is the only way out of the catalog for the index, so nothing else
 /// filters. Asked again after the lock changes.
+///
+/// Until the titles of the store's catalog are built, they are those of the
+/// cache file (`saved_at`).
 #[derive(Clone)]
 pub struct Titles {
     index: Arc<TitleIndex>,
     unlocked: bool,
+    /// When the cache file the titles come from was written, unix seconds;
+    /// none for a catalog's own.
+    saved_at: Option<i64>,
 }
 
 impl Titles {
@@ -360,6 +367,12 @@ impl Titles {
     /// The portal's categories.
     pub fn categories(&self) -> impl Iterator<Item = CategoryInfo<'_>> + '_ {
         self.index.categories()
+    }
+
+    /// When the cache file these titles come from was written (unix seconds):
+    /// Thuis says "Gegevens van <dag> <tijd>". None for a catalog's own.
+    pub fn saved_at(&self) -> Option<i64> {
+        self.saved_at
     }
 }
 
@@ -904,6 +917,49 @@ mod zap_tests {
         // Its live channels are kept apart, in `live`.
         assert_eq!(stored.live.len(), 4);
     }
+
+    #[tokio::test]
+    async fn a_store_whose_titles_came_first_takes_none_from_the_cache_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vod-h_80.json");
+        let cached = TitleIndex::build(
+            &[],
+            &[Series {
+                series_id: 1,
+                name: "Cached".into(),
+                ..Series::default()
+            }],
+            &Categories::default(),
+            2027,
+        );
+        crate::vod::cache::save(&path, &cached, 1).unwrap();
+        let portal = Arc::new(crate::portal::xtream::XtreamPortal::new(
+            crate::args::XtreamCreds {
+                username: "u".into(),
+                password: "p".into(),
+                host: "h".into(),
+                port: 80,
+            },
+        ));
+        let store =
+            CatalogStore::from_catalog(portal, PortalCatalog::default()).with_vod_cache(Some(path));
+        store.read_vod_cache();
+        // The read holds the slot until it ends: then the store alone does.
+        for _ in 0..400 {
+            if Arc::strong_count(&store.titles) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(Arc::strong_count(&store.titles), 1, "the read has ended");
+        let held = store.titles.read();
+        let (index, saved_at) = held.as_ref().expect("the catalog's own titles");
+        assert!(
+            index.is_empty() && saved_at.is_none(),
+            "no second index held"
+        );
+        assert_eq!(store.titles_revision(), 1, "the file put nothing");
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -945,13 +1001,103 @@ pub struct CatalogStore {
     defect_revision: AtomicU64,
     /// The thuisbioscoop's titles (`vod::index`), adult ones included: they
     /// leave the store only as `Titles`, which apply the lock. Put after the
-    /// catalog they come from (`put_titles`).
-    titles: Arc<RwLock<Option<Arc<TitleIndex>>>>,
+    /// catalog they come from (`put_titles`); until then those of the cache
+    /// file, once read (`read_vod_cache`).
+    titles: Arc<RwLock<Option<StoredTitles>>>,
     /// How many times `titles` was put (see [`CatalogStore::titles_revision`]).
     titles_revision: Arc<AtomicU64>,
     /// How long the titles wait for the category lists once the catalog is in
     /// ([`CatalogStore::with_categories_wait`]).
     categories_wait: Duration,
+    /// Where this portal's titles are kept between starts (`vod::cache`);
+    /// none for an M3U list, and in tests that do not ask for one.
+    vod_cache: Option<PathBuf>,
+    /// The file was asked for: it is read once per store.
+    vod_cache_asked: AtomicBool,
+    /// The store's source is no longer in use ([`CatalogStore::retire`]): its
+    /// titles are not written to the file any more. Every write holds it from
+    /// that check until the file is in place ([`keep_titles`]), which keeps the
+    /// store's writes one at a time as well.
+    vod_cache_retired: Arc<Mutex<bool>>,
+}
+
+/// Titles in the store, and when the cache file they come from was written
+/// (unix seconds; none for a catalog's own).
+type StoredTitles = (Arc<TitleIndex>, Option<i64>);
+
+/// Writes `titles` to the cache file at `path`, on the blocking pool
+/// ([`keep_titles`]).
+fn write_vod_cache(path: PathBuf, titles: Arc<TitleIndex>, retired: Arc<Mutex<bool>>) {
+    tokio::task::spawn_blocking(move || keep_titles(&path, &titles, &retired));
+}
+
+/// Writes `titles` to the cache file at `path`, unless the source of their
+/// store is no longer in use (`retired`, [`CatalogStore::retire`]). The flag is
+/// held until the file is in place, as an M3U list's own is while it saves its
+/// list: a retire waits for a write that has begun, and no write begins after
+/// it. So the store's writes go one at a time, and those of the process too
+/// (`cache::save`). A write that fails leaves the file that was there whole and
+/// is logged by the file's name, never its folder (which holds the user's
+/// name); the next build writes again.
+fn keep_titles(path: &Path, titles: &TitleIndex, retired: &Mutex<bool>) {
+    let retired = retired.lock();
+    if *retired {
+        info!("vod: cache not written - the source is no longer in use");
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    match crate::vod::cache::save(path, titles, now) {
+        Ok((n, bytes)) => info!("vod: cache written ({} titles, {} KB)", n, bytes / 1024),
+        Err(e) => {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            warn!("vod: cache not written ({name}: {e})");
+        }
+    }
+}
+
+/// The titles of the cache file at `path`, put in `slot` while it holds none
+/// and counted in `titles_revision`; on the blocking pool
+/// ([`CatalogStore::read_vod_cache`]). A file that cannot be read is ignored,
+/// and its error logged masked and cut ([`logged_error`]).
+fn read_titles(path: &Path, slot: &RwLock<Option<StoredTitles>>, titles_revision: &AtomicU64) {
+    let t0 = Instant::now();
+    match crate::vod::cache::load(path) {
+        Ok(Some((index, saved_at))) => {
+            info!(
+                "vod: cache read ({} titles, written at {}) in {} ms",
+                index.len(),
+                saved_at,
+                t0.elapsed().as_millis()
+            );
+            // Titles that came first (the catalog's own) are fresher.
+            let mut held = slot.write();
+            if held.is_none() {
+                *held = Some((Arc::new(index), Some(saved_at)));
+                titles_revision.fetch_add(1, Ordering::Release);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => warn!(
+            "vod: cache unreadable ({}) - ignored, the next load writes a new one",
+            logged_error(&e)
+        ),
+    }
+}
+
+/// How many characters of a file's error its log line keeps.
+const LOGGED_ERROR_CHARS: usize = 300;
+
+/// A file's error as its log line says it: masked (`redact`), then cut to
+/// `LOGGED_ERROR_CHARS` characters at a character's boundary. serde quotes the
+/// value it could not read, and a file may hold anything: a name of 70,000
+/// characters would make a line of 70,000, and an account cut in two before it
+/// is masked would be one that `redact` no longer knows.
+fn logged_error(e: &str) -> String {
+    let e = crate::redact::redact(e);
+    match e.char_indices().nth(LOGGED_ERROR_CHARS) {
+        Some((cut, _)) => format!("{}...", &e[..cut]),
+        None => e.into_owned(),
+    }
 }
 
 /// Puts a catalog in its slot and counts it. The count moves after the catalog
@@ -971,20 +1117,22 @@ fn put_catalog(
 
 /// Puts the titles built from the catalog put at count `of` in their slot and
 /// counts them, as `put_catalog` does, when that catalog is still the store's
-/// (`revision`): a newer one's own titles come after it.
+/// (`revision`): a newer one's own titles come after it. They take the place
+/// of the cache file's. Whether they were put.
 fn put_titles(
-    slot: &RwLock<Option<Arc<TitleIndex>>>,
+    slot: &RwLock<Option<StoredTitles>>,
     titles_revision: &AtomicU64,
     revision: &AtomicU64,
     of: u64,
     titles: Arc<TitleIndex>,
-) {
+) -> bool {
     let mut held = slot.write();
     if revision.load(Ordering::Acquire) != of {
-        return;
+        return false;
     }
-    *held = Some(titles);
+    *held = Some((titles, None));
     titles_revision.fetch_add(1, Ordering::Release);
+    true
 }
 
 /// How long the titles wait for the portal's category lists once the catalog
@@ -1027,6 +1175,9 @@ impl CatalogStore {
             titles: Arc::new(RwLock::new(None)),
             titles_revision: Arc::new(AtomicU64::new(0)),
             categories_wait: CATEGORIES_WAIT,
+            vod_cache: None,
+            vod_cache_asked: AtomicBool::new(false),
+            vod_cache_retired: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -1035,6 +1186,49 @@ impl CatalogStore {
     pub fn with_categories_wait(mut self, wait: Duration) -> Self {
         self.categories_wait = wait;
         self
+    }
+
+    /// This store keeps its titles in the file at `path` (`vod::cache`): it
+    /// writes it after every build of its titles and reads it once, when asked
+    /// ([`CatalogStore::read_vod_cache`]). None keeps no file.
+    pub fn with_vod_cache(mut self, path: Option<PathBuf>) -> Self {
+        self.vod_cache = path;
+        self
+    }
+
+    /// Reads the titles of the last start from the file, once, on the blocking
+    /// pool: the app asks after its first frame (spec 2026-10-15 §4.6). They are
+    /// put only while the store has no titles, and the titles of its catalog
+    /// take their place. A file that cannot be read is ignored; the next load
+    /// writes a new one.
+    pub fn read_vod_cache(&self) {
+        // Asked every frame: once asked, an atomic load and nothing else.
+        if self.vod_cache_asked.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(path) = self.vod_cache.clone() else {
+            self.vod_cache_asked.store(true, Ordering::Release);
+            return;
+        };
+        if self.vod_cache_asked.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (titles, titles_revision) = (self.titles.clone(), self.titles_revision.clone());
+        runtime.spawn_blocking(move || read_titles(&path, &titles, &titles_revision));
+    }
+
+    /// The app no longer runs on this store: its source was switched away
+    /// from, saved with another address or deleted. Its portal writes nothing
+    /// for it any more ([`Portal::retire`]), and neither does the store: a write
+    /// of the titles' file that has begun ends before this returns, and none
+    /// begins after it. A fetch still under way may still put its titles here,
+    /// in a store that no longer shows.
+    pub fn retire(&self) {
+        self.portal.retire();
+        *self.vod_cache_retired.lock() = true;
     }
 
     /// A store with a catalog already loaded (tests, tools), and its titles,
@@ -1148,6 +1342,8 @@ impl CatalogStore {
         let notice = self.notice.clone();
         let titles = self.titles.clone();
         let titles_revision = self.titles_revision.clone();
+        let vod_cache = self.vod_cache.clone();
+        let vod_cache_retired = self.vod_cache_retired.clone();
         let categories_wait = self.categories_wait;
         *status.write() = CatalogStatus::Connecting;
 
@@ -1216,7 +1412,13 @@ impl CatalogStore {
                     let build = move || input.build(&categories);
                     match tokio::task::spawn_blocking(build).await {
                         Ok(built) => {
-                            put_titles(&titles, &titles_revision, &revision, of, Arc::new(built));
+                            let built = Arc::new(built);
+                            let put =
+                                put_titles(&titles, &titles_revision, &revision, of, built.clone());
+                            // The file keeps the titles that show.
+                            if let (true, Some(path)) = (put, vod_cache) {
+                                write_vod_cache(path, built, vod_cache_retired);
+                            }
                         }
                         Err(e) => warn!("vod: titles not built ({e})"),
                     }
@@ -1478,13 +1680,15 @@ impl CatalogStore {
     }
 
     /// The thuisbioscoop's titles as the lock stands now ([`Titles`]): those of
-    /// the store's catalog once they are built (`put_titles`); none before.
+    /// the store's catalog once they are built (`put_titles`), else those of the
+    /// cache file once read ([`CatalogStore::read_vod_cache`]); none before.
     pub fn titles(&self) -> Option<Titles> {
         let unlocked = self.adult_unlocked();
         let held = self.titles.read();
-        held.as_ref().map(|index| Titles {
+        held.as_ref().map(|(index, saved_at)| Titles {
             index: index.clone(),
             unlocked,
+            saved_at: *saved_at,
         })
     }
 
@@ -1676,5 +1880,118 @@ mod titles_tests {
         assert_eq!(store.categories_wait, Duration::from_secs(15));
         let store = store.with_categories_wait(Duration::from_millis(5));
         assert_eq!(store.categories_wait, Duration::from_millis(5));
+    }
+
+    /// What the log says on this thread while `work` runs: as app.rs's
+    /// `LogCapture`, with a second dispatcher, so that another test's thread
+    /// that meets a line first cannot silence it here.
+    fn logged(work: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, work);
+        let bytes = sink.0.lock().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Carry 2 (the Task 6a review's m3): serde quotes the value it could not
+    /// read, and a file may hold anything. The warn line masks the error and
+    /// then cuts it at a character's boundary, so a value of 70,000 characters
+    /// is no line of 70,000, and an account the cut would split is masked
+    /// whole.
+    #[test]
+    fn an_unreadable_cache_is_logged_masked_and_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vod-h_80.json");
+        let write = |filler: usize| {
+            let value = format!(
+                "{}http://bob:s3cr3t@h/{}",
+                "x".repeat(filler),
+                "\u{20ac}".repeat(70_000)
+            );
+            let file =
+                format!(r#"{{"version":1,"saved_at":"{value}","categories":[],"titles":[]}}"#);
+            std::fs::write(&path, file).unwrap();
+        };
+        // Where the error quotes the value: the account goes across the cut.
+        write(0);
+        let Err(raw) = crate::vod::cache::load(&path) else {
+            panic!("text is no time");
+        };
+        let before = raw[..raw.find("http://").unwrap()].chars().count();
+        write(LOGGED_ERROR_CHARS - before - "http://bob:s3".len());
+        let slot = RwLock::new(None);
+        let revision = AtomicU64::new(0);
+        let text = logged(|| read_titles(&path, &slot, &revision));
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("vod: cache")).collect();
+        assert_eq!(lines.len(), 1, "{} lines", lines.len());
+        let line = lines[0];
+        let chars = line.chars().count();
+        assert!(
+            chars < LOGGED_ERROR_CHARS + 150,
+            "a line of {chars} characters"
+        );
+        assert!(line.contains(" WARN "), "{line}");
+        assert!(
+            line.contains("vod: cache unreadable (invalid type: string \"xxx"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with("...) - ignored, the next load writes a new one"),
+            "{line}"
+        );
+        assert!(!line.contains("bob") && !line.contains("s3cr3t"), "{line}");
+        assert!(slot.read().is_none(), "nothing put");
+        assert_eq!(revision.load(Ordering::Acquire), 0);
+    }
+
+    /// Carry 3 (Task 6a, concern 2): a save that fails, as one of a file that
+    /// another program holds, is one warn line that names the file and not its
+    /// folder (which holds the user's name), and leaves the file's place as it
+    /// was.
+    #[test]
+    fn a_save_that_fails_is_one_line_with_the_files_name_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vod-h_80.json");
+        // Its place is taken.
+        std::fs::create_dir(&path).unwrap();
+        let titles = TitleIndex::build(
+            &[],
+            &[Series {
+                series_id: 1,
+                name: "Dark".into(),
+                ..Series::default()
+            }],
+            &Categories::default(),
+            2027,
+        );
+        let text = logged(|| keep_titles(&path, &titles, &Mutex::new(false)));
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("vod: cache")).collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let line = lines[0];
+        assert!(line.contains(" WARN "), "{line}");
+        assert!(
+            line.contains("vod: cache not written (vod-h_80.json: "),
+            "{line}"
+        );
+        let folder = dir.path().file_name().unwrap().to_string_lossy();
+        assert!(!line.contains(&*folder), "{line}");
+        assert!(!line.contains('\\') && !line.contains('/'), "{line}");
+        assert!(path.is_dir() && !path.with_extension("json.tmp").exists());
     }
 }

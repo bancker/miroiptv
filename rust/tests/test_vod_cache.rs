@@ -1,15 +1,22 @@
-//! The title index in a file (vod/cache.rs, spec 2026-10-15 §4.6): what goes
-//! in and what never does, a file that is missing or broken, and what a file
-//! says that nothing may trust.
+//! The title index in a file (vod/cache.rs and the catalog's side of it, spec
+//! 2026-10-15 §4.6): what goes in and what never does, a file that is missing
+//! or broken, what a file says that nothing may trust, and the titles a store
+//! shows from it until its catalog's own are built.
 
 use bongo_player::args::XtreamCreds;
-use bongo_player::portal::{Categories, Category, Movie, Series};
+use bongo_player::catalog::{CatalogStatus, CatalogStore};
+use bongo_player::portal::xtream::XtreamPortal;
+use bongo_player::portal::{Categories, Category, Movie, Portal, Series};
 use bongo_player::vod::cache::{load, path_for, portal_key, save};
 use bongo_player::vod::genres::{Genre, Labels};
-use bongo_player::vod::index::{Query, TitleIndex};
+use bongo_player::vod::index::{Query, Sort, TitleIndex};
 use bongo_player::vod::{Kind, TitleId};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use wiremock::matchers::query_param;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const SAVED_AT: i64 = 1_792_022_400;
 
@@ -920,4 +927,560 @@ fn two_saves_of_one_file_at_once_leave_it_whole() {
         "a mix of both: {} titles",
         back.len()
     );
+}
+
+/// Waits (2 s at most) until `done`.
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..400 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// A portal on a mock whose film list holds one film, `name`, beside two live
+/// channels.
+async fn portal_with_film(name: &str) -> (MockServer, Arc<dyn Portal>) {
+    let server = MockServer::start().await;
+    let films = format!(r#"[{{"stream_id":7,"name":"{name}"}}]"#);
+    Mock::given(query_param("action", "get_vod_streams"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(films))
+        .mount(&server)
+        .await;
+    let live = r#"[{"stream_id":1,"name":"NL | Een"},{"stream_id":2,"name":"NL | Twee"}]"#;
+    Mock::given(query_param("action", "get_live_streams"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(live))
+        .mount(&server)
+        .await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .mount(&server)
+        .await;
+    let uri = url::Url::parse(&server.uri()).unwrap();
+    let portal = XtreamPortal::new(XtreamCreds {
+        username: "u".into(),
+        password: "p".into(),
+        host: uri.host_str().unwrap().into(),
+        port: uri.port().unwrap(),
+    });
+    (server, Arc::new(portal))
+}
+
+/// The names a store's titles show, A to Z, and when their file was written.
+fn shown(store: &CatalogStore) -> Option<(Vec<String>, Option<i64>)> {
+    let titles = store.titles()?;
+    let q = Query {
+        sort: Sort::Title,
+        ..Query::default()
+    };
+    let names = titles
+        .search(&q)
+        .titles
+        .iter()
+        .map(|&p| titles.title(p as usize).unwrap().name.to_owned())
+        .collect();
+    Some((names, titles.saved_at()))
+}
+
+fn cache_with_library(dir: &Path) -> PathBuf {
+    let path = dir.join("vod-h_80.json");
+    save(&path, &library(), SAVED_AT).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn a_store_shows_the_files_titles_until_its_catalog_has_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = cache_with_library(dir.path());
+    let (_server, portal) = portal_with_film("Fresh (2026)").await;
+    let store = Arc::new(CatalogStore::new(portal).with_vod_cache(Some(path.clone())));
+    assert!(
+        store.titles().is_none(),
+        "nothing is read before it is asked"
+    );
+    store.read_vod_cache();
+    until("the file's titles", || store.titles().is_some()).await;
+    assert_eq!(
+        shown(&store),
+        Some((
+            vec!["Dark".into(), "Secret".into(), "The Matrix".into()],
+            Some(SAVED_AT)
+        ))
+    );
+    store.spawn_fetch();
+    until("the catalog's own titles", || {
+        shown(&store).is_some_and(|(_, saved_at)| saved_at.is_none())
+    })
+    .await;
+    assert_eq!(
+        shown(&store),
+        Some((vec!["Fresh".into()], None)),
+        "the catalog's own"
+    );
+    // The fresh titles write the file anew.
+    until("the new file", || {
+        load(&path)
+            .ok()
+            .flatten()
+            .is_some_and(|(index, _)| index.find(film(7)).is_some())
+    })
+    .await;
+}
+
+#[test]
+fn the_cached_titles_show_while_the_fresh_ones_are_built() {
+    // One blocking thread, which the test holds once the file is read: the
+    // build of the fresh titles has to wait for it, the catalog must not.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_with_library(dir.path());
+        let (_server, portal) = portal_with_film("Fresh (2026)").await;
+        let store = Arc::new(CatalogStore::new(portal).with_vod_cache(Some(path)));
+        store.read_vod_cache();
+        until("the file's titles", || store.titles().is_some()).await;
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let holder = tokio::task::spawn_blocking(move || held.recv());
+        store.spawn_fetch();
+        until("the catalog", || store.status() == CatalogStatus::Loaded).await;
+        // The lists are in: the catalog works, beside the file's titles.
+        assert!(store.is_loaded());
+        assert_eq!(store.zap_channels().len(), 2, "zapping works");
+        assert_eq!(
+            shown(&store).map(|(names, saved_at)| (names.len(), saved_at)),
+            Some((3, Some(SAVED_AT))),
+            "still the file's titles"
+        );
+        release.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        // ... until the fresh ones take their place.
+        until("the catalog's own titles", || {
+            shown(&store).is_some_and(|(_, saved_at)| saved_at.is_none())
+        })
+        .await;
+        assert_eq!(shown(&store), Some((vec!["Fresh".into()], None)));
+    });
+}
+
+/// On one blocking thread, which reads in turn (`settled`): with a margin of
+/// 100 ms instead, a first read that started late under load read the second
+/// file (2 runs in 120).
+#[test]
+fn the_file_is_read_once() {
+    one_blocking_thread().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vod-h_80.json");
+        std::fs::write(&path, b"<html>not a cache</html>").unwrap();
+        let store = CatalogStore::new(idle_portal()).with_vod_cache(Some(path.clone()));
+        store.read_vod_cache();
+        settled().await;
+        assert!(store.titles().is_none(), "nothing to show");
+        // Another file in its place: a second read would show its one title.
+        let other = TitleIndex::build(
+            &[],
+            &[Series {
+                series_id: 1,
+                name: "Other".into(),
+                ..Series::default()
+            }],
+            &Categories::default(),
+            2027,
+        );
+        save(&path, &other, SAVED_AT).unwrap();
+        store.read_vod_cache();
+        settled().await;
+        assert!(store.titles().is_none(), "not asked again");
+    });
+}
+
+#[tokio::test]
+async fn an_unreadable_file_is_ignored_and_the_next_load_replaces_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vod-h_80.json");
+    std::fs::write(&path, b"<html>not a cache</html>").unwrap();
+    let (_server, portal) = portal_with_film("Fresh (2026)").await;
+    let store = Arc::new(CatalogStore::new(portal).with_vod_cache(Some(path.clone())));
+    store.read_vod_cache();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(store.titles().is_none());
+    store.spawn_fetch();
+    until("the new file", || {
+        load(&path).is_ok_and(|read| read.is_some())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_catalog_that_came_first_shows_its_own_titles() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = cache_with_library(dir.path());
+    let (_server, portal) = portal_with_film("Fresh (2026)").await;
+    let store = Arc::new(CatalogStore::new(portal).with_vod_cache(Some(path)));
+    store.spawn_fetch();
+    until("the catalog's own titles", || store.titles().is_some()).await;
+    store.read_vod_cache();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(shown(&store), Some((vec!["Fresh".into()], None)));
+}
+
+fn idle_portal() -> Arc<dyn Portal> {
+    Arc::new(XtreamPortal::new(XtreamCreds {
+        username: "u".into(),
+        password: "p".into(),
+        host: "h".into(),
+        port: 80,
+    }))
+}
+
+// ---- Task 6b's carries, and the mutants the plan's tests above let live: a
+// store whose source is retired, a catalog replaced while its titles are
+// built, a save that fails, the count of the titles put, and the lock over the
+// file's titles. ----
+
+use bongo_player::epg::Epg;
+use bongo_player::portal::{Catalog, Episode, PortalError};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use tokio::sync::oneshot;
+
+/// A runtime on this thread with one blocking thread, which takes the jobs
+/// handed to it in turn: `settled` then waits for every job handed over before
+/// it, with no clock.
+fn one_blocking_thread() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+}
+
+/// Every job handed to the blocking pool before this one has run (on
+/// `one_blocking_thread`), the reads and the writes of the cache file among
+/// them.
+async fn settled() {
+    tokio::task::spawn_blocking(|| ()).await.unwrap();
+}
+
+/// A portal in memory. Fetch n brings one film, `films[n]` (the last one again
+/// after them), stream id 7 + n; the category lists of fetch n come at once, or
+/// once the test sends on the gate of that fetch. It notes how many category
+/// lists it answered, and that it was retired.
+struct Memory {
+    films: Vec<&'static str>,
+    fetches: AtomicUsize,
+    gates: Mutex<VecDeque<Option<oneshot::Receiver<()>>>>,
+    answered: AtomicUsize,
+    retired: AtomicBool,
+}
+
+impl Memory {
+    /// Its fetches bring `films`; the category lists of fetch n wait when
+    /// `held[n]`, for the next of the senders it returns.
+    fn new(films: &[&'static str], held: &[bool]) -> (Arc<Self>, VecDeque<oneshot::Sender<()>>) {
+        let mut senders = VecDeque::new();
+        let gates = held
+            .iter()
+            .map(|&held| {
+                held.then(|| {
+                    let (send, gate) = oneshot::channel();
+                    senders.push_back(send);
+                    gate
+                })
+            })
+            .collect();
+        let portal = Memory {
+            films: films.to_vec(),
+            fetches: AtomicUsize::new(0),
+            gates: Mutex::new(gates),
+            answered: AtomicUsize::new(0),
+            retired: AtomicBool::new(false),
+        };
+        (Arc::new(portal), senders)
+    }
+}
+
+#[async_trait::async_trait]
+impl Portal for Memory {
+    fn retire(&self) {
+        self.retired.store(true, Ordering::SeqCst);
+    }
+    async fn fetch_catalog(&self) -> Result<Catalog, PortalError> {
+        let n = self.fetches.fetch_add(1, Ordering::SeqCst);
+        Ok(Catalog {
+            movies: vec![Movie {
+                stream_id: 7 + n as i64,
+                name: self.films[n.min(self.films.len() - 1)].into(),
+                ..Movie::default()
+            }],
+            ..Catalog::default()
+        })
+    }
+    async fn fetch_categories(&self) -> Result<Categories, PortalError> {
+        let gate = self.gates.lock().unwrap().pop_front().flatten();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
+        self.answered.fetch_add(1, Ordering::SeqCst);
+        Ok(Categories::default())
+    }
+    async fn fetch_epg(&self, _: i64) -> Result<Epg, PortalError> {
+        Ok(Epg::new(Vec::new()))
+    }
+    async fn fetch_day_epg(&self, _: i64) -> Result<Epg, PortalError> {
+        Ok(Epg::new(Vec::new()))
+    }
+    async fn fetch_series_episodes(&self, _: i64) -> Result<Vec<Episode>, PortalError> {
+        Ok(Vec::new())
+    }
+    fn live_stream_url(&self, _: i64) -> String {
+        String::new()
+    }
+    fn live_stream_id(&self, _: &str) -> Option<i64> {
+        None
+    }
+    fn movie_stream_url(&self, _: i64, _: &str) -> String {
+        String::new()
+    }
+    fn series_stream_url(&self, _: &str, _: &str) -> String {
+        String::new()
+    }
+    fn catchup_url(&self, _: i64, _: chrono::DateTime<chrono::Utc>, _: u32) -> String {
+        String::new()
+    }
+}
+
+/// Carry 1 (the Task 5 review's m9a): a store retired while its titles wait for
+/// their categories still puts them when they come, in a store that is no
+/// longer the app's, but writes no file for its source, which may be gone by
+/// then; its portal is retired with it. A store beside it that is not retired
+/// has written its file by the same point, so the wait is long enough.
+#[test]
+fn a_store_retired_while_its_titles_wait_writes_no_file() {
+    one_blocking_thread().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("vod-gone_80.json");
+        let kept = dir.path().join("vod-kept_80.json");
+        let (portal, mut held) = Memory::new(&["Fresh (2026)"], &[true]);
+        let (beside, mut beside_held) = Memory::new(&["Fresh (2026)"], &[true]);
+        let store = Arc::new(CatalogStore::new(portal.clone()).with_vod_cache(Some(gone.clone())));
+        let other = Arc::new(CatalogStore::new(beside).with_vod_cache(Some(kept.clone())));
+        store.spawn_fetch();
+        other.spawn_fetch();
+        until("both catalogs", || store.is_loaded() && other.is_loaded()).await;
+        store.retire();
+        assert!(
+            portal.retired.load(Ordering::SeqCst),
+            "its portal is retired with it"
+        );
+        held.pop_front().unwrap().send(()).unwrap();
+        beside_held.pop_front().unwrap().send(()).unwrap();
+        until("both stores' titles", || {
+            store.titles().is_some() && other.titles().is_some()
+        })
+        .await;
+        // Each write was handed over with its titles: it has had its turn.
+        settled().await;
+        assert!(kept.exists(), "a store in use has written its file by now");
+        assert_eq!(
+            shown(&store),
+            Some((vec!["Fresh".into()], None)),
+            "the retired store's titles are put"
+        );
+        assert!(!gone.exists(), "but not written");
+        assert!(!gone.with_extension("json.tmp").exists());
+    });
+}
+
+/// Mutant (e): the titles of a catalog that F5 replaced while they were built
+/// are not put (Task 5), and not written either: the file keeps the titles that
+/// show.
+#[test]
+fn the_titles_of_a_catalog_replaced_while_they_are_built_are_not_written() {
+    one_blocking_thread().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vod-h_80.json");
+        // The first fetch's categories come at once, the second's when told.
+        let (portal, mut held) = Memory::new(&["First (2020)", "Second (2021)"], &[false, true]);
+        let store = Arc::new(CatalogStore::new(portal.clone()).with_vod_cache(Some(path.clone())));
+        // The one blocking thread is the test's: the first titles wait for it.
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let holder = tokio::task::spawn_blocking(move || hold.recv());
+        store.spawn_fetch();
+        until("the first fetch's categories", || {
+            portal.answered.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // The fetch they woke runs before this task does: it has passed its
+        // check and handed its build to the pool.
+        tokio::task::yield_now().await;
+        store.spawn_fetch();
+        until("the second catalog", || store.search("second").len() == 1).await;
+        // The store, the test, the first fetch (waiting for its build: it did
+        // not stop at its check), the second and its category lists.
+        assert_eq!(Arc::strong_count(&portal), 5);
+        release.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        until("the first fetch's end", || Arc::strong_count(&portal) == 4).await;
+        // Whatever it handed over has had its turn.
+        settled().await;
+        assert!(
+            store.titles().is_none(),
+            "the first catalog's titles are not put"
+        );
+        assert!(!path.exists(), "nor written");
+        held.pop_front().unwrap().send(()).unwrap();
+        until("the second catalog's titles", || store.titles().is_some()).await;
+        settled().await;
+        let (index, _) = load(&path).unwrap().unwrap();
+        assert!(index.find(film(8)).is_some() && index.find(film(7)).is_none());
+    });
+}
+
+/// Carry 3 (Task 6a, concern 2): a save that fails (its place taken, as by a
+/// file that another program holds) changes nothing for the store, and the
+/// next build writes the file.
+#[test]
+fn a_save_that_fails_is_made_again_by_the_next_build() {
+    one_blocking_thread().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vod-h_80.json");
+        std::fs::create_dir(&path).unwrap();
+        let (portal, _) = Memory::new(&["First (2020)", "Second (2021)"], &[]);
+        let store = Arc::new(CatalogStore::new(portal).with_vod_cache(Some(path.clone())));
+        store.spawn_fetch();
+        until("the first titles", || store.titles().is_some()).await;
+        settled().await;
+        assert!(path.is_dir(), "not written");
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(shown(&store), Some((vec!["First".into()], None)));
+        std::fs::remove_dir(&path).unwrap();
+        store.spawn_fetch();
+        until("the second titles", || {
+            shown(&store).is_some_and(|(names, _)| names == ["Second"])
+        })
+        .await;
+        settled().await;
+        let (index, _) = load(&path).unwrap().unwrap();
+        assert!(index.find(film(8)).is_some());
+    });
+}
+
+/// Mutant (i): the file's titles count as titles put (`titles_revision`), and
+/// so do the catalog's own after them: whatever is worked out from the titles
+/// notices both.
+#[test]
+fn the_files_titles_and_the_catalogs_own_each_count_as_titles_put() {
+    one_blocking_thread().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_with_library(dir.path());
+        let (portal, mut held) = Memory::new(&["Fresh (2026)"], &[true]);
+        let store = Arc::new(CatalogStore::new(portal).with_vod_cache(Some(path)));
+        store.read_vod_cache();
+        settled().await;
+        assert_eq!(store.titles_revision(), 1, "the file's titles");
+        assert_eq!(
+            shown(&store).map(|(names, saved_at)| (names.len(), saved_at)),
+            Some((3, Some(SAVED_AT)))
+        );
+        store.spawn_fetch();
+        until("the catalog", || store.is_loaded()).await;
+        assert_eq!(store.titles_revision(), 1, "the catalog alone puts none");
+        held.pop_front().unwrap().send(()).unwrap();
+        until("the catalog's own titles", || {
+            shown(&store).is_some_and(|(_, saved_at)| saved_at.is_none())
+        })
+        .await;
+        assert_eq!(store.titles_revision(), 2, "the catalog's own");
+    });
+}
+
+/// Mutant (h): what the lock does with the file's titles. The file holds no
+/// adult title (`save` leaves them out, and nothing in it says adult), so its
+/// titles are the same locked and unlocked: the lock has none of theirs to
+/// hide.
+#[test]
+fn the_files_titles_hold_no_adult_title_to_hide() {
+    one_blocking_thread().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        // `library` has the adult film 3.
+        let path = cache_with_library(dir.path());
+        let store = CatalogStore::new(idle_portal()).with_vod_cache(Some(path));
+        store.read_vod_cache();
+        settled().await;
+        let names: Vec<String> = vec!["Dark".into(), "Secret".into(), "The Matrix".into()];
+        assert_eq!(
+            shown(&store),
+            Some((names.clone(), Some(SAVED_AT))),
+            "locked"
+        );
+        store.set_adult_unlocked(true);
+        assert_eq!(shown(&store), Some((names, Some(SAVED_AT))), "unlocked");
+        let titles = store.titles().unwrap();
+        assert_eq!(titles.find(film(3)), None, "the adult film is in no file");
+        let found = titles.search(&Query::default()).titles;
+        assert!(found
+            .iter()
+            .all(|&p| !titles.title(p as usize).unwrap().adult));
+    });
+}
+
+/// Carry 8: the file is read on the blocking pool, never on the thread that
+/// asks for it (the screen's): with the pool's one thread held, the ask
+/// returns and nothing is read until the thread is free.
+#[test]
+fn the_file_is_read_on_the_blocking_pool_and_not_where_it_is_asked() {
+    one_blocking_thread().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_with_library(dir.path());
+        let store = CatalogStore::new(idle_portal()).with_vod_cache(Some(path));
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let holder = tokio::task::spawn_blocking(move || hold.recv());
+        store.read_vod_cache();
+        assert!(store.titles().is_none(), "read where it was asked");
+        release.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        settled().await;
+        assert_eq!(store.titles().and_then(|t| t.saved_at()), Some(SAVED_AT));
+    });
+}
+
+/// Ruling 32: the titles are written on the blocking pool, never on the
+/// fetch's own task (a tokio worker, where the relay runs): with the pool's one
+/// thread held once the build has had it, the titles are put and their file
+/// waits for the thread.
+#[test]
+fn the_titles_are_written_on_the_blocking_pool_and_not_on_the_fetchs_task() {
+    one_blocking_thread().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vod-h_80.json");
+        let (portal, _) = Memory::new(&["Fresh (2026)"], &[]);
+        let store = Arc::new(CatalogStore::new(portal.clone()).with_vod_cache(Some(path.clone())));
+        // The pool's one thread: the test's, then the build's, then the test's.
+        let (first, hold_first) = std::sync::mpsc::channel::<()>();
+        let first_holder = tokio::task::spawn_blocking(move || hold_first.recv());
+        store.spawn_fetch();
+        until("the categories", || {
+            portal.answered.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // The fetch they woke has handed its build to the pool.
+        tokio::task::yield_now().await;
+        let (second, hold_second) = std::sync::mpsc::channel::<()>();
+        let second_holder = tokio::task::spawn_blocking(move || hold_second.recv());
+        first.send(()).unwrap();
+        first_holder.await.unwrap().unwrap();
+        until("the titles", || store.titles().is_some()).await;
+        assert!(!path.exists(), "written on the fetch's task");
+        second.send(()).unwrap();
+        second_holder.await.unwrap().unwrap();
+        settled().await;
+        assert!(path.exists(), "written on the pool once it was free");
+    });
 }

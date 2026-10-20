@@ -228,7 +228,9 @@ fn main() -> anyhow::Result<()> {
         creds,
         state: portal_state,
     } = opened;
-    let catalog = Arc::new(CatalogStore::new(portal));
+    // The thuisbioscoop's titles of the last start: read after the first frame.
+    let vod_cache = bongo_player::vod::cache::path_for(&storage.cache_dir(), creds.as_ref());
+    let catalog = Arc::new(CatalogStore::new(portal).with_vod_cache(vod_cache));
 
     // Local relay for live HLS (see relay/mod.rs). Loopback only; if it can't
     // bind, live plays straight from the portal as before.

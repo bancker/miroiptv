@@ -684,6 +684,9 @@ pub struct TvApp {
     epg_cache_write_failed: Arc<std::sync::atomic::AtomicBool>,
     /// No write before this moment: one that failed waits a minute.
     epg_cache_retry_after: Option<Instant>,
+    /// A frame has been drawn: from the next one on the catalog may read the
+    /// thuisbioscoop's titles of the last start (`CatalogStore::read_vod_cache`).
+    first_frame_drawn: bool,
     /// When the stream that loads now went to the player; its first frame
     /// clears it. EPG fetching waits meanwhile (10 s at most): zapping first.
     /// An M3U channel that fails while it is set has shown no picture of its
@@ -993,6 +996,7 @@ impl TvApp {
             epg_cache_reading_since: None,
             epg_cache_write_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             epg_cache_retry_after: None,
+            first_frame_drawn: false,
             stream_starting_since: None,
             current_has_played: false,
             bad_streams: None,
@@ -3105,11 +3109,13 @@ impl TvApp {
         creds: Option<XtreamCreds>,
         state: PortalState,
     ) {
-        // What the old portal still has under way writes nothing for it now:
-        // its source may be deleted next, and its number given to another.
-        self.catalog.portal().retire();
+        // What the old store still has under way writes nothing for it now (its
+        // portal's saved list, its titles' file): its source may be deleted
+        // next, and its number given to another.
+        self.catalog.retire();
         self.creds = creds;
-        self.catalog = Arc::new(CatalogStore::new(portal));
+        let vod_cache = crate::vod::cache::path_for(&self.storage.cache_dir(), self.creds.as_ref());
+        self.catalog = Arc::new(CatalogStore::new(portal).with_vod_cache(vod_cache));
         self.catalog_generation += 1;
         // Another portal: its stream ids mean other channels, so the old lists'
         // positions and the guide's per-channel data are of no use. The new
@@ -3368,7 +3374,7 @@ impl TvApp {
             // The list in use: a download of the old address still under way
             // must not save its list again once it is dropped.
             if activate {
-                self.catalog.portal().retire();
+                self.catalog.retire();
             }
             self.storage.remove_saved_list(id);
             // Its marks too: they are stream ids of the old list, and would hide
@@ -5093,6 +5099,12 @@ impl TvApp {
         self.read_epg_cache();
         self.write_epg_cache_when_due(Instant::now());
         self.logos.drain();
+        // The titles of the last start, once a frame is drawn (spec 2026-10-15
+        // §4.6); the store reads them once, so this is an atomic load a frame.
+        if self.first_frame_drawn {
+            self.catalog.read_vod_cache();
+        }
+        self.first_frame_drawn = true;
         // First start: nothing else until a language is chosen.
         if let Some(selected) = self.choosing_language.as_mut() {
             if let Some(l) = crate::settings_ui::language_screen(ctx, selected) {
@@ -6726,6 +6738,60 @@ https://c.example/twee-nieuws.m3u8\n";
             said * 4.0 < frame,
             "the frame took {frame} ms, the line says {said} ms"
         );
+    }
+
+    #[tokio::test]
+    async fn the_titles_of_the_last_start_are_read_once_a_frame_is_drawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vod-h_80.json");
+        let kept = crate::portal::Movie {
+            stream_id: 7,
+            name: "Kept (2020)".into(),
+            ..Default::default()
+        };
+        let categories = crate::portal::Categories::default();
+        let index = crate::vod::index::TitleIndex::build(&[kept], &[], &categories, 2027);
+        crate::vod::cache::save(&path, &index, 1_792_022_400).unwrap();
+        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+        // A store with the file, as `main` makes it, from its first frame on.
+        let store = Arc::new(CatalogStore::new(idle_portal()).with_vod_cache(Some(path)));
+        h.app.catalog = store.clone();
+        h.app.first_frame_drawn = false;
+        h.frame(&[]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(store.titles().is_none(), "not read in the first frame");
+        h.frame(&[]);
+        wait_until("the titles of the last start", || store.titles().is_some()).await;
+        assert_eq!(store.titles().unwrap().saved_at(), Some(1_792_022_400));
+    }
+
+    /// Carry 1: a switch of source retires the store it leaves, so a fetch of
+    /// that store still under way writes no titles' file for a source that may
+    /// be gone by then. One blocking thread, which takes its jobs in turn: once
+    /// the old store's titles are put, its write has had its turn when a job
+    /// handed over after it has run.
+    #[test]
+    fn a_switch_of_source_leaves_the_old_store_writing_no_file() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("vod-h_80.json");
+            let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+            let portal = FakePortal::new(Vec::new(), Vec::new());
+            portal.release_catalog();
+            let old = Arc::new(CatalogStore::new(portal).with_vod_cache(Some(path.clone())));
+            h.app.catalog = old.clone();
+            let next = idle_portal();
+            h.app.install_portal(next, None, PortalState::Missing);
+            old.spawn_fetch();
+            wait_until("the old store's titles", || old.titles().is_some()).await;
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(!path.exists(), "the old store wrote its file");
+        });
     }
 
     /// The press of `f` as a keyboard makes it: the key and its letter, together.
