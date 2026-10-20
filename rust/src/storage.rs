@@ -71,6 +71,11 @@ impl Storage {
     pub fn bad_streams_path(&self) -> PathBuf {
         self.source_file("bad_streams", self.source)
     }
+    /// What the source in use watched, its list and its thumbs
+    /// (`vod::watching`): numbers and times only.
+    pub fn watching_path(&self) -> PathBuf {
+        self.source_file("watching", self.source)
+    }
     pub fn settings_path(&self) -> PathBuf {
         self.root.join("settings.json")
     }
@@ -93,14 +98,17 @@ impl Storage {
         self.m3u_cache_path(id).with_extension("m3u.tmp")
     }
 
-    /// Removes source `id`'s favorites, presets, last channel, defect marks and
-    /// saved list, with the temp file of that list; how many of them there were.
+    /// Removes source `id`'s favorites, presets, last channel, defect marks,
+    /// what it watched (and the `.bad` copy of that file) and saved list, with
+    /// the temp file of that list; how many of them there were.
     pub fn remove_source_files(&self, id: SourceId) -> usize {
         [
             self.source_file("favorites", id),
             self.source_file("presets", id),
             self.source_file("last_watched", id),
             self.source_file("bad_streams", id),
+            self.source_file("watching", id),
+            self.source_file("watching", id).with_extension("json.bad"),
             self.m3u_cache_path(id),
             self.m3u_temp_path(id),
         ]

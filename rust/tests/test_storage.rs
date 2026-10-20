@@ -118,6 +118,7 @@ fn source_1_keeps_the_0_6_1_file_names_and_the_others_carry_their_id() {
     assert_eq!(storage.presets_path(), root.join("presets.json"));
     assert_eq!(storage.last_watched_path(), root.join("last_watched.json"));
     assert_eq!(storage.bad_streams_path(), root.join("bad_streams.json"));
+    assert_eq!(storage.watching_path(), root.join("watching.json"));
     storage.set_source(2);
     assert_eq!(storage.favorites_path(), root.join("favorites-2.json"));
     assert_eq!(storage.presets_path(), root.join("presets-2.json"));
@@ -126,6 +127,7 @@ fn source_1_keeps_the_0_6_1_file_names_and_the_others_carry_their_id() {
         root.join("last_watched-2.json")
     );
     assert_eq!(storage.bad_streams_path(), root.join("bad_streams-2.json"));
+    assert_eq!(storage.watching_path(), root.join("watching-2.json"));
     // Shared by every source.
     assert_eq!(storage.settings_path(), root.join("settings.json"));
     assert_eq!(
@@ -146,17 +148,28 @@ fn removing_a_sources_files_leaves_the_other_sources_alone() {
             storage.presets_path(),
             storage.last_watched_path(),
             storage.bad_streams_path(),
+            storage.watching_path(),
+            storage.watching_path().with_extension("json.bad"),
             storage.m3u_cache_path(id),
         ] {
             std::fs::write(path, "x").unwrap();
         }
     }
-    assert_eq!(storage.remove_source_files(2), 5, "its marks go too");
+    assert_eq!(
+        storage.remove_source_files(2),
+        7,
+        "its marks and what it watched go too"
+    );
     assert!(!storage.favorites_path().exists(), "source 2's own");
     assert!(!storage.bad_streams_path().exists(), "source 2's own marks");
+    assert!(!storage.watching_path().exists(), "what source 2 watched");
     storage.set_source(1);
     assert!(storage.favorites_path().exists() && storage.m3u_cache_path(1).exists());
     assert!(storage.bad_streams_path().exists(), "source 1's marks stay");
+    assert!(
+        storage.watching_path().exists(),
+        "what source 1 watched stays"
+    );
     assert_eq!(storage.remove_source_files(2), 0, "nothing left to remove");
 }
 

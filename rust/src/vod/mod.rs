@@ -5,6 +5,7 @@ pub mod cache;
 pub mod genres;
 pub mod index;
 pub mod versions;
+pub mod watching;
 
 /// What a title is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
