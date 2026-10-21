@@ -92,7 +92,7 @@ Phase 1's `plan-globals.md` rules apply, together with CLAUDE.md:
 - **Adult content:** the catalog's lock is the only adult filter. An open adult page closes when the lock goes on.
 - **The machine:**
   - Tests are TDD: red, then green.
-  - The `ct`/`cc`/`fmt` gates as in phase 1, with the rustfmt baseline unchanged.
+  - The `ct`/`cc`/`fmt` gates as in phase 1, with the rustfmt baseline unchanged and `cc` at its 11 known warnings under clippy 1.99, with no new one. Phase 1's plan said 2; the other nine are in code phase 1 never touched.
   - Builds go in a target outside Dropbox (never `rust\target`).
   - Commits go through `rust/e2e/check-staged.sh`.
   - Window runs only with the user's consent, against the mock only, with posted keys only.
