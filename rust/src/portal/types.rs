@@ -249,7 +249,7 @@ pub struct Categories {
 /// (`get_vod_info`, `get_series_info`; spec 2026-10-15 §4.3): only those
 /// fields, and no image address with an account in it. `vod::details` keeps
 /// it as a file per title.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VodDetails {
     pub plot: String,
@@ -287,7 +287,8 @@ pub struct VodDetails {
 }
 
 /// A season of a series: its number (0: the extras), name and cover.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub struct SeasonInfo {
     pub number: u32,
@@ -296,7 +297,8 @@ pub struct SeasonInfo {
 }
 
 /// An episode of a series, as its page lists it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub struct EpisodeInfo {
     /// Its id as the portal gives it: what `Portal::series_stream_url` plays.
@@ -315,6 +317,70 @@ pub struct EpisodeInfo {
     pub added: i64,
 }
 
+/// An image address as `Debug` shows it: without its query. `redact` does not
+/// mask a token there, and the details keep such an address in memory (Ruling
+/// 9), so a `{:?}` of them (a log line, a failed `assert_eq!`) must not print it.
+struct NoQuery<'a>(&'a str);
+
+impl std::fmt::Debug for NoQuery<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.split_once('?') {
+            Some((address, _)) => write!(f, "{address:?} + a query"),
+            None => std::fmt::Debug::fmt(self.0, f),
+        }
+    }
+}
+
+// `Debug` by hand, since the integration tests need it outside `cfg(test)`:
+// the backdrop and the trailer (an address too, as the portal gives it) show
+// without their query, and the seasons and episodes, whose covers and stills
+// are image addresses, as how many there are. Every field is named, so a field
+// added to `VodDetails` does not build until someone has said how it shows.
+impl std::fmt::Debug for VodDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            plot,
+            cast,
+            director,
+            genre,
+            released,
+            year,
+            age,
+            duration,
+            rating,
+            trailer,
+            backdrop,
+            tmdb,
+            width,
+            height,
+            hdr,
+            channels,
+            seasons,
+            episodes,
+        } = self;
+        f.debug_struct("VodDetails")
+            .field("plot", plot)
+            .field("cast", cast)
+            .field("director", director)
+            .field("genre", genre)
+            .field("released", released)
+            .field("year", year)
+            .field("age", age)
+            .field("duration", duration)
+            .field("rating", rating)
+            .field("trailer", &NoQuery(trailer))
+            .field("backdrop", &NoQuery(backdrop))
+            .field("tmdb", tmdb)
+            .field("width", width)
+            .field("height", height)
+            .field("hdr", hdr)
+            .field("channels", channels)
+            .field("seasons", &seasons.len())
+            .field("episodes", &episodes.len())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Episode {
     pub id: String,
@@ -329,4 +395,70 @@ pub struct Catalog {
     pub live: Vec<LiveChannel>,
     pub movies: Vec<Movie>,
     pub series: Vec<Series>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The details keep an image address with a token in its query in memory (the
+    /// token is no account `redact` knows), so their `Debug` form, which a log line
+    /// or a failed `assert_eq!` prints, leaves every query out; the seasons' covers
+    /// and the episodes' stills are not printed at all, only how many there are.
+    #[test]
+    fn the_debug_form_of_details_prints_no_query() {
+        let details = VodDetails {
+            plot: "A plot.".into(),
+            trailer: "dQw4w9WgXcQ".into(),
+            backdrop: "https://cdn.example/b.jpg?token=SECRET1".into(),
+            seasons: vec![SeasonInfo {
+                number: 1,
+                name: "Season 1".into(),
+                cover: "https://cdn.example/s.jpg?token=SECRET2".into(),
+            }],
+            episodes: vec![
+                EpisodeInfo {
+                    id: "7".into(),
+                    still: "https://cdn.example/e.jpg?token=SECRET3".into(),
+                    ..EpisodeInfo::default()
+                },
+                EpisodeInfo::default(),
+            ],
+            ..VodDetails::default()
+        };
+        let text = format!("{details:?}");
+        for leak in ["SECRET", "token", "?", "cdn.example/s", "cdn.example/e"] {
+            assert!(!text.contains(leak), "{leak:?} is printed: {text}");
+        }
+        for shown in [
+            "VodDetails",
+            "A plot.",
+            "dQw4w9WgXcQ",
+            "\"https://cdn.example/b.jpg\" + a query",
+            "seasons: 1",
+            "episodes: 2",
+        ] {
+            assert!(text.contains(shown), "{shown:?} is missing: {text}");
+        }
+        // An address without a query shows whole, and a trailer address is cut like
+        // the backdrop's.
+        let plain = VodDetails {
+            backdrop: "https://cdn.example/plain.jpg".into(),
+            trailer: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+            ..VodDetails::default()
+        };
+        let text = format!("{plain:?}");
+        assert!(text.contains("\"https://cdn.example/plain.jpg\""), "{text}");
+        assert!(
+            text.contains("\"https://www.youtube.com/watch\" + a query"),
+            "{text}"
+        );
+        assert!(!text.contains("dQw4w9WgXcQ"), "{text}");
+        // Two details that differ in a query only are still different, as `==` says.
+        let other = VodDetails {
+            backdrop: "https://cdn.example/plain.jpg?x=1".into(),
+            ..plain.clone()
+        };
+        assert_ne!(plain, other);
+    }
 }
