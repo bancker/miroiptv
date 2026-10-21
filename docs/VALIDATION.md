@@ -33,7 +33,7 @@ Run after `rust\build-zip.ps1` + `rust\verify.ps1` pass. Use a known-good Xtream
 - [ ] Esc dismisses search
 
 ## Thuisbioscoop, phase 1 (the log only)
-- [ ] Start on the Xtream portal and wait for the catalog: the log says `vod: <n> titles (… series, … films in … versions, … left out), … categories - cover … %, rating … %, year … %, genre … %, Dutch … %, English … % - index … KB, covers … KB, built in … ms`. Note the line for the user: the shares say how good the portal's data is, and the build stays within 150 ms
+- [ ] Start on the Xtream portal and wait for the catalog: the log says `vod: <n> titles (… series, … films in … versions, at most … in one film, … left out), … categories - cover … %, rating … %, year … %, genre … %, Dutch … %, English … % - index … KB, covers … KB, built in … ms`. Note the line for the user: the shares say how good the portal's data is, and the build stays within 150 ms
 - [ ] The catalog comes first and the titles after it: zapping, the guide and `f` work as soon as `catalog: loaded in …` is logged, before the `vod:` line
 - [ ] Then `vod: cache written (<n> titles, … KB)`, and `%APPDATA%\BongoIPTVPlayer\config\cache\vod-<host>_<port>.json` exists; it holds no user name, no password and no adult title
 - [ ] Quit and start again: soon after the window shows, `vod: cache read (<n> titles, written at …) in … ms`

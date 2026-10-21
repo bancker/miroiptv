@@ -139,9 +139,9 @@ The spec is the authority. These settle what it leaves open, one line each: what
 
 **Covers (§4.4)**
 
-39. **6 downloads and, beside them, 6 reads of kept files at once:** a slow server never holds up a kept cover ("Covers uit de schijfcache volgen binnen 300 ms"), and a fast scroll starts no swarm of blocking threads. A cover that a frame no longer asks for before it comes is dropped at `end_frame`; one without a picture is not asked again this session, as the logos.
+39. **6 downloads and, beside them, 6 reads or decodes at once** (the decode of a downloaded body takes a read's place; Task 9's review, i3)**:** a slow server never holds up a kept cover ("Covers uit de schijfcache volgen binnen 300 ms"), and a fast scroll starts no swarm of blocking threads. A cover that a frame no longer asks for before it comes is dropped at `end_frame`; one without a picture is not asked again this session, as the logos.
 40. **At most 8 textures are made per frame,** so a screenful read from disk spreads over a few frames instead of making one long one (§5: "geen frame boven 16 ms").
-41. **Decoding:** JPEG or PNG by their first bytes, at most 16 MB a body and 8192 px a side, cut to fill the size at the middle (CatmullRom); the textures are named `cover <hash> WxH`. The texture LRU is generic over `CoverTexture` (its bytes) and the store over `Uploader` (egui's context in the app, a fake in the tests). One texture over the cap alone stays alone.
+41. **Decoding:** JPEG or PNG by their first bytes, at most 16 MB a body and 8192 px a side, cut to fill the size at the middle (CatmullRom). A body is looked at before a decoder gets it (Task 9's review, c1, i1, i2): a PNG whose palette has a length no palette has, or whose colour profile is over 64 KB, a JPEG of more than 64 scans, and a picture whose fill would scale it past 8 times the size's area are no covers. The textures are named `cover <hash> WxH`. The texture LRU is generic over `CoverTexture` (its bytes) and the store over `Uploader` (egui's context in the app, a fake in the tests). One texture over the cap alone stays alone.
 42. **The folder's 500 MB:** `covers::prune` removes the oldest files by their write time; `main` runs it in the background at every start (`prune_in_background`, spec §4.4: "Bij het starten ruimt de app op de achtergrond het oudste op"). Before phase 2 nothing writes covers, and a missing folder costs one failed `read_dir`.
 43. **The placeholder's colour:** the hue from the first two bytes of `sha256(name)`, saturation 0.45 and value 0.35 as the screen shows it: muted and dark under white letters.
 
@@ -9350,12 +9350,15 @@ Run from `C:\Dropbox\Sources\tv`: `git add rust/src/vod/details.rs rust/src/vod/
   impl<U: Uploader> CoverStore<U> {
       pub fn new(dir: PathBuf, uploader: U) -> Self;
       pub fn cover(&mut self, url: &str, shape: Shape, shown: [f32; 2]) -> Option<&U::Texture>;
+      pub fn cover_in_memory(&mut self, url: &str, shape: Shape, shown: [f32; 2]) -> Option<&U::Texture>;  // an adult title's: never a file (Task 9's review, i4)
       pub fn is_loading(&self, url: &str, shape: Shape, shown: [f32; 2]) -> bool;
       pub fn downloads_in_flight(&self) -> usize;
+      pub fn reads_in_flight(&self) -> usize;                // reads and decodes (Task 9's review)
       pub fn texture_bytes(&self) -> usize;
       pub fn end_frame(&mut self);                           // once per frame, after the covers were asked
   }
   pub fn decode(bytes: &[u8], size: [u32; 2]) -> Option<egui::ColorImage>;
+  pub fn png_is_sound(bytes: &[u8]) -> bool;               // the logos use it too (Task 9's review, c1)
   pub fn prune(dir: &Path, cap: u64) -> std::io::Result<(usize, u64)>;
   pub fn prune_in_background(dir: PathBuf);
   ```
