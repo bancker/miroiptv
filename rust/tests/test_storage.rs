@@ -1,4 +1,5 @@
 use bongo_player::storage::Storage;
+use bongo_player::vod::watching::{bad_copy, KEPT_COPIES};
 use std::ffi::OsString;
 use std::sync::Mutex;
 
@@ -215,4 +216,34 @@ fn a_sources_defect_marks_go_by_its_id_and_alone() {
     assert!(storage.favorites_path().exists(), "its favorites stay");
     // Marks that are not there are no failure.
     storage.remove_bad_streams(2);
+}
+
+#[test]
+fn removing_a_source_takes_every_unreadable_copy_of_what_it_watched() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut storage = Storage::with_root(dir.path().to_path_buf());
+    for id in [1, 2] {
+        storage.set_source(id);
+        for n in 1..=KEPT_COPIES {
+            std::fs::write(bad_copy(&storage.watching_path(), n), "x").unwrap();
+        }
+    }
+    assert_eq!(
+        storage.remove_source_files(2),
+        KEPT_COPIES as usize,
+        "all of its copies, and only those"
+    );
+    for n in 1..=KEPT_COPIES {
+        assert!(
+            !bad_copy(&storage.watching_path(), n).exists(),
+            "source 2's copy {n}"
+        );
+    }
+    storage.set_source(1);
+    for n in 1..=KEPT_COPIES {
+        assert!(
+            bad_copy(&storage.watching_path(), n).exists(),
+            "source 1's copy {n}"
+        );
+    }
 }

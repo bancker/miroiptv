@@ -14194,8 +14194,11 @@ https://c.example/twee-nieuws.m3u8\n";
         h.app.apply_settings_action(SettingsAction::DeleteSource(2));
         std::env::remove_var("BONGO_INI");
         let text = log.text();
-        let named = format!("storage: {} not removed: ", two.favorites_path().display());
-        assert!(text.contains(&named), "{text}");
+        // The file's name only: its folder holds the Windows user's name.
+        let named = "storage: favorites-2.json not removed: ";
+        assert!(text.contains(named), "{text}");
+        let folder = dir.path().display().to_string();
+        assert!(!text.contains(&folder), "{text}");
         // The files that were not there are no failure.
         assert!(!text.contains("presets-2.json"), "{text}");
         assert!(

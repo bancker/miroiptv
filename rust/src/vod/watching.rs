@@ -6,12 +6,15 @@
 //! A position under 60 s is "not started"; from 90 % of the length on, or at
 //! the end of the file, it is seen. Writes go through a temporary file, at
 //! most one every 5 s, and always at a stop (`flush`). A file that cannot be
-//! read is kept as `watching.json.bad`; the store starts empty and says so
-//! once in the log.
+//! read is kept as `watching.json.bad`, the next as `watching.json.2.bad` and
+//! so on (a copy that is there is never replaced); the store starts empty and
+//! says so once in the log. An entry of a file that can be read, but that
+//! cannot be read itself, costs that entry only (Ruling 35).
 
 use super::{write_atomic_with, Kind, TitleId};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -23,6 +26,13 @@ pub const SEEN_SHARE: f64 = 0.9;
 pub const WRITE_EVERY: Duration = Duration::from_secs(5);
 
 const VERSION: u32 = 1;
+
+/// How many unreadable copies of one file are kept: `watching.json.bad`, then
+/// `watching.json.2.bad` up to `watching.json.9.bad`.
+pub const KEPT_COPIES: u32 = 9;
+
+/// Notepad's "UTF-8 with BOM" puts these bytes first; JSON does not allow them.
+const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
 /// What plays: a film's version by its stream id (`m:<id>`), or an episode by
 /// its id (`e:<id>`). A film title's progress is that of its most recent
@@ -80,14 +90,26 @@ pub enum Thumb {
     Down,
 }
 
-#[derive(Serialize, Deserialize)]
-struct WatchFile {
+/// The file as it is read: its frame (a version and three collections) has to
+/// be right, but each entry stays a value until it is converted, so one that
+/// cannot be read leaves out itself and nothing else.
+#[derive(Deserialize)]
+struct ReadFile {
     version: u32,
     #[serde(default)]
+    items: BTreeMap<String, Value>,
+    #[serde(default)]
+    list: Vec<Value>,
+    #[serde(default)]
+    thumbs: BTreeMap<String, Value>,
+}
+
+/// The file as it is written.
+#[derive(Serialize)]
+struct WatchFile {
+    version: u32,
     items: BTreeMap<String, ItemEntry>,
-    #[serde(default)]
     list: Vec<ListEntry>,
-    #[serde(default)]
     thumbs: BTreeMap<String, i8>,
 }
 
@@ -177,7 +199,8 @@ impl Watching {
                 return me;
             }
         };
-        let file = match serde_json::from_slice::<WatchFile>(&bytes) {
+        let text = bytes.strip_prefix(BOM).unwrap_or(&bytes);
+        let file = match serde_json::from_slice::<ReadFile>(text) {
             Ok(file) if file.version == VERSION => file,
             Ok(file) => {
                 me.keep_as_bad(&format!("version {}", file.version));
@@ -188,8 +211,11 @@ impl Watching {
                 return me;
             }
         };
-        for (key, e) in file.items {
-            let Some(item) = Item::of_key(&key) else {
+        let mut left_out = 0usize;
+        for (key, value) in file.items {
+            let read = Item::of_key(&key).zip(serde_json::from_value::<ItemEntry>(value).ok());
+            let Some((item, e)) = read else {
+                left_out += 1;
                 continue;
             };
             let episode = e.series.map(|series| EpisodeOf {
@@ -208,31 +234,56 @@ impl Watching {
                 },
             );
         }
-        for e in file.list {
-            if let Some(kind) = kind_of(&e.k) {
-                let t = TitleId { kind, id: e.id };
-                if !me.list.iter().any(|(had, _)| *had == t) {
-                    me.list.push((t, e.at));
-                }
+        // The first entry of a title stays. A set to ask, not a scan of the
+        // list for every entry: that is quadratic, and a damaged file can hold
+        // tens of thousands.
+        let mut listed = HashSet::new();
+        for value in file.list {
+            let read = serde_json::from_value::<ListEntry>(value)
+                .ok()
+                .and_then(|e| Some((kind_of(&e.k)?, e)));
+            let Some((kind, e)) = read else {
+                left_out += 1;
+                continue;
+            };
+            let t = TitleId { kind, id: e.id };
+            if listed.insert(t) {
+                me.list.push((t, e.at));
             }
         }
         for (key, value) in file.thumbs {
-            let thumb = match value {
-                1 => Thumb::Up,
-                -1 => Thumb::Down,
-                _ => continue,
+            let thumb = match value.as_i64() {
+                Some(1) => Thumb::Up,
+                Some(-1) => Thumb::Down,
+                _ => {
+                    left_out += 1;
+                    continue;
+                }
             };
-            if let Some(t) = title_of_key(&key) {
-                me.thumbs.insert(t, thumb);
+            match title_of_key(&key) {
+                Some(t) => {
+                    me.thumbs.insert(t, thumb);
+                }
+                None => left_out += 1,
             }
+        }
+        if left_out > 0 {
+            tracing::warn!(
+                "vod: {} left out entries it cannot read ({left_out})",
+                file_name(&me.path)
+            );
         }
         me
     }
 
-    /// Moves the unreadable file aside as `<name>.bad` (over an older one)
-    /// and says so once.
+    /// Moves the unreadable file aside as `<name>.bad`, or, when that copy is
+    /// there already, as the next free `<name>.2.bad` ...: an older copy is the
+    /// user's data too, and a second bad file must not take its place. Past
+    /// [`KEPT_COPIES`] the last one is replaced. Says so once.
     fn keep_as_bad(&self, why: &str) {
-        let bad = self.path.with_extension("json.bad");
+        let bad = bad_copies(&self.path)
+            .find(|copy| !copy.exists())
+            .unwrap_or_else(|| bad_copy(&self.path, KEPT_COPIES));
         let kept = std::fs::rename(&self.path, &bad).is_ok();
         tracing::warn!(
             "vod: {} unreadable ({why}) - {} - starting empty",
@@ -448,6 +499,22 @@ impl Watching {
             }
         }
     }
+}
+
+/// Where the `n`th (1 to [`KEPT_COPIES`]) unreadable copy of `path` is kept:
+/// `watching.json.bad`, then `watching.json.2.bad`.
+pub fn bad_copy(path: &Path, n: u32) -> PathBuf {
+    if n <= 1 {
+        path.with_extension("json.bad")
+    } else {
+        path.with_extension(format!("json.{n}.bad"))
+    }
+}
+
+/// Every place an unreadable copy of `path` can be in; deleting a source
+/// takes them all.
+pub fn bad_copies(path: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    (1..=KEPT_COPIES).map(move |n| bad_copy(path, n))
 }
 
 /// The file's name, for the log: its folder is the user's profile.

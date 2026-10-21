@@ -99,20 +99,21 @@ impl Storage {
     }
 
     /// Removes source `id`'s favorites, presets, last channel, defect marks,
-    /// what it watched (and the `.bad` copy of that file) and saved list, with
+    /// what it watched (and the `.bad` copies of that file) and saved list, with
     /// the temp file of that list; how many of them there were.
     pub fn remove_source_files(&self, id: SourceId) -> usize {
+        let watching = self.source_file("watching", id);
         [
             self.source_file("favorites", id),
             self.source_file("presets", id),
             self.source_file("last_watched", id),
             self.source_file("bad_streams", id),
-            self.source_file("watching", id),
-            self.source_file("watching", id).with_extension("json.bad"),
+            watching.clone(),
             self.m3u_cache_path(id),
             self.m3u_temp_path(id),
         ]
-        .iter()
+        .into_iter()
+        .chain(crate::vod::watching::bad_copies(&watching))
         .filter(|path| remove_file(path))
         .count()
     }
@@ -134,13 +135,15 @@ impl Storage {
 }
 
 /// Removes the file at `path`; whether it was there. A failure other than its
-/// not being there is logged: the paths here name a source by its id only.
+/// not being there is logged by the file's name, which names a source by its
+/// id only: the folder holds the Windows user's name.
 fn remove_file(path: &Path) -> bool {
     match std::fs::remove_file(path) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
-            tracing::warn!("storage: {} not removed: {}", path.display(), e);
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            tracing::warn!("storage: {} not removed: {}", name, e);
             false
         }
     }
