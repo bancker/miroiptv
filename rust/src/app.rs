@@ -5810,6 +5810,33 @@ https://c.example/twee-nieuws.m3u8\n";
             sources: Sources,
             relay: Option<Relay>,
         ) -> Self {
+            let mut harness =
+                Self::unframed(root, catalog, state, initial_url, creds, sources, relay);
+            harness.frame(&[]);
+            harness.frame(&[]);
+            // The cache file, which the app reads on a thread of its own once its
+            // catalog is loaded, has landed: the guide's fetches wait for it, so a
+            // test that counts them starts from there.
+            for _ in 0..2000 {
+                if harness.app.epg_cache_reading_since.is_none() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+                harness.frame(&[]);
+            }
+            harness
+        }
+
+        /// The app as `start_with` starts it, before its first frame.
+        fn unframed(
+            root: &std::path::Path,
+            catalog: Arc<CatalogStore>,
+            state: PortalState,
+            initial_url: Option<&str>,
+            creds: Option<XtreamCreds>,
+            sources: Sources,
+            relay: Option<Relay>,
+        ) -> Self {
             let (cmd_tx, cmds) = tokio::sync::mpsc::unbounded_channel();
             let (events, evt_rx) = tokio::sync::mpsc::unbounded_channel();
             let player = PlayerHandle {
@@ -5855,18 +5882,6 @@ https://c.example/twee-nieuws.m3u8\n";
             SWAPPED.set(false);
             KEY_POLLS.set(0);
             SWAP_READS.set(0);
-            harness.frame(&[]);
-            harness.frame(&[]);
-            // The cache file, which the app reads on a thread of its own once its
-            // catalog is loaded, has landed: the guide's fetches wait for it, so a
-            // test that counts them starts from there.
-            for _ in 0..2000 {
-                if harness.app.epg_cache_reading_since.is_none() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-                harness.frame(&[]);
-            }
             harness
         }
 
@@ -6740,29 +6755,60 @@ https://c.example/twee-nieuws.m3u8\n";
         );
     }
 
-    #[tokio::test]
-    async fn the_titles_of_the_last_start_are_read_once_a_frame_is_drawn() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vod-h_80.json");
-        let kept = crate::portal::Movie {
-            stream_id: 7,
-            name: "Kept (2020)".into(),
-            ..Default::default()
-        };
-        let categories = crate::portal::Categories::default();
-        let index = crate::vod::index::TitleIndex::build(&[kept], &[], &categories, 2027);
-        crate::vod::cache::save(&path, &index, 1_792_022_400).unwrap();
-        let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
-        // A store with the file, as `main` makes it, from its first frame on.
-        let store = Arc::new(CatalogStore::new(idle_portal()).with_vod_cache(Some(path)));
-        h.app.catalog = store.clone();
-        h.app.first_frame_drawn = false;
-        h.frame(&[]);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(store.titles().is_none(), "not read in the first frame");
-        h.frame(&[]);
-        wait_until("the titles of the last start", || store.titles().is_some()).await;
-        assert_eq!(store.titles().unwrap().saved_at(), Some(1_792_022_400));
+    /// A runtime on this thread with one blocking thread, which takes the jobs
+    /// handed to it in turn: `settled` then waits for every job before it.
+    fn one_blocking_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+    }
+
+    /// Every job handed to the blocking pool before this one has run (on
+    /// `one_blocking_thread`), the reads of the titles' file among them.
+    async fn settled() {
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+    }
+
+    /// The app started on a store with the file, as `main` makes it. On one
+    /// blocking thread (`settled`), where a margin of 100 ms let a read of the
+    /// first frame that came late pass, and from the start itself, where setting
+    /// `first_frame_drawn` back let one that `start` set pass.
+    #[test]
+    fn the_titles_of_the_last_start_are_read_once_a_frame_is_drawn() {
+        one_blocking_thread().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("vod-h_80.json");
+            let kept = crate::portal::Movie {
+                stream_id: 7,
+                name: "Kept (2020)".into(),
+                ..Default::default()
+            };
+            let categories = crate::portal::Categories::default();
+            let index = crate::vod::index::TitleIndex::build(&[kept], &[], &categories, 2027);
+            crate::vod::cache::save(&path, &index, 1_792_022_400).unwrap();
+            // A store with the file, as `main` makes it, from its first frame on.
+            let store = Arc::new(CatalogStore::new(idle_portal()).with_vod_cache(Some(path)));
+            let mut h = Harness::unframed(
+                dir.path(),
+                store.clone(),
+                PortalState::Configured,
+                None,
+                Some(test_creds()),
+                Sources::default(),
+                None,
+            );
+            h.frame(&[]);
+            settled().await;
+            assert!(store.titles().is_none(), "not read in the first frame");
+            h.frame(&[]);
+            settled().await;
+            assert_eq!(
+                store.titles().map(|t| t.saved_at()),
+                Some(Some(1_792_022_400))
+            );
+        });
     }
 
     /// Carry 1: a switch of source retires the store it leaves, so a fetch of
@@ -6791,6 +6837,50 @@ https://c.example/twee-nieuws.m3u8\n";
             wait_until("the old store's titles", || old.titles().is_some()).await;
             tokio::task::spawn_blocking(|| ()).await.unwrap();
             assert!(!path.exists(), "the old store wrote its file");
+        });
+    }
+
+    /// The review of Task 6b: a switch of source gives the new store the file of
+    /// its own portal, found by the new credentials and not the old ones, and the
+    /// next frame reads it.
+    #[test]
+    fn a_switch_of_source_gives_the_new_store_the_file_of_its_portal() {
+        one_blocking_thread().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = dir.path().join("cache");
+            let categories = crate::portal::Categories::default();
+            for (file, name, saved_at) in [
+                ("vod-h_80.json", "Old (2020)", 1),
+                ("vod-n_8080.json", "New (2021)", 2),
+            ] {
+                let film = crate::portal::Movie {
+                    stream_id: 7,
+                    name: name.into(),
+                    ..Default::default()
+                };
+                let index = crate::vod::index::TitleIndex::build(&[film], &[], &categories, 2027);
+                crate::vod::cache::save(&cache.join(file), &index, saved_at).unwrap();
+            }
+            // On the tests' portal, h:80.
+            let mut h = Harness::start(dir.path(), loaded_catalog(), PortalState::Configured, None);
+            let creds = XtreamCreds {
+                username: "u".into(),
+                password: "p".into(),
+                host: "n".into(),
+                port: 8080,
+            };
+            let next: Arc<dyn Portal> = Arc::new(XtreamPortal::new(creds.clone()));
+            let creds = Some(creds);
+            // Missing: nothing is asked of the new portal.
+            h.app.install_portal(next, creds, PortalState::Missing);
+            let store = h.app.catalog.clone();
+            h.frame(&[]);
+            settled().await;
+            assert_eq!(
+                store.titles().and_then(|t| t.saved_at()),
+                Some(2),
+                "the new portal's file"
+            );
         });
     }
 

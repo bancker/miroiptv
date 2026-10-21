@@ -1015,10 +1015,9 @@ pub struct CatalogStore {
     /// The file was asked for: it is read once per store.
     vod_cache_asked: AtomicBool,
     /// The store's source is no longer in use ([`CatalogStore::retire`]): its
-    /// titles are not written to the file any more. Every write holds it from
-    /// that check until the file is in place ([`keep_titles`]), which keeps the
-    /// store's writes one at a time as well.
-    vod_cache_retired: Arc<Mutex<bool>>,
+    /// titles are not written to the file any more. A write reads it when its
+    /// turn to save comes ([`keep_titles`]), so a retire never waits for one.
+    vod_cache_retired: Arc<AtomicBool>,
 }
 
 /// Titles in the store, and when the cache file they come from was written
@@ -1027,27 +1026,25 @@ type StoredTitles = (Arc<TitleIndex>, Option<i64>);
 
 /// Writes `titles` to the cache file at `path`, on the blocking pool
 /// ([`keep_titles`]).
-fn write_vod_cache(path: PathBuf, titles: Arc<TitleIndex>, retired: Arc<Mutex<bool>>) {
+fn write_vod_cache(path: PathBuf, titles: Arc<TitleIndex>, retired: Arc<AtomicBool>) {
     tokio::task::spawn_blocking(move || keep_titles(&path, &titles, &retired));
 }
 
 /// Writes `titles` to the cache file at `path`, unless the source of their
-/// store is no longer in use (`retired`, [`CatalogStore::retire`]). The flag is
-/// held until the file is in place, as an M3U list's own is while it saves its
-/// list: a retire waits for a write that has begun, and no write begins after
-/// it. So the store's writes go one at a time, and those of the process too
-/// (`cache::save`). A write that fails leaves the file that was there whole and
-/// is logged by the file's name, never its folder (which holds the user's
-/// name); the next build writes again.
-fn keep_titles(path: &Path, titles: &TitleIndex, retired: &Mutex<bool>) {
-    let retired = retired.lock();
-    if *retired {
-        info!("vod: cache not written - the source is no longer in use");
-        return;
-    }
+/// store is no longer in use by the time this write's turn comes (`retired`,
+/// [`CatalogStore::retire`]): `cache::save_unless` reads the flag under the
+/// lock every save of the process holds, one at a time. So a retire never
+/// waits (it runs on the screen's thread), no write begins after it, and one
+/// that began before it ends before any later save begins: the next store's
+/// file, which may be this one, never has an older store's titles written over
+/// it. A write that fails leaves the file that was there whole and is logged by
+/// the file's name, never its folder (which holds the user's name); the next
+/// build writes again.
+fn keep_titles(path: &Path, titles: &TitleIndex, retired: &AtomicBool) {
     let now = chrono::Utc::now().timestamp();
-    match crate::vod::cache::save(path, titles, now) {
-        Ok((n, bytes)) => info!("vod: cache written ({} titles, {} KB)", n, bytes / 1024),
+    match crate::vod::cache::save_unless(path, titles, now, retired) {
+        Ok(Some((n, bytes))) => info!("vod: cache written ({} titles, {} KB)", n, bytes / 1024),
+        Ok(None) => info!("vod: cache not written - the source is no longer in use"),
         Err(e) => {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             warn!("vod: cache not written ({name}: {e})");
@@ -1177,7 +1174,7 @@ impl CatalogStore {
             categories_wait: CATEGORIES_WAIT,
             vod_cache: None,
             vod_cache_asked: AtomicBool::new(false),
-            vod_cache_retired: Arc::new(Mutex::new(false)),
+            vod_cache_retired: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1222,13 +1219,14 @@ impl CatalogStore {
 
     /// The app no longer runs on this store: its source was switched away
     /// from, saved with another address or deleted. Its portal writes nothing
-    /// for it any more ([`Portal::retire`]), and neither does the store: a write
-    /// of the titles' file that has begun ends before this returns, and none
-    /// begins after it. A fetch still under way may still put its titles here,
+    /// for it any more ([`Portal::retire`]), and neither does the store: no
+    /// write of the titles' file begins after this, and one that began before
+    /// it ends before any later save begins ([`keep_titles`]). It waits for no
+    /// write of the file. A fetch still under way may still put its titles here,
     /// in a store that no longer shows.
     pub fn retire(&self) {
         self.portal.retire();
-        *self.vod_cache_retired.lock() = true;
+        self.vod_cache_retired.store(true, Ordering::SeqCst);
     }
 
     /// A store with a catalog already loaded (tests, tools), and its titles,
@@ -1980,7 +1978,7 @@ mod titles_tests {
             &Categories::default(),
             2027,
         );
-        let text = logged(|| keep_titles(&path, &titles, &Mutex::new(false)));
+        let text = logged(|| keep_titles(&path, &titles, &AtomicBool::new(false)));
         let lines: Vec<&str> = text.lines().filter(|l| l.contains("vod: cache")).collect();
         assert_eq!(lines.len(), 1, "{text}");
         let line = lines[0];
@@ -1993,5 +1991,90 @@ mod titles_tests {
         assert!(!line.contains(&*folder), "{line}");
         assert!(!line.contains('\\') && !line.contains('/'), "{line}");
         assert!(path.is_dir() && !path.with_extension("json.tmp").exists());
+    }
+
+    /// One series, "Dark".
+    fn dark() -> TitleIndex {
+        TitleIndex::build(
+            &[],
+            &[Series {
+                series_id: 1,
+                name: "Dark".into(),
+                ..Series::default()
+            }],
+            &Categories::default(),
+            2027,
+        )
+    }
+
+    /// The review of Task 6b: the lines Task 12's checklist looks for, and the
+    /// time a write gives the file (Thuis says "Gegevens van <dag> <tijd>"):
+    /// the moment it is written. A retired store says why it writes nothing.
+    #[test]
+    fn the_file_says_when_it_was_written_and_the_log_what_was_written_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vod-h_80.json");
+        let text = logged(|| keep_titles(&path, &dark(), &AtomicBool::new(true)));
+        assert!(
+            text.contains(" INFO ")
+                && text.contains("vod: cache not written - the source is no longer in use"),
+            "{text}"
+        );
+        assert!(!path.exists());
+        let before = chrono::Utc::now().timestamp();
+        let text = logged(|| keep_titles(&path, &dark(), &AtomicBool::new(false)));
+        let after = chrono::Utc::now().timestamp();
+        assert!(
+            text.contains(" INFO ") && text.contains("vod: cache written (1 titles, 0 KB)"),
+            "{text}"
+        );
+        let slot = RwLock::new(None);
+        let text = logged(|| read_titles(&path, &slot, &AtomicU64::new(0)));
+        let saved_at = slot.read().as_ref().and_then(|(_, saved_at)| *saved_at);
+        assert!(
+            saved_at.is_some_and(|t| (before..=after).contains(&t)),
+            "written at {saved_at:?}, between {before} and {after}"
+        );
+        let read = format!(
+            "vod: cache read (1 titles, written at {}) in ",
+            saved_at.unwrap()
+        );
+        assert!(text.contains(" INFO ") && text.contains(&read), "{text}");
+    }
+
+    /// The review of Task 6b: a file's error is kept whole up to
+    /// `LOGGED_ERROR_CHARS` characters, as most are, and else cut after that
+    /// many, between two characters (a € is three bytes), with "..." after it.
+    #[test]
+    fn a_files_error_is_kept_whole_up_to_its_bound_and_cut_after_it() {
+        let short = "invalid type: string \"x\", expected i64 at line 1 column 27";
+        assert_eq!(logged_error(short), short);
+        assert_eq!(logged_error("version 2"), "version 2");
+        let at_the_bound = "\u{20ac}".repeat(LOGGED_ERROR_CHARS);
+        assert_eq!(logged_error(&at_the_bound), at_the_bound);
+        let past_it = "\u{20ac}".repeat(LOGGED_ERROR_CHARS + 1);
+        assert_eq!(logged_error(&past_it), format!("{at_the_bound}..."));
+    }
+
+    /// Carry 1 without a wait (the review of Task 6b): the app retires a store
+    /// on the screen's thread, which must not wait for a write of the titles'
+    /// file (a save of Pandora's titles takes ~80 ms, a slow disk longer). A
+    /// write whose turn has not come when the store is retired (another save
+    /// has it) writes nothing once it comes, and the retire returned at once
+    /// all the same: with the turn held here, one that waited would not return.
+    #[test]
+    fn a_retire_waits_for_no_write_and_a_write_whose_turn_comes_after_it_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vod-h_80.json");
+        let store = CatalogStore::new(idle_portal()).with_vod_cache(Some(path.clone()));
+        let turn = crate::vod::cache::hold_saves();
+        let writer = {
+            let (path, retired) = (path.clone(), store.vod_cache_retired.clone());
+            std::thread::spawn(move || keep_titles(&path, &dark(), &retired))
+        };
+        store.retire();
+        drop(turn);
+        writer.join().unwrap();
+        assert!(!path.exists() && !path.with_extension("json.tmp").exists());
     }
 }

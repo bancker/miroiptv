@@ -15,14 +15,15 @@ use super::{write_atomic_with, Kind};
 use crate::args::XtreamCreds;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const VERSION: u32 = 1;
 
 /// Every save of a file goes through the same temporary file
 /// (`write_atomic_with`), so two at once would write into each other: the
 /// stores of two sources of one portal (an edited account, two accounts of one
-/// provider) share the file. Held by `save` alone, which runs on the blocking
-/// pool: a writer of another file never waits for it.
+/// provider) share the file. Held by `save_unless` alone (`save` is one), which
+/// runs on the blocking pool: a writer of another file never waits for it.
 static SAVING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// The file as it is read.
@@ -160,7 +161,32 @@ pub fn path_for(cache_dir: &Path, creds: Option<&XtreamCreds>) -> Option<PathBuf
 /// or a query. How many titles went in and the file's size. One save runs at a
 /// time in the process (`SAVING`).
 pub fn save(path: &Path, index: &TitleIndex, saved_at: i64) -> std::io::Result<(usize, u64)> {
+    let retired = AtomicBool::new(false);
+    Ok(save_unless(path, index, saved_at, &retired)?.unwrap_or_default())
+}
+
+/// Every save's turn, held until the guard is dropped, as by a save that takes
+/// long (the crate's tests).
+#[cfg(test)]
+pub(crate) fn hold_saves() -> parking_lot::MutexGuard<'static, ()> {
+    SAVING.lock()
+}
+
+/// [`save`], unless `retired` is set by the time this save's turn comes: it is
+/// read under the lock every save holds (`SAVING`). So whoever sets it never
+/// waits for a save, a save whose turn comes after it writes nothing, and one
+/// that had its turn before ends before any save after it begins (the next
+/// store's, of this file or another). None when it wrote nothing.
+pub fn save_unless(
+    path: &Path,
+    index: &TitleIndex,
+    saved_at: i64,
+    retired: &AtomicBool,
+) -> std::io::Result<Option<(usize, u64)>> {
     let _one_at_a_time = SAVING.lock();
+    if retired.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
     let file = CacheFileRef {
         version: VERSION,
         saved_at,
@@ -174,7 +200,7 @@ pub fn save(path: &Path, index: &TitleIndex, saved_at: i64) -> std::io::Result<(
         serde_json::to_writer(out, &file).map_err(std::io::Error::other)
     })?;
     let bytes = std::fs::metadata(path)?.len();
-    Ok((kept(index).count(), bytes))
+    Ok(Some((kept(index).count(), bytes)))
 }
 
 /// The titles in the file at `path` and when it was written; none when there

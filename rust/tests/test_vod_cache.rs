@@ -855,10 +855,21 @@ fn a_series_that_carries_versions_in_a_file_has_none() {
 /// with "The system cannot find the file specified", readers meet files that are
 /// halfway, and the file at the end can be a valid mix of both. GREEN with one
 /// save at a time in the process.
+///
+/// A program outside may hold the file a save has just put in place (the Task
+/// 6b review found the System process, a scanner's filter, holding it for a
+/// few ms; once 51 saves in a row were refused): then a save or a read is
+/// refused, as one of the app's may be, which logs it and writes again at the
+/// next build. That is no save writing into another, so it is counted apart,
+/// and the last read waits until the file is let go.
 #[test]
 fn two_saves_of_one_file_at_once_leave_it_whole() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    /// Refused by a program that holds the file: access denied (5), in use (32).
+    fn held(error: &str) -> bool {
+        error.ends_with("(os error 5)") || error.ends_with("(os error 32)")
+    }
     let films = |n: i64, tag: &str| -> Arc<TitleIndex> {
         let movies: Vec<Movie> = (1..=n)
             .map(|i| Movie {
@@ -915,13 +926,28 @@ fn two_saves_of_one_file_at_once_leave_it_whole() {
         .collect();
     done.store(true, Ordering::Relaxed);
     let halfway = reader.join().unwrap();
+    let (refused, failed): (Vec<_>, Vec<_>) = failed.into_iter().partition(|e| held(e));
+    let (let_go, halfway): (Vec<_>, Vec<_>) = halfway.into_iter().partition(|e| held(e));
     assert!(
         failed.is_empty(),
-        "{} saves failed: {failed:?}",
-        failed.len()
+        "{} saves failed: {failed:?} ({} refused by a holder)",
+        failed.len(),
+        refused.len()
     );
-    assert!(halfway.is_empty(), "reads of a file halfway: {halfway:?}");
-    let (back, _) = load(&path).unwrap().unwrap();
+    assert!(
+        halfway.is_empty(),
+        "reads of a file halfway: {halfway:?} ({} refused by a holder)",
+        let_go.len()
+    );
+    let mut last = load(&path);
+    for _ in 0..400 {
+        if !last.as_ref().is_err_and(|e| held(e)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        last = load(&path);
+    }
+    let (back, _) = last.unwrap().unwrap();
     assert!(
         back.len() == small.len() || back.len() == big.len(),
         "a mix of both: {} titles",
@@ -1065,6 +1091,8 @@ fn the_cached_titles_show_while_the_fresh_ones_are_built() {
         })
         .await;
         assert_eq!(shown(&store), Some((vec!["Fresh".into()], None)));
+        // Their write ends before the folder goes (it would make it again).
+        settled().await;
     });
 }
 
@@ -1099,34 +1127,45 @@ fn the_file_is_read_once() {
     });
 }
 
-#[tokio::test]
-async fn an_unreadable_file_is_ignored_and_the_next_load_replaces_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("vod-h_80.json");
-    std::fs::write(&path, b"<html>not a cache</html>").unwrap();
-    let (_server, portal) = portal_with_film("Fresh (2026)").await;
-    let store = Arc::new(CatalogStore::new(portal).with_vod_cache(Some(path.clone())));
-    store.read_vod_cache();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(store.titles().is_none());
-    store.spawn_fetch();
-    until("the new file", || {
-        load(&path).is_ok_and(|read| read.is_some())
-    })
-    .await;
+/// On one blocking thread, which reads in turn (`settled`): with a margin of
+/// 100 ms instead, a read that came late would pass for one that put nothing.
+#[test]
+fn an_unreadable_file_is_ignored_and_the_next_load_replaces_it() {
+    one_blocking_thread().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vod-h_80.json");
+        std::fs::write(&path, b"<html>not a cache</html>").unwrap();
+        let (_server, portal) = portal_with_film("Fresh (2026)").await;
+        let store = Arc::new(CatalogStore::new(portal).with_vod_cache(Some(path.clone())));
+        store.read_vod_cache();
+        settled().await;
+        assert!(store.titles().is_none());
+        store.spawn_fetch();
+        until("the new file", || {
+            load(&path).is_ok_and(|read| read.is_some())
+        })
+        .await;
+        settled().await;
+    });
 }
 
-#[tokio::test]
-async fn a_catalog_that_came_first_shows_its_own_titles() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = cache_with_library(dir.path());
-    let (_server, portal) = portal_with_film("Fresh (2026)").await;
-    let store = Arc::new(CatalogStore::new(portal).with_vod_cache(Some(path)));
-    store.spawn_fetch();
-    until("the catalog's own titles", || store.titles().is_some()).await;
-    store.read_vod_cache();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(shown(&store), Some((vec!["Fresh".into()], None)));
+/// On one blocking thread (`settled`): with a margin of 100 ms instead, a read
+/// that came late would pass for one that put nothing. The write of the
+/// catalog's titles ends before the folder goes: one that landed after it would
+/// make the folder again, and leave it behind.
+#[test]
+fn a_catalog_that_came_first_shows_its_own_titles() {
+    one_blocking_thread().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_with_library(dir.path());
+        let (_server, portal) = portal_with_film("Fresh (2026)").await;
+        let store = Arc::new(CatalogStore::new(portal).with_vod_cache(Some(path)));
+        store.spawn_fetch();
+        until("the catalog's own titles", || store.titles().is_some()).await;
+        store.read_vod_cache();
+        settled().await;
+        assert_eq!(shown(&store), Some((vec!["Fresh".into()], None)));
+    });
 }
 
 fn idle_portal() -> Arc<dyn Portal> {
@@ -1398,6 +1437,8 @@ fn the_files_titles_and_the_catalogs_own_each_count_as_titles_put() {
         })
         .await;
         assert_eq!(store.titles_revision(), 2, "the catalog's own");
+        // Their write ends before the folder goes (it would make it again).
+        settled().await;
     });
 }
 
@@ -1443,6 +1484,8 @@ fn the_file_is_read_on_the_blocking_pool_and_not_where_it_is_asked() {
         let (release, hold) = std::sync::mpsc::channel::<()>();
         let holder = tokio::task::spawn_blocking(move || hold.recv());
         store.read_vod_cache();
+        // Not on this runtime's thread either, as a task it would run now.
+        tokio::task::yield_now().await;
         assert!(store.titles().is_none(), "read where it was asked");
         release.send(()).unwrap();
         holder.await.unwrap().unwrap();
