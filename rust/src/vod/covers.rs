@@ -9,7 +9,13 @@
 //!
 //! An address may hold the portal's account: it is never logged (only its
 //! host), never a file's name and never a texture's (a hash). A title without
-//! a cover shows its name on a colour of its own (`placeholder_tint`).
+//! a cover shows its name on a colour of its own (`placeholder_tint`). The
+//! cover of an adult title is asked for with `cover_in_memory`: like an adult
+//! column's logo in the guide, it is never kept as a file.
+//!
+//! A body is looked at before a decoder gets it (`decode`): the release build
+//! aborts on a panic, and the decoders panic on, or spend gigabytes on, a few
+//! hundred bytes made for it.
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -20,8 +26,9 @@ use tokio::sync::Semaphore;
 
 /// Downloads at the same time.
 pub const AT_ONCE: usize = 6;
-/// Covers read from their files and decoded at the same time: beside the
-/// downloads, so a slow server never holds up a kept cover.
+/// Covers read from their files and decoded at the same time, and bodies that
+/// came decoded: beside the downloads, so a slow server never holds up a kept
+/// cover, and a screenful of originals is not decoded all at once.
 pub const READS_AT_ONCE: usize = 6;
 /// The textures' bytes together (width × height × 4).
 pub const TEXTURE_BYTES: usize = 96 * 1024 * 1024;
@@ -34,6 +41,19 @@ pub const UPLOADS_PER_FRAME: usize = 8;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 /// A canvas wider or taller than this is no cover.
 const MAX_CANVAS: u32 = 8192;
+/// A picture that `resize_to_fill` would scale to more than this many times the
+/// area of the size first (it scales by the larger of the two ratios and cuts
+/// after) is a strip, not a cover: 256 x 2 pixels, 133 bytes, would make a
+/// 57,600 x 450 picture (74 MB) for a 300 x 450 cover, and 8192 x 2, 365 bytes,
+/// one of 2.4 GB that takes a minute and a half.
+const MAX_STRETCH: u64 = 8;
+/// A PNG's colour profile (`iCCP`) bigger than this is no cover's: the decoder
+/// inflates it whole, and 1 MB of PNG made it 529 MB. Real profiles are a few KB.
+const MAX_PROFILE_BYTES: usize = 64 * 1024;
+/// A JPEG with more scans than this is no cover (a progressive one has about
+/// ten): the decoder goes over every block of the frame in each, 22 ms at 8192 x
+/// 8192, and 5,000 scans, 295 KB, took two minutes.
+const MAX_SCANS: usize = 64;
 
 /// What a picture is drawn as, and so the sizes it is made in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -273,6 +293,30 @@ impl<U: Uploader> CoverStore<U> {
     /// once it is there; asked for when it is not. None while it comes and for
     /// no cover: the tile shows its placeholder, of the same size.
     pub fn cover(&mut self, url: &str, shape: Shape, shown: [f32; 2]) -> Option<&U::Texture> {
+        self.ask(url, shape, shown, true)
+    }
+
+    /// [`cover`](Self::cover) for a title the catalog's lock hides while it is
+    /// on (an adult one): what is downloaded for it is never kept as a file, as
+    /// the guide keeps an adult column's logo in memory only. The lock lives in
+    /// memory and the folder does not: anyone who opens it would see the covers.
+    pub fn cover_in_memory(
+        &mut self,
+        url: &str,
+        shape: Shape,
+        shown: [f32; 2],
+    ) -> Option<&U::Texture> {
+        self.ask(url, shape, shown, false)
+    }
+
+    /// `to_disk`: whether what is downloaded is kept as a file.
+    fn ask(
+        &mut self,
+        url: &str,
+        shape: Shape,
+        shown: [f32; 2],
+        to_disk: bool,
+    ) -> Option<&U::Texture> {
         let key = CoverKey {
             hash: url_hash(url),
             size: shape.size_for(shown),
@@ -282,7 +326,7 @@ impl<U: Uploader> CoverStore<U> {
             return self.textures.peek(&key);
         }
         if !self.slots.contains_key(&key) {
-            self.start(key, url);
+            self.start(key, url, to_disk);
         }
         None
     }
@@ -299,6 +343,12 @@ impl<U: Uploader> CoverStore<U> {
     /// Downloads on their way now.
     pub fn downloads_in_flight(&self) -> usize {
         AT_ONCE - self.downloads.available_permits()
+    }
+
+    /// Covers being read from their files or decoded now (a download's body
+    /// too): at most [`READS_AT_ONCE`].
+    pub fn reads_in_flight(&self) -> usize {
+        READS_AT_ONCE - self.reads.available_permits()
     }
 
     /// The textures' bytes.
@@ -345,7 +395,7 @@ impl<U: Uploader> CoverStore<U> {
     }
 
     /// Reads or fetches the cover in the background.
-    fn start(&mut self, key: CoverKey, url: &str) {
+    fn start(&mut self, key: CoverKey, url: &str, to_disk: bool) {
         let Some(client) = self.http_client() else {
             self.slots.insert(key, Slot::Missing);
             return;
@@ -353,7 +403,7 @@ impl<U: Uploader> CoverStore<U> {
         let (url, dir, done) = (url.to_owned(), self.dir.clone(), self.done.clone());
         let (downloads, reads) = (self.downloads.clone(), self.reads.clone());
         let task = tokio::spawn(async move {
-            let image = load_cover(&client, &url, &dir, key, &downloads, &reads).await;
+            let image = load_cover(&client, &url, &dir, key, to_disk, &downloads, &reads).await;
             done.lock().push(Arrived { key, image });
         });
         self.slots.insert(key, Slot::Loading(task.abort_handle()));
@@ -384,12 +434,14 @@ impl<U: Uploader> CoverStore<U> {
 }
 
 /// The cover from its file when that decodes, else from the web (kept as a
-/// file only once it decodes), made in `key.size`. None for no cover.
+/// file only once it decodes, and only when `to_disk`), made in `key.size`.
+/// None for no cover.
 async fn load_cover(
     client: &reqwest::Client,
     url: &str,
     dir: &Path,
     key: CoverKey,
+    to_disk: bool,
     downloads: &Semaphore,
     reads: &Semaphore,
 ) -> Option<egui::ColorImage> {
@@ -415,10 +467,17 @@ async fn load_cover(
         return None;
     };
     let dir = dir.to_path_buf();
-    let image = tokio::task::spawn_blocking(move || keep(&bytes, &dir, &stem, key.size))
-        .await
-        .ok()
-        .flatten();
+    // A body that came is decoded in a read's place too: its download has let go
+    // of its own, and a screenful of originals (2000 x 3000 JPEGs, 50 MB each
+    // while they are decoded) arriving at once would otherwise all be decoded at
+    // the same time.
+    let image = {
+        let _place = reads.acquire().await.ok()?;
+        tokio::task::spawn_blocking(move || keep(&bytes, &dir, &stem, key.size, to_disk))
+            .await
+            .ok()
+            .flatten()
+    };
     if image.is_none() {
         tracing::debug!("cover: {host} is no JPEG or PNG - the placeholder shows");
     }
@@ -434,15 +493,23 @@ fn read_kept(dir: &Path, stem: &str, size: [u32; 2]) -> Option<egui::ColorImage>
     })
 }
 
-/// Decodes a downloaded body and keeps it as a file, but only when it decodes:
-/// a kept file is trusted next time. A file that cannot be written costs the
-/// next session a download, not this cover.
-fn keep(bytes: &[u8], dir: &Path, stem: &str, size: [u32; 2]) -> Option<egui::ColorImage> {
+/// Decodes a downloaded body and keeps it as a file (when `to_disk`), but only
+/// when it decodes: a kept file is trusted next time. A file that cannot be
+/// written costs the next session a download, not this cover.
+fn keep(
+    bytes: &[u8],
+    dir: &Path,
+    stem: &str,
+    size: [u32; 2],
+    to_disk: bool,
+) -> Option<egui::ColorImage> {
     let (_, ext) = format_of(bytes)?;
     let image = decode(bytes, size)?;
-    let _ = std::fs::create_dir_all(dir);
-    if let Err(e) = std::fs::write(dir.join(format!("{stem}.{ext}")), bytes) {
-        tracing::debug!("cover: could not be kept as a file ({e})");
+    if to_disk {
+        let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = std::fs::write(dir.join(format!("{stem}.{ext}")), bytes) {
+            tracing::debug!("cover: could not be kept as a file ({e})");
+        }
     }
     Some(image)
 }
@@ -459,9 +526,21 @@ fn format_of(bytes: &[u8]) -> Option<(image::ImageFormat, &'static str)> {
 }
 
 /// A JPEG or PNG made to fill `size` exactly (cut to its shape at the middle);
-/// none for anything else, and for a canvas over `MAX_CANVAS` either way.
+/// none for anything else, for a canvas over `MAX_CANVAS` either way, for what
+/// `is_sound` turns down, and for a strip that filling would scale up to
+/// `MAX_STRETCH` times the size's area.
 pub fn decode(bytes: &[u8], size: [u32; 2]) -> Option<egui::ColorImage> {
     let (format, _) = format_of(bytes)?;
+    if !is_sound(bytes, format) {
+        return None;
+    }
+    // The header tells the shape before a pixel is read.
+    let (width, height) = image::io::Reader::with_format(std::io::Cursor::new(bytes), format)
+        .into_dimensions()
+        .ok()?;
+    if !fills_without_stretching([width, height], size) {
+        return None;
+    }
     let mut reader = image::io::Reader::with_format(std::io::Cursor::new(bytes), format);
     let mut limits = image::io::Limits::default();
     limits.max_image_width = Some(MAX_CANVAS);
@@ -475,6 +554,64 @@ pub fn decode(bytes: &[u8], size: [u32; 2]) -> Option<egui::ColorImage> {
         dims,
         rgba.as_raw(),
     ))
+}
+
+/// Whether a picture of `from` pixels fills `size` without being scaled up to
+/// more than `MAX_STRETCH` times its area first. The shapes are compared
+/// crosswise, so nothing is divided.
+fn fills_without_stretching(from: [u32; 2], size: [u32; 2]) -> bool {
+    let (wide, tall) = (
+        u64::from(from[0]) * u64::from(size[1]),
+        u64::from(from[1]) * u64::from(size[0]),
+    );
+    wide.min(tall) > 0 && wide.max(tall) <= MAX_STRETCH.saturating_mul(wide.min(tall))
+}
+
+/// What a body holds that its decoder cannot take or should not be given,
+/// found before the decoder sees it. The release build aborts on a panic, and
+/// the png crate (0.17.16 in `Cargo.lock`) panics on a palette it does not
+/// check: a PLTE chunk whose length is no multiple of 3, or that holds
+/// more than 256 entries (in the test profile that only loses a task, which is
+/// why the plan's tests never saw it). Both decoders also spend far more than a
+/// cover is worth on a file made for it: see `MAX_PROFILE_BYTES` and `MAX_SCANS`.
+fn is_sound(bytes: &[u8], format: image::ImageFormat) -> bool {
+    match format {
+        image::ImageFormat::Png => png_is_sound(bytes),
+        _ => jpeg_is_sound(bytes),
+    }
+}
+
+/// The chunks of a PNG (length, type, data, CRC) up to its end, looked at for
+/// the palette and the colour profile only. Every PNG the app decodes goes
+/// through it: the guide's logos too.
+pub fn png_is_sound(bytes: &[u8]) -> bool {
+    let mut at = 8usize; // past the signature
+    while let Some(head) = bytes.get(at..).and_then(|rest| rest.get(..8)) {
+        let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        match &head[4..] {
+            b"PLTE" if len == 0 || len > 3 * 256 || matches!(len % 3, 1 | 2) => return false,
+            b"iCCP" if len > MAX_PROFILE_BYTES => return false,
+            b"IEND" => return true,
+            _ => {}
+        }
+        let Some(next) = at.checked_add(12).and_then(|n| n.checked_add(len)) else {
+            return false;
+        };
+        at = next;
+    }
+    true
+}
+
+/// The scans of a JPEG, counted by their start-of-scan markers. In entropy-coded
+/// data every 0xFF is followed by 0x00 or a restart marker, so FF DA is the
+/// start of a scan (or of a thumbnail's, inside a header).
+fn jpeg_is_sound(bytes: &[u8]) -> bool {
+    bytes
+        .windows(2)
+        .filter(|pair| *pair == [0xff, 0xda])
+        .take(MAX_SCANS + 1)
+        .count()
+        <= MAX_SCANS
 }
 
 /// `url`'s body, at most [`MAX_BYTES`]; none on an error status, a failure,

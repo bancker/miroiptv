@@ -285,6 +285,11 @@ pub fn decode(bytes: &[u8]) -> Option<egui::ColorImage> {
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return None;
     }
+    // Not what the decoder panics on (the release build aborts on a panic) or
+    // inflates whole: a palette it does not check, a colour profile.
+    if !crate::vod::covers::png_is_sound(bytes) {
+        return None;
+    }
     // `MAX_BYTES` limits the file, not the canvas: a small PNG can claim
     // hundreds of megabytes of pixels. The decoder checks the claim before it
     // allocates them.
@@ -322,9 +327,11 @@ pub fn file_name(url: &str) -> String {
 }
 
 /// The host (and port) of a URL, for the log: a logo URL may carry a token.
+/// A backslash ends it as a slash does: the URL parser, and so the request,
+/// reads `http://host\user\pass\a.png` as a path.
 pub fn host_of(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or("");
     authority.rsplit('@').next().unwrap_or("")
 }
 
@@ -339,6 +346,23 @@ mod tests {
             .write_to(&mut out, image::ImageOutputFormat::Png)
             .unwrap();
         out.into_inner()
+    }
+
+    /// 81 bytes found by fuzzing: a 1 x 1 picture whose PLTE chunk is 2 bytes
+    /// long. The png crate (0.17.16) panics on it, and the release build aborts
+    /// on a panic: one such logo would end the app.
+    const BROKEN_PALETTE: [u8; 81] = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x03, 0x00, 0x00, 0x00, 0x25,
+        0xdb, 0x56, 0xca, 0x00, 0x00, 0x00, 0x02, 0x50, 0x4c, 0x54, 0x45, 0x00, 0x00, 0x12, 0x71,
+        0xcb, 0xc2, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x00,
+        0x00, 0x00, 0x02, 0x00, 0x01, 0x48, 0xaf, 0xa4, 0x71, 0x00, 0x00, 0x00, 0x00, 0x09, 0x45,
+        0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn a_png_the_decoder_would_panic_on_is_no_logo() {
+        assert!(decode(&BROKEN_PALETTE).is_none());
     }
 
     #[test]
@@ -383,6 +407,15 @@ mod tests {
         );
         assert_eq!(host_of("https://cdn.example/x/y.png"), "cdn.example");
         assert_eq!(host_of("no-scheme/x.png"), "no-scheme");
+        // The URL parser reads a backslash as a slash: what follows is a path.
+        assert_eq!(
+            host_of("http://logos.example\\user\\pw\\a.png"),
+            "logos.example"
+        );
+        assert_eq!(
+            host_of("https://logos.example:8080\\user/pw/a.png"),
+            "logos.example:8080"
+        );
     }
 
     /// Takes results in until `url`'s texture is there; its size.
