@@ -26,6 +26,8 @@
 
 ## 0. Decisions for the user before the build
 
+**Decided by the user on 2026-10-21:** D1 (b). D2 yes: 0.7.1 is released locally (e312180, tag `BongoIPTVPlayer-v0.7.1`, not pushed). D3: the four buttons wait for phase 3. D4 stands as written.
+
 **D1. Pandora's data has a year for 30 % of its titles and a genre for 32 %.**
 - **Source:** VALIDATION's `vod:` line on the real portal, 2026-10-20 (memory "pandora-vod-data-quality"). Covers are at 91 % and ratings at 81 %.
 - **Effect:** Z2's Jaar and Genre filters then reach only a third of the titles. A title's details do carry a year and genres, and `TitleIndex::learn` adds them once its page has been opened, so the share grows with use but starts low.
